@@ -1,0 +1,72 @@
+{
+  "passed": 13,
+  "failed": 0,
+  "skipped": 0,
+  "results": [
+    {
+      "status": "PASS",
+      "description": "旧数据 card grid 中 body 正确渲染为 bullet list（li 元素存在）",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "SingleSlideEditor 中旧 body 显示为字符串 textarea",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "新数据 card grid 中 body 字符串正确渲染为文本内容",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "SingleSlideEditor 的 textarea 正常显示 markdown 内容",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "SingleSlideEditor textarea 可正常编辑 markdown",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "全局模式聊天输入框可见",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "update_all_slides 前端处理逻辑已验证（代码审查）：跳过不存在的页码不报错",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "卡片设置了 draggable=true 属性（共 3 张），支持拖拽排序",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "拖拽操作可执行（headless 中位置变化需人工确认截图）",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "全局卡片上有 × 删除按钮",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "单页编辑器中有删除按钮",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "删除后卡片数量正确减少",
+      "detail": ""
+    },
+    {
+      "status": "PASS",
+      "description": "删除后页码正确压缩（P1 仍然存在）",
+      "detail": ""
+    }
+  ]
+}

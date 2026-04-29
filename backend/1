@@ -1,0 +1,179 @@
+[2026-04-25 23:55:10,758: INFO/MainProcess] Connected to redis://localhost:6379/0
+[2026-04-25 23:55:10,766: INFO/MainProcess] mingle: searching for neighbors
+[2026-04-25 23:55:11,776: INFO/MainProcess] mingle: all alone
+[2026-04-25 23:55:11,795: INFO/MainProcess] celery@JoedeMacBook-Air.local ready.
+[2026-04-25 23:55:19,700: INFO/MainProcess] Task app.tasks.generate_slides_task[1eb7f788-f3a7-463f-becf-0562e43d4184] received
+[2026-04-25 23:55:19,712: INFO/ForkPoolWorker-8] Celery task started: project=3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, pages=[4], prototype=False
+[2026-04-25 23:55:19,712: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, page_nums=[4]
+[2026-04-25 23:55:19,724: INFO/ForkPoolWorker-8] Pipeline: 打样模式，只生成 1 页
+[2026-04-25 23:55:19,729: INFO/ForkPoolWorker-8] Slide 4: 共加载 0 张参考图
+[2026-04-25 23:57:20,454: INFO/ForkPoolWorker-8] Retrying request to /images/generations in 0.424906 seconds
+[2026-04-25 23:59:23,026: INFO/ForkPoolWorker-8] Retrying request to /images/generations in 0.835217 seconds
+[2026-04-26 00:00:20,756: ERROR/MainProcess] Process 'ForkPoolWorker-8' pid:35168 exited with 'signal 9 (SIGKILL)'
+[2026-04-26 00:00:20,774: ERROR/MainProcess] Task handler raised error: WorkerLostError('Worker exited prematurely: signal 9 (SIGKILL) Job: 0.')
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.einfo.ExceptionWithTraceback: 
+"""
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.exceptions.WorkerLostError: Worker exited prematurely: signal 9 (SIGKILL) Job: 0.
+"""
+[2026-04-26 00:00:37,502: INFO/MainProcess] Connected to redis://localhost:6379/0
+[2026-04-26 00:00:37,504: INFO/MainProcess] mingle: searching for neighbors
+[2026-04-26 00:00:38,512: INFO/MainProcess] mingle: all alone
+[2026-04-26 00:00:38,531: INFO/MainProcess] celery@JoedeMacBook-Air.local ready.
+[2026-04-26 00:00:45,345: INFO/MainProcess] Task app.tasks.generate_slides_task[840202ba-7f8e-4b49-8073-68460e170c41] received
+[2026-04-26 00:00:45,355: INFO/ForkPoolWorker-8] Celery task started: project=3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, pages=[4], prototype=False
+[2026-04-26 00:00:45,355: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, page_nums=[4]
+[2026-04-26 00:00:45,365: INFO/ForkPoolWorker-8] Pipeline: 打样模式，只生成 1 页
+[2026-04-26 00:00:45,370: INFO/ForkPoolWorker-8] Slide 4: 共加载 0 张参考图
+[2026-04-26 00:02:46,194: INFO/ForkPoolWorker-8] Retrying request to /images/generations in 0.462215 seconds
+[2026-04-26 00:03:40,444: ERROR/MainProcess] Process 'ForkPoolWorker-8' pid:36787 exited with 'signal 9 (SIGKILL)'
+[2026-04-26 00:03:40,464: ERROR/MainProcess] Task handler raised error: WorkerLostError('Worker exited prematurely: signal 9 (SIGKILL) Job: 0.')
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.einfo.ExceptionWithTraceback: 
+"""
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.exceptions.WorkerLostError: Worker exited prematurely: signal 9 (SIGKILL) Job: 0.
+"""
+INFO:     Will watch for changes in these directories: ['/Users/Joe_1/Desktop/Development/ppt-god/backend']
+ERROR:    [Errno 48] Address already in use
+[2026-04-26 00:15:29,609: INFO/MainProcess] Task app.tasks.generate_slides_task[1733f6f7-0ffb-426f-8f68-c0c3effa36c4] received
+[2026-04-26 00:15:29,634: INFO/ForkPoolWorker-9] Celery task started: project=3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, pages=None, prototype=False
+[2026-04-26 00:15:29,634: INFO/ForkPoolWorker-9] Pipeline: 开始生成项目 3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4, page_nums=None
+[2026-04-26 00:15:29,660: INFO/ForkPoolWorker-9] Slide 1: 共加载 0 张参考图
+[2026-04-26 00:15:40,791: INFO/MainProcess] Task app.tasks.generate_slides_task[383551cc-a2f3-4e5c-b8d8-7cad27aff4eb] received
+[2026-04-26 00:15:40,802: WARNING/ForkPoolWorker-1] Project 3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4 already has a generation task running
+[2026-04-26 00:15:40,803: INFO/ForkPoolWorker-1] Task app.tasks.generate_slides_task[383551cc-a2f3-4e5c-b8d8-7cad27aff4eb] succeeded in 0.010467207990586758s: {'project_id': '3dc7e852-cdf7-4d0a-bbf7-660c08aab2f4', 'status': 'skipped', 'reason': 'already_running'}
+[2026-04-26 00:16:24,968: ERROR/MainProcess] Process 'ForkPoolWorker-2' pid:36781 exited with 'signal 15 (SIGTERM)'
+[2026-04-26 00:16:24,993: ERROR/MainProcess] Process 'ForkPoolWorker-9' pid:37144 exited with 'signal 15 (SIGTERM)'
+[2026-04-26 00:16:24,998: ERROR/MainProcess] Task handler raised error: WorkerLostError('Worker exited prematurely: signal 15 (SIGTERM) Job: 1.')
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.einfo.ExceptionWithTraceback: 
+"""
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/worker/worker.py", line 203, in start
+    self.blueprint.start(self)
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/bootsteps.py", line 116, in start
+    step.start(parent)
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/bootsteps.py", line 365, in start
+    return self.obj.start()
+           ^^^^^^^^^^^^^^^^
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/worker/consumer/consumer.py", line 346, in start
+    blueprint.start(self)
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/bootsteps.py", line 116, in start
+    step.start(parent)
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/worker/consumer/consumer.py", line 788, in start
+    c.loop(*c.loop_args())
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/worker/loops.py", line 86, in asynloop
+    state.maybe_shutdown()
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/celery/worker/state.py", line 93, in maybe_shutdown
+    raise WorkerShutdown(should_stop)
+celery.exceptions.WorkerShutdown: 0
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/Joe_1/Desktop/Development/ppt-god/backend/venv/lib/python3.12/site-packages/billiard/pool.py", line 1265, in mark_as_worker_lost
+    raise WorkerLostError(
+billiard.exceptions.WorkerLostError: Worker exited prematurely: signal 15 (SIGTERM) Job: 1.
+"""
+[2026-04-26 00:16:24,998: ERROR/MainProcess] Process 'ForkPoolWorker-1' pid:36780 exited with 'signal 15 (SIGTERM)'
+INFO:     Will watch for changes in these directories: ['/Users/Joe_1/Desktop/Development/ppt-god/backend']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [39631] using WatchFiles
+INFO:     Started server process [39633]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'app/services/image_generation.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [39633]
+INFO:     Started server process [40946]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'app/api/slides.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [40946]
+INFO:     Started server process [40966]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+[2026-04-30 03:49:05,883: INFO/MainProcess] Connected to redis://localhost:6379/0
+[2026-04-30 03:49:05,887: INFO/MainProcess] mingle: searching for neighbors
+[2026-04-30 03:49:06,895: INFO/MainProcess] mingle: all alone
+[2026-04-30 03:49:06,914: INFO/MainProcess] celery@JoedeMacBook-Air.local ready.
+[2026-04-30 04:02:02,726: INFO/MainProcess] Task app.tasks.generate_slides_task[20aa05b3-494d-448a-b482-c056db62f228] received
+[2026-04-30 04:02:02,747: INFO/ForkPoolWorker-8] Celery task started: project=d5a7e341-a438-43a6-9844-81051c409fd7, pages=[18], prototype=False
+[2026-04-30 04:02:02,747: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 d5a7e341-a438-43a6-9844-81051c409fd7, page_nums=[18]
+[2026-04-30 04:02:02,782: INFO/ForkPoolWorker-8] Pipeline: 指定页面生成，只生成 1 页
+[2026-04-30 04:02:02,785: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=bookend, page=1
+[2026-04-30 04:02:02,785: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=content, page=2
+[2026-04-30 04:02:02,788: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=hero, page=32
+[2026-04-30 04:02:02,789: INFO/ForkPoolWorker-8] Pipeline: 阶段二，生成 1 个非种子页，种子页参考 families=['bookend', 'content', 'hero']
+[2026-04-30 04:02:02,801: INFO/ForkPoolWorker-8] Slide 18: 共加载 1 张参考图
+[2026-04-30 04:02:02,801: INFO/ForkPoolWorker-8] Slide 18: 加载种子页参考图 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/slide_02.png (family=content)
+[2026-04-30 04:02:03,905: INFO/ForkPoolWorker-8] ImageGen: calling edit API with 2 reference images
+[2026-04-30 04:03:37,255: INFO/ForkPoolWorker-8] ImageGen: downloading URL (attempt 1/3)
+[2026-04-30 04:03:38,977: INFO/ForkPoolWorker-8] ImageGen: success, model=gpt-image-2-all, size=(1536, 1024)
+[2026-04-30 04:03:39,596: INFO/ForkPoolWorker-8] Pipeline: 第 18 页生成完成
+[2026-04-30 04:03:41,203: INFO/ForkPoolWorker-8] Assembler: PPTX 已保存至 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx，共 33 页
+[2026-04-30 04:03:41,205: INFO/ForkPoolWorker-8] Pipeline: PPTX 组装完成 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx
+[2026-04-30 04:03:41,205: INFO/ForkPoolWorker-8] Celery task completed: project=d5a7e341-a438-43a6-9844-81051c409fd7
+[2026-04-30 04:03:41,207: INFO/ForkPoolWorker-8] Task app.tasks.generate_slides_task[20aa05b3-494d-448a-b482-c056db62f228] succeeded in 98.47684570902493s: {'project_id': 'd5a7e341-a438-43a6-9844-81051c409fd7', 'status': 'completed', 'page_nums': [18], 'prototype': False}
+[2026-04-30 04:09:25,740: INFO/MainProcess] Task app.tasks.generate_slides_task[b7299b8c-30f6-465c-94e9-83e8cc0a4ede] received
+[2026-04-30 04:09:25,748: INFO/ForkPoolWorker-8] Celery task started: project=d5a7e341-a438-43a6-9844-81051c409fd7, pages=[18], prototype=False
+[2026-04-30 04:09:25,749: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 d5a7e341-a438-43a6-9844-81051c409fd7, page_nums=[18]
+[2026-04-30 04:09:25,761: INFO/ForkPoolWorker-8] Pipeline: 指定页面生成，只生成 1 页
+[2026-04-30 04:09:25,764: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=bookend, page=1
+[2026-04-30 04:09:25,765: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=content, page=2
+[2026-04-30 04:09:25,768: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=hero, page=32
+[2026-04-30 04:09:25,768: INFO/ForkPoolWorker-8] Slide 18: 种子页已有图片，跳过生成 (family=content)
+[2026-04-30 04:09:27,187: INFO/ForkPoolWorker-8] Assembler: PPTX 已保存至 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx，共 32 页
+[2026-04-30 04:09:27,188: INFO/ForkPoolWorker-8] Pipeline: PPTX 组装完成 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx
+[2026-04-30 04:09:27,189: INFO/ForkPoolWorker-8] Celery task completed: project=d5a7e341-a438-43a6-9844-81051c409fd7
+[2026-04-30 04:09:27,191: INFO/ForkPoolWorker-8] Task app.tasks.generate_slides_task[b7299b8c-30f6-465c-94e9-83e8cc0a4ede] succeeded in 1.4466200839960948s: {'project_id': 'd5a7e341-a438-43a6-9844-81051c409fd7', 'status': 'completed', 'page_nums': [18], 'prototype': False}
+[2026-04-30 04:21:35,365: INFO/MainProcess] Task app.tasks.generate_slides_task[171ca451-5341-4d15-b9c9-ab2b82930d95] received
+[2026-04-30 04:21:35,373: INFO/ForkPoolWorker-8] Celery task started: project=d5a7e341-a438-43a6-9844-81051c409fd7, pages=[33], prototype=False
+[2026-04-30 04:21:35,374: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 d5a7e341-a438-43a6-9844-81051c409fd7, page_nums=[33]
+[2026-04-30 04:21:35,390: INFO/ForkPoolWorker-8] Pipeline: 指定页面生成，只生成 1 页
+[2026-04-30 04:21:35,393: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=bookend, page=1
+[2026-04-30 04:21:35,393: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=content, page=2
+[2026-04-30 04:21:35,396: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=hero, page=32
+[2026-04-30 04:21:35,396: INFO/ForkPoolWorker-8] Pipeline: 阶段二，生成 1 个非种子页，种子页参考 families=['bookend', 'content', 'hero']
+[2026-04-30 04:21:35,397: INFO/ForkPoolWorker-8] Slide 33: 共加载 0 张参考图
+[2026-04-30 04:21:35,398: INFO/ForkPoolWorker-8] Slide 33: 加载种子页参考图 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/slide_01.png (family=bookend)
+[2026-04-30 04:21:35,944: INFO/ForkPoolWorker-8] ImageGen: calling edit API with 1 reference images
+[2026-04-30 04:22:14,609: INFO/MainProcess] Task app.tasks.generate_slides_task[2dac3ef3-958c-425c-9194-4297a8c32ed2] received
+[2026-04-30 04:22:14,680: WARNING/ForkPoolWorker-1] Project d5a7e341-a438-43a6-9844-81051c409fd7 already has a generation task running
+[2026-04-30 04:22:14,744: INFO/ForkPoolWorker-1] Task app.tasks.generate_slides_task[2dac3ef3-958c-425c-9194-4297a8c32ed2] succeeded in 0.10671633400488645s: {'project_id': 'd5a7e341-a438-43a6-9844-81051c409fd7', 'status': 'skipped', 'reason': 'already_running'}
+[2026-04-30 04:22:54,284: INFO/ForkPoolWorker-8] ImageGen: success, model=gpt-image-2-all, size=(1536, 1024)
+[2026-04-30 04:22:55,055: INFO/ForkPoolWorker-8] Pipeline: 第 33 页生成完成
+[2026-04-30 04:22:56,304: INFO/ForkPoolWorker-8] Assembler: PPTX 已保存至 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx，共 30 页
+[2026-04-30 04:22:56,306: INFO/ForkPoolWorker-8] Pipeline: PPTX 组装完成 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx
+[2026-04-30 04:22:56,306: INFO/ForkPoolWorker-8] Celery task completed: project=d5a7e341-a438-43a6-9844-81051c409fd7
+[2026-04-30 04:22:56,308: INFO/ForkPoolWorker-8] Task app.tasks.generate_slides_task[171ca451-5341-4d15-b9c9-ab2b82930d95] succeeded in 80.93730666697957s: {'project_id': 'd5a7e341-a438-43a6-9844-81051c409fd7', 'status': 'completed', 'page_nums': [33], 'prototype': False}
+[2026-04-30 04:27:52,773: INFO/MainProcess] Task app.tasks.generate_slides_task[2865f9fe-3201-41bd-a98e-3a13684020f6] received
+[2026-04-30 04:27:52,785: INFO/ForkPoolWorker-8] Celery task started: project=d5a7e341-a438-43a6-9844-81051c409fd7, pages=[18], prototype=False
+[2026-04-30 04:27:52,786: INFO/ForkPoolWorker-8] Pipeline: 开始生成项目 d5a7e341-a438-43a6-9844-81051c409fd7, page_nums=[18]
+[2026-04-30 04:27:52,792: INFO/ForkPoolWorker-8] Pipeline: 指定页面生成，只生成 1 页
+[2026-04-30 04:27:52,795: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=bookend, page=1
+[2026-04-30 04:27:52,795: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=content, page=2
+[2026-04-30 04:27:52,798: INFO/ForkPoolWorker-8] Pipeline: 复用已有种子页图片 family=hero, page=32
+[2026-04-30 04:27:52,798: INFO/ForkPoolWorker-8] Slide 18: 种子页已有图片，跳过生成 (family=content)
+[2026-04-30 04:27:54,158: INFO/ForkPoolWorker-8] Assembler: PPTX 已保存至 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx，共 31 页
+[2026-04-30 04:27:54,159: INFO/ForkPoolWorker-8] Pipeline: PPTX 组装完成 ./outputs/d5a7e341-a438-43a6-9844-81051c409fd7/presentation.pptx
+[2026-04-30 04:27:54,159: INFO/ForkPoolWorker-8] Celery task completed: project=d5a7e341-a438-43a6-9844-81051c409fd7
+[2026-04-30 04:27:54,163: INFO/ForkPoolWorker-8] Task app.tasks.generate_slides_task[2865f9fe-3201-41bd-a98e-3a13684020f6] succeeded in 1.3815889580291696s: {'project_id': 'd5a7e341-a438-43a6-9844-81051c409fd7', 'status': 'completed', 'page_nums': [18], 'prototype': False}
+nohup: celery: No such file or directory
