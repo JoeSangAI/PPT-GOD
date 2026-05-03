@@ -7,11 +7,18 @@ class ProjectBase(BaseModel):
     title: str
     status: Optional[str] = "draft"
     style_id: Optional[str] = None
-    content_plan_confirmed: Optional[bool] = None
+    content_plan_confirmed: bool = False
 
 
 class ProjectCreate(ProjectBase):
-    topic: Optional[str] = None
+    pass
+
+
+class ProjectUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    style_id: Optional[str] = None
+    content_plan_confirmed: Optional[bool] = None
 
 
 class ProjectResponse(ProjectBase):
@@ -23,6 +30,13 @@ class ProjectResponse(ProjectBase):
     selected_template_recommendations: Optional[dict] = None
     created_at: datetime
     updated_at: datetime
+
+
+class ReferenceImageResponse(BaseModel):
+    id: str
+    role: str = "style_ref"
+    process_mode: str = "blend"
+    url: str
 
 
 class SlideBase(BaseModel):
@@ -40,3 +54,5 @@ class SlideResponse(SlideBase):
     visual_json: Optional[dict] = None
     prompt_text: Optional[str] = None
     image_path: Optional[str] = None
+    error_msg: Optional[str] = None
+    reference_images: Optional[list[ReferenceImageResponse]] = None

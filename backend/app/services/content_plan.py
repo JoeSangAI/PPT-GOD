@@ -6,6 +6,7 @@ from typing import Callable, Dict, List
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.services.search_service import get_knowledge_augmenter
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,20 @@ def generate_content_plan(
 3. 页数可以从文档内容的丰富程度推断，不一定严格限制在 {page_count} 页，但应尽量接近。
 """
 
+    # 【新增】内容规划阶段也触发实时搜索，避免模型对前沿话题产生幻觉
+    search_section = ""
+    search_context = get_knowledge_augmenter().augment(topic, has_documents=has_docs)
+    if search_context:
+        search_section = f"""
+{search_context}
+
+【搜索结果使用规则】
+1. 上述网络搜索结果是实时获取的，你必须基于这些事实信息设计 PPT 大纲。
+2. 人名、角色名、剧情、数据等关键信息必须与搜索结果一致，严禁编造。
+3. 如果搜索结果不足以支撑完整大纲，可以合理推断，但必须标注为"推测"。
+"""
+        logger.info(f"ContentPlan: 已注入搜索上下文，topic={topic[:30]}")
+
     prompt = f"""你是一位顶尖的商业演示架构师。请为以下主题设计一份 PPT 大纲。
 
 【主题】
@@ -77,6 +92,7 @@ def generate_content_plan(
 - 目标受众: {audience}
 - 期望页数: {page_count} 页左右
 {doc_section}
+{search_section}
 
 【任务要求】
 1. 设计清晰的叙事结构（起承转合）。

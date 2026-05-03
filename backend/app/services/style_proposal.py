@@ -3,6 +3,7 @@ import glob
 import json
 import logging
 import os
+import re
 from typing import List, Dict, Optional
 
 import yaml
@@ -11,6 +12,31 @@ from app.core.config import settings
 from app.core.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
+
+
+TRADITIONAL_CULTURE_TERMS = [
+    "古法", "非遗", "传承", "匠心", "老字号", "古朴", "传统", "文化",
+    "中式", "东方", "国潮", "节庆", "喜庆", "宴会", "礼赠",
+]
+FOOD_AGRI_TERMS = ["食品", "餐饮", "农业", "花生油", "粮油", "调味品", "食用油", "风味", "香"]
+TECH_TERMS = ["科技", "AI", "人工智能", "数据", "算法", "数字化", "芯片", "云计算"]
+TECH_NEGATION_PATTERNS = [
+    "拒绝科技", "不是科技", "非科技", "去科技", "反科技", "科技与狠活", "科技狠活",
+    "拒绝工业化", "反工业化",
+]
+
+
+def _contains_unnegated_tech(text: str) -> bool:
+    """Avoid classifying anti-tech phrases such as “拒绝科技与狠活” as a tech deck."""
+    if any(pattern in text for pattern in TECH_NEGATION_PATTERNS):
+        text = text
+        for pattern in TECH_NEGATION_PATTERNS:
+            text = text.replace(pattern, "")
+    return any(term in text for term in TECH_TERMS)
+
+
+def _score_terms(text: str, terms: List[str]) -> int:
+    return sum(text.count(term) for term in terms)
 
 
 @functools.lru_cache(maxsize=1)
@@ -68,28 +94,69 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
     page_types = set()
     industries = []
     keywords = []
+    full_text_fragments = []
+    # 用于内容主旨推断（供无素材时 LLM 理解主题）
+    topic_hints = []
 
     for page in content_plan[:15]:
-        text = page.get("text_content", {})
+        text = page.get("text_content", {}) or {}
         h = text.get("headline", "")
+        sub = text.get("subhead", "")
+        body = text.get("body", "")
+
         if h:
             headlines.append(h)
+            topic_hints.append(h)
+            full_text_fragments.append(h)
+        if sub:
+            topic_hints.append(sub)
+            full_text_fragments.append(sub)
+        # 从 body 中提取第一行作为 topic hint
+        if body:
+            if isinstance(body, str):
+                full_text_fragments.append(body)
+                first_line = body.strip().split("\n")[0][:100]
+                if first_line:
+                    topic_hints.append(first_line)
+            elif isinstance(body, list) and len(body) > 0:
+                full_text_fragments.append(" ".join(str(x) for x in body[:8]))
+                first_item = body[0] if isinstance(body[0], str) else (body[0].get("content", "") if isinstance(body[0], dict) else "")
+                if first_item:
+                    topic_hints.append(str(first_item)[:100])
 
         ptype = page.get("type", "content")
         page_types.add(ptype)
 
-        # 简单关键词提取（从 headline 中找行业/场景词）
-        for kw in ["金融", "医疗", "教育", "科技", "消费", "品牌", "数据", "学术", "艺术", "设计", "汽车", "地产", "零售", "投资", "AI", "产品", "战略"]:
-            if kw in h:
+        # 简单关键词提取（从 headline + subhead + body 中找行业/场景词）
+        text_to_search = f"{h} {sub} {str(body) if body else ''}"
+        keyword_pool = [
+            "金融", "医疗", "教育", "消费", "品牌", "学术", "艺术", "设计", "汽车",
+            "地产", "零售", "投资", "产品", "战略", *TECH_TERMS,
+            *FOOD_AGRI_TERMS, *TRADITIONAL_CULTURE_TERMS,
+        ]
+        for kw in keyword_pool:
+            if kw in TECH_TERMS and not _contains_unnegated_tech(text_to_search):
+                continue
+            if kw in text_to_search:
                 keywords.append(kw)
 
-    # 推断行业/场景
+    full_text = "\n".join(full_text_fragments)
+    traditional_score = _score_terms(full_text, TRADITIONAL_CULTURE_TERMS)
+    food_score = _score_terms(full_text, FOOD_AGRI_TERMS)
+    tech_score = _score_terms(full_text, TECH_TERMS) if _contains_unnegated_tech(full_text) else 0
+    brand_score = _score_terms(full_text, ["消费", "品牌", "零售", "产品", "战略"])
+
+    # 推断行业/场景。先处理强语义，避免“拒绝科技与狠活”一类反向表达误判为科技。
     if "金融" in keywords or "投资" in keywords:
         industries.append("金融/投资")
-    if "科技" in keywords or "AI" in keywords or "数据" in keywords:
+    if tech_score >= 2 and tech_score >= traditional_score + food_score:
         industries.append("科技/数据")
-    if "消费" in keywords or "品牌" in keywords or "零售" in keywords:
+    if brand_score:
         industries.append("消费/品牌")
+    if food_score:
+        industries.append("食品/农业")
+    if traditional_score:
+        industries.append("古法非遗/传统文化")
     if "学术" in keywords:
         industries.append("学术/研究")
     if "艺术" in keywords or "设计" in keywords:
@@ -103,6 +170,282 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
         "industries": list(set(industries)),
         "keywords": list(set(keywords)),
         "total_pages": len(content_plan),
+        "topic_hints": topic_hints[:6],  # 用于帮助 LLM 理解内容主旨
+        "style_direction_hint": _build_content_style_direction(
+            traditional_score=traditional_score,
+            food_score=food_score,
+            tech_score=tech_score,
+            brand_score=brand_score,
+        ),
+    }
+
+
+def _build_content_style_direction(traditional_score: int, food_score: int, tech_score: int, brand_score: int) -> str:
+    if traditional_score and food_score:
+        return "内容核心更接近古法非遗、传统食品/农业品牌，应优先考虑传统质感、品牌主色、暖性浅底、纹样装饰与可信赖的商业表达；不要因为出现“战略”或“拒绝科技与狠活”而推荐科技风。"
+    if traditional_score:
+        return "内容核心偏传统文化/非遗/东方审美，应优先考虑中式、古朴、典雅、节庆或国潮方向。"
+    if food_score:
+        return "内容核心偏食品/农业/消费品牌，应优先考虑温暖、有食欲、可信赖、品牌化的视觉方向。"
+    if tech_score:
+        return "内容核心偏科技/数据/AI，可考虑冷色、秩序感、数据化的现代视觉方向。"
+    if brand_score:
+        return "内容核心偏消费品牌/商业提案，应优先考虑品牌识别、货架记忆和说服效率。"
+    return "根据内容标题和正文真实判断风格，不要套用默认科技商务模板。"
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int] | None:
+    if not isinstance(hex_color, str):
+        return None
+    value = hex_color.strip().lstrip("#")
+    if len(value) != 6:
+        return None
+    try:
+        return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def _is_warm_accent(hex_color: str) -> bool:
+    rgb = _hex_to_rgb(hex_color)
+    return bool(rgb and rgb[0] > 130 and rgb[1] > 85 and rgb[0] >= rgb[1] and rgb[2] < 110)
+
+
+def _is_dark(hex_color: str) -> bool:
+    rgb = _hex_to_rgb(hex_color)
+    return bool(rgb and (rgb[0] + rgb[1] + rgb[2]) / 3 < 75)
+
+
+def _is_neutral_dark(hex_color: str) -> bool:
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return False
+    r, g, b = rgb
+    return _is_dark(hex_color) and max(rgb) - min(rgb) < 28
+
+
+def _brightness(hex_color: str) -> float:
+    rgb = _hex_to_rgb(hex_color)
+    return sum(rgb) / 3 if rgb else 0
+
+
+def _saturation(hex_color: str) -> float:
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return 0
+    high = max(rgb)
+    low = min(rgb)
+    return (high - low) / high if high else 0
+
+
+def _is_chromatic_brand_color(hex_color: str) -> bool:
+    return _saturation(hex_color) >= 0.28 and not _is_neutral_dark(hex_color)
+
+
+def _needs_page_type_modulation(hex_color: str) -> bool:
+    return _is_dark(hex_color) or _saturation(hex_color) >= 0.38
+
+
+def _color_label(hex_color: str) -> str:
+    if _is_warm_accent(hex_color):
+        return "暖性强调色"
+    if _is_chromatic_brand_color(hex_color):
+        return "品牌主色"
+    if _is_neutral_dark(hex_color):
+        return "深色层次"
+    if _is_dark(hex_color):
+        return "深色系"
+    return "参考色"
+
+
+def _extract_hex(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"#[0-9a-fA-F]{6}", value)
+    return match.group(0).upper() if match else None
+
+
+def _collect_clone_palette(ref: Dict, logo: Dict | None = None) -> List[Dict]:
+    colors = ref.get("colors") or {}
+    weighted: list[tuple[str, float]] = []
+
+    for key in ("background", "primary", "accent", "text"):
+        hex_color = _extract_hex(colors.get(key))
+        if hex_color:
+            weighted.append((hex_color, 0.05))
+    for item in ref.get("dominant_palette") or []:
+        if isinstance(item, dict) and item.get("hex"):
+            weighted.append((_extract_hex(item["hex"]) or "", float(item.get("share") or 0.0)))
+    if logo:
+        logo_primary = _extract_hex(logo.get("primary_color"))
+        if logo_primary:
+            weighted.append((logo_primary, 0.25))
+        for color in logo.get("secondary_colors") or []:
+            hex_color = _extract_hex(color)
+            if hex_color:
+                weighted.append((hex_color, 0.15))
+
+    score_by_color: dict[str, float] = {}
+    order: list[str] = []
+    for hex_color, score in weighted:
+        if not hex_color:
+            continue
+        if hex_color not in order:
+            order.append(hex_color)
+        score_by_color[hex_color] = score_by_color.get(hex_color, 0.0) + max(score, 0.01)
+
+    unique = order
+    if unique:
+        brand_colors = sorted(
+            [c for c in unique if _is_chromatic_brand_color(c) and _brightness(c) <= 170],
+            key=lambda c: score_by_color.get(c, 0),
+            reverse=True,
+        )
+        accent_colors = sorted(
+            [c for c in unique if _is_chromatic_brand_color(c)],
+            key=lambda c: score_by_color.get(c, 0),
+            reverse=True,
+        )
+        light_colors = sorted(
+            [
+                c for c in unique
+                if (_hex_to_rgb(c) and sum(_hex_to_rgb(c) or (0, 0, 0)) / 3 > 145)
+            ],
+            key=lambda c: score_by_color.get(c, 0),
+            reverse=True,
+        )
+        neutral_darks = sorted(
+            [c for c in unique if _is_neutral_dark(c)],
+            key=lambda c: score_by_color.get(c, 0),
+            reverse=True,
+        )
+
+        ordered: list[str] = []
+
+        # 参考图如果有明确的有彩品牌主色，优先记录为风格基因；
+        # 中性深色只作为层次，不应抢走品牌主色。
+        if brand_colors:
+            ordered.append(brand_colors[0])
+        else:
+            ordered.append(unique[0])
+
+        for group in (accent_colors[:2], light_colors[:1], neutral_darks[:1], unique):
+            for color in group:
+                if color not in ordered:
+                    ordered.append(color)
+        unique = ordered
+        has_light_text = any((_hex_to_rgb(c) and sum(_hex_to_rgb(c) or (0, 0, 0)) / 3 > 150) for c in unique)
+        if not has_light_text and "#F4E8D0" not in unique:
+            insert_at = min(2, len(unique))
+            unique.insert(insert_at, "#F4E8D0")
+
+    fallback = ["#2F2A24", "#B8945C", "#F4E8D0", "#1F1F1F"]
+    for color in fallback:
+        if len(unique) >= 4:
+            break
+        if color not in unique:
+            unique.append(color)
+
+    if unique and _needs_page_type_modulation(unique[0]):
+        roles = ["品牌主色（强视觉页可放大，信息页做强调）", "强调/装饰色", "信息页浅底/留白", "深色文字/层次"]
+    else:
+        roles = ["主背景色", "标题/强调色", "正文色", "辅助点缀色"]
+    names = [_color_label(color) for color in unique[:4]]
+
+    return [{"name": names[i], "hex": color, "role": roles[i]} for i, color in enumerate(unique[:4])]
+
+
+def _has_clone_reference(ref: Dict, template: Dict) -> bool:
+    if ref.get("description") or ref.get("style_name") or ref.get("dominant_palette"):
+        return True
+    if ref.get("colors", {}).get("primary"):
+        return True
+    template_ref = template.get("reference_analysis") if isinstance(template, dict) else None
+    return bool(template_ref and (template_ref.get("description") or template_ref.get("dominant_palette")))
+
+
+def _page_type_adaptation_rules(palette: List[Dict]) -> str:
+    primary = palette[0]["hex"] if palette else "#2F2A24"
+    accent = palette[1]["hex"] if len(palette) > 1 else "#B8945C"
+    light = "#F7F3EA"
+    for color in palette:
+        rgb = _hex_to_rgb(color.get("hex", ""))
+        if rgb and sum(rgb) / 3 > 145 and _saturation(color["hex"]) < 0.45:
+            light = color["hex"]
+            break
+
+    if palette and _needs_page_type_modulation(primary):
+        return (
+            "页面类型适配规则：参考图只用于定调，不要求所有页面按同一强度复刻。"
+            f"封面、章节页、转场页、金句页可放大使用品牌主色 {primary} 和强调色 {accent}，承担品牌定调和情绪冲击；"
+            f"内容页、数据页、表格页、长文分析页应优先使用 {light} 或其他低饱和浅底，"
+            f"用 {primary} 做标题、页眉、编号、强调块，用 {accent} 做少量装饰线和重点信息；"
+            "正文使用高可读的深色文字。信息越密集，背景越要降饱和、提亮度、减少装饰。"
+            "地图页、图表页、配图页和业务场景页的具体画面必须由该页文案决定，不能机械复刻参考图构图。"
+        )
+
+    return (
+        "页面类型适配规则：参考图提供风格基因，不是每页画面模板。"
+        "封面/章节页可以更强烈地使用主色，内容/数据/表格页必须优先保证阅读效率，"
+        "根据页面信息密度选择浅底或留白，并由文案决定具体配图内容。"
+    )
+
+
+def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
+    logo = assets.get("logo_analysis") or {}
+    ref = assets.get("reference_analysis") or {}
+    template = assets.get("template_analysis") or {}
+    template_ref = template.get("reference_analysis") if isinstance(template, dict) else None
+    if template_ref and not (ref.get("description") or ref.get("dominant_palette")):
+        ref = template_ref
+
+    palette = _collect_clone_palette(ref, logo)
+    palette_hex = [c["hex"] for c in palette]
+    style_name = (ref.get("style_name") or "").strip()
+    if not style_name:
+        desc_for_name = " ".join(str(x) for x in [ref.get("description"), ref.get("mood"), ref.get("ornaments"), ref.get("texture")] if x)
+        if any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
+            style_name = "品牌主色典雅"
+        elif any(_is_dark(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
+            style_name = "深色典雅"
+        elif "国潮" in desc_for_name or "中式" in desc_for_name:
+            style_name = "中式典雅"
+        else:
+            style_name = "参考图复刻"
+
+    # 用户给了参考图时，风格命名必须来自图像，不混入内容里的“科技/战略”等词。
+    style_name = re.sub(r"(科技|战略|未来|数据|智能|AI)", "", style_name, flags=re.IGNORECASE).strip(" -_·")
+    if not style_name:
+        style_name = "参考图复刻"
+    if any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex) and style_name == "参考图复刻":
+        style_name = "品牌主色典雅"
+
+    mood = ref.get("mood") or "古朴、典雅、厚重"
+    font = ref.get("font_suggestion") or logo.get("font_style") or "标题使用文化感较强的宋体/书法体，正文使用清晰黑体"
+    composition = ref.get("composition_style") or "沿用参考图的版式节奏"
+    ornaments = ref.get("ornaments") or "沿用参考图中的装饰纹样与边框语言"
+    texture = ref.get("texture") or "沿用参考图的背景肌理与光影层次"
+    clone_rules = ref.get("clone_rules") or "提取参考图的主色关系、装饰气质和整体氛围，并按页面类型调节使用强度。"
+    adaptation_rules = _page_type_adaptation_rules(palette)
+
+    description = (
+        f"已按用户上传的参考图提取风格基因：核心色沿用 {palette[0]['hex']}，"
+        f"强调与标题色沿用 {palette[1]['hex']}，整体保持「{mood}」的气质。"
+        f"版式按「{composition}」处理，装饰保留「{ornaments}」，材质保留「{texture}」。"
+        f"{clone_rules} {adaptation_rules}"
+    )
+
+    return {
+        "name": style_name,
+        "palette": palette,
+        "mood": mood,
+        "font": font,
+        "description": description[:420],
+        "source": "asset_clone",
+        "clone_mode": "style_dna",
+        "reference_usage": "style_text_only",
+        "page_type_adaptation": adaptation_rules,
+        "content_style_hint": summary.get("style_direction_hint", ""),
     }
 
 
@@ -113,16 +456,23 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     - 如果用户未提供素材，输出 3 套推荐（AI原创1套 + 风格库匹配2套）
     每套包含：name, palette(4色), mood, font, description（专业总监口吻长文本）
     """
+    assets = assets or {}
     summary = _extract_content_summary(content_plan)
     style_library = _load_style_library()
 
-    # 判断是否有用户素材
-    has_assets = assets and any([
-        assets.get("logo_analysis"),
-        assets.get("reference_analysis"),
-        assets.get("user_description"),
-        assets.get("template_analysis"),
-    ])
+    # 判断是否有有效用户素材（内容不为空才算）
+    logo = assets.get("logo_analysis") or {}
+    ref = assets.get("reference_analysis") or {}
+    has_logo = bool(logo.get("primary_color") or logo.get("description"))
+    has_ref = bool(
+        ref.get("description")
+        or ref.get("style_name")
+        or ref.get("dominant_palette")
+        or ref.get("colors", {}).get("primary")
+    )
+    has_user_desc = bool(assets.get("user_description", "").strip())
+    has_template = bool(assets.get("template_analysis", {}).get("has_template"))
+    has_assets = has_logo or has_ref or has_user_desc or has_template
 
     if has_assets:
         return _generate_asset_based_proposal(content_plan, summary, assets, style_library)
@@ -152,6 +502,12 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 【内容标题摘录】（这些标题决定了 PPT 的核心主题和受众）
 {"\n".join("- " + h for h in summary["headlines"][:8])}
 
+【内容主题线索】（从正文提取的事实关键词，帮助判断配色方向）
+{summary.get("topic_hints", "")}
+
+【内容风格判断提示】（必须优先于通用商务/科技模板）
+{summary.get("style_direction_hint", "")}
+
 【可用风格库（第 2、3 套必须从中选择）】
 {json.dumps(style_catalog, ensure_ascii=False, indent=2)}
 
@@ -175,7 +531,8 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 
 第 1 套：AI 原创（source = "original"）
 - 你必须基于 PPT 的主题、行业和受众，设计一套最适合的原创风格。
-- 不要泛泛而谈"商务通用"，要具体到这份 PPT 的内容。比如如果是科技投资主题，就要说明为什么冷色调适合传达数据可信度；如果是消费品品牌，就要说明为什么暖色调能唤起购买欲。
+- 不要泛泛而谈"商务通用"，要具体到这份 PPT 的内容；必须说明为什么这套视觉语言适合当前主题、受众和使用场景。
+- 不得只因为标题或正文中出现少量行业热词，就套用与真实主题气质不一致的通用风格。风格判断必须来自内容主线、品牌/产品属性、受众和演示目标。
 
 第 2、3 套：风格库匹配（source = 对应 id）
 - 你必须从上方风格库中挑选，**挑选依据必须是这份 PPT 的内容**。
@@ -309,13 +666,18 @@ def _generate_asset_based_proposal(
     user_desc = assets.get("user_description", "").strip()
     template = assets.get("template_analysis") or {}
 
+    if _has_clone_reference(ref, template):
+        logger.info("StyleProposal(AssetBased): using deterministic strict reference clone proposal")
+        return [_build_reference_clone_proposal(summary, assets)]
+
     asset_sections = []
     if logo.get("description") or logo.get("primary_color"):
         asset_sections.append(f"【Logo 分析】\n主色: {logo.get('primary_color', 'N/A')}\n辅助色: {', '.join(logo.get('secondary_colors', []))}\n调性: {logo.get('mood', 'N/A')}\n字体风格: {logo.get('font_style', 'N/A')}\n行业气质: {logo.get('industry_vibe', 'N/A')}\n描述: {logo.get('description', 'N/A')}")
 
     if ref.get("description") or ref.get("colors", {}).get("primary"):
         colors = ref.get("colors", {})
-        asset_sections.append(f"【参考图分析】\n背景色: {colors.get('background', 'N/A')}\n主色: {colors.get('primary', 'N/A')}\n点缀色: {colors.get('accent', 'N/A')}\n文字色: {colors.get('text', 'N/A')}\n构图: {ref.get('composition_style', 'N/A')}\n氛围: {ref.get('mood', 'N/A')}\n字体建议: {ref.get('font_suggestion', 'N/A')}\n描述: {ref.get('description', 'N/A')}")
+        dominant_palette = ", ".join(c.get("hex", "") for c in ref.get("dominant_palette", []) if isinstance(c, dict) and c.get("hex"))
+        asset_sections.append(f"【参考图分析】\n风格名: {ref.get('style_name', 'N/A')}\n背景色: {colors.get('background', 'N/A')}\n主色: {colors.get('primary', 'N/A')}\n点缀色: {colors.get('accent', 'N/A')}\n文字色: {colors.get('text', 'N/A')}\n本地提取主色: {dominant_palette or 'N/A'}\n构图: {ref.get('composition_style', 'N/A')}\n氛围: {ref.get('mood', 'N/A')}\n字体建议: {ref.get('font_suggestion', 'N/A')}\n装饰: {ref.get('ornaments', 'N/A')}\n材质: {ref.get('texture', 'N/A')}\n复刻规则: {ref.get('clone_rules', 'N/A')}\n描述: {ref.get('description', 'N/A')}")
 
     if template.get("has_template"):
         asset_sections.append(f"【模板信息】\n用户提供了参考模板，包含封面、目录、内容、结尾页。模板页的配色和布局应作为核心参考。")
@@ -323,38 +685,39 @@ def _generate_asset_based_proposal(
     if user_desc:
         asset_sections.append(f"【用户风格描述】\n{user_desc}")
 
-    prompt = f"""你是一位顶级 PPT 视觉总监。客户已经提供了明确的设计素材，你的任务是基于这些素材，输出 1 套完整的视觉风格阐述。
+    prompt = f"""你是一位顶级 PPT 视觉总监。客户提供了参考风格图，你的任务是提取这套风格的视觉基因，并把它转成可用于整套 PPT 的风格系统。
 
-【PPT 内容概览】
+【PPT 内容概览】（用于判断页面类型、阅读密度和具体配图方向；不用于篡改参考图本身的风格判断）
 - 主题关键词：{"、".join(summary["keywords"]) if summary["keywords"] else "商务演示"}
 - 行业/场景：{"、".join(summary["industries"])}
 - 页面类型：{"、".join(summary["page_types"])}
 - 总页数：{summary["total_pages"]}
+- 内容风格提示：{summary.get("style_direction_hint", "")}
 
-【用户提供的素材】
+【用户提供的素材】（参考图决定风格基因，具体页面画面仍由页面文案决定）
 {"\n\n".join(asset_sections)}
 
 【输出格式】
 严格输出 JSON 对象（不是数组）：
 {{
-  "name": "风格名称（简洁直观的设计语言命名）",
+  "name": "风格名称（直接概括参考图的实际风格基因，不混入内容行业判断）",
   "palette": [
-    {{"name": "颜色名称", "hex": "#0A1628", "role": "主背景色"}},
-    {{"name": "颜色名称", "hex": "#E8D5A3", "role": "标题色"}},
-    {{"name": "颜色名称", "hex": "#F5F5F0", "role": "正文色"}},
-    {{"name": "颜色名称", "hex": "#1E3A5F", "role": "点缀色"}}
+    {{"name": "颜色名称（来自参考图）", "hex": "参考图中的实际色值", "role": "品牌主色/强视觉页主色"}},
+    {{"name": "颜色名称（来自参考图）", "hex": "参考图中的实际色值", "role": "强调色/标题色/装饰色"}},
+    {{"name": "颜色名称（可来自参考图或由其推导）", "hex": "适合信息页阅读的浅底色", "role": "内容页背景/留白"}},
+    {{"name": "颜色名称（可来自参考图或由其推导）", "hex": "高可读文字色", "role": "正文/数据文字"}}
   ],
-  "mood": "氛围标签（3-5个具体形容词）",
-  "font": "字体建议",
-  "description": "风格说明（250-400字，具体、说人话、解决实际问题）"
+  "mood": "氛围标签（忠实来自参考图，不发明新风格）",
+  "font": "字体建议（延续参考图字体气质，同时保证正文可读）",
+  "description": "风格说明（120-180字，说明参考图风格基因如何按封面、章节、内容、数据、表格等页面类型调节强度）"
 }}
 
-【写作要求】
-1. 第一段必须开门见山：直接说基于客户提供的素材，最适合的风格是什么
-2. 配色必须具体到功能（背景色为什么、标题色为什么、点缀色为什么）
-3. 必须明确回应用户素材中的信息（如 Logo 主色怎么用、参考图的构图怎么借鉴）
-4. 禁止堆砌形容词和哲学隐喻
-5. 要像在给客户讲方案：解释这个风格如何解决这份 PPT 的具体问题"""
+【核心原则】
+1. **忠实定调**：风格名、主色关系、材质、装饰语言必须来自参考图，不得根据文案另造风格
+2. **不是逐页照搬**：参考图只提供风格基因，不是每一页的画面模板
+3. **按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，降低背景强度、减少装饰、增加留白
+4. **内容决定配图**：地图、图表、业务场景、产品场景和人物/物件选择由该页文案决定，不机械复制参考图里的画面对象
+5. **命名不跑偏**：风格名不得混入内容中的行业词，除非参考图本身明确呈现该行业视觉语言"""
 
     response = client.chat.completions.create(
         model=settings.MINIMAX_LLM_MODEL,

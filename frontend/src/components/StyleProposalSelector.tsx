@@ -70,7 +70,7 @@ export default function StyleProposalSelector({
           <div className="space-y-4 mb-6">
             {proposals.length === 0 ? (
               <div className="border-2 border-dashed border-gray-200 rounded-lg p-8 text-center">
-                <div className="text-4xl mb-3">🎨</div>
+                <div className="text-4xl mb-3">—</div>
                 <h3 className="text-base font-semibold text-gray-800 mb-1">暂无风格提案</h3>
                 <p className="text-sm text-gray-500 mb-4">你可以先上传素材（Logo / 参考图 / 模板），或直接生成风格提案</p>
                 <button
@@ -95,7 +95,7 @@ export default function StyleProposalSelector({
                       <div className="flex items-center gap-2 mb-2">
                         <div className="text-sm font-semibold text-gray-800">{proposal.name}</div>
                         <span
-                          className={`text-[10px] px-1.5 py-0.5 rounded leading-none ${
+                          className={`text-2xs px-1.5 py-0.5 rounded leading-none ${
                             isOriginal
                               ? "bg-purple-100 text-purple-700"
                               : "bg-gray-100 text-gray-500"
@@ -153,7 +153,7 @@ export default function StyleProposalSelector({
               disabled={loading || disabled}
               className="text-sm text-gray-500 hover:text-gray-700 underline disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? "⏳ 正在重新提案..." : "都不满意，让 Agent 重新提案"}
+              {loading ? "正在重新提案..." : "都不满意，让 Agent 重新提案"}
             </button>
           </div>
         </>

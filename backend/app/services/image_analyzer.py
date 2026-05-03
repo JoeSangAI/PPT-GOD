@@ -1,9 +1,11 @@
 import base64
+from collections import Counter
 import json
 import logging
 import os
-from typing import Dict, Optional
+from typing import Dict
 
+from PIL import Image as PILImage
 import requests
 
 from app.core.config import settings
@@ -28,6 +30,47 @@ def _guess_mime_type(path: str) -> str:
         ".gif": "image/gif",
     }
     return mapping.get(ext, "image/jpeg")
+
+
+def extract_image_palette(image_path: str, max_colors: int = 6) -> list[Dict]:
+    """Extract an approximate dominant palette locally so style cloning has concrete colors."""
+    if not os.path.exists(image_path):
+        return []
+
+    try:
+        with PILImage.open(image_path) as img:
+            img = img.convert("RGBA")
+            img.thumbnail((240, 240))
+
+            pixels = []
+            for r, g, b, a in img.getdata():
+                if a < 24:
+                    continue
+                # Quantize manually to reduce noise while keeping the actual hue family.
+                rq, gq, bq = (round(r / 16) * 16, round(g / 16) * 16, round(b / 16) * 16)
+                pixels.append((min(rq, 255), min(gq, 255), min(bq, 255)))
+
+            if not pixels:
+                return []
+
+            total = len(pixels)
+            dominant = Counter(pixels).most_common(max_colors * 3)
+            palette = []
+            for (r, g, b), count in dominant:
+                # Skip nearly identical colors already selected.
+                if any(abs(r - c["rgb"][0]) + abs(g - c["rgb"][1]) + abs(b - c["rgb"][2]) < 48 for c in palette):
+                    continue
+                palette.append({
+                    "hex": f"#{r:02X}{g:02X}{b:02X}",
+                    "share": round(count / total, 4),
+                    "rgb": [r, g, b],
+                })
+                if len(palette) >= max_colors:
+                    break
+            return palette
+    except Exception as e:
+        logger.warning(f"ImageAnalyzer: local palette extraction failed for {image_path}: {e}")
+        return []
 
 
 def _minimax_coding_plan_url() -> str:
@@ -102,9 +145,12 @@ def analyze_reference_image(image_path: str) -> Dict:
         logger.warning(f"Reference image not found: {image_path}")
         return _default_reference_analysis()
 
-    prompt = """你是一位 PPT 视觉设计分析师。请分析这张参考图片，提取以下设计信息并严格输出 JSON 格式：
+    local_palette = extract_image_palette(image_path)
+
+    prompt = """你是一位 PPT 视觉设计分析师。请只分析这张参考图片本身，提取可迁移到 PPT 风格系统中的视觉基因，并严格输出 JSON 格式：
 
 {
+  "style_name": "基于图片实际观感的风格名，不要加入图片外的行业或内容推断",
   "colors": {
     "background": "背景色（带 HEX）",
     "primary": "主色调（带 HEX）",
@@ -114,16 +160,32 @@ def analyze_reference_image(image_path: str) -> Dict:
   "composition_style": "构图风格（如'全屏沉浸、左右分栏、卡片网格'）",
   "mood": "整体氛围（3-5个形容词）",
   "font_suggestion": "字体建议（如'无衬线黑体、标题粗体'）",
-  "description": "80字以内的风格描述，说明这张图的设计特点"
+  "ornaments": "装饰元素/纹样/材质，描述图片中真实存在的视觉语言",
+  "texture": "材质与光影，描述图片中真实存在的背景、质感和明暗层次",
+  "clone_rules": "风格迁移规则：配色关系、装饰密度、留白与字体处理，80字以内",
+  "description": "80字以内的风格描述，说明这张图的实际设计特点"
 }
 
 注意：
 1. 必须输出合法的 JSON，不要加任何额外说明
 2. 颜色必须给出 HEX 编码
-3. 如果无法判断某项，留空字符串"""
+3. 必须忠实描述图片自身的气质；不要因为 PPT 文案中出现战略、科技、数据、增长等词而改变参考图风格判断
+4. 如果无法判断某项，留空字符串"""
 
     raw = _call_vision_model(image_path, prompt)
-    return _parse_analysis_result(raw, "reference")
+    result = _parse_analysis_result(raw, "reference")
+    result["dominant_palette"] = local_palette
+    colors = result.setdefault("colors", {})
+    if local_palette:
+        if not colors.get("background"):
+            colors["background"] = local_palette[0]["hex"]
+        if not colors.get("primary"):
+            colors["primary"] = local_palette[1]["hex"] if len(local_palette) > 1 else local_palette[0]["hex"]
+        if not colors.get("accent"):
+            colors["accent"] = local_palette[2]["hex"] if len(local_palette) > 2 else local_palette[0]["hex"]
+        if not colors.get("text"):
+            colors["text"] = local_palette[3]["hex"] if len(local_palette) > 3 else "#FFFFFF"
+    return result
 
 
 def _parse_analysis_result(raw: str, analysis_type: str) -> Dict:
@@ -161,9 +223,14 @@ def _default_logo_analysis() -> Dict:
 
 def _default_reference_analysis() -> Dict:
     return {
+        "style_name": "",
         "colors": {"background": "", "primary": "", "accent": "", "text": ""},
         "composition_style": "",
         "mood": "",
         "font_suggestion": "",
+        "ornaments": "",
+        "texture": "",
+        "clone_rules": "",
         "description": "",
+        "dominant_palette": [],
     }

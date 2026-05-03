@@ -4,16 +4,31 @@ async function checkRes(res: Response) {
   if (!res.ok) {
     const text = await res.text().catch(() => "Unknown error");
     const isHtml = text.trim().startsWith("<") && text.includes("</");
-    const cleanText = isHtml
-      ? (text.match(/<title>(.*?)<\/title>/i)?.[1] || `服务器错误 ${res.status}`)
-      : text.slice(0, 200);
-    throw new Error(`HTTP ${res.status}: ${cleanText}`);
+    if (isHtml) {
+      const title = text.match(/<title>(.*?)<\/title>/i)?.[1];
+      throw new Error(`HTTP ${res.status}: ${title || "服务器错误"}`);
+    }
+    // FastAPI 返回 { detail: "..." }，尝试提取
+    try {
+      const json = JSON.parse(text);
+      if (json.detail) {
+        throw new Error(`HTTP ${res.status}: ${json.detail}`);
+      }
+    } catch {
+      // 不是 JSON，继续用原文
+    }
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
   return res;
 }
 
 export async function fetchProjects() {
   const res = await fetch(`${API_BASE}/projects`);
+  return (await checkRes(res)).json();
+}
+
+export async function fetchProject(projectId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}`);
   return (await checkRes(res)).json();
 }
 
@@ -86,15 +101,15 @@ export async function generateVisualPrompts(projectId: string, pageNums?: number
   return (await checkRes(res)).json();
 }
 
+/**
+
+ * @returns {{ generation_status: "running" | "idle", project_status: string, active_run: object | null }}
+ */
 export async function fetchGenerationStatus(projectId: string) {
   const res = await fetch(`${API_BASE}/projects/${projectId}/generation-status`);
   return (await checkRes(res)).json();
 }
 
-export async function fetchSlidePrompt(projectId: string, slideId: string) {
-  const res = await fetch(`${API_BASE}/projects/${projectId}/prompts/${slideId}`);
-  return (await checkRes(res)).json();
-}
 
 export async function startGeneration(projectId: string, pageNums?: number[], prototype?: boolean) {
   const res = await fetch(`${API_BASE}/projects/${projectId}/generate`, {
@@ -138,7 +153,7 @@ export function getDownloadUrl(projectId: string, prototype?: boolean) {
 export async function uploadFile(
   projectId: string,
   file: File,
-  role: "style_ref" | "logo" | "template" | "content_ref" | "chart_ref",
+  role: "style_ref" | "logo" | "template" | "content_ref" | "chart_ref" | "finetune_ref",
   slideId?: string,
   processMode?: "blend" | "crop" | "original"
 ) {
@@ -180,18 +195,19 @@ export async function deleteReferenceImage(projectId: string, refId: string) {
 }
 
 export async function updateReferenceImageMode(projectId: string, refId: string, processMode: string) {
-  const formData = new FormData();
-  formData.append("process_mode", processMode);
   const res = await fetch(`${API_BASE}/projects/${projectId}/reference-images/${refId}`, {
     method: "PATCH",
-    body: formData,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ process_mode: processMode }),
   });
   return (await checkRes(res)).json();
 }
 
-export async function retrySlide(projectId: string, slideId: string) {
+export async function retrySlide(projectId: string, slideId: string, regeneratePrompt: boolean = false) {
   const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/retry`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ regenerate_prompt: regeneratePrompt }),
   });
   return (await checkRes(res)).json();
 }
@@ -199,6 +215,36 @@ export async function retrySlide(projectId: string, slideId: string) {
 export async function retryFailed(projectId: string) {
   const res = await fetch(`${API_BASE}/projects/${projectId}/retry-failed`, {
     method: "POST",
+  });
+  return (await checkRes(res)).json();
+}
+
+// ========== 单页微调：版本管理 ==========
+
+export async function getSlideVersions(projectId: string, slideId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/versions`);
+  return (await checkRes(res)).json();
+}
+
+export async function deleteSlideVersion(projectId: string, slideId: string, versionId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/versions/${versionId}`, {
+    method: "DELETE",
+  });
+  return (await checkRes(res)).json();
+}
+
+export async function restoreSlideVersion(projectId: string, slideId: string, versionId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/versions/${versionId}/restore`, {
+    method: "POST",
+  });
+  return (await checkRes(res)).json();
+}
+
+export async function finetuneSlide(projectId: string, slideId: string, instruction: string, attachmentIds?: string[]) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/finetune`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ instruction, attachment_ids: attachmentIds || [] }),
   });
   return (await checkRes(res)).json();
 }
@@ -263,8 +309,17 @@ export async function* chatWithAgentStream(
       }
     }
   } catch (readErr: any) {
-    yield { type: "error", message: "读取响应流失败：" + (readErr?.message || "网络连接中断") };
+    const errMsg = readErr?.message || "";
+    // 只有用户主动取消（点击停止）才静默返回
+    if (signal?.aborted) {
+      return;
+    }
+    // Chrome 等浏览器在流意外中断时会抛 AbortError（如 BodyStreamBuffer was aborted）
+    // 这不是用户主动取消，必须上报，否则聊天会"卡住"且用户无感知
+    yield { type: "error", message: "读取响应流失败：" + (errMsg || "网络连接中断") };
     return;
+  } finally {
+    reader.releaseLock();
   }
 
   if (buffer.startsWith("data: ")) {
@@ -396,8 +451,7 @@ export async function pollForStyleProposals(
 ): Promise<any[]> {
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, intervalMs));
-    const projects = await fetchProjects();
-    const project = projects.find((p: any) => p.id === projectId);
+    const project = await fetchProject(projectId);
     if (project?.style_proposal?.proposals) {
       return project.style_proposal.proposals;
     }

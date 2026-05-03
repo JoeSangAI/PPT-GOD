@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.utils.text_cleaning import clean_llm_output
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,57 @@ def _infer_seed_family(page_type: str) -> str:
     return "content"
 
 
+def _safe_parse_json(raw: str, batch_num: int) -> Optional[Dict]:
+    """安全解析 LLM 返回的 JSON，尝试多种修复策略。"""
+    # 策略 1: 直接解析
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # 策略 2: 查找最外层 JSON 对象（有时 LLM 会包裹在 markdown 或其他文本中）
+    try:
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            return json.loads(raw[start:end+1])
+    except json.JSONDecodeError:
+        pass
+
+    # 策略 3: 修复常见 JSON 语法错误
+    fixed = raw
+    # 3a. 修复 trailing commas（如 {"a": 1,}）
+    fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+    # 3b. 修复单引号为双引号
+    fixed = fixed.replace("'", '"')
+    # 3c. 修复未转义的换行符在字符串值中（简单修复：将字符串内的换行替换为 \n）
+    # 这个比较复杂，先尝试简单修复
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    # 策略 4: 尝试逐行提取有效 JSON（如果 LLM 返回了多个对象或混合文本）
+    # 先尝试找到所有完整的 key-value 对
+    try:
+        # 使用更宽松的解析：提取所有 "数字": { ... } 模式
+        pattern = r'"(\d+)"\s*:\s*\{[^{}]*\}'
+        matches = re.findall(pattern, raw)
+        if matches:
+            # 尝试构建一个完整 JSON
+            entries = []
+            for m in re.finditer(r'"(\d+)"\s*:\s*(\{[^{}]*\})', raw):
+                entries.append(f'"{m.group(1)}": {m.group(2)}')
+            if entries:
+                combined = "{" + ", ".join(entries) + "}"
+                return json.loads(combined)
+    except (json.JSONDecodeError, re.error):
+        pass
+
+    logger.warning(f"VisualPlan: batch {batch_num} JSON 解析失败，raw 前200字: {raw[:200]}")
+    return None
+
+
 def _build_batch_prompt(pages_summary: List[Dict], style: Dict, batch_num: int = 1, total_batches: int = 1) -> str:
     """构建批量生成 visual_description 的 LLM prompt。"""
     palette = style["meta"].get("palette", ["#1E3A5F", "#F5F5F0"])
@@ -107,6 +159,15 @@ def _build_batch_prompt(pages_summary: List[Dict], style: Dict, batch_num: int =
 
 """
 
+    page_type_style_rules = """
+【页面类型适配规则 — 必须遵守】
+参考图/风格方案只提供“风格基因”，不是每页画面模板。具体每页画什么，必须由该页文案内容决定。
+- cover / section / ending / 金句页：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
+- content / data / table / 对比分析页：优先保证阅读效率。信息越密集，背景越应降饱和、提亮度、减少装饰；品牌主色只用于标题、页眉、编号、强调块和少量装饰。
+- 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
+- 如果参考图本身是强视觉封面、海报、广告KV或单页主视觉，必须先抽象为色彩/材质/装饰/构图原则，再按页面类型调节强度，不能把单页主视觉机械扩散到全 deck。
+"""
+
     prompt = f"""你是一位顶级 PPT 视觉总监。为以下每一页 PPT 生成视觉意图（visual intent）。
 
 {batch_hint}
@@ -119,6 +180,7 @@ def _build_batch_prompt(pages_summary: List[Dict], style: Dict, batch_num: int =
 【大纲（{len(sanitized_pages)} 页）】
 {json.dumps(sanitized_pages, ensure_ascii=False, indent=2)}
 {ref_instruction}
+{page_type_style_rules}
 【任务】
 为每一页生成两个字段：
 1. visual_summary：一句话画面意向（20-30字；有参考图时 20-35 字），用于全局预览页快速理解。如"全屏深色背景，中央 DNA 双螺旋光纹"
@@ -128,12 +190,11 @@ def _build_batch_prompt(pages_summary: List[Dict], style: Dict, batch_num: int =
 
 【质量标准】
 1. visual_summary 必须极简，只说「画面是什么」（有参考图时可点出「基于用户参考路线图」等）。
-2. visual_description 与页面主题强相关；禁止空洞套话；有参考图时**必须**让读者看出参考素材是什么、大致摆在哪，而不是只写氛围。
-3. 必须体现风格系统的配色和调性（无参考图页尤其重要）
+2. visual_description 描述画面的氛围、意象、构图方向。只写"感觉"和"方向"，不写具体装饰细节（如线条位置、渐变形状）。与页面主题强相关，禁止空洞套话；有参考图时**必须**让读者看出参考素材是什么、大致摆在哪，而不是只写氛围。
+3. 必须体现风格系统的配色和调性（无参考图页尤其重要），但只描述整体色调感觉，不写具体装饰元素的颜色。
 4. 如果 existing_visual_suggestion 有内容，以它为基础扩展；如果为空，根据内容自行设计
 5. 不要规定具体字体名与字号；不要写出必须在页面上出现的正文原句。
-6. 颜色出现时，尽量带 HEX，如"深墨蓝(#0A1628)"
-7. ⚠️ 每页的 visual_description 只能描述该页自己的画面。严禁引用其他页面的参考图或视觉元素。
+6. ⚠️ 每页的 visual_description 只能描述该页自己的画面。严禁引用其他页面的参考图或视觉元素。
 
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
@@ -223,7 +284,12 @@ def _do_generate_visual_plan(
         ref_pages_in_batch = [p["page_num"] for p in batch if (p.get("reference_context") or "").strip()]
         logger.info(f"VisualPlan: batch {batch_num}/{total_batches}, pages={[p['page_num'] for p in batch]}, ref_pages={ref_pages_in_batch}")
         if progress_callback:
-            progress_callback(f"🧠 正在生成视觉方案（批次 {batch_num}/{total_batches}）...")
+            progress_callback({
+                "stage": "visual_planning",
+                "message": "正在生成视觉方案",
+                "current_page": batch_idx,
+                "total_pages": total_pages,
+            })
 
         prompt = _build_batch_prompt(batch, style, batch_num=batch_num, total_batches=total_batches)
 
@@ -243,23 +309,25 @@ def _do_generate_visual_plan(
             raw = raw.strip()
             logger.info(f"VisualPlan: batch {batch_num}/{total_batches} raw length={len(raw)}")
 
-            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            raw = re.sub(r"^```(?:json)?\s*|```$", "", raw, flags=re.MULTILINE | re.IGNORECASE).strip()
+            raw = clean_llm_output(raw)
 
             if raw:
-                try:
-                    batch_descriptions = json.loads(raw)
-                    if isinstance(batch_descriptions, dict):
-                        descriptions.update(batch_descriptions)
-                    else:
-                        logger.warning(f"VisualPlan: batch {batch_num} 返回非 dict: {type(batch_descriptions)}")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"VisualPlan: batch {batch_num} JSON 解析失败: {e}，raw前100字: {raw[:100]}")
+                batch_descriptions = _safe_parse_json(raw, batch_num)
+                if batch_descriptions and isinstance(batch_descriptions, dict):
+                    descriptions.update(batch_descriptions)
             else:
                 logger.warning(f"VisualPlan: batch {batch_num} 返回空内容")
         except Exception as e:
             logger.error(f"VisualPlan: batch {batch_num}/{total_batches} 调用失败: {e}")
             # 单批次失败不影响其他批次，继续执行
+        finally:
+            if progress_callback:
+                progress_callback({
+                    "stage": "visual_planning",
+                    "message": "正在生成视觉方案",
+                    "current_page": min(batch_idx + len(batch), total_pages),
+                    "total_pages": total_pages,
+                })
 
     # 3. 组装 Visual Plan Intent
     visual_plan = []
@@ -329,7 +397,12 @@ def _do_generate_visual_plan(
 
     logger.info(f"VisualPlan: 生成完成，共 {len(visual_plan)} 页，推荐种子页: {list(family_first_pages.keys())}")
     if progress_callback:
-        progress_callback(f"✅ 视觉方案已生成（{len(visual_plan)} 页），开始逐页撰写生图 Prompt...")
+        progress_callback({
+            "stage": "prompt_writing",
+            "message": "视觉方案已生成，正在撰写生图 Prompt",
+            "current_page": len(visual_plan),
+            "total_pages": len(visual_plan),
+        })
     return visual_plan
 
 

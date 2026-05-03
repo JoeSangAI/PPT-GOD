@@ -1,6 +1,5 @@
 import json
 import json_repair
-import os
 import re
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -11,6 +10,8 @@ from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.core.llm_client import get_llm_client
 from app.core.config import settings
+from app.utils.project_docs import load_project_documents
+from app.services.search_service import get_knowledge_augmenter
 
 router = APIRouter(prefix="/projects", tags=["chat"])
 
@@ -24,33 +25,24 @@ class ChatMessage(BaseModel):
     @field_validator("agent_role")
     @classmethod
     def _validate_agent_role(cls, v: str) -> str:
-        allowed = {"content", "visual"}
+        allowed = {"content", "visual", "finetune"}
         if v not in allowed:
             raise ValueError(f"agent_role must be one of {allowed}, got '{v}'")
         return v
 
 
-def _load_project_documents(project_id: str) -> str:
-    """读取项目已上传文档的提取文本。"""
-    docs_dir = os.path.join(settings.UPLOAD_DIR, project_id, "docs")
-    if not os.path.exists(docs_dir):
-        return ""
-
-    parts = []
-    for filename in sorted(os.listdir(docs_dir)):
-        if filename.endswith(".extracted.txt"):
-            original_name = filename[:-14]
-            path = os.path.join(docs_dir, filename)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    text = f.read()
-                if len(text) > 8000:
-                    text = text[:8000] + "\n\n[文档内容过长，已截断]"
-                parts.append(f"--- 文档: {original_name} ---\n{text}")
-            except Exception:
-                continue
-
-    return "\n\n".join(parts)
+def _has_content_edit_intent(message: str) -> bool:
+    """判断用户消息是否包含明确的内容编辑/修改意图。"""
+    msg = message.strip().lower()
+    edit_keywords = {
+        "修改", "调整", "改写", "重写", "编辑", "更新",
+        "添加", "插入", "增加", "追加",
+        "删除", "移除", "删掉", "去掉",
+        "换", "改", "加", "删", "增", "减", "变",
+        "页面", "第", "页",
+        "大纲", "结构", "章节", "标题", "内容",
+    }
+    return any(kw in msg for kw in edit_keywords)
 
 
 def _build_draft_prompt(has_documents: bool) -> str:
@@ -134,8 +126,9 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
         first_interaction_rule = """- **首次介入时，用户已经上传了设计素材**。你的任务是：
   1. 简要确认收到的素材（如"已收到你的Logo和3张风格参考"）
   2. 询问用户是否还有其他素材需要补充
-  3. 如果素材已经足够，直接输出风格提案（action="propose_styles"）
-  4. 如果用户想补充素材，等待补充后再提案"""
+  3. 如果素材已经足够，返回 action="propose_styles" 推进到风格提案生成
+  4. 如果系统上下文只告诉你"已上传参考图/模板"但没有给出图片的颜色、构图、字体等分析细节，你只能在 response 中说明将由后端读取素材并提取真实视觉特征，**不要自己编造 style_proposal 对象**
+  5. 如果用户想补充素材，等待补充后再提案"""
     else:
         first_interaction_rule = """- **首次介入时，用户还没有上传任何设计素材**。你的首要任务是**引导用户上传设计素材**。回复结构：自我介绍（1句）+ 询问用户是否有以下素材可以上传：参考模板、参考图、Logo、文字风格描述（清晰列出4项）+ 说明上传这些素材如何帮助提案更精准。
 - **绝对不能**在首次回复中直接给出配色方案、字体建议、风格判断或完整的视觉分析。你必须先确认用户的素材情况。"""
@@ -144,10 +137,17 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
 
 【绝对规则】你必须且只能输出合法的 JSON 对象。不要输出任何解释性文字、markdown 代码块、HTML 标签或多余的自然语言。无论用户说什么，你的每一次回复都必须是且只能是一个可被直接解析的 JSON 对象。违反此规则会导致系统错误。
 
-你的任务是根据客户的内容规划，为他们制定视觉策略、提案风格方案，并解答视觉相关咨询。
+你的任务是根据客户的内容规划，为他们制定视觉策略、提案风格方案，并解答视觉相关咨询。**你不是问答机器人，你是流程推进者。每次回复都必须给用户明确的下一步指引，不能停在反问或让用户体验到"我不知道该做什么"。**
 
 【当前项目内容规划】
 {content_plan_summary}{asset_section}
+
+【素材优先级规则】
+- 如果用户上传了风格参考图，参考图是最高优先级的风格来源：提取其色彩关系、字体气质、材质、装饰密度和构图节奏，转成文字风格系统；不要把风格图当作每页生图垫图。
+- 如果用户上传了参考模板，模板用于拆分和匹配封面、目录、内容、结尾等页面类型；模板适度影响版式和视觉秩序，具体配图仍由每页文案决定。
+- 上传参考图/模板后，内容规划用于判断页面类型、信息密度和具体配图；不得根据内容里的行业热词推翻素材本身的视觉气质。
+- 强视觉单页参考只用于定调。封面/章节/转场/金句页可以强化主色和装饰；内容/数据/表格/长文页必须优先可读，降低背景强度、减少装饰、增加留白。
+- 如果你无法看到图片细节，只能触发 action="propose_styles" 让后端图像分析生成，不要输出臆测的 style_proposal。
 
 【工作流 action 说明】
 - "collect_assets"：用户还没有素材，或素材不够，你需要引导用户上传/描述更多设计素材。**不要直接输出风格提案**。
@@ -204,7 +204,8 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
 
 【规则】
 {first_interaction_rule}
-- 只有用户明确说"没有素材"、"直接提案吧"、"你推荐吧"，才能进入 propose_styles。
+- **【绝对规则】当用户已提供足够素材、或明确表达了风格偏好（如描述了喜欢的配色、风格、场景）、或明确表示"直接提案吧/你推荐吧/生成风格提案/确认素材"时，必须返回 action="propose_styles"。如果素材是用户上传的参考图/模板且你看不到图片细节，不要输出 `style_proposal`，让后端图像分析生成；如果是用户用文字明确描述了风格，则在 `style_proposal` 字段中输出完整的结构化风格提案。禁止只返回 action="answer" 和文字描述。**
+- **每次回复都必须包含下一步行动指引**。比如：提案后告诉用户"满意请确认，不满意告诉我调整方向"；确认风格后告诉用户"正在进入画面设计阶段"；调整画面后告诉用户"调整已应用，可以确认生成图片"。禁止只回答用户当前问题而不给下一步方向。
 - **当用户明确确认选择某个风格时（如"ok"、"就用这个"、"确认"、"选这个"），必须返回 action="confirm_style"，并在 `style` 字段中输出完整的风格对象。不要只返回 "answer"。**
 - 说话要有设计师的品味，但不要说空话套话。具体、有观点。
 - 如果用户提到颜色、字体、排版、风格，给出专业建议。
@@ -217,17 +218,19 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
 - **【关键】每次回复的末尾，必须根据当前素材状态，明确告诉用户下一步可以点击什么按钮。格式：另起一行写 "👉 下一步：..."**
   - 如果用户已上传素材或描述了风格，但还没生成提案：👉 下一步：点击「确认素材已齐，生成风格提案」按钮，我立即开始
   - 如果用户素材明显不够（只有文字描述，没有图）：👉 下一步：你可以继续上传参考图或 Logo，补完后点击「确认素材已齐，生成风格提案」
-  - 如果风格提案已生成，等待用户选择：👉 下一步：请在主舞台选择一套风格方案，或在聊天中直接告诉我你的选择
-  - 如果用户在聊天中直接确认风格（如说"ok"、"选这个"）：返回 action="confirm_style"，👉 下一步：系统会自动保存并进入画面设计阶段，无需额外操作
-  - 如果用户已选风格，还没生成生图方案：👉 下一步：点击「确认风格，生成生图方案」按钮，开始为每一页生成画面描述
+  - 如果风格提案已生成，等待用户选择：👉 下一步：请查看上方风格卡片，点击「选择此方案」确认，或告诉我你的调整意见（如「更暖一些」「更现代一点」）
+  - 如果用户在聊天中直接确认风格（如说"ok"、"选这个"）：返回 action="confirm_style"，👉 下一步：已确认，正在进入画面设计阶段
+  - 如果用户已选风格，还没生成生图方案：👉 下一步：正在生成画面描述，请稍候
   - 如果是纯咨询问题：👉 下一步：如果还有其他视觉问题随时问我，或者点击按钮继续推进
 - 必须只返回合法JSON，不要markdown代码块，不要任何解释性文字"""
 
 
 def _build_normal_prompt() -> str:
     """有 slides 后的内容执行阶段 prompt（内容总监）。"""
-    return """你是 PPT GOD 的内容总监。你有三重背景：TED演讲教练、麦肯锡咨询顾问、顶尖商业文案。用户已经进入了内容执行阶段，你的任务是根据用户指令执行内容操作或给出专业建议。解析用户意图并返回 JSON：
-- "action": "regenerate_pages" | "retry_failed" | "update_style" | "update_slide_content" | "update_all_slides" | "regenerate_plan" | "add_slide_before" | "add_slide_after" | "answer"
+    return """你是 PPT GOD 的内容总监。你有三重背景：TED演讲教练、麦肯锡咨询顾问、顶尖商业文案。用户已经进入了内容执行阶段，你的任务是根据用户指令执行内容操作或给出专业建议。**你不是问答机器人，你是流程推进者。每次回复都必须给用户明确的下一步指引，不能停在反问或让用户体验到"我不知道该做什么"。**
+
+解析用户意图并返回 JSON：
+- "action": "regenerate_pages" | "retry_failed" | "update_style" | "update_slide_content" | "update_all_slides" | "regenerate_plan" | "add_slide_before" | "add_slide_after" | "forward_to_visual" | "answer"
 - "page_nums": int[]（regenerate_pages 时提取页码）
 - "style_id": string（update_style 时）
 - "updated_content": object（update_slide_content 时，返回该页完整的 content_json，必须包含 page_num、type、section_title、text_content、speaker_notes、visual_suggestion）
@@ -246,21 +249,26 @@ def _build_normal_prompt() -> str:
 - **用户要求"重新生成内容规划"、"重新规划页面"、"按大纲重新来"、页数需要增减变化时 → action="regenerate_plan"，并在 topic 字段中输出完整的主题描述（用于重新生成内容规划）**
 - 用户说"在第X页前面加一页"、"在前面插入一页"、"加一页" → action="add_slide_before"
 - 用户说"在第X页后面加一页"、"在后面插入一页"、"追加一页" → action="add_slide_after"
+- **【规则】当上下文显示"内容规划已确认：是"，且用户只回复了简单的确认性词语（如"ok"、"好的"、"明白了"、"可以"）或闲聊时，返回 action="forward_to_visual" 引导用户切换到视觉总监，不要反问用户"是否需要生成PPT"。**
+- **但如果用户有明确的内容操作意图（如"修改"、"添加"、"删除"、"调整"、"重写"、"加一页"、"改标题"、"按文档更新"等），正常处理用户请求，执行相应操作，并在 response 末尾提示用户"内容调整完成后，可点击上方切换到视觉总监继续"。**
 - 其他 → action="answer"
 - 如果用户提到"文档""原文""MD""文件"里的内容，请基于已上传的文档内容回答，不要反问用户。
 - update_slide_content 时：
   1. 必须在 updated_content 中返回该页完整的 content_json（包含所有字段）
   2. 只修改用户明确要求改的部分，其他字段保持原样
   3. 同步在 response 中简要说明改了什么
+  4. **response 中必须告诉用户下一步该做什么**（如"如需继续调整其他页面请告诉我，或点击上方切换到视觉总监进入设计阶段"）
 - update_all_slides 时：
   1. 在 updated_slides 数组中返回需要修改的页面，每个元素格式：{"page_num": N, "text_content": {"headline":"...","subhead":"...","body":"markdown正文..."}}
   2. 只返回确实需要改的页面，无需修改的页面不要出现在数组中
   3. body 是 markdown 格式的字符串，不是数组
+  4. **response 中必须告诉用户下一步该做什么**
 - add_slide_before / add_slide_after 时：
   1. 必须在 new_slide 中返回新页完整的 content_json（包含所有字段）
   2. page_num 填用户指定的目标位置页码；如果用户没有明确指定，填当前上下文中的 page_num
   3. type 根据内容推断（cover/toc/content/data/hero/ending），默认 content
   4. 如果用户没有提供具体内容，生成与上下文风格一致、自然过渡的页面内容
+  5. **response 中必须告诉用户下一步该做什么**
 - 只返回 JSON，不要 markdown。
 - 【重要】JSON 字符串值中如果包含双引号 "，必须转义为 \"。建议避免在字符串中使用双引号，可用中文引号「」或单引号代替。
 
@@ -271,6 +279,46 @@ def _build_normal_prompt() -> str:
 {"action": "add_slide_after", "new_slide": {"page_num":3,"type":"content","section_title":"","text_content":{"headline":"新标题","subhead":"新副标题","body":""},"speaker_notes":"","visual_suggestion":""}, "response": "已在第3页后插入新页。"}
 
 - 必须只返回合法 JSON，不要 markdown 代码块，不要任何解释性文字。确保 JSON 可以被直接解析。"""
+
+
+def _build_finetune_prompt(current_slide_info: str = "") -> str:
+    """单页微调 Agent 的 system prompt。"""
+    slide_context = f"\n\n【当前正在微调的幻灯片】\n{current_slide_info}" if current_slide_info else ""
+
+    return f"""你是「单页微调总监」—— 一个专注幻灯片单页精准修改的 AI Agent。
+
+你的核心职责：根据用户的修改指令，对当前这一页幻灯片进行**外科手术式的精准调整**。
+
+## 铁律（最高优先级）
+
+1. **用户没提到的，一个字、一个像素都不能改**
+   - 用户只说"把标题加粗" → 只改标题字重，不改颜色、不改位置、不改其他文字
+   - 用户只说"换张图" → 只替换指定图片，不改文字、不改布局、不改配色
+   - 不存在"顺便优化一下"—— 任何用户未明确授权的内容都是禁区
+
+2. **精准理解修改范围**
+   - 改文字 → 只替换文字内容，保持字号/颜色/位置/字体不变
+   - 改配色 → 只调整指定元素的颜色，不牵连同页其他元素
+   - 改图片 → 只修改指定区域/图片，其他区域原封不动
+   - 改布局 → 只移动指定元素，不影响其他内容
+
+3. **你的输出是生图指令**
+   - 你需要输出一个 `refine_slide` action，其中 `new_prompt` 是对当前页的完整生图 prompt
+   - 这个 prompt 必须包含：原始图片的所有内容描述 + 用户要求的精准修改
+   - 在 prompt 中明确标注："保持所有未提及的元素与原始图片完全一致"
+
+4. **上下文隔离**
+   - 你只操作当前这一页，不涉及其他页面
+   - 你不修改内容规划（content_json），只修改视觉呈现（通过生图 prompt）
+
+## 输出格式
+
+严格返回以下 JSON（只返回 JSON，不要任何其他文字）：
+
+{{"action": "refine_slide", "new_prompt": "完整的生图 prompt...", "response": "对用户说的话（简短说明修改了什么）"}}
+
+如果用户的话不涉及具体修改（如闲聊、问问题），返回：
+{{"action": "answer", "response": "你的回复"}}{slide_context}"""
 
 
 def _stream_intent(user_message: str, project_context: dict, history: list[dict], documents: str = "", page_context: dict | None = None, agent_role: str = "content", content_plan_summary: str = "", assets_summary: str = ""):
@@ -288,6 +336,14 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
     # 根据 agent_role 选择 system prompt
     if agent_role == "visual":
         system_prompt = _build_visual_prompt(content_plan_summary, assets_summary)
+    elif agent_role == "finetune":
+        # 单页微调：构建当前页上下文
+        current_slide_info = ""
+        if page_context:
+            cp = page_context.get("current_page", {}) if isinstance(page_context, dict) else {}
+            if cp:
+                current_slide_info = json.dumps(cp, ensure_ascii=False, indent=2)
+        system_prompt = _build_finetune_prompt(current_slide_info)
     elif agent_role == "content":
         if is_draft:
             system_prompt = _build_draft_prompt(has_documents)
@@ -299,6 +355,21 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             system_prompt = _build_draft_prompt(has_documents)
         else:
             system_prompt = _build_normal_prompt()
+
+    # 【关键】内容已确认时，强制内容总监引导用户进入视觉阶段
+    # 不依赖 LLM 判断，直接硬编码返回，确保流程推进的可靠性
+    if agent_role == "content" and project_context.get("content_plan_confirmed"):
+        # 用户有明确的内容修改意图时，允许内容总监继续处理
+        if not _has_content_edit_intent(user_message):
+            yield {"type": "thinking", "delta": "内容规划已确认，直接引导用户切换到视觉总监。"}
+            yield {
+                "type": "result",
+                "data": {
+                    "action": "forward_to_visual",
+                    "response": "内容已确认，现在进入视觉设计阶段。请点击上方切换到「视觉总监」，我会为你制定整体视觉风格和画面方案。"
+                }
+            }
+            return
 
     # 把文档内容放到系统 prompt 中（内容总监和视觉总监都需要）
     if has_documents and agent_role != "visual":
@@ -321,10 +392,10 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             else:
                 page_json = json.dumps(page_context, ensure_ascii=False, indent=2)
                 system_prompt += f"\n\n=== 当前正在编辑的单页上下文 ===\n{page_json}\n=== 单页上下文结束 ==="
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to serialize page_context: {e}")
 
-    context = f"项目：{project_context['title']}，状态：{project_context['status']}，共 {project_context['total_slides']} 页，已完成 {project_context['completed_slides']} 页"
+    context = f"项目：{project_context['title']}，状态：{project_context['status']}，共 {project_context['total_slides']} 页，已完成 {project_context['completed_slides']} 页，内容规划已确认：{'是' if project_context.get('content_plan_confirmed') else '否'}"
 
     # 把 history 中的 system 操作日志合并到 system prompt 中
     # MiniMax API 不支持 messages 中出现多条 system 角色，所以必须合并
@@ -336,6 +407,12 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
         system_prompt += "\n\n【用户在主舞台的操作日志】\n" + "\n".join(f"- {p}" for p in system_log_parts)
         system_prompt += "\n\n你必须基于上述日志理解用户当前的项目进展和状态，给出精准的建议。不要反问用户\"你做了什么\"，因为日志里已经有了。"
 
+    # 【内容总监】按需搜索实时信息
+    if agent_role == "content":
+        search_context = get_knowledge_augmenter().augment(user_message)
+        if search_context:
+            system_prompt += f"\n\n{search_context}"
+
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for h in history:
         role = h.get("role")
@@ -345,7 +422,14 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             role = "assistant"
         messages.append({"role": role, "content": h.get("content", "")})
 
-    user_content = f"上下文：{context}\n用户：{user_message}"
+    # 内容已确认时，在 user message 中重复强调，确保 LLM 不会忽略
+    if agent_role == "content" and project_context.get("content_plan_confirmed"):
+        if _has_content_edit_intent(user_message):
+            user_content = f"上下文：{context}\n\n【系统指令】内容规划已确认，但用户提出了明确的内容编辑请求。请先处理用户的编辑请求，执行相应操作，然后在 response 末尾提示用户：内容调整完成后，可点击上方切换到视觉总监继续。\n用户：{user_message}"
+        else:
+            user_content = f"上下文：{context}\n\n【系统指令】内容规划已确认，用户没有提出明确的内容编辑请求。返回 action='forward_to_visual' 引导用户切换到视觉总监。禁止反问用户下一步想做什么。\n用户：{user_message}"
+    else:
+        user_content = f"上下文：{context}\n用户：{user_message}"
     messages.append({"role": "user", "content": user_content})
 
     stream = client.chat.completions.create(
@@ -452,55 +536,6 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
         logger.warning(f"[Chat] JSON parse failed after all fixes. Preview: {preview!r}")
         return None
 
-    def _escape_newlines_in_json(text: str) -> str:
-        """修复 JSON 字符串中未转义的换行符。"""
-        result = []
-        in_string = False
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if ch == '"' and (i == 0 or text[i - 1] != '\\'):
-                in_string = not in_string
-                result.append(ch)
-            elif in_string and ch in ('\n', '\r'):
-                result.append('\\n')
-                if ch == '\r' and i + 1 < len(text) and text[i + 1] == '\n':
-                    i += 1  # 跳过 \n
-            else:
-                result.append(ch)
-            i += 1
-        return ''.join(result)
-
-    def _escape_quotes_in_json(text: str) -> str:
-        """修复 JSON 字符串中未转义的双引号。
-
-        LLM 经常在字符串值里写 增加了"爱"这一维度 但不转义，导致整个 JSON 非法。
-        启发式判断：字符串内遇到的未转义 "，如果后面不是紧跟逗号/冒号/}]/空白，就认为是内部引号，需要转义。
-        """
-        result = []
-        in_string = False
-        i = 0
-        while i < len(text):
-            ch = text[i]
-            if ch == '"' and (i == 0 or text[i - 1] != '\\'):
-                if not in_string:
-                    in_string = True
-                    result.append(ch)
-                else:
-                    # 字符串内的未转义引号——判断是字符串结束还是内部引号
-                    j = i + 1
-                    while j < len(text) and text[j] in ' \t\n\r':
-                        j += 1
-                    if j < len(text) and text[j] in ',:}]':
-                        in_string = False
-                        result.append(ch)
-                    else:
-                        result.append('\\"')
-            else:
-                result.append(ch)
-            i += 1
-        return ''.join(result)
-
     # 依次尝试解析 content_buffer、full_buffer
     result = _try_parse(content_buffer) or _try_parse(full_buffer)
 
@@ -567,6 +602,10 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
                 result["action"] = "answer"
         elif agent_role == "content":
             allowed_actions = {
+                "diagnose",
+                "collect_content",
+                "propose_plan",
+                "generate_plan",
                 "regenerate_pages",
                 "retry_failed",
                 "update_style",
@@ -575,6 +614,13 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
                 "regenerate_plan",
                 "add_slide_before",
                 "add_slide_after",
+                "answer",
+            }
+            if result.get("action") not in allowed_actions:
+                result["action"] = "answer"
+        elif agent_role == "finetune":
+            allowed_actions = {
+                "refine_slide",
                 "answer",
             }
             if result.get("action") not in allowed_actions:
@@ -612,9 +658,7 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
                     messages=fallback_messages,
                     temperature=0.1,
                 )
-                fallback_text = (fallback_response.choices[0].message.content or "").strip()
-                fallback_text = re.sub(r"<think>.*?</think>", "", fallback_text, flags=re.DOTALL).strip()
-                fallback_text = re.sub(r"^```(?:json)?\s*|```$", "", fallback_text, flags=re.MULTILINE | re.IGNORECASE).strip()
+                fallback_text = clean_llm_output(fallback_response.choices[0].message.content or "")
                 if fallback_text:
                     fallback_parsed = json_repair.loads(fallback_text)
                     if isinstance(fallback_parsed, dict) and fallback_parsed.get("action") in allowed_actions:
@@ -642,9 +686,10 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
         "status": project.status,
         "total_slides": len(slides),
         "completed_slides": completed,
+        "content_plan_confirmed": project.content_plan_confirmed or False,
     }
 
-    documents = _load_project_documents(project_id)
+    documents = load_project_documents(project_id)
 
     # 为视觉总监构建内容规划摘要
     content_plan_summary = ""
@@ -687,6 +732,7 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
 
     def event_stream():
         _logger.info(f"Chat API: starting stream for project={project_id}, role={body.agent_role}")
+        result_data = None
         try:
             for event in _stream_intent(
                 body.message, context, body.history, documents,
@@ -694,11 +740,40 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
             ):
                 line = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if event.get("type") == "result":
-                    _logger.info(f"Chat API: yielding result action={event.get('data', {}).get('action') if isinstance(event.get('data'), dict) else 'n/a'}")
+                    result_data = event.get("data")
+                    _logger.info(f"Chat API: yielding result action={result_data.get('action') if isinstance(result_data, dict) else 'n/a'}")
                 yield line
         except Exception as e:
             _logger.error(f"Chat API: stream exception: {e}", exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        # 流结束后：如果 Agent 返回了风格提案，保存到数据库确保前后端一致
+        if result_data and isinstance(result_data, dict) and result_data.get("action") in ("propose_styles", "adjust_style"):
+            style_proposal = result_data.get("style_proposal")
+            if style_proposal and isinstance(style_proposal, dict):
+                try:
+                    from datetime import datetime, timezone
+                    # 标准化 palette 格式
+                    palette = style_proposal.get("palette", [])
+                    if palette and isinstance(palette, list):
+                        normalized_palette = []
+                        for c in palette:
+                            if isinstance(c, dict) and "hex" in c:
+                                normalized_palette.append(c)
+                            elif isinstance(c, str):
+                                normalized_palette.append({"name": c, "hex": c, "role": ""})
+                        style_proposal["palette"] = normalized_palette
+
+                    project.style_proposal = {
+                        "proposals": [style_proposal],
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "agent_based": True,
+                    }
+                    db.commit()
+                    _logger.info(f"[Chat] Saved agent style_proposal to project={project_id}, action={result_data.get('action')}")
+                except Exception as e:
+                    _logger.warning(f"[Chat] Failed to save agent style_proposal: {e}")
+
         _logger.info(f"Chat API: stream ended for project={project_id}")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

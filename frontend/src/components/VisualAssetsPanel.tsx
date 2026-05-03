@@ -14,6 +14,10 @@ interface VisualAssetsPanelProps {
   onDelete: (refId: string) => void;
   onImageClick: (url: string) => void;
   apiBase: string;
+  onUploadLogo?: () => void;
+  onUploadStyleRef?: () => void;
+  onUploadTemplate?: () => void;
+  showInVisualStage?: boolean;
 }
 
 function getImageUrl(apiBase: string, url: string) {
@@ -31,20 +35,42 @@ function AssetCard({
 }) {
   return (
     <div className="relative group bg-white rounded-lg border border-gray-200 p-2 flex flex-col items-center gap-1.5 min-w-[100px] h-[92px]">
-      <span className="text-[10px] text-gray-500 font-medium leading-none h-3 flex items-center">
-        {label || " "}
+      <span className="text-2xs text-gray-500 font-medium leading-none h-3 flex items-center">
+        {label || " "}
       </span>
       <div className="flex-1 flex items-center justify-center overflow-hidden">
         {children}
       </div>
       <button
         onClick={onDelete}
-        className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600"
+        className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600"
         title="删除"
       >
-        ×
+        X
       </button>
     </div>
+  );
+}
+
+function AddAssetButton({
+  label,
+  formats,
+  onClick,
+}: {
+  label: string;
+  formats: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={`点击上传 ${label}，支持 ${formats}`}
+      className="flex-shrink-0 bg-white rounded-lg border border-dashed border-purple-200 p-2 flex flex-col items-center justify-center gap-0.5 min-w-[100px] h-[92px] hover:border-purple-400 hover:bg-purple-50 transition-colors group"
+    >
+      <span className="text-lg text-purple-400 group-hover:text-purple-500 transition-colors">+</span>
+      <span className="text-2xs text-gray-600 font-medium">{label}</span>
+      <span className="text-2xs text-gray-400">{formats}</span>
+    </button>
   );
 }
 
@@ -55,6 +81,10 @@ export default function VisualAssetsPanel({
   onDelete,
   onImageClick,
   apiBase,
+  onUploadLogo,
+  onUploadStyleRef,
+  onUploadTemplate,
+  showInVisualStage = false,
 }: VisualAssetsPanelProps) {
   const [showTemplatePages, setShowTemplatePages] = useState(false);
 
@@ -62,23 +92,33 @@ export default function VisualAssetsPanel({
   const styleRefs = referenceImages.filter((r) => r.role === "style_ref");
   const template = referenceImages.find((r) => r.role === "template");
 
-  if (!logo && styleRefs.length === 0 && !template) return null;
+  // 在视觉总监阶段始终显示面板，即使没有素材
+  const shouldShow = showInVisualStage || referenceImages.length > 0;
+  if (!shouldShow) return null;
+
+  const hasAnyAssets = referenceImages.length > 0;
 
   return (
     <div className="bg-gray-50 border-b border-gray-200 px-3 py-2">
       <div className="flex items-center gap-2 mb-1.5">
-        <span className="text-xs font-semibold text-gray-700">设计素材</span>
-        {(styleRefs.length > 0 || logo) && (
-          <span className="text-[10px] text-gray-400">
+        <span className="text-xs font-semibold text-gray-700">视觉素材</span>
+        {hasAnyAssets && (
+          <span className="text-2xs text-gray-400">
             {logo ? "Logo · " : ""}
             {styleRefs.length > 0 ? `${styleRefs.length} 张风格参考` : ""}
+            {template ? " · 模板" : ""}
+          </span>
+        )}
+        {!hasAnyAssets && showInVisualStage && (
+          <span className="text-2xs text-gray-400">
+            上传素材可让风格提案更精准
           </span>
         )}
       </div>
 
       <div className="flex items-start gap-2 overflow-x-auto pb-1">
         {/* Logo */}
-        {logo && (
+        {logo ? (
           <AssetCard label="Logo" onDelete={() => onDelete(logo.id)}>
             <img
               src={getImageUrl(apiBase, logo.url)}
@@ -90,7 +130,9 @@ export default function VisualAssetsPanel({
               }}
             />
           </AssetCard>
-        )}
+        ) : showInVisualStage && onUploadLogo ? (
+          <AddAssetButton label="上传 Logo" formats="PNG, JPG, SVG" onClick={onUploadLogo} />
+        ) : null}
 
         {/* Style references */}
         {styleRefs.map((ref, idx) => (
@@ -110,11 +152,14 @@ export default function VisualAssetsPanel({
             />
           </AssetCard>
         ))}
+        {showInVisualStage && onUploadStyleRef && (
+          <AddAssetButton label="风格参考" formats="PNG, JPG, WEBP" onClick={onUploadStyleRef} />
+        )}
 
         {/* Template */}
-        {template && (
+        {template ? (
           <div className="relative group bg-white rounded-lg border border-gray-200 p-2 flex flex-col items-center gap-1.5 min-w-[100px] h-[92px]">
-            <span className="text-[10px] text-gray-500 font-medium leading-none h-3 flex items-center">模板</span>
+            <span className="text-2xs text-gray-500 font-medium leading-none h-3 flex items-center">模板</span>
             <div className="flex-1 flex items-center justify-center w-full">
               <div
                 className="h-full w-[80px] bg-gray-100 rounded flex items-center justify-center cursor-pointer text-xs text-gray-600 hover:bg-gray-200 transition-colors"
@@ -127,13 +172,15 @@ export default function VisualAssetsPanel({
             </div>
             <button
               onClick={() => onDelete(template.id)}
-              className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-[10px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600"
+              className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600"
               title="删除"
             >
-              ×
+              X
             </button>
           </div>
-        )}
+        ) : showInVisualStage && onUploadTemplate ? (
+          <AddAssetButton label="参考模板" formats="PPT, PPTX, PDF" onClick={onUploadTemplate} />
+        ) : null}
       </div>
 
       {/* Template pages expandable */}
@@ -169,7 +216,7 @@ export default function VisualAssetsPanel({
                   className="h-16 w-auto rounded object-cover"
                   onClick={() => onImageClick(getImageUrl(apiBase, page.url))}
                 />
-                <div className="text-[10px] text-center mt-0.5">
+                <div className="text-2xs text-center mt-0.5">
                   <span className="text-gray-500">{page.page_num}页</span>
                   {isRecommended && (
                     <span className="text-purple-600 ml-0.5 font-medium">

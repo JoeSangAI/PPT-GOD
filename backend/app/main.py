@@ -11,11 +11,26 @@ from app.models import models
 
 models.Base.metadata.create_all(bind=engine)
 
+# Startup validation: warn about missing API keys in real mode
+if settings.IMAGE_GEN_MODE == "real":
+    missing = []
+    if not settings.MINIMAX_API_KEY:
+        missing.append("MINIMAX_API_KEY")
+    if not settings.DEER_API_KEY:
+        missing.append("DEER_API_KEY")
+    if missing:
+        import warnings
+        warnings.warn(
+            f"IMAGE_GEN_MODE=real but missing API keys: {', '.join(missing)}. "
+            "Set them in .env or switch to IMAGE_GEN_MODE=mock/cached.",
+            stacklevel=2,
+        )
+
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:8000", "http://127.0.0.1:8000", "http://127.0.0.1:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:8000", "http://127.0.0.1:8000", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:5175"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,5 +1,4 @@
 import os
-from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
@@ -117,6 +116,10 @@ def delete_document(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # 防止路径遍历攻击
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
     docs_dir = _get_docs_dir(project_id)
     original_path = os.path.join(docs_dir, filename)

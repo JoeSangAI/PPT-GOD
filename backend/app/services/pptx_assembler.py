@@ -21,9 +21,9 @@ def assemble_pptx(
     logo_path: 可选的 Logo 图片路径（叠加到每页）
     """
     prs = Presentation()
-    # 3:2 (1536x1024)
+    # 16:9 (1792x1024)
     prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(8.889)
+    prs.slide_height = Inches(7.5)
 
     # 按 page_num 排序
     sorted_slides = sorted(slide_images, key=lambda x: x["page_num"])

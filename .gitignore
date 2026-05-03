@@ -37,8 +37,11 @@ venv/
 
 # Database
 *.db
+*.db.backup-*
 *.sqlite
 *.sqlite3
 
 # Logs
 *.log
+backend/1
+backend/celery*.log

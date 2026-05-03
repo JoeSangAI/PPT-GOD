@@ -16,7 +16,7 @@ from openai import (
     APITimeoutError,
     OpenAI,
 )
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app.core.config import settings
 
@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 _image_client = None
 _image_client_lock = threading.Lock()
 _run_state_lock = threading.Lock()
+_image_api_semaphore = threading.BoundedSemaphore(
+    max(1, int(settings.IMAGE_API_MAX_CONCURRENCY or 1))
+)
 _real_image_calls_this_run = 0
 
 
@@ -41,36 +44,6 @@ def _get_image_client() -> OpenAI:
                     max_retries=0,  # 禁用 SDK 自动重试，由本模块手动控制，防止重复计费
                 )
     return _image_client
-
-
-def _pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
-    buffered = io.BytesIO()
-    img.save(buffered, format=fmt)
-    return buffered.getvalue()
-
-
-def _crop_to_3_2(img: Image.Image) -> Image.Image:
-    """裁剪为 3:2（1536x1024）比例。"""
-    w, h = img.size
-    target_ratio = 3 / 2
-    current_ratio = w / h
-    if abs(current_ratio - target_ratio) > 0.05:
-        if current_ratio < target_ratio:
-            new_h = int(w / target_ratio)
-            top = (h - new_h) // 2
-            img = img.crop((0, top, w, top + new_h))
-        else:
-            new_w = int(h * target_ratio)
-            left = (w - new_w) // 2
-            img = img.crop((left, 0, left + new_w, h))
-    return img
-
-
-def reset_image_generation_run_state() -> None:
-    """Reset per-process real image accounting for tests and controlled smoke runs."""
-    global _real_image_calls_this_run
-    with _run_state_lock:
-        _real_image_calls_this_run = 0
 
 
 def _reserve_real_image_call() -> None:
@@ -124,15 +97,32 @@ def _cache_path(key: str) -> str:
 
 def _is_api_retryable(exc: Exception) -> bool:
     """
-    只对明确不计费的状态码重试。
-    429 = 服务器限流，请求未被处理，不计费。
-    ConnectionError / Timeout / 5xx 一律不重试：
-    请求可能已到达服务器并完成计费，重试会导致重复扣费。
+    只在同一接口、同一 Idempotency-Key 下重试瞬时失败。
+    不切换模型，不改成无参考图生成，也不返回占位图。
     """
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
     if isinstance(exc, APIStatusError):
         status = exc.status_code
-        if status == 429:
+        if status == 429 or 500 <= status < 600:
             return True
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        status = exc.response.status_code
+        if status == 429 or 500 <= status < 600:
+            return True
+    text = str(exc).lower()
+    retryable_markers = (
+        "connection error",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "图片接口上传超时",
+    )
+    if any(marker in text for marker in retryable_markers):
+        return True
     return False
 
 
@@ -153,8 +143,42 @@ def _download_image_bytes(url: str, max_attempts: int = 3) -> bytes:
     raise Exception("Image download failed after all retries")
 
 
+def _prepare_reference_image_for_upload(ref: Image.Image) -> Image.Image:
+    """Normalize user/template references before sending them to the image API."""
+    max_side = max(256, int(settings.IMAGE_REFERENCE_MAX_SIDE or 1400))
+    img = ImageOps.exif_transpose(ref)
+    img = img.copy()
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    if img.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        alpha = img.getchannel("A")
+        background.paste(img.convert("RGBA"), mask=alpha)
+        img = background
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
+
+
+def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesIO, str, int]:
+    img = _prepare_reference_image_for_upload(ref)
+    buf = io.BytesIO()
+    quality = min(95, max(60, int(settings.IMAGE_REFERENCE_JPEG_QUALITY or 85)))
+    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+    size_bytes = buf.tell()
+    buf.seek(0)
+    return f"ref_{index}.jpg", buf, "image/jpeg", size_bytes
+
+
+def _is_connection_timeout(exc: Exception) -> bool:
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text or "connection aborted" in text
+
+
 def _call_gpt_image_2_generate(
-    prompt: str, size: str = "1536x1024", idempotency_key: Optional[str] = None
+    prompt: str, size: str = "1792x1024", idempotency_key: Optional[str] = None
 ) -> Image.Image:
     client = _get_image_client()
     headers = {}
@@ -179,23 +203,21 @@ def _call_gpt_image_2_generate(
 
 
 def _call_gpt_image_2_edit(
-    prompt: str, reference_images: List[Image.Image], size: str = "1536x1024",
+    prompt: str, reference_images: List[Image.Image], size: str = "1792x1024",
     idempotency_key: Optional[str] = None
 ) -> Image.Image:
     """使用 requests 直接调用 DeerAPI images/edit，支持 additional_images[] 多图垫图。"""
     if not reference_images:
         raise ValueError("reference_images required for edit")
     files = []
-    primary_ref = reference_images[0]
-    buf = io.BytesIO()
-    primary_ref.save(buf, format="PNG")
-    buf.seek(0)
-    files.append(("image", ("ref_0.png", buf, "image/png")))
+    upload_bytes = 0
+    filename, buf, mime_type, size_bytes = _reference_upload_file(reference_images[0], 0)
+    upload_bytes += size_bytes
+    files.append(("image", (filename, buf, mime_type)))
     for i, ref in enumerate(reference_images[1:], 1):
-        buf = io.BytesIO()
-        ref.save(buf, format="PNG")
-        buf.seek(0)
-        files.append(("additional_images[]", (f"ref_{i}.png", buf, "image/png")))
+        filename, buf, mime_type, size_bytes = _reference_upload_file(ref, i)
+        upload_bytes += size_bytes
+        files.append(("additional_images[]", (filename, buf, mime_type)))
     data = {
         "model": settings.DEER_IMAGE_MODEL,
         "prompt": prompt,
@@ -205,14 +227,28 @@ def _call_gpt_image_2_edit(
     headers = {"Authorization": f"Bearer {settings.DEER_API_KEY or settings.MINIMAX_API_KEY}"}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    logger.info(f"ImageGen: calling edit API with {len(reference_images)} reference images")
-    resp = requests.post(
-        f"{settings.DEER_API_BASE}/images/edits",
-        headers=headers,
-        data=data,
-        files=files,
-        timeout=(30, 600),
+    logger.info(
+        "ImageGen: calling edit API with %s reference images, upload=%.2fMB",
+        len(reference_images),
+        upload_bytes / (1024 * 1024),
     )
+    try:
+        resp = requests.post(
+            f"{settings.DEER_API_BASE}/images/edits",
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=(
+                int(settings.IMAGE_EDIT_CONNECT_TIMEOUT_SECONDS or 120),
+                int(settings.IMAGE_EDIT_READ_TIMEOUT_SECONDS or 900),
+            ),
+        )
+    except requests.exceptions.RequestException as e:
+        if _is_connection_timeout(e):
+            raise RuntimeError(
+                "图片接口上传超时：参考图已压缩后仍未能稳定写入 API，请稍后重试失败页"
+            ) from e
+        raise
     resp.raise_for_status()
     body = resp.json()
     image_data = body["data"][0]
@@ -235,7 +271,7 @@ def _call_gemini_chat_generate(
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     for ref_img in (reference_images or [])[:14]:
         buffered = io.BytesIO()
-        ref_img.save(buffered, format="PNG")
+        _prepare_reference_image_for_upload(ref_img).save(buffered, format="PNG", optimize=True)
         img_b64 = base64.b64encode(buffered.getvalue()).decode()
         messages[0]["content"].append({
             "type": "image_url",
@@ -267,9 +303,15 @@ def _generate_real_slide_image(
     aspect_ratio: str = "16:9",
 ) -> Image.Image:
     model = settings.DEER_IMAGE_MODEL.lower()
-    size = "1536x1024"
+    # GPT-Image / DALL-E 支持的标准尺寸
+    if aspect_ratio == "16:9":
+        size = "1792x1024"
+    elif aspect_ratio == "9:16":
+        size = "1024x1792"
+    else:
+        size = "1024x1024"
     idempotency_key = str(uuid.uuid4())
-    api_backoff = [0, 5]
+    api_backoff = [0, 5, 15]
     for attempt, delay in enumerate(api_backoff):
         if delay > 0:
             logger.info(f"ImageGen: waiting {delay}s before API call...")
@@ -290,7 +332,6 @@ def _generate_real_slide_image(
                 img = _call_gemini_chat_generate(
                     prompt, reference_images, aspect_ratio, resolution
                 )
-            img = _crop_to_3_2(img)
             logger.info(f"ImageGen: success, model={settings.DEER_IMAGE_MODEL}, size={img.size}")
             return img
         except Exception as e:
@@ -301,11 +342,11 @@ def _generate_real_slide_image(
             logger.warning(
                 f"ImageGen: API call failed (attempt {attempt + 1}/{len(api_backoff)}): {err_detail}"
             )
-            if not _is_api_retryable(e):
-                logger.error(f"ImageGen: non-retryable error, aborting: {err_detail}")
-                raise
             if attempt == len(api_backoff) - 1:
                 logger.error(f"ImageGen: all retries exhausted: {err_detail}")
+                raise
+            if not _is_api_retryable(e):
+                logger.error(f"ImageGen: non-retryable error, aborting: {err_detail}")
                 raise
     raise Exception("Image generation failed after all retries")
 
@@ -329,7 +370,8 @@ def generate_slide_image(
             return Image.open(path).copy()
 
         _reserve_real_image_call()
-        img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
+        with _image_api_semaphore:
+            img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
         os.makedirs(settings.IMAGE_GEN_CACHE_DIR, exist_ok=True)
         img.save(path, "PNG")
         logger.info(f"ImageGen: cached generated image {path}")
@@ -339,7 +381,8 @@ def generate_slide_image(
         raise ValueError("IMAGE_GEN_MODE must be one of: real, mock, cached")
 
     _reserve_real_image_call()
-    return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
+    with _image_api_semaphore:
+        return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
 
 
 def save_slide_image(img: Image.Image, project_id: str, page_num: int, output_dir: str = "./outputs") -> str:

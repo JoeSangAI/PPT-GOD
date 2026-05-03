@@ -6,26 +6,12 @@ from typing import Dict, List, Optional
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.utils.text_cleaning import clean_llm_output
+from app.utils.reference_image import reference_process_mode_instruction
 
 logger = logging.getLogger(__name__)
 
 
-def _reference_process_mode_instruction(mode: str | None) -> str:
-    mode = mode or "blend"
-    if mode == "blend":
-        return (
-            "Blend mode: extract the main subject/style from the reference image and integrate it naturally into the slide. "
-            "Scale, lighting, perspective, and background may be adjusted to fit the design."
-        )
-    if mode == "crop":
-        return (
-            "Crop mode: preserve the reference image content as a recognizable visual block, while cropping only as needed for the slide composition."
-        )
-    if mode == "original":
-        return (
-            "Original mode: preserve the reference image exactly as-is. Do not crop, stretch, rotate, or alter it; reserve intact layout space for it."
-        )
-    return f"Respect custom reference mode: {mode}."
 
 
 def _load_template(path: str) -> str:
@@ -110,10 +96,17 @@ def _build_rich_brief(
         refs_section = """【References】
 None"""
 
+    def _format_body(val):
+        if isinstance(val, str):
+            return _strip_markdown(val)
+        elif isinstance(val, list):
+            return json.dumps(val, ensure_ascii=False)
+        return ""
+
     brief = f"""【Content — 本页核心主题，决定视觉主体画什么】
 Headline: {_strip_markdown(content_text.get("headline", ""))}
 Subhead: {_strip_markdown(content_text.get("subhead", ""))}
-Body: {_strip_markdown(content_text.get("body", "")) if isinstance(content_text.get("body"), str) else json.dumps(content_text.get("body", []), ensure_ascii=False)}
+Body: {_format_body(content_text.get("body"))}
 
 【Design System】
 Style:
@@ -131,9 +124,8 @@ Layout:
 {refs_section}
 
 【Requirements】
-- 3:2 aspect ratio (1536x1024), landscape orientation
+- 16:9 aspect ratio (1792x1024), landscape orientation
 - Single presentation slide background image
-- Render ALL text (headline, subhead, every body line) onto the image with strong contrast and readability
 - No logo, brand mark, watermark, UI elements, frames, or page numbers
 - The visual must be a direct conceptual translation of the content topic — not generic decoration
 - Magazine-quality, award-winning design
@@ -152,24 +144,23 @@ def _call_llm_for_final_prompt(rich_brief: str) -> str:
                 "content": (
                     "You are an elite visual designer and prompt engineer for AI image generation. "
                     "Your job is to DESIGN a single presentation slide background image — then describe it in vivid, precise, cinematic prose. "
-                    "The Content section (headline, subhead, body) is your PRIMARY source for deciding what visual elements to depict. "
-                    "The Visual Description and Design System provide color mood and atmosphere — treat them as reference, not as orders. "
+                    "The Content section (headline, subhead, body) is your PRIMARY source for deciding the SUBJECT MATTER of the image. "
+                    "The Visual Description provides the intended mood, atmosphere, and compositional direction. Translate its ESSENCE into the Final Prompt, not every decorative detail. Let the image model handle aesthetic execution — lines, shapes, lighting placement, decorative accents. Your job is to align with user intent, not to micromanage the model's artistic choices. The Design System provides color palette and typography requirements — these MUST be preserved for consistency across all slides. "
                     "REFERENCE IMAGE RULES — STRICTLY FOLLOW: "
                     "(a) If the References section lists 'None', you MUST NOT mention, describe, or incorporate ANY reference images, uploaded photos, or user-provided visual assets. Do NOT hallucinate or invent references that do not exist. "
                     "(b) ONLY when the References section explicitly describes specific images, incorporate those subjects into your design as concrete elements, not abstract replacements. "
+                    "(c) When reference images specify a process mode (blend / crop / original), you MUST preserve these EXACT handling requirements in your Final Prompt. Do NOT soften, generalize, or omit the specific mode instructions. "
                     "Output ONLY the image generation prompt, no extra commentary."
                 ),
             },
             {"role": "user", "content": rich_brief},
         ],
-        temperature=0.5,
+        temperature=0.3,
     )
     final = response.choices[0].message.content or ""
     final = final.strip()
     # 去掉可能的代码块包裹和 thinking 标签
-    import re
-    final = re.sub(r"^```(?:\w+)?\s*|```$", "", final, flags=re.MULTILINE).strip()
-    final = re.sub(r"<think>.*?</think>", "", final, flags=re.DOTALL).strip()
+    final = clean_llm_output(final)
     return final
 
 
@@ -226,20 +217,20 @@ def generate_prompt_for_page(
             process_mode = img.get("process_mode", "")
             if role == "style_ref":
                 reference_descriptions.append(
-                    f"Style template image ({process_mode}): {_reference_process_mode_instruction(process_mode)} "
+                    f"Style template image ({process_mode}): {reference_process_mode_instruction(process_mode)} "
                     f"Extract color mood and composition style. {desc}"
                 )
             elif role == "content_ref":
                 reference_descriptions.append(
                     f"Content reference image ({process_mode or 'blend'}): "
-                    f"{_reference_process_mode_instruction(process_mode)} "
+                    f"{reference_process_mode_instruction(process_mode)} "
                     f"{desc or 'User-provided visual reference.'} "
                     "Rough placement relative to text: follow the Visual Description from Director when it hints at layout; "
                     "otherwise balance the reference with readable text. Let the image model handle aesthetics and fine composition."
                 )
             elif role == "chart_ref":
                 reference_descriptions.append(
-                    f"Chart reference image ({process_mode}): {_reference_process_mode_instruction(process_mode)} "
+                    f"Chart reference image ({process_mode}): {reference_process_mode_instruction(process_mode)} "
                     f"Use data visualization structure and color coding. {desc}"
                 )
 
@@ -256,46 +247,59 @@ def generate_prompt_for_page(
     final_prompt = _call_llm_for_final_prompt(rich_brief)
 
     # 5. 强制追加文字渲染指令（确保文字一定出现在图片上）
-    # 注意：用户文本可能包含双引号，必须先替换避免嵌套引号破坏 prompt 结构
+    # 外层用单引号包裹用户文本，避免与用户文本中的双引号冲突
     # 同时去除 Markdown 标记（**、- 等），避免模型把格式符号也渲染到图上
     def _escape(text: str) -> str:
-        return text.replace('"', "'")
+        # 只处理会破坏 prompt 结构的反斜杠，保留用户原始引号
+        return text.replace("\\", "")
 
     # 从 style_text 中提取字体要求，强制统一字体
+    # 优先识别 "Font:" 行，其次从 "Typography Feel" 中提取字体关键词
     font_spec = ""
     for line in (style_text or "").splitlines():
-        if line.strip().startswith("Font:"):
-            font_spec = line.strip().replace("Font:", "").strip()
+        stripped = line.strip()
+        if stripped.startswith("Font:"):
+            font_spec = stripped.replace("Font:", "").strip()
             break
+    if not font_spec:
+        # 从 Typography Feel 中提取 serif / sans-serif 等字体关键词
+        tf_text = ""
+        in_tf = False
+        for line in (style_text or "").splitlines():
+            if "Typography Feel" in line or "排版感" in line:
+                in_tf = True
+            if in_tf:
+                tf_text += line + " "
+                if line.strip().endswith("-->"):
+                    in_tf = False
+        import re as _re
+        font_match = _re.search(r'(serif|sans-serif|monospace|Display|Script|Slab)', tf_text, _re.IGNORECASE)
+        if font_match:
+            font_spec = font_match.group(1)
 
     text_directives = []
     if content_text.get("headline"):
         h = _escape(_strip_markdown(content_text["headline"]))
-        text_directives.append(
-            f'Headline: "{h}" must appear on the slide, clearly rendered, highly legible.'
-        )
+        text_directives.append(f'Headline: "{h}" must appear on the slide')
     if content_text.get("subhead"):
         s = _escape(_strip_markdown(content_text["subhead"]))
-        text_directives.append(
-            f'Subhead: "{s}" must appear on the slide, clearly rendered, highly legible.'
-        )
+        text_directives.append(f'Subhead: "{s}" must appear on the slide')
     body = content_text.get("body")
     if body:
         if isinstance(body, str):
             lines = [line.strip() for line in body.splitlines() if line.strip()]
-            for item in lines[:20]:
-                item_clean = _escape(_strip_markdown(item))
-                if item_clean:
-                    text_directives.append(
-                        f'Body text: "{item_clean}" must appear on the slide, clearly rendered, highly legible.'
-                    )
+            for item in lines:
+                cleaned = _escape(_strip_markdown(item))
+                if cleaned:
+                    text_directives.append(f'Body text: "{cleaned}" must appear on the slide')
         else:
             for item in body:
-                item_clean = _escape(_strip_markdown(item))
-                if item_clean:
-                    text_directives.append(
-                        f'Body text: "{item_clean}" must appear on the slide, clearly rendered, highly legible.'
-                    )
+                cleaned = _escape(_strip_markdown(item))
+                if cleaned:
+                    text_directives.append(f'Body text: "{cleaned}" must appear on the slide')
+
+    if text_directives:
+        text_directives.append("ALL listed text must appear on the slide, clearly rendered, highly legible.")
 
     # 强制统一字体（如果 style 中指定了）
     if font_spec:
@@ -317,7 +321,10 @@ def generate_prompt_for_page(
             + final_prompt
         )
 
-    logger.info(f"PromptEngine: 第 {page_intent.get('page_num')} 页 Prompt 生成完成，长度 {len(final_prompt)}")
+    prompt_len = len(final_prompt)
+    if prompt_len > 3000:
+        logger.warning(f"PromptEngine: 第 {page_intent.get('page_num')} 页 Prompt 过长 ({prompt_len} chars)，可能超出模型有效上下文窗口")
+    logger.info(f"PromptEngine: 第 {page_intent.get('page_num')} 页 Prompt 生成完成，长度 {prompt_len}")
     return final_prompt
 
 

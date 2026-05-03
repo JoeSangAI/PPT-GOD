@@ -37,6 +37,9 @@ palette:
 - Minimal line art for icons and illustrations
 <!-- 艺术方向：编辑摄影风格，抽象几何装饰，极简线描图标 -->
 
+**Font:** DM Sans (a clean, modern geometric sans-serif)
+<!-- 字体：DM Sans，干净现代的几何无衬线体 -->
+
 **Typography Feel (describe only, do not render text):**
 - Strong serif or clean sans-serif for headlines
 - Clear hierarchy through size and weight contrast

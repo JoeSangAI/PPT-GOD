@@ -1,6 +1,5 @@
 import logging
-from datetime import datetime
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 logger = logging.getLogger(__name__)
 from pydantic import BaseModel
@@ -8,10 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.models.base import get_db
 from app.models.models import Project, Slide
-from app.schemas.project import ProjectCreate, ProjectResponse
-from app.tasks import generate_style_proposals_task, redis_client
-from app.services.style_proposal import generate_style_proposals
-from app.services.image_analyzer import analyze_logo, analyze_reference_image
+from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
+from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
+from app.services.run_state import cancel_active_run, create_project_run, get_active_run, serialize_run
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -45,7 +43,7 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
-def update_project(project_id: str, payload: ProjectCreate, db: Session = Depends(get_db)):
+def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -73,12 +71,6 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
     return {"message": "Project deleted"}
 
 
-def _generate_style_proposals_bg(project_id: str):
-    """旧后台任务（已废弃，改用 Celery）。保留用于兼容。"""
-    # 现在改用 Celery 队列，见 projects.py POST /style-proposals 路由
-    pass
-
-
 class StyleUpdateRequest(BaseModel):
     selected_style: dict | None = None
 
@@ -103,7 +95,6 @@ def update_project_style(
 @router.post("/{project_id}/style-proposals")
 def create_style_proposals(
     project_id: str,
-    background_tasks: BackgroundTasks = None,
     force: bool = False,
     db: Session = Depends(get_db),
 ):
@@ -113,6 +104,8 @@ def create_style_proposals(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if get_active_run(db, project_id):
+        raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     slides = (
         db.query(Slide)
@@ -123,13 +116,51 @@ def create_style_proposals(
     if not slides:
         raise HTTPException(status_code=400, detail="No content plan found. Generate content plan first.")
 
-    # 如果已有有效的风格提案且未强制重新生成，直接返回缓存
+    current_asset_signature = compute_style_asset_signature(project)
+    has_global_style_ref = any(
+        ref.role == "style_ref" and not ref.slide_id
+        for ref in (project.reference_images or [])
+    )
+
+    # 如果已有有效的风格提案且未强制重新生成，只有在素材指纹一致时才返回缓存。
+    # 这样用户上传/删除参考图后，不会继续看到旧的“无素材推荐”或过期提案。
     if not force and project.style_proposal and project.style_proposal.get("proposals"):
-        return {
-            "message": "Style proposals already exist",
-            "proposals": project.style_proposal["proposals"],
-            "project": project,
-        }
+        cached_asset_signature = project.style_proposal.get("asset_signature")
+        cached_proposals = project.style_proposal.get("proposals") or []
+        cached_is_style_dna = any(
+            isinstance(p, dict) and (p.get("source") == "asset_clone" or p.get("clone_mode") == "style_dna")
+            for p in cached_proposals
+        )
+        if cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature):
+            if has_global_style_ref and not cached_is_style_dna:
+                logger.info(
+                    "Style proposal cache invalidated for project=%s: style reference requires style DNA proposal",
+                    project_id,
+                )
+            else:
+                return {
+                    "status": "completed",
+                    "proposals": project.style_proposal["proposals"],
+                }
+        else:
+            logger.info(
+                "Style proposal cache invalidated for project=%s: cached assets changed",
+                project_id,
+            )
+            project.style_proposal = None
+            db.commit()
+            db.refresh(project)
+
+        if has_global_style_ref and not cached_is_strict_clone:
+            project.style_proposal = None
+            project.selected_style = None
+            db.commit()
+            db.refresh(project)
+        elif cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature):
+            return {
+                "status": "completed",
+                "proposals": project.style_proposal["proposals"],
+            }
 
     # 强制重新生成时先清空旧缓存
     if force:
@@ -138,8 +169,23 @@ def create_style_proposals(
         db.refresh(project)
 
     # 改用 Celery 队列执行，比 FastAPI BackgroundTasks 更可靠
-    generate_style_proposals_task.delay(project_id)
-    return {"message": "Style proposals generation started", "status": "generating"}
+    try:
+        run = create_project_run(
+            db,
+            project_id,
+            kind="style_proposal",
+            stage="style_proposal",
+            total_count=3,
+            message="风格提案生成已排队",
+        )
+        db.commit()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    task = generate_style_proposals_task.delay(project_id, run.id)
+    run.task_id = task.id
+    db.commit()
+    return {"status": "generating", "proposals": None, "run": serialize_run(run)}
 
 
 class TemplateRecommendationsRequest(BaseModel):
@@ -184,6 +230,7 @@ def rollback_project(
         raise HTTPException(status_code=400, detail=f"无效的回退目标阶段，可选: {valid_stages}")
 
     # 根据目标阶段清理下游数据
+    cancel_active_run(db, project_id, "用户回退流程")
     if target == "planning":
         project.status = "planning"
         project.content_plan_confirmed = False

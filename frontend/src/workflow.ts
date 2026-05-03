@@ -7,6 +7,7 @@ export interface WorkflowSlide {
 export interface WorkflowInput {
   projectStatus?: string;
   slides?: WorkflowSlide[];
+  activeRun?: WorkflowRun | null;
   contentPlanConfirmed?: boolean;
   showPrototypePreview?: boolean;
   selectedPageCount?: number;
@@ -16,6 +17,17 @@ export interface WorkflowInput {
   };
   templatePageCount?: number;
   isBusy?: boolean;
+}
+
+export interface WorkflowRun {
+  id?: string;
+  kind?: string;
+  status?: string;
+  stage?: string;
+  message?: string | null;
+  total_count?: number;
+  completed_count?: number;
+  failed_count?: number;
 }
 
 export interface WorkflowState {
@@ -37,6 +49,7 @@ export interface WorkflowState {
   templatePageCount: number;
   isBusy: boolean;
   contentPlanConfirmed: boolean;
+  activeRun: WorkflowRun | null;
 }
 
 export const WORKFLOW_STEPS = [
@@ -62,6 +75,7 @@ export const STATUS_LABEL: Record<string, string> = {
 export function buildWorkflowState(input: WorkflowInput): WorkflowState {
   const slides = input.slides || [];
   const projectStatus = input.projectStatus || "draft";
+  const activeRun = isActiveRun(input.activeRun) ? input.activeRun! : null;
   const hasGeneratedImage = slides.some((s) => Boolean(s.image_path));
   const hasPrompt = slides.some((s) => Boolean(s.prompt_text));
   const hasFailedSlide = slides.some((s) => s.status === "failed");
@@ -69,7 +83,7 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     contentPlanConfirmed: input.contentPlanConfirmed,
     hasGeneratedImage,
     hasPrompt,
-  });
+  }, activeRun);
 
   return {
     projectStatus,
@@ -77,7 +91,7 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     steps: WORKFLOW_STEPS,
     stepIndex,
     stepStatuses: WORKFLOW_STEPS.map((_, idx) => getStepStatus(projectStatus, stepIndex, idx)),
-    isLoading: ["planning", "prototype", "generating"].includes(projectStatus),
+    isLoading: Boolean(activeRun),
     hasFailedSlide,
     hasGeneratedImage,
     hasPrompt,
@@ -89,13 +103,22 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     templatePageCount: input.templatePageCount || 0,
     isBusy: Boolean(input.isBusy),
     contentPlanConfirmed: Boolean(input.contentPlanConfirmed),
+    activeRun,
   };
+}
+
+export function isActiveRun(run?: WorkflowRun | null) {
+  return Boolean(run && (run.status === "queued" || run.status === "running"));
 }
 
 function getStepIndex(
   projectStatus: string,
-  facts: { contentPlanConfirmed?: boolean; hasGeneratedImage: boolean; hasPrompt: boolean }
+  facts: { contentPlanConfirmed?: boolean; hasGeneratedImage: boolean; hasPrompt: boolean },
+  activeRun?: WorkflowRun | null
 ) {
+  const activeStep = getStepIndexForRun(activeRun);
+  if (activeStep != null) return activeStep;
+
   switch (projectStatus) {
     case "draft":
       return 0;
@@ -120,6 +143,27 @@ function getStepIndex(
   }
 }
 
+function getStepIndexForRun(run?: WorkflowRun | null) {
+  if (!isActiveRun(run)) return null;
+  switch (run?.kind) {
+    case "content_plan":
+      return 0;
+    case "style_proposal":
+      return 1;
+    case "visual_prompts":
+      return 2;
+    case "prototype_generation":
+      return 3;
+    case "batch_generation":
+    case "page_generation":
+    case "retry_failed":
+    case "finetune":
+      return 4;
+    default:
+      return null;
+  }
+}
+
 function getStepStatus(projectStatus: string, stepIndex: number, idx: number) {
   if (projectStatus === "failed") {
     if (idx === stepIndex) return "error";
@@ -132,6 +176,9 @@ function getStepStatus(projectStatus: string, stepIndex: number, idx: number) {
 }
 
 export function getGuidanceText(state: WorkflowState) {
+  if (state.activeRun) {
+    return state.activeRun.message || "任务正在处理中，请稍候";
+  }
   switch (state.projectStatus) {
     case "draft":
       return "新建项目，请输入 PPT 主题或上传文档开始";
