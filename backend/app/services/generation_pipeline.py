@@ -11,24 +11,54 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Project, Slide
 from app.services.image_generation import generate_slide_image, save_slide_image
+from app.services.logo_assets import prepare_logo_overlay_image
+from app.services.logo_policy import should_use_logo_as_scene_asset
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import finish_run, mark_run_running, update_run_progress, cleanup_generation_progress
-from app.services.visual_plan import _infer_seed_family
+from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
+MAX_REFERENCE_INPUTS = 14
 
 
-def _load_reference_images(slide: Slide) -> List[Dict]:
+def _reference_input_priority(ref: Dict) -> int:
+    role = ref.get("role")
+    kind = str(ref.get("asset_kind") or "").lower()
+    if role == "visual_asset" and kind in {"product", "material"}:
+        return 0
+    if role == "logo":
+        return 1
+    if role in {"content_ref", "chart_ref"}:
+        return 2
+    if role == "visual_asset":
+        return 3
+    if role == "seed_ref":
+        return 4
+    if role == "template":
+        return 5
+    return 9
+
+
+def _load_reference_images(
+    slide: Slide,
+    seed_image_paths: Optional[List[str]] = None,
+) -> List[Dict]:
     """
     加载一页真正需要作为 image input 上传给生图模型的参考图：
-    1. 单页微调：当前页历史图片 + 本轮附件
-    2. 页面级内容/图表参考图
-    3. 模板级：project.selected_template_recommendations 中对应类型的模板页
+    1. 单页微调：当前页历史图片 + 本轮附件（finetune 模式提前返回）
+    2. 页面级内容/图表参考图（用户为本页明确上传的素材）
+    3. 项目级 Logo：默认不进生图，PPT/预览阶段叠加；blend 模式下少数页面可作场景资产
+    4. 项目级视觉资产：visual plan 为当前页选中的产品/人物/物料图
+    5. 同家族种子页：作为版式锚点（仅复用版式语言，不复制内容）
+    6. 模板级：仅当没有种子时使用 selected_template_recommendations
 
     注意：全局 style_ref 只用于前置风格分析和 prompt 约束，不作为垫图上传；
-    logo 也暂不作为垫图上传。
+
+    参数：
+    - seed_image_paths: 同家族已生成的种子页图片路径，用于版式一致性。
+      若为 None 或空，按旧逻辑使用 template 兜底；若有则跳过 template。
 
     返回 List[Dict]，每个 Dict 包含 image (PIL.Image) 和 process_mode (str)。
     """
@@ -54,6 +84,12 @@ def _load_reference_images(slide: Slide) -> List[Dict]:
         else:
             logger.warning(f"微调底图文件不存在: {finetune_base_path}")
 
+    finetune_visual_asset_ids = []
+    if finetune_base_path and slide.visual_json and isinstance(slide.visual_json, dict):
+        raw_asset_ids = slide.visual_json.get("finetune_visual_asset_ids") or []
+        if isinstance(raw_asset_ids, list):
+            finetune_visual_asset_ids = [str(x) for x in raw_asset_ids][:3]
+
     # 1. 页面级参考图优先：Prompt 中的 Reference Image 1/2/3 必须与
     # 生图 API 的图片输入顺序一致，便于模型按用户意图使用这些图。
     if slide.reference_images:
@@ -78,25 +114,152 @@ def _load_reference_images(slide: Slide) -> List[Dict]:
                         "role": ref.role,
                         "label": f"Reference Image {idx}",
                         "file_path": ref.file_path,
+                        "id": getattr(ref, "id", None),
+                        "asset_name": getattr(ref, "asset_name", None),
+                        "asset_kind": getattr(ref, "asset_kind", None),
+                        "usage_note": getattr(ref, "usage_note", None),
                     })
                 except Exception as e:
                     logger.warning(f"无法加载页面参考图 {ref.file_path}: {e}")
             else:
                 logger.warning(f"页面参考图文件不存在: {ref.file_path}")
 
-    if finetune_base_path:
-        logger.info(f"Slide {slide.page_num}: 微调模式仅加载底图和本轮附件，共 {len(refs)} 张参考图")
-        return refs
+    if finetune_base_path and finetune_visual_asset_ids and slide.project and slide.project.reference_images:
+        selected_set = set(finetune_visual_asset_ids)
+        project_assets = [
+            ref for ref in slide.project.reference_images
+            if ref.role == "visual_asset" and ref.id in selected_set and not ref.slide_id
+        ]
+        project_assets.sort(
+            key=lambda ref: finetune_visual_asset_ids.index(ref.id)
+            if ref.id in finetune_visual_asset_ids else 999
+        )
+        for idx, ref in enumerate(project_assets, start=1):
+            if len(refs) >= MAX_REFERENCE_INPUTS:
+                break
+            if os.path.exists(ref.file_path):
+                try:
+                    refs.append({
+                        "image": Image.open(ref.file_path),
+                        "process_mode": ref.process_mode or default_visual_asset_process_mode(getattr(ref, "asset_kind", None)),
+                        "role": ref.role,
+                        "label": f"Protected Project Visual Asset {idx}",
+                        "file_path": ref.file_path,
+                        "id": getattr(ref, "id", None),
+                        "asset_name": getattr(ref, "asset_name", None),
+                        "asset_kind": getattr(ref, "asset_kind", None),
+                        "usage_note": getattr(ref, "usage_note", None),
+                    })
+                    logger.info(f"Slide {slide.page_num}: 微调模式加载项目视觉资产 {ref.file_path}")
+                except Exception as e:
+                    logger.warning(f"无法加载微调项目视觉资产 {ref.file_path}: {e}")
+            else:
+                logger.warning(f"微调项目视觉资产文件不存在: {ref.file_path}")
 
-    # 2. 模板级参考图（默认 blend）
-    if slide.project and slide.project.selected_template_recommendations:
+    if finetune_base_path:
+        logger.info(f"Slide {slide.page_num}: 微调模式加载底图、本轮附件和项目资产，共 {len(refs)} 张参考图")
+        return refs[:MAX_REFERENCE_INPUTS]
+
+    # 2. 项目级 Logo：默认不进生图，后续用程序 overlay。
+    # 只有用户把 Logo 设为 blend 且页面适合做场景标识时，才作为画面元素参考。
+    if slide.project and slide.project.reference_images and len(refs) < MAX_REFERENCE_INPUTS:
+        logo_ref = next(
+            (
+                ref for ref in slide.project.reference_images
+                if (
+                    ref.role == "logo"
+                    and not ref.slide_id
+                    and os.path.exists(ref.file_path)
+                    and should_use_logo_as_scene_asset(slide, ref)
+                )
+            ),
+            None,
+        )
+        if logo_ref:
+            try:
+                logo_path = prepare_logo_overlay_image(logo_ref.file_path)
+                refs.append({
+                    "image": Image.open(logo_path),
+                    "process_mode": "blend",
+                    "role": "logo",
+                    "label": "Protected Brand Logo",
+                    "file_path": logo_path,
+                    "id": getattr(logo_ref, "id", None),
+                    "asset_name": getattr(logo_ref, "asset_name", None),
+                    "asset_kind": getattr(logo_ref, "asset_kind", None),
+                    "usage_note": getattr(logo_ref, "usage_note", None),
+                })
+                logger.info(f"Slide {slide.page_num}: 加载受保护 Logo {logo_path}")
+            except Exception as e:
+                logger.warning(f"无法加载 Logo {logo_ref.file_path}: {e}")
+
+    # 3. 全局视觉资产：只加载 visual plan 为当前页选中的资产。
+    selected_asset_ids = []
+    if slide.visual_json and isinstance(slide.visual_json, dict):
+        raw_ids = slide.visual_json.get("visual_asset_ids") or []
+        if isinstance(raw_ids, list):
+            selected_asset_ids = [str(x) for x in raw_ids][:3]
+
+    if selected_asset_ids and slide.project and slide.project.reference_images:
+        selected_set = set(selected_asset_ids)
+        project_assets = [
+            ref for ref in slide.project.reference_images
+            if ref.role == "visual_asset" and ref.id in selected_set and not ref.slide_id
+        ]
+        project_assets.sort(key=lambda ref: selected_asset_ids.index(ref.id) if ref.id in selected_asset_ids else 999)
+        for idx, ref in enumerate(project_assets, start=1):
+            if len(refs) >= MAX_REFERENCE_INPUTS:
+                break
+            if os.path.exists(ref.file_path):
+                try:
+                    refs.append({
+                        "image": Image.open(ref.file_path),
+                        "process_mode": ref.process_mode or default_visual_asset_process_mode(getattr(ref, "asset_kind", None)),
+                        "role": ref.role,
+                        "label": f"Global Visual Asset {idx}",
+                        "file_path": ref.file_path,
+                        "id": getattr(ref, "id", None),
+                        "asset_name": getattr(ref, "asset_name", None),
+                        "asset_kind": getattr(ref, "asset_kind", None),
+                        "usage_note": getattr(ref, "usage_note", None),
+                    })
+                    logger.info(f"Slide {slide.page_num}: 加载视觉资产 {ref.file_path}")
+                except Exception as e:
+                    logger.warning(f"无法加载视觉资产 {ref.file_path}: {e}")
+            else:
+                logger.warning(f"视觉资产文件不存在: {ref.file_path}")
+
+    # 4. 同家族种子页：版式锚点。仅取最多 2 张，避免抢主体权重。
+    seed_loaded = False
+    if seed_image_paths:
+        for seed_idx, seed_path in enumerate(seed_image_paths[:2], start=1):
+            if len(refs) >= MAX_REFERENCE_INPUTS:
+                break
+            if not seed_path or not os.path.exists(seed_path):
+                logger.warning(f"种子页文件不存在: {seed_path}")
+                continue
+            try:
+                refs.append({
+                    "image": Image.open(seed_path),
+                    "process_mode": "blend",
+                    "role": "seed_ref",
+                    "label": f"Family Seed Layout {seed_idx}",
+                    "file_path": seed_path,
+                })
+                seed_loaded = True
+                logger.info(f"Slide {slide.page_num}: 加载同家族种子页 {seed_path}")
+            except Exception as e:
+                logger.warning(f"无法加载种子页 {seed_path}: {e}")
+
+    # 5. 模板级参考图（仅在没有种子页时使用，作为兜底）
+    if not seed_loaded and slide.project and slide.project.selected_template_recommendations:
         recommendations = slide.project.selected_template_recommendations
         slide_type = slide.type or "content"
         template_key = _map_slide_type_to_template_key(slide_type)
         tmpl = recommendations.get(template_key)
         if tmpl and isinstance(tmpl, dict) and tmpl.get("file_path"):
             tmpl_path = tmpl["file_path"]
-            if os.path.exists(tmpl_path):
+            if os.path.exists(tmpl_path) and len(refs) < MAX_REFERENCE_INPUTS:
                 try:
                     refs.append({
                         "image": Image.open(tmpl_path),
@@ -109,8 +272,9 @@ def _load_reference_images(slide: Slide) -> List[Dict]:
                 except Exception as e:
                     logger.warning(f"无法加载模板参考图 {tmpl_path}: {e}")
 
-    logger.info(f"Slide {slide.page_num}: 共加载 {len(refs)} 张参考图")
-    return refs
+    refs = sorted(refs, key=_reference_input_priority)
+    logger.info(f"Slide {slide.page_num}: 共加载 {len(refs)} 张参考图（种子: {'有' if seed_loaded else '无'}）")
+    return refs[:MAX_REFERENCE_INPUTS]
 
 
 def _map_slide_type_to_template_key(slide_type: str) -> str:
@@ -125,11 +289,109 @@ def _map_slide_type_to_template_key(slide_type: str) -> str:
     return mapping.get(slide_type, "content")
 
 
+def _slide_family(slide: Slide) -> Optional[str]:
+    """从 slide.visual_json 读取 seed_family；为兼容老数据，缺失时按 type 推断。"""
+    if slide.visual_json and isinstance(slide.visual_json, dict):
+        family = slide.visual_json.get("seed_family")
+        if family:
+            return str(family)
+    # 老数据 fallback：按 slide.type 推断
+    slide_type = (slide.type or "content").lower()
+    if slide_type in ("cover", "ending"):
+        return "bookend"
+    if slide_type == "hero":
+        return "hero"
+    if slide_type == "toc":
+        return "section"
+    return "content"
+
+
+def _is_finetune_slide(slide: Slide) -> bool:
+    """该页是否处于 finetune（单页微调）模式：底图优先，跳过种子参考。"""
+    if not slide.visual_json or not isinstance(slide.visual_json, dict):
+        return False
+    return bool(slide.visual_json.get("finetune_base_image_path"))
+
+
+def _collect_existing_seeds(slides: List[Slide]) -> Dict[str, List[str]]:
+    """
+    扫描所有 slide，把已经成功生成的页按 seed_family 聚合，
+    返回 {family: [image_path, ...]}，按推荐种子优先 + 页码升序排序。
+    每家族最多保留 2 张，避免 Stage 2 注入过多版式样本干扰主体。
+    """
+    pool: Dict[str, List[Dict]] = {}
+    for s in slides:
+        if s.status != "completed":
+            continue
+        if not s.image_path or not os.path.exists(s.image_path):
+            continue
+        if _is_finetune_slide(s):
+            # finetune 模式产生的图片继承自旧底图，不作为家族种子
+            continue
+        family = _slide_family(s)
+        if not family:
+            continue
+        is_recommended = False
+        if isinstance(s.visual_json, dict):
+            is_recommended = bool(s.visual_json.get("is_seed_recommended"))
+        pool.setdefault(family, []).append({
+            "image_path": s.image_path,
+            "page_num": s.page_num,
+            "is_recommended": is_recommended,
+        })
+
+    seeds_by_family: Dict[str, List[str]] = {}
+    for family, items in pool.items():
+        items.sort(key=lambda x: (not x["is_recommended"], x["page_num"]))
+        seeds_by_family[family] = [item["image_path"] for item in items[:2]]
+    return seeds_by_family
+
+
+def _is_product_or_material_ref(ref: Dict) -> bool:
+    return (
+        ref.get("role") == "visual_asset"
+        and str(ref.get("asset_kind") or "").lower() in {"product", "material"}
+    )
+
+
+def _uses_direct_finetune_ref(ref_data: List[Dict]) -> bool:
+    return any(ref.get("role") == "finetune_base" for ref in ref_data)
+
+
+def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
+    return [ref for ref in ref_data if _is_product_or_material_ref(ref)]
+
+
+def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
+    product_names = [
+        str(ref.get("asset_name") or "").strip()
+        for ref in product_refs
+        if str(ref.get("asset_name") or "").strip()
+    ]
+    product_label = " / ".join(product_names[:3]) if product_names else "the uploaded product"
+    return (
+        prompt
+        + "\n\nFIRST PASS: generate the complete slide using the supplied reference material, including "
+        f"{product_label}. Product fidelity can be approximate in this first pass; a second hidden refinement "
+        "pass will strengthen the product details using the same uploaded reference image."
+    )
+
+
+def _product_refinement_prompt(slide: Slide, product_refs: List[Dict]) -> str:
+    paths = [
+        str(ref.get("file_path") or "").strip()
+        for ref in product_refs
+        if str(ref.get("file_path") or "").strip()
+    ]
+    if paths:
+        return f"用第2张及后续参考图替换第一张PPT图中的产品。参考素材路径：{'; '.join(paths)}"
+    return "用第2张及后续参考图替换第一张PPT图中的产品。"
+
+
 def _generate_one_slide(
     slide: Slide,
     project_id: str,
     output_dir: str,
-    seed_image_paths: Optional[Dict[str, str]] = None,
     preloaded_ref_data: Optional[List[Dict]] = None,
 ) -> Dict:
     """
@@ -141,26 +403,28 @@ def _generate_one_slide(
 
     try:
         ref_data = list(preloaded_ref_data) if preloaded_ref_data else []
-        ref_images = [r["image"] for r in ref_data]
-        is_finetune_edit = bool(
-            slide.visual_json
-            and isinstance(slide.visual_json, dict)
-            and slide.visual_json.get("finetune_base_image_path")
-        )
-
+        product_refs = _product_refinement_refs(ref_data)
+        use_product_refinement = bool(product_refs) and not _uses_direct_finetune_ref(ref_data)
+        first_pass_ref_data = list(ref_data)
+        ref_images = [r["image"] for r in first_pass_ref_data]
         prompt = slide.prompt_text
 
-        # 非种子页只通过文字锚定种子 family 的视觉一致性，不再上传种子图垫图。
-        if seed_image_paths and slide.visual_json and not slide.visual_json.get("is_seed_recommended") and not is_finetune_edit:
-            family = slide.visual_json.get("seed_family") or _infer_seed_family(slide.type or "content")
-            if seed_image_paths.get(family):
-                prompt = (
-                    "CRITICAL — Maintain deck-level visual consistency through the written style system. "
-                    "Do not copy a generated seed slide as an image reference. "
-                    "Use the selected style's palette, typography mood, ornament language, and page-type adaptation rules. "
-                    f"This slide belongs to the {family} family.\n\n"
-                    + prompt
-                )
+        # 当本页带有种子参考图时，在 prompt 末尾追加一行明确告知模型，
+        # 让它把同家族种子页当作版式锚点 — 不复制内容、只复用视觉系统。
+        seed_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref")
+        if seed_count > 0:
+            seed_instruction = (
+                f"\n\nIMPORTANT — SAME-FAMILY LAYOUT REFERENCE: "
+                f"{seed_count} of the attached reference images are previously generated slides from the same page family in this deck. "
+                f"They are LAYOUT ANCHORS only: reuse their typography choices, color palette, ornament language, grid system, and hierarchy. "
+                f"DO NOT copy any of their text content, headlines, body, photographs, illustrations, or scene subjects. "
+                f"DO NOT copy a logo from the seed unless this slide also has the uploaded logo attached as its own reference. "
+                f"Render this slide's own text and visual evidence in the SAME design DNA so the deck feels visually consistent."
+            )
+            prompt = prompt + seed_instruction
+
+        if use_product_refinement:
+            prompt = _background_pass_prompt(prompt, product_refs)
 
         img = generate_slide_image(
             prompt=prompt,
@@ -168,13 +432,46 @@ def _generate_one_slide(
             resolution="4K",
             aspect_ratio="16:9",
         )
+
+        if use_product_refinement:
+            base_path = save_slide_image(
+                img=img,
+                project_id=project_id,
+                page_num=slide.page_num,
+                output_dir=output_dir,
+                suffix="_base",
+            )
+            refinement_images = [img] + [ref["image"] for ref in product_refs]
+            refinement_paths = [
+                str(ref.get("file_path") or "").strip()
+                for ref in product_refs
+                if str(ref.get("file_path") or "").strip()
+            ]
+            if refinement_paths:
+                logger.info(
+                    f"Pipeline: 第 {slide.page_num} 页产品二次生成参考素材路径: "
+                    + " | ".join(refinement_paths)
+                )
+            img = generate_slide_image(
+                prompt=_product_refinement_prompt(slide, product_refs),
+                reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
+                resolution="4K",
+                aspect_ratio="16:9",
+            )
+            logger.info(
+                f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
+                f"(base={base_path}, product_refs={len(product_refs)})"
+            )
+
         image_path = save_slide_image(
             img=img,
             project_id=project_id,
             page_num=slide.page_num,
             output_dir=output_dir,
         )
-        logger.info(f"Pipeline: 第 {slide.page_num} 页生成完成")
+        logger.info(f"Pipeline: 第 {slide.page_num} 页生成完成"
+                    + (f" (使用 {seed_count} 张同家族种子参考)" if seed_count else "")
+                    + (f" (产品二次生成 {len(product_refs)} 张参考)" if use_product_refinement else ""))
         return {"slide": slide, "image_path": image_path, "error": None}
     except Exception as e:
         logger.error(f"Pipeline: 第 {slide.page_num} 页生成失败: {e}")
@@ -236,39 +533,7 @@ def run_generation_pipeline(
     output_dir = settings.OUTPUT_DIR or "./outputs"
     slide_images = []
 
-    # ===== 两阶段生成：先种子页，再非种子页（仅用文字锚定一致性）=====
-
-    # 1. 预先收集项目中所有种子页的已有图片（包括不在 target_slides 中的）
-    seed_image_paths: Dict[str, str] = {}
-    for s in slides:
-        if s.visual_json and s.visual_json.get("is_seed_recommended") and s.image_path and os.path.exists(s.image_path):
-            family = s.visual_json.get("seed_family") or _infer_seed_family(s.type or "content")
-            if family not in seed_image_paths:
-                seed_image_paths[family] = s.image_path
-                logger.info(f"Pipeline: 复用已有种子页图片 family={family}, page={s.page_num}")
-
-    # 2. 从 target_slides 中分离种子页和非种子页
-    seed_slides = [s for s in target_slides if s.visual_json and s.visual_json.get("is_seed_recommended")]
-    non_seed_slides = [s for s in target_slides if s not in seed_slides]
-
-    # 3. 阶段一：生成需要重新生成的种子页
-    seeds_to_generate = []
-    for s in seed_slides:
-        family = s.visual_json.get("seed_family") or _infer_seed_family(s.type or "content")
-        # 如果用户明确指定了这页（通过 page_nums），强制重新生成，不走缓存
-        force_regenerate = page_nums is not None and s.page_num in page_nums
-        if force_regenerate:
-            seeds_to_generate.append(s)
-            logger.info(f"Slide {s.page_num}: 用户明确指定重新生成，强制生成种子页 (family={family})")
-        elif not seed_image_paths.get(family) and s.prompt_text:
-            seeds_to_generate.append(s)
-        elif seed_image_paths.get(family):
-            # 该种子页已有图片，直接复用并标记为完成，避免状态永远卡在 generating
-            s.status = "completed"
-            s.error_msg = None
-            logger.info(f"Slide {s.page_num}: 种子页已有图片，跳过生成 (family={family})")
-
-    def record_generation_result(result: Dict, *, update_seed_family: bool = False) -> None:
+    def record_generation_result(result: Dict) -> None:
         slide = result["slide"]
         if result.get("error"):
             slide.status = "failed"
@@ -280,12 +545,14 @@ def run_generation_pipeline(
             if slide.visual_json and isinstance(slide.visual_json, dict) and slide.visual_json.get("finetune_base_image_path"):
                 slide.visual_json = {
                     k: v for k, v in slide.visual_json.items()
-                    if k not in {"finetune_base_image_path", "finetune_instruction", "finetune_attachment_ids"}
+                    if k not in {
+                        "finetune_base_image_path",
+                        "finetune_instruction",
+                        "finetune_attachment_ids",
+                        "finetune_visual_asset_ids",
+                    }
                 }
                 flag_modified(slide, "visual_json")
-            if update_seed_family:
-                family = slide.visual_json.get("seed_family") or _infer_seed_family(slide.type or "content")
-                seed_image_paths[family] = result["image_path"]
             speaker_notes = ""
             if slide.content_json and isinstance(slide.content_json, dict):
                 speaker_notes = slide.content_json.get("speaker_notes", "")
@@ -293,6 +560,8 @@ def run_generation_pipeline(
                 "page_num": slide.page_num,
                 "image_path": result["image_path"],
                 "speaker_notes": speaker_notes,
+                "type": slide.type or "content",
+                "visual_json": slide.visual_json or {},
             })
         db.commit()
         completed_now = sum(1 for s in target_slides if s.status == "completed")
@@ -308,34 +577,109 @@ def run_generation_pipeline(
         )
         db.commit()
 
-    if seeds_to_generate:
-        logger.info(f"Pipeline: 阶段一，生成 {len(seeds_to_generate)} 个种子页")
-        # 在主线程预加载参考图，避免 worker 线程访问 SQLAlchemy 触发 SQLite 线程错误
-        seed_ref_data = {s.id: _load_reference_images(s) for s in seeds_to_generate}
-        with ThreadPoolExecutor(max_workers=min(len(seeds_to_generate), 2)) as executor:
-            future_to_slide = {
-                executor.submit(_generate_one_slide, slide, project_id, output_dir, None, seed_ref_data.get(slide.id)): slide
-                for slide in seeds_to_generate
-            }
-            for future in as_completed(future_to_slide):
-                result = future.result()
-                record_generation_result(result, update_seed_family=True)
+    slides_with_prompt = [s for s in target_slides if s.prompt_text]
+    if slides_with_prompt:
+        # 两阶段生成：先生成同家族的种子页，再以种子图为版式锚点生成其它页。
+        # 已经完成的页（finetune/重生成场景）直接进入 existing seeds 池，
+        # 不重新生成；finetune 模式的页面跳过种子参考。
+        seeds_by_family = _collect_existing_seeds(slides)
 
-    # 4. 阶段二：生成非种子页，仅传入已有种子 family 信息用于文字提示锚定
-    non_seed_with_prompt = [s for s in non_seed_slides if s.prompt_text]
-    if non_seed_with_prompt:
-        logger.info(f"Pipeline: 阶段二，生成 {len(non_seed_with_prompt)} 个非种子页，文字锚定 families={list(seed_image_paths.keys())}")
-        # 在主线程预加载参考图，避免 worker 线程访问 SQLAlchemy 触发 SQLite 线程错误
-        non_seed_ref_data = {s.id: _load_reference_images(s) for s in non_seed_with_prompt}
-        max_workers = min(len(non_seed_with_prompt), 3)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_slide = {
-                executor.submit(_generate_one_slide, slide, project_id, output_dir, seed_image_paths, non_seed_ref_data.get(slide.id)): slide
-                for slide in non_seed_with_prompt
-            }
-            for future in as_completed(future_to_slide):
-                result = future.result()
-                record_generation_result(result)
+        # Stage 1：识别需要先行生成的「家族种子页」。
+        # 条件：1) 是 is_seed_recommended 推荐种子页 OR 同家族目前还没有任何已完成页；
+        #      2) 该页是 target_slides 的一部分；
+        #      3) 不是 finetune 模式（finetune 优先底图，不参与种子家族）。
+        target_families = {
+            _slide_family(s) for s in slides_with_prompt if _slide_family(s)
+        }
+
+        seed_pages: List[Slide] = []
+        non_seed_pages: List[Slide] = []
+        for slide in slides_with_prompt:
+            if _is_finetune_slide(slide):
+                non_seed_pages.append(slide)
+                continue
+            family = _slide_family(slide)
+            if not family:
+                non_seed_pages.append(slide)
+                continue
+            if family in seeds_by_family:
+                non_seed_pages.append(slide)
+                continue
+            # 此家族还没有任何已完成图片：让推荐种子优先生成；
+            # 若推荐种子不在本批次，就把当前批次中该家族最早的页当种子。
+            is_recommended = bool((slide.visual_json or {}).get("is_seed_recommended")) if isinstance(slide.visual_json, dict) else False
+            if is_recommended:
+                seed_pages.append(slide)
+            else:
+                non_seed_pages.append(slide)
+
+        # 兜底：家族在 target 中但还没种子也没有推荐种子 (例如批次只生成 page 5、不含 page 3)，
+        # 取该家族在 slides_with_prompt 中最早的页作种子，提升 Stage 1。
+        seed_target_families = {_slide_family(s) for s in seed_pages if _slide_family(s)}
+        for family in target_families:
+            if family in seeds_by_family or family in seed_target_families:
+                continue
+            family_pages = [s for s in non_seed_pages if _slide_family(s) == family]
+            if not family_pages:
+                continue
+            family_pages.sort(key=lambda s: s.page_num)
+            promoted = family_pages[0]
+            non_seed_pages = [s for s in non_seed_pages if s.id != promoted.id]
+            seed_pages.append(promoted)
+            seed_target_families.add(family)
+            logger.info(
+                f"Pipeline: 家族 {family} 没有推荐种子或现有种子，临时提升 page {promoted.page_num} 作种子"
+            )
+
+        if seed_pages:
+            logger.info(
+                f"Pipeline: 两阶段生成 — Stage 1 种子页 {len(seed_pages)} 张，"
+                f"Stage 2 非种子页 {len(non_seed_pages)} 张；已有家族种子 {list(seeds_by_family.keys())}"
+            )
+        else:
+            logger.info(
+                f"Pipeline: 单阶段生成 — 所有 {len(non_seed_pages)} 页均使用现有种子或无种子家族；"
+                f"已有家族种子 {list(seeds_by_family.keys())}"
+            )
+
+        # Stage 1：生成种子页（不带种子参考图，因为它们本身就是种子）
+        if seed_pages:
+            ref_data_by_slide = {s.id: _load_reference_images(s, seed_image_paths=None) for s in seed_pages}
+            max_workers = min(len(seed_pages), 3)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_slide = {
+                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id)): slide
+                    for slide in seed_pages
+                }
+                for future in as_completed(future_to_slide):
+                    result = future.result()
+                    record_generation_result(result)
+                    # 把成功生成的种子页加入 seeds_by_family，供 Stage 2 使用
+                    if not result.get("error"):
+                        slide = result["slide"]
+                        family = _slide_family(slide)
+                        if family and result.get("image_path"):
+                            seeds_by_family.setdefault(family, []).append(result["image_path"])
+
+        # Stage 2：生成非种子页，按家族注入种子参考图
+        if non_seed_pages:
+            ref_data_by_slide = {}
+            for s in non_seed_pages:
+                family = _slide_family(s)
+                seed_paths = seeds_by_family.get(family, []) if family else []
+                # finetune 页面不使用种子参考（底图优先）
+                if _is_finetune_slide(s):
+                    seed_paths = []
+                ref_data_by_slide[s.id] = _load_reference_images(s, seed_image_paths=seed_paths)
+            max_workers = min(len(non_seed_pages), 3)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_slide = {
+                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id)): slide
+                    for slide in non_seed_pages
+                }
+                for future in as_completed(future_to_slide):
+                    result = future.result()
+                    record_generation_result(result)
 
     # 组装 PPTX 时，收集所有已完成页面的图片（包括之前任务生成的），
     # 而不是仅用当前任务生成的页面，避免重试单页后 PPTX 只剩 1 页。
@@ -349,6 +693,8 @@ def run_generation_pipeline(
                 "page_num": s.page_num,
                 "image_path": s.image_path,
                 "speaker_notes": speaker_notes,
+                "type": s.type or "content",
+                "visual_json": s.visual_json or {},
             })
     all_completed_images.sort(key=lambda x: x["page_num"])
 
@@ -365,10 +711,24 @@ def run_generation_pipeline(
                     pptx_path = os.path.join(output_dir, project_id, "presentation.pptx")
                 os.makedirs(os.path.dirname(pptx_path), exist_ok=True)
 
+                logo_ref = next(
+                    (
+                        ref for ref in project.reference_images or []
+                        if ref.role == "logo" and not ref.slide_id and os.path.exists(ref.file_path)
+                    ),
+                    None,
+                )
+                logo_config = (
+                    {
+                        "file_path": logo_ref.file_path,
+                        "anchor": getattr(logo_ref, "logo_anchor", None) or "top-right",
+                    }
+                    if logo_ref else None
+                )
                 assemble_pptx(
                     slide_images=all_completed_images,
                     output_path=pptx_path,
-                    logo_path=None,
+                    logo_config=logo_config,
                 )
                 logger.info(f"Pipeline: PPTX 组装完成 {pptx_path}")
             except Exception as e:

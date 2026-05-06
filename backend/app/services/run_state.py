@@ -10,6 +10,19 @@ from app.models.models import Project, ProjectRun, Slide
 
 ACTIVE_RUN_STATUSES = {"queued", "running"}
 TERMINAL_RUN_STATUSES = {"succeeded", "failed", "cancelled", "stale"}
+RUN_PROGRESS_LABELS = {
+    "content_plan": "内容规划进度",
+    "style_proposal": "风格提案生成进度",
+    "visual_prompts": "画面描述生成进度",
+    "prototype_generation": "打样生成进度",
+    "batch_generation": "批量生成进度",
+    "page_generation": "单页生成进度",
+    "retry_failed": "失败页重试进度",
+    "finetune": "单页微调进度",
+}
+RUN_PROGRESS_UNITS = {
+    "style_proposal": "套",
+}
 
 # 全局生成进度存储（内存级，项目重启后丢失）
 generation_progress: dict[str, dict] = {}
@@ -34,6 +47,15 @@ def get_active_run(db: Session, project_id: str) -> ProjectRun | None:
     return (
         db.query(ProjectRun)
         .filter(ProjectRun.project_id == project_id, ProjectRun.status.in_(ACTIVE_RUN_STATUSES))
+        .order_by(ProjectRun.started_at.desc())
+        .first()
+    )
+
+
+def get_latest_run(db: Session, project_id: str) -> ProjectRun | None:
+    return (
+        db.query(ProjectRun)
+        .filter(ProjectRun.project_id == project_id)
         .order_by(ProjectRun.started_at.desc())
         .first()
     )
@@ -222,6 +244,80 @@ def serialize_run(run: ProjectRun | None, slides: list[Slide] | None = None) -> 
     }
 
 
+def serialize_run_progress(run: ProjectRun | None, slides: list[Slide] | None = None) -> dict | None:
+    run_data = serialize_run(run, slides)
+    if not run_data:
+        return None
+
+    total = max(0, int(run_data.get("total_count") or 0))
+    completed = clamp_count(run_data.get("completed_count") or 0, total)
+    failed = clamp_count(run_data.get("failed_count") or 0, total)
+    percent = round((completed / total) * 100, 1) if total > 0 else 0
+    kind = run_data.get("kind") or ""
+    unit = RUN_PROGRESS_UNITS.get(kind, "页")
+    return {
+        "run_id": run_data.get("id"),
+        "kind": kind,
+        "status": run_data.get("status"),
+        "stage": run_data.get("stage"),
+        "label": RUN_PROGRESS_LABELS.get(kind, "任务进度"),
+        "message": run_data.get("message") or RUN_PROGRESS_LABELS.get(kind, "任务处理中"),
+        "current": completed,
+        "total": total,
+        "failed": failed,
+        "unit": unit,
+        "percent": percent,
+        "target_page_nums": run_data.get("target_page_nums"),
+        "can_cancel": run_data.get("status") in ACTIVE_RUN_STATUSES,
+        # Backward-compatible aliases for older frontend surfaces while the UI is
+        # migrated to current/total.
+        "current_page": completed,
+        "total_pages": total,
+    }
+
+
+def serialize_workflow_status(
+    project: Project,
+    slides: list[Slide],
+    *,
+    active_run: ProjectRun | None = None,
+    latest_run: ProjectRun | None = None,
+    has_pptx: bool = False,
+    pptx_path: str | None = None,
+) -> dict:
+    target_count, target_completed, target_failed = target_counts(active_run, slides)
+    total_completed = sum(1 for s in slides if s.status == "completed")
+    target_page_nums = active_run.target_page_nums if active_run else None
+
+    return {
+        "project_id": project.id,
+        "project_phase": project.status,
+        # Backward-compatible name used by existing frontend code.
+        "project_status": project.status,
+        "total_slides": len(slides),
+        "completed_slides": target_completed,
+        "total_completed_slides": total_completed,
+        "target_completed_slides": target_completed,
+        "target_failed_slides": target_failed,
+        "target_count": target_count or len(slides),
+        "target_page_nums": target_page_nums,
+        "active_run": serialize_run(active_run, slides),
+        "last_run": serialize_run(latest_run, slides) if latest_run else None,
+        "progress": serialize_run_progress(active_run, slides),
+        "has_pptx": has_pptx,
+        "pptx_path": pptx_path if has_pptx else None,
+        "slides": [
+            {
+                "id": s.id,
+                "page_num": s.page_num,
+                "status": s.status,
+                "error_msg": s.error_msg,
+            }
+            for s in slides
+        ],
+    }
+
+
 def infer_project_stage_from_slides(project: Project, slides: list[Slide]) -> str:
     if not slides:
         return "draft"
@@ -234,9 +330,23 @@ def infer_project_stage_from_slides(project: Project, slides: list[Slide]) -> st
     return "planning"
 
 
+def normalize_confirmed_project_stage(project: Project, slides: list[Slide], run: ProjectRun | None = None) -> str:
+    """
+    Repair legacy/edge states where content was confirmed but the project still
+    advertises planning. This is a no-op while a run is active.
+    """
+    if run and run.status in ACTIVE_RUN_STATUSES:
+        return project.status
+    if project.content_plan_confirmed and slides and project.status in {"draft", "planning"}:
+        project.status = "visual_ready"
+    return project.status
+
+
 def reconcile_project_state(project: Project, slides: list[Slide], run: ProjectRun | None = None) -> str:
     if run and run.status in ACTIVE_RUN_STATUSES:
         return project.status
+
+    normalize_confirmed_project_stage(project, slides, run)
 
     if run and run.status == "succeeded":
         if run.kind == "content_plan":

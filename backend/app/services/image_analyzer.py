@@ -188,6 +188,58 @@ def analyze_reference_image(image_path: str) -> Dict:
     return result
 
 
+def analyze_visual_asset(image_path: str, asset_name: str = "", asset_kind: str = "", usage_note: str = "") -> Dict:
+    """
+    Analyze a global visual asset such as a product, person, scene, or material.
+    The result is content-facing, not style-facing: it helps later pages decide
+    whether and how to use the image as a concrete reference.
+    """
+    if not os.path.exists(image_path):
+        logger.warning(f"Visual asset file not found: {image_path}")
+        return _default_visual_asset_analysis(asset_name, asset_kind, usage_note)
+
+    local_palette = extract_image_palette(image_path)
+    filename = os.path.basename(image_path)
+    prompt = f"""你是一位 PPT 视觉资产编目助手。请只分析这张图片中真实存在的主体，帮助后续模型判断哪些页面需要引用它，并在生成时锁定它的身份。严格输出 JSON：
+
+{{
+  "detected_kind": "product/person/scene/material/other 中最合适的一类",
+  "subject": "图片主体的简短名称，如某个具体产品、人物、主KV、物料或场景",
+  "description": "80字以内，客观描述图片中主体、包装/外观/服装/姿态/场景",
+  "identity_elements": ["身份承载元素1，如外轮廓/结构/材质/标识/文字层级/表面图形/姿态", "元素2", "元素3"],
+  "distinctive_features": ["必须保真的可识别特征1", "特征2", "特征3"],
+  "must_not_change": ["生成时绝对不能改变的身份项1", "身份项2", "身份项3"],
+  "suggested_keywords": ["后续页面文案中可能触发使用它的关键词"],
+  "recommended_usage": "这张资产适合出现在哪类页面，80字以内",
+  "fidelity_note": "通用保真要求，说明哪些身份元素必须保持，80字以内"
+}}
+
+用户给出的名称：{asset_name or "未提供"}
+用户给出的类别：{asset_kind or "未提供"}
+用户给出的使用说明：{usage_note or "未提供"}
+文件名：{filename}
+
+注意：
+1. 必须输出合法 JSON，不要加额外说明
+2. 不要把它当作风格参考图，不要分析 PPT 风格系统，重点是主体识别和身份保真
+3. 输出必须可泛化到任意产品/人物/物料/主KV，不要只套用某一种商品品类的细节
+4. 如果无法判断，仍给出基于文件名和可见主体的保守描述"""
+
+    raw = _call_vision_model(image_path, prompt)
+    result = _parse_analysis_result(raw, "visual_asset")
+    result.setdefault("detected_kind", asset_kind or "other")
+    result.setdefault("subject", asset_name or os.path.splitext(filename)[0])
+    result.setdefault("description", "")
+    result.setdefault("identity_elements", [])
+    result.setdefault("distinctive_features", [])
+    result.setdefault("must_not_change", [])
+    result.setdefault("suggested_keywords", [])
+    result.setdefault("recommended_usage", usage_note or "")
+    result.setdefault("fidelity_note", "")
+    result["dominant_palette"] = local_palette
+    return result
+
+
 def _parse_analysis_result(raw: str, analysis_type: str) -> Dict:
     """解析视觉模型返回的 JSON，失败时返回默认值。"""
     raw = raw.strip()
@@ -207,6 +259,8 @@ def _parse_analysis_result(raw: str, analysis_type: str) -> Dict:
     # 回退默认值
     if analysis_type == "logo":
         return _default_logo_analysis()
+    if analysis_type == "visual_asset":
+        return _default_visual_asset_analysis()
     return _default_reference_analysis()
 
 
@@ -232,5 +286,20 @@ def _default_reference_analysis() -> Dict:
         "texture": "",
         "clone_rules": "",
         "description": "",
+        "dominant_palette": [],
+    }
+
+
+def _default_visual_asset_analysis(asset_name: str = "", asset_kind: str = "", usage_note: str = "") -> Dict:
+    return {
+        "detected_kind": asset_kind or "other",
+        "subject": asset_name or "",
+        "description": "",
+        "identity_elements": [],
+        "distinctive_features": [],
+        "must_not_change": [],
+        "suggested_keywords": [],
+        "recommended_usage": usage_note or "",
+        "fidelity_note": "",
         "dominant_palette": [],
     }

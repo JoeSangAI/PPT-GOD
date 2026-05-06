@@ -20,6 +20,10 @@ frontend/dist/
 # Uploads and outputs (user data)
 backend/uploads/
 backend/outputs/
+outputs/
+
+# Local browser/debug artifacts
+.playwright-cli/
 
 # IDE
 .vscode/

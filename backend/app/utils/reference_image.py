@@ -1,3 +1,20 @@
+ALLOWED_VISUAL_ASSET_KINDS = {"product", "person", "scene", "material", "other"}
+
+
+def normalize_visual_asset_kind(kind: str | None) -> str:
+    kind = (kind or "").strip().lower()
+    return kind if kind in ALLOWED_VISUAL_ASSET_KINDS else "other"
+
+
+def default_visual_asset_process_mode(kind: str | None) -> str:
+    kind = normalize_visual_asset_kind(kind)
+    if kind in {"product", "material"}:
+        return "crop"
+    if kind in {"person", "scene"}:
+        return "blend"
+    return "blend"
+
+
 def reference_process_mode_instruction(mode: str | None) -> str:
     mode = mode or "blend"
     if mode == "blend":
@@ -7,8 +24,9 @@ def reference_process_mode_instruction(mode: str | None) -> str:
         )
     if mode == "crop":
         return (
-            "Crop mode: preserve the reference image content as a recognizable visual block, but crop it to fit the slide composition. "
-            "Do not reinterpret the subject; design around its visible core."
+            "High-fidelity crop-integrate mode: use the reference image as the authoritative identity source. "
+            "You may crop only empty margins/background and adjust scale or placement for the slide composition. "
+            "Do not crop away, redraw, reinterpret, rotate, restyle, or replace the identity-bearing subject itself; design around its visible core."
         )
     if mode == "original":
         return (

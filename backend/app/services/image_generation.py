@@ -88,6 +88,7 @@ def _cache_key(
     for ref in reference_images or []:
         h.update(str(ref.size).encode("utf-8"))
         h.update(str(ref.mode).encode("utf-8"))
+        h.update(ref.tobytes())
     return h.hexdigest()
 
 
@@ -163,11 +164,13 @@ def _prepare_reference_image_for_upload(ref: Image.Image) -> Image.Image:
 def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesIO, str, int]:
     img = _prepare_reference_image_for_upload(ref)
     buf = io.BytesIO()
-    quality = min(95, max(60, int(settings.IMAGE_REFERENCE_JPEG_QUALITY or 85)))
-    img.save(buf, format="JPEG", quality=quality, optimize=True, progressive=True)
+    # Reference images can contain identity-bearing micro-details such as labels,
+    # marks, packaging graphics, or face/clothing cues. Keep them lossless before
+    # the model sees them; generation can still integrate the asset naturally.
+    img.save(buf, format="PNG", optimize=True)
     size_bytes = buf.tell()
     buf.seek(0)
-    return f"ref_{index}.jpg", buf, "image/jpeg", size_bytes
+    return f"ref_{index}.png", buf, "image/png", size_bytes
 
 
 def _is_connection_timeout(exc: Exception) -> bool:
@@ -385,9 +388,16 @@ def generate_slide_image(
         return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
 
 
-def save_slide_image(img: Image.Image, project_id: str, page_num: int, output_dir: str = "./outputs") -> str:
+def save_slide_image(
+    img: Image.Image,
+    project_id: str,
+    page_num: int,
+    output_dir: str = "./outputs",
+    suffix: str = "",
+) -> str:
     project_dir = os.path.join(output_dir, project_id)
     os.makedirs(project_dir, exist_ok=True)
-    path = os.path.join(project_dir, f"slide_{page_num:02d}.png")
+    safe_suffix = "".join(ch for ch in suffix if ch.isalnum() or ch in {"_", "-"})
+    path = os.path.join(project_dir, f"slide_{page_num:02d}{safe_suffix}.png")
     img.save(path, "PNG")
     return path

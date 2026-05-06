@@ -138,6 +138,12 @@ def generate_slides_task(project_id: str, page_nums: list = None, prototype: boo
         mark_run_running(db, run_id, stage="batch_generation", message="图片生成任务已启动")
         db.commit()
         run_generation_pipeline(project_id, db, page_nums=acquired_pages, prototype=prototype, run_id=run_id)
+        # 生成完成，设置未读通知提醒用户查看
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if project:
+            project.has_unread_notification = True
+            project.unread_notification_message = "打样完成" if prototype else "图片生成完成"
+            db.commit()
         logger.info(f"Celery task completed: project={project_id}")
         return {"project_id": project_id, "status": "completed", "page_nums": acquired_pages, "prototype": prototype, "skipped_pages": skipped_pages}
     except Exception as exc:
@@ -253,6 +259,7 @@ def generate_style_proposals_task(self, project_id: str, run_id: str = None):
         # 风格提案生成后，项目进入视觉方案待确认阶段
         if project.status in ("planning", "draft"):
             project.status = "visual_ready"
+        project.content_plan_confirmed = True
         finish_run(
             db,
             run_id,
@@ -260,6 +267,9 @@ def generate_style_proposals_task(self, project_id: str, run_id: str = None):
             message=f"风格提案已生成，共 {len(proposals)} 套",
             completed_count=len(proposals),
         )
+        # 风格提案生成完成，设置未读通知
+        project.has_unread_notification = True
+        project.unread_notification_message = "风格提案已生成"
         db.commit()
         logger.info(f"[StyleProposals Celery] Completed for project={project_id}, count={len(proposals)}, asset_based={asset_based}")
         return {"project_id": project_id, "status": "completed", "proposals_count": len(proposals), "asset_based": asset_based}

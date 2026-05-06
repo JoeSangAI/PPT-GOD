@@ -9,7 +9,7 @@ from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
-from app.services.run_state import cancel_active_run, create_project_run, get_active_run, serialize_run
+from app.services.run_state import cancel_active_run, create_project_run, get_active_run, normalize_confirmed_project_stage, serialize_run
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -31,7 +31,15 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(db: Session = Depends(get_db)):
-    return db.query(Project).order_by(Project.created_at.desc()).all()
+    projects = db.query(Project).order_by(Project.created_at.desc()).all()
+    changed = False
+    for project in projects:
+        before = project.status
+        normalize_confirmed_project_stage(project, list(project.slides or []), get_active_run(db, project.id))
+        changed = changed or project.status != before
+    if changed:
+        db.commit()
+    return projects
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -39,6 +47,15 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    before = project.status
+    normalize_confirmed_project_stage(project, list(project.slides or []), get_active_run(db, project_id))
+    # 用户已进入项目详情，清除未读通知
+    if project.has_unread_notification:
+        project.has_unread_notification = False
+        project.unread_notification_message = None
+    if project.status != before or not project.has_unread_notification:
+        db.commit()
+        db.refresh(project)
     return project
 
 
@@ -56,6 +73,8 @@ def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depend
         project.style_id = payload.style_id
     if payload.content_plan_confirmed is not None:
         project.content_plan_confirmed = payload.content_plan_confirmed
+        if payload.content_plan_confirmed and project.slides and project.status in {"draft", "planning"}:
+            project.status = "visual_ready"
     db.commit()
     db.refresh(project)
     return project
@@ -86,7 +105,14 @@ def update_project_style(
         raise HTTPException(status_code=404, detail="Project not found")
     if payload.selected_style is not None:
         project.selected_style = payload.selected_style
+        project.content_plan_confirmed = True
         project.status = "visual_ready"
+        for slide in project.slides or []:
+            slide.visual_json = {}
+            slide.prompt_text = None
+            slide.image_path = None
+            slide.error_msg = None
+            slide.status = "pending"
     db.commit()
     db.refresh(project)
     return project
@@ -128,45 +154,47 @@ def create_style_proposals(
         cached_asset_signature = project.style_proposal.get("asset_signature")
         cached_proposals = project.style_proposal.get("proposals") or []
         cached_is_style_dna = any(
-            isinstance(p, dict) and (p.get("source") == "asset_clone" or p.get("clone_mode") == "style_dna")
+            isinstance(p, dict)
+            and (p.get("source") == "asset_clone" or p.get("clone_mode") in {"style_dna", "strict_reference"})
             for p in cached_proposals
         )
-        if cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature):
-            if has_global_style_ref and not cached_is_style_dna:
-                logger.info(
-                    "Style proposal cache invalidated for project=%s: style reference requires style DNA proposal",
-                    project_id,
-                )
-            else:
-                return {
-                    "status": "completed",
-                    "proposals": project.style_proposal["proposals"],
-                }
+        cache_signature_matches = cached_asset_signature == current_asset_signature or (
+            not cached_asset_signature and not current_asset_signature
+        )
+        if cache_signature_matches and (not has_global_style_ref or cached_is_style_dna):
+            return {
+                "status": "completed",
+                "proposals": cached_proposals,
+            }
+
+        if cache_signature_matches and has_global_style_ref and not cached_is_style_dna:
+            logger.info(
+                "Style proposal cache invalidated for project=%s: style reference requires style DNA proposal",
+                project_id,
+            )
         else:
             logger.info(
                 "Style proposal cache invalidated for project=%s: cached assets changed",
                 project_id,
             )
-            project.style_proposal = None
-            db.commit()
-            db.refresh(project)
-
-        if has_global_style_ref and not cached_is_strict_clone:
-            project.style_proposal = None
+        project.style_proposal = None
+        if has_global_style_ref:
             project.selected_style = None
-            db.commit()
-            db.refresh(project)
-        elif cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature):
-            return {
-                "status": "completed",
-                "proposals": project.style_proposal["proposals"],
-            }
+        db.commit()
+        db.refresh(project)
 
     # 强制重新生成时先清空旧缓存
     if force:
         project.style_proposal = None
         db.commit()
         db.refresh(project)
+
+    # 根据是否有素材决定 total_count：有素材时生成 1 套，无素材时生成 3 套
+    has_assets = any(
+        ref.role in {"logo", "style_ref", "template"}
+        for ref in (project.reference_images or [])
+    )
+    total_count = 1 if has_assets else 3
 
     # 改用 Celery 队列执行，比 FastAPI BackgroundTasks 更可靠
     try:
@@ -175,7 +203,7 @@ def create_style_proposals(
             project_id,
             kind="style_proposal",
             stage="style_proposal",
-            total_count=3,
+            total_count=total_count,
             message="风格提案生成已排队",
         )
         db.commit()

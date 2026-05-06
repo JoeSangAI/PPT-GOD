@@ -139,6 +139,11 @@ export async function fetchProjectStatus(projectId: string) {
   return (await checkRes(res)).json();
 }
 
+export async function fetchWorkflowStatus(projectId: string) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/workflow-status`);
+  return (await checkRes(res)).json();
+}
+
 export async function fetchGenerationProgress(projectId: string) {
   const res = await fetch(`${API_BASE}/projects/${projectId}/generation-progress`);
   return (await checkRes(res)).json();
@@ -153,9 +158,10 @@ export function getDownloadUrl(projectId: string, prototype?: boolean) {
 export async function uploadFile(
   projectId: string,
   file: File,
-  role: "style_ref" | "logo" | "template" | "content_ref" | "chart_ref" | "finetune_ref",
+  role: "style_ref" | "logo" | "template" | "visual_asset" | "content_ref" | "chart_ref" | "finetune_ref",
   slideId?: string,
-  processMode?: "blend" | "crop" | "original"
+  processMode?: "blend" | "crop" | "original",
+  metadata?: { asset_name?: string; asset_kind?: string; usage_note?: string; logo_anchor?: string }
 ) {
   const formData = new FormData();
   formData.append("file", file);
@@ -163,7 +169,11 @@ export async function uploadFile(
   if (slideId) {
     formData.append("slide_id", slideId);
   }
-  formData.append("process_mode", processMode || "blend");
+  if (processMode) formData.append("process_mode", processMode);
+  if (metadata?.asset_name) formData.append("asset_name", metadata.asset_name);
+  if (metadata?.asset_kind) formData.append("asset_kind", metadata.asset_kind);
+  if (metadata?.usage_note) formData.append("usage_note", metadata.usage_note);
+  if (metadata?.logo_anchor) formData.append("logo_anchor", metadata.logo_anchor);
   const res = await fetch(`${API_BASE}/projects/${projectId}/upload`, {
     method: "POST",
     body: formData,
@@ -199,6 +209,22 @@ export async function updateReferenceImageMode(projectId: string, refId: string,
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ process_mode: processMode }),
+  });
+  return (await checkRes(res)).json();
+}
+
+export async function updateReferenceImage(projectId: string, refId: string, data: {
+  process_mode?: string;
+  asset_name?: string;
+  asset_kind?: string;
+  usage_note?: string;
+  logo_anchor?: string;
+  reanalyze?: boolean;
+}) {
+  const res = await fetch(`${API_BASE}/projects/${projectId}/reference-images/${refId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
   });
   return (await checkRes(res)).json();
 }
@@ -295,9 +321,10 @@ export async function* chatWithAgentStream(
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
+        const normalizedLine = line.endsWith("\r") ? line.slice(0, -1) : line;
+        if (normalizedLine.startsWith("data: ")) {
           try {
-            const data = JSON.parse(line.slice(6));
+            const data = JSON.parse(normalizedLine.slice(6));
             if (import.meta.env.DEV) {
               console.debug("[chatWithAgentStream] yield event:", data.type);
             }
@@ -322,12 +349,21 @@ export async function* chatWithAgentStream(
     reader.releaseLock();
   }
 
-  if (buffer.startsWith("data: ")) {
-    try {
-      yield JSON.parse(buffer.slice(6));
-    } catch {
-      // 流结束时还有未解析完的 data 行（JSON 被截断），主动报错而不是静默忽略
-      yield { type: "error", message: "响应流被意外中断，JSON 不完整" };
+  const trailing = decoder.decode();
+  if (trailing) {
+    buffer += trailing;
+  }
+
+  for (const line of buffer.split("\n")) {
+    const normalizedLine = line.trimEnd();
+    if (!normalizedLine) continue;
+    if (normalizedLine.startsWith("data: ")) {
+      try {
+        yield JSON.parse(normalizedLine.slice(6));
+      } catch {
+        // 流结束时还有未解析完的 data 行（JSON 被截断），主动报错而不是静默忽略
+        yield { type: "error", message: "响应流被意外中断，JSON 不完整" };
+      }
     }
   }
 }
@@ -397,20 +433,6 @@ export async function reorderSlides(projectId: string, pageNums: number[]) {
   return (await checkRes(res)).json();
 }
 
-export async function setSeedPage(projectId: string, slideId: string) {
-  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/set-seed`, {
-    method: "POST",
-  });
-  return (await checkRes(res)).json();
-}
-
-export async function unsetSeedPage(projectId: string, slideId: string) {
-  const res = await fetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/unset-seed`, {
-    method: "POST",
-  });
-  return (await checkRes(res)).json();
-}
-
 export async function extractTemplate(projectId: string, file: File) {
   const formData = new FormData();
   formData.append("file", file);
@@ -446,8 +468,8 @@ export async function generateStyleProposals(projectId: string, force: boolean =
 
 export async function pollForStyleProposals(
   projectId: string,
-  maxAttempts = 40,
-  intervalMs = 3000
+  maxAttempts = 120,
+  intervalMs = 5000
 ): Promise<any[]> {
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, intervalMs));

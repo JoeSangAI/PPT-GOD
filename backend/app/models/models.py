@@ -30,6 +30,8 @@ class Project(Base):
     style_proposal = Column(JSON, nullable=True)
     selected_style = Column(JSON, nullable=True)
     selected_template_recommendations = Column(JSON, nullable=True)
+    has_unread_notification = Column(Boolean, default=False, nullable=False)
+    unread_notification_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -103,6 +105,11 @@ class ReferenceImage(Base):
     file_path = Column(String, nullable=False)
     role = Column(String, default="style_ref")
     process_mode = Column(String, default="blend")
+    asset_name = Column(String, nullable=True)
+    asset_kind = Column(String, nullable=True)
+    usage_note = Column(Text, nullable=True)
+    asset_analysis = Column(JSON, nullable=True)
+    logo_anchor = Column(String, nullable=True)
 
     project = relationship("Project", back_populates="reference_images")
     slide = relationship("Slide", back_populates="reference_images")

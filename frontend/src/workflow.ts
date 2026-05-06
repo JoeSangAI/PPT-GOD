@@ -188,11 +188,11 @@ export function getGuidanceText(state: WorkflowState) {
     case "visual_ready":
       return "请选择视觉风格方案，或告诉视觉总监你的偏好";
     case "prompt_ready":
-      return "请检查每页画面描述，可上传参考图，然后点击「先打样种子页」";
+      return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
     case "prototype":
-      return "种子页正在生成中，请稍候";
+      return "打样页正在生成中，请稍候";
     case "prototype_ready":
-      return "种子页已生成，请检查效果，满意后点击确认开始批量生成";
+      return "打样页已生成，请检查效果，满意后点击确认开始批量生成";
     case "generating":
       return "正在批量生成所有页面";
     case "completed":
@@ -223,7 +223,6 @@ export function getSecondaryActionKeys(state: WorkflowState) {
     actions.push("templates");
   }
   if (state.projectStatus === "prompt_ready" || state.projectStatus === "failed") {
-    if (state.selectedPageCount > 0) actions.push("sample-selected");
     actions.push("generate-all");
   }
   if (state.projectStatus === "prototype_ready") {

@@ -28,6 +28,8 @@ class ProjectResponse(ProjectBase):
     style_proposal: Optional[dict] = None
     selected_style: Optional[dict] = None
     selected_template_recommendations: Optional[dict] = None
+    has_unread_notification: bool = False
+    unread_notification_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -37,6 +39,12 @@ class ReferenceImageResponse(BaseModel):
     role: str = "style_ref"
     process_mode: str = "blend"
     url: str
+    overlay_url: Optional[str] = None
+    asset_name: Optional[str] = None
+    asset_kind: Optional[str] = None
+    usage_note: Optional[str] = None
+    asset_analysis: Optional[dict] = None
+    logo_anchor: Optional[str] = None
 
 
 class SlideBase(BaseModel):

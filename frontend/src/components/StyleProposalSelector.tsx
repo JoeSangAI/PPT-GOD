@@ -109,7 +109,7 @@ export default function StyleProposalSelector({
                           <div
                             key={cidx}
                             className="group flex items-center gap-2 cursor-default"
-                            title={`${color.name}${color.role ? " · " + color.role : ""}`}
+                            title={color.name}
                           >
                             <div className="relative">
                               <div

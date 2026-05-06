@@ -53,7 +53,7 @@ function ProposalCard({
             key={i}
             className="flex-1"
             style={{ backgroundColor: c.hex }}
-            title={`${c.name} ${c.hex}`}
+            title={c.name}
           />
         ))}
       </div>

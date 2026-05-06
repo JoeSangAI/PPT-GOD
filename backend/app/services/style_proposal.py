@@ -182,7 +182,7 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
 
 def _build_content_style_direction(traditional_score: int, food_score: int, tech_score: int, brand_score: int) -> str:
     if traditional_score and food_score:
-        return "内容核心更接近古法非遗、传统食品/农业品牌，应优先考虑传统质感、品牌主色、暖性浅底、纹样装饰与可信赖的商业表达；不要因为出现“战略”或“拒绝科技与狠活”而推荐科技风。"
+        return "内容核心更接近古法非遗、传统食品/农业品牌，应优先考虑传统质感、品牌主色、暖性浅底、纹样装饰与可信赖的商业表达。"
     if traditional_score:
         return "内容核心偏传统文化/非遗/东方审美，应优先考虑中式、古朴、典雅、节庆或国潮方向。"
     if food_score:
@@ -191,7 +191,7 @@ def _build_content_style_direction(traditional_score: int, food_score: int, tech
         return "内容核心偏科技/数据/AI，可考虑冷色、秩序感、数据化的现代视觉方向。"
     if brand_score:
         return "内容核心偏消费品牌/商业提案，应优先考虑品牌识别、货架记忆和说服效率。"
-    return "根据内容标题和正文真实判断风格，不要套用默认科技商务模板。"
+    return "根据内容标题和正文真实判断风格，选择最贴合主题和受众的视觉方向。"
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int] | None:
@@ -244,6 +244,90 @@ def _is_chromatic_brand_color(hex_color: str) -> bool:
 
 def _needs_page_type_modulation(hex_color: str) -> bool:
     return _is_dark(hex_color) or _saturation(hex_color) >= 0.38
+
+
+def _get_color_name(hex_color: str) -> str:
+    """根据色值返回直观的中文颜色名（如'酒红'、'琥珀金'），而非技术角色名。"""
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return "参考色"
+    r, g, b = rgb
+
+    # 黑白灰判断
+    diff = max(rgb) - min(rgb)
+    if diff < 20:
+        avg = sum(rgb) / 3
+        if avg < 50:
+            return "深墨"
+        if avg < 100:
+            return "炭灰"
+        if avg < 180:
+            return "银灰"
+        return "纯白"
+
+    # 计算色调
+    max_val = max(rgb)
+    min_val = min(rgb)
+    delta = max_val - min_val
+
+    if delta == 0:
+        hue = 0
+    elif max_val == r:
+        hue = (60 * ((g - b) / delta) + 360) % 360
+    elif max_val == g:
+        hue = (60 * ((b - r) / delta) + 120) % 360
+    else:
+        hue = (60 * ((r - g) / delta) + 240) % 360
+
+    brightness = sum(rgb) / 3
+
+    # 按色调区间 + 亮度命名
+    if 345 <= hue or hue < 15:
+        if brightness < 80:
+            return "酒红"
+        if brightness > 180:
+            return "粉红"
+        return "朱红"
+    elif 15 <= hue < 35:
+        if brightness < 100:
+            return "咖啡棕"
+        if delta / max_val < 0.5:
+            return "暖棕"
+        return "琥珀金"
+    elif 35 <= hue < 50:
+        if brightness < 120:
+            return "土黄"
+        if delta / max_val < 0.5:
+            return "米黄"
+        return "金黄"
+    elif 50 <= hue < 75:
+        if brightness < 120:
+            return "橄榄绿"
+        return "柠檬黄"
+    elif 75 <= hue < 150:
+        if brightness < 100:
+            return "墨绿"
+        if brightness > 180:
+            return "翠绿"
+        return "草绿"
+    elif 150 <= hue < 190:
+        return "湖蓝"
+    elif 190 <= hue < 260:
+        if brightness < 100:
+            return "藏蓝"
+        if brightness > 180:
+            return "天蓝"
+        return "海蓝"
+    elif 260 <= hue < 300:
+        if brightness < 100:
+            return "深紫"
+        return "紫罗兰"
+    elif 300 <= hue < 345:
+        if brightness < 120:
+            return "玫红"
+        return "桃红"
+
+    return "参考色"
 
 
 def _color_label(hex_color: str) -> str:
@@ -350,7 +434,7 @@ def _collect_clone_palette(ref: Dict, logo: Dict | None = None) -> List[Dict]:
         roles = ["品牌主色（强视觉页可放大，信息页做强调）", "强调/装饰色", "信息页浅底/留白", "深色文字/层次"]
     else:
         roles = ["主背景色", "标题/强调色", "正文色", "辅助点缀色"]
-    names = [_color_label(color) for color in unique[:4]]
+    names = [_get_color_name(color) for color in unique[:4]]
 
     return [{"name": names[i], "hex": color, "role": roles[i]} for i, color in enumerate(unique[:4])]
 
@@ -428,11 +512,11 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
     clone_rules = ref.get("clone_rules") or "提取参考图的主色关系、装饰气质和整体氛围，并按页面类型调节使用强度。"
     adaptation_rules = _page_type_adaptation_rules(palette)
 
+    primary_name = _get_color_name(palette[0]['hex']) if palette else '品牌主色'
+    accent_name = _get_color_name(palette[1]['hex']) if len(palette) > 1 else '强调色'
     description = (
-        f"已按用户上传的参考图提取风格基因：核心色沿用 {palette[0]['hex']}，"
-        f"强调与标题色沿用 {palette[1]['hex']}，整体保持「{mood}」的气质。"
-        f"版式按「{composition}」处理，装饰保留「{ornaments}」，材质保留「{texture}」。"
-        f"{clone_rules} {adaptation_rules}"
+        f"整体「{mood}」气质。{primary_name}定调品牌识别，{accent_name}做重点强调；"
+        f"封面/章节页可放大装饰，内容/数据页优先留白与可读性。{clone_rules}"
     )
 
     return {
@@ -516,14 +600,14 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 {{
   "name": "风格名称（简洁直观的设计语言命名，如'流体玻璃极简'、'折叠纸艺温暖'，禁止用'原生之境'这类虚词）",
   "palette": [
-    {{"name": "深墨蓝", "hex": "#0A1628", "role": "主背景色"}},
-    {{"name": "象牙白", "hex": "#E8D5A3", "role": "标题色"}},
-    {{"name": "米白", "hex": "#F5F5F0", "role": "正文色"}},
-    {{"name": "深蓝", "hex": "#1E3A5F", "role": "点缀色"}}
+    {{"name": "直观颜色名（如'酒红'、'琥珀金'、'米白'，不要用'品牌主色'这类技术词）", "hex": "#0A1628", "role": "主背景色"}},
+    {{"name": "直观颜色名", "hex": "#E8D5A3", "role": "标题色"}},
+    {{"name": "直观颜色名", "hex": "#F5F5F0", "role": "正文色"}},
+    {{"name": "直观颜色名", "hex": "#1E3A5F", "role": "点缀色"}}
   ],
   "mood": "氛围标签（3-5个具体形容词，如'冷静、专业、克制'）",
   "font": "字体建议（如'无衬线黑体，标题加粗'）",
-  "description": "风格说明（250-400字）",
+  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清为什么适合这份PPT即可）",
   "source": "original（第1套）或 风格库id（第2、3套）"
 }}
 
@@ -543,11 +627,9 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 
 1. **第一段必须开门见山**：直接说「这份 PPT 讲的是 XXX，所以我认为最适合的风格是……」。不要绕弯子。
 
-2. **配色必须具体到功能**：
-   - 背景色用什么，为什么（如"深色背景能让数据图表更突出"）
-   - 标题色用什么，为什么（如"高对比的白色标题在深色背景上能第一时间抓住注意力"）
-   - 正文色用什么，为什么（如"浅灰色正文避免与标题抢戏，同时保证长文可读性"）
-   - 点缀色用什么，为什么（如"橙色仅用于关键数据和 CTA，控制使用面积在 5% 以内"）
+2. **配色只说功能，不写色号**：
+   - 用直观颜色名（如"酒红"、"琥珀金"），禁止写"品牌主色 #800000"这类技术参数
+   - 说清每种颜色在PPT里承担什么功能即可（如"深色背景让数据图表更突出"）
 
 3. **禁止以下说辞**（这些都是用户讨厌的空话套话）：
    - "凝视深渊的勇气与沉静"
@@ -561,8 +643,8 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 
 5. **情绪氛围关键词放在最后**，3-5 个词即可，不要展开解释。
 
-【参考口吻示例】（这种具体的、有功能指向的说明才是对的）
-"这份 PPT 是关于老庙黄金的品牌升级方案，面向的是经销商和投资人，需要在专业感和品牌溢价之间找到平衡。我推荐「白色为主、海军蓝为辅」的配色逻辑：白色（#FFFFFF / #F4F7FA）作为背景，因为这份 PPT 有大量产品参数和财务数据，白色背景能最大化文字可读性，避免深色背景导致的阅读疲劳。海军蓝（#1A365D）用于所有标题和重点数据，它传递的是沉稳和信任——对投资人来说，这是最重要的情绪信号。琥珀金（#D69E2E）作为点缀色，仅用于品牌 logo 复刻和关键价格数字，面积控制在 5% 以内，制造「克制中的奢华感」。字体上，标题用思源黑体 Heavy 保证远距离投影的清晰度，正文用 Regular 保证长段落的阅读舒适。整体情绪：干净、通透、高端。"
+【参考口吻示例】（精简、有功能指向、不说色号）
+"这份PPT面向投资人，需要传递信任和专业。我推荐「白色为主、海军蓝为辅」的配色：白色背景最大化数据可读性，海军蓝标题传递沉稳信任，琥珀金仅用于关键数字和品牌logo，面积控制在5%以内。字体标题用黑体Heavy保证投影清晰，正文用Regular保证长段落舒适。整体情绪：干净、通透、高端。"
 """
 
     response = client.chat.completions.create(
@@ -644,9 +726,8 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 
         # 如果 description 太短，补一段默认话术
         if len(p["description"]) < 60:
-            first_color = p["palette"][0]["hex"] if p["palette"] and isinstance(p["palette"][0], dict) else str(p["palette"][0])
-            second_color = p["palette"][1]["hex"] if len(p["palette"]) > 1 and isinstance(p["palette"][1], dict) else str(p["palette"][1]) if len(p["palette"]) > 1 else ""
-            p["description"] = f"「{p['name']}」是一套{p['mood']}的视觉方案。以 {first_color} 为主色调，搭配 {second_color} 营造整体氛围，适合本演示文稿的内容调性。"
+            first_name = p["palette"][0].get("name", "主色") if p["palette"] and isinstance(p["palette"][0], dict) else "主色"
+            p["description"] = f"「{p['name']}」是一套{p['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页优先保证可读性与留白。"
 
     return proposals[:3]
 
@@ -700,16 +781,16 @@ def _generate_asset_based_proposal(
 【输出格式】
 严格输出 JSON 对象（不是数组）：
 {{
-  "name": "风格名称（直接概括参考图的实际风格基因，不混入内容行业判断）",
+  "name": "风格调性词，不是布局词。示范：'暖橘衬线'、'墨白极简'、'红白都会' ✅；'三栏暖橘'、'分屏极简'、'居左商务' ❌（版式特征写进 description，不是 name）",
   "palette": [
-    {{"name": "颜色名称（来自参考图）", "hex": "参考图中的实际色值", "role": "品牌主色/强视觉页主色"}},
-    {{"name": "颜色名称（来自参考图）", "hex": "参考图中的实际色值", "role": "强调色/标题色/装饰色"}},
-    {{"name": "颜色名称（可来自参考图或由其推导）", "hex": "适合信息页阅读的浅底色", "role": "内容页背景/留白"}},
-    {{"name": "颜色名称（可来自参考图或由其推导）", "hex": "高可读文字色", "role": "正文/数据文字"}}
+    {{"name": "直观颜色名（如'酒红'、'琥珀金'，不要用'品牌主色'这类技术词）", "hex": "参考图中的实际色值", "role": "品牌主色/强视觉页主色"}},
+    {{"name": "直观颜色名", "hex": "参考图中的实际色值", "role": "强调色/标题色/装饰色"}},
+    {{"name": "直观颜色名", "hex": "适合信息页阅读的浅底色", "role": "内容页背景/留白"}},
+    {{"name": "直观颜色名", "hex": "高可读文字色", "role": "正文/数据文字"}}
   ],
   "mood": "氛围标签（忠实来自参考图，不发明新风格）",
   "font": "字体建议（延续参考图字体气质，同时保证正文可读）",
-  "description": "风格说明（120-180字，说明参考图风格基因如何按封面、章节、内容、数据、表格等页面类型调节强度）"
+  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清风格基因和页面类型调节即可。版式特征如'参考图本身是三栏布局'可以在这里说明"在合适的页面会复用这种分栏感"）"
 }}
 
 【核心原则】
@@ -717,7 +798,7 @@ def _generate_asset_based_proposal(
 2. **不是逐页照搬**：参考图只提供风格基因，不是每一页的画面模板
 3. **按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，降低背景强度、减少装饰、增加留白
 4. **内容决定配图**：地图、图表、业务场景、产品场景和人物/物件选择由该页文案决定，不机械复制参考图里的画面对象
-5. **命名不跑偏**：风格名不得混入内容中的行业词，除非参考图本身明确呈现该行业视觉语言"""
+5. **命名不跑偏**：风格名只取调性，不混入行业词，也不混入版式词（参考输出格式 name 字段的示范）"""
 
     response = client.chat.completions.create(
         model=settings.MINIMAX_LLM_MODEL,
@@ -793,7 +874,7 @@ def _generate_asset_based_proposal(
         ]
 
     if len(proposal.get("description", "")) < 60:
-        first_color = proposal["palette"][0]["hex"] if proposal["palette"] else ""
-        proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以 {first_color} 为主色调，适合本演示文稿的内容调性。"
+        first_name = proposal["palette"][0].get("name", "主色") if proposal["palette"] and isinstance(proposal["palette"][0], dict) else "主色"
+        proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页优先保证可读性与留白。"
 
     return [proposal]

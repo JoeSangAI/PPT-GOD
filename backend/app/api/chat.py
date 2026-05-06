@@ -12,6 +12,7 @@ from app.core.llm_client import get_llm_client
 from app.core.config import settings
 from app.utils.project_docs import load_project_documents
 from app.services.search_service import get_knowledge_augmenter
+from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VISUAL_ACTIONS, with_next_action
 
 router = APIRouter(prefix="/projects", tags=["chat"])
 
@@ -45,6 +46,94 @@ def _has_content_edit_intent(message: str) -> bool:
     return any(kw in msg for kw in edit_keywords)
 
 
+def _has_content_regenerate_intent(message: str) -> bool:
+    """判断用户是否在要求重做/扩写当前内容规划，而不是普通问答。"""
+    msg = message.strip().lower()
+    if not msg:
+        return False
+
+    page_count_feedback = {
+        "页数太少", "页太少", "内容太少", "太少了", "不够多", "不够丰富",
+        "太简略", "太粗略", "太薄", "扩充", "丰富", "完整一点", "更完整",
+        "多加几页", "增加页数", "加页", "加一页", "补一页", "扩写",
+    }
+    source_feedback = {
+        "没用原文", "没有用原文", "不用原文", "不是原文", "按原文",
+        "按照原文", "基于原文", "用原文", "还原原文", "按文档",
+        "按照文档", "基于文档", "用文档", "没按文档", "没有按文档",
+    }
+    structure_feedback = {
+        "结构不对", "逻辑不对", "顺序不对", "章节不对", "大纲不对",
+        "重新排", "换个结构", "重新组织", "跑题", "偏题", "主题不对",
+        "没覆盖", "没有覆盖", "遗漏", "漏了", "少了", "缺少", "补充",
+        "案例页", "数据页", "总结页", "目录页", "封面", "封底",
+    }
+    regenerate_verbs = {
+        "重做", "重新做", "重新生成", "重新规划", "再生成", "重新来",
+        "按原来的", "按大纲重新",
+    }
+    return any(k in msg for k in page_count_feedback | source_feedback | structure_feedback | regenerate_verbs)
+
+
+def _infer_regenerate_page_count(message: str, current_total: int) -> int | None:
+    """从用户反馈中提取或保守推断新的内容规划页数。"""
+    msg = message.strip()
+    explicit = re.search(r"(\d{1,3})\s*页", msg)
+    if explicit:
+        try:
+            value = int(explicit.group(1))
+            if 1 <= value <= 80:
+                return value
+        except ValueError:
+            pass
+
+    if any(k in msg for k in ("页数太少", "页太少", "内容太少", "太少了", "不够丰富", "扩充", "增加页数", "多加几页")):
+        if current_total > 0:
+            return min(60, max(current_total + 6, current_total * 2))
+    return None
+
+
+def _coerce_content_regenerate_action(
+    result: dict,
+    user_message: str,
+    project_context: dict,
+    is_draft: bool,
+) -> dict:
+    """把口头承诺式回复纠正为真正会执行的内容规划 action。"""
+    if is_draft:
+        return result
+    action = result.get("action")
+    if not _has_content_regenerate_intent(user_message):
+        return result
+    incomplete_payload_actions = {
+        "regenerate_plan": "topic",
+        "update_slide_content": "updated_content",
+        "update_all_slides": "updated_slides",
+        "add_slide_before": "new_slide",
+        "add_slide_after": "new_slide",
+    }
+    can_coerce = action in {"answer", "collect_content"} or (
+        action in incomplete_payload_actions and not result.get(incomplete_payload_actions[action])
+    )
+    if not can_coerce:
+        return result
+
+    title = project_context.get("title") or "当前项目"
+    page_count = _infer_regenerate_page_count(user_message, int(project_context.get("total_slides") or 0))
+    coerced = {
+        **result,
+        "action": "regenerate_plan",
+        "topic": (
+            f"{title}。用户反馈：{user_message}。"
+            "请重新生成内容规划，优先基于已上传原文/文档展开，保留原文中的关键论点、结构、数据和表达，不要只做概括。"
+        ),
+        "response": result.get("response") or "明白，我会基于原文重新生成更完整的内容规划。",
+    }
+    if page_count:
+        coerced["page_count"] = page_count
+    return coerced
+
+
 def _build_draft_prompt(has_documents: bool) -> str:
     """draft 阶段（无 slides）的对话收集 prompt。"""
     doc_hint = """
@@ -58,6 +147,12 @@ def _build_draft_prompt(has_documents: bool) -> str:
     return f"""你是 PPT GOD 的内容总监。你有三重背景：TED演讲教练、麦肯锡咨询顾问、顶尖商业文案。你不是问答机器人，你是在帮用户导演一场演示。
 
 你的任务是通过多轮对话帮用户把 PPT 需求理清楚，然后输出定调摘要，等用户确认后再生成。
+
+【绝对长度上限】
+- "response" 字段是给用户的"聊天回复"，必须 ≤200 字。
+- 详细页面规划（每页内容、子标题、列表）**绝对禁止写进 response**。详细规划由后续 generate_plan 触发的 Celery 任务输出，不在这次回复的职责范围。
+- 即使用户要求"再丰富一点"、"按原话还原"等让你想多写的指令，response 仍必须 ≤200 字，把丰富放到 positioning.key_highlights 数组里、把每页要点放到 positioning.strategy 里，绝不在 response 直接铺陈一大堆 markdown。
+- 违反此长度规则会导致 JSON 被截断、用户卡住，是严重故障。
 
 {doc_hint}
 
@@ -86,6 +181,11 @@ def _build_draft_prompt(has_documents: bool) -> str:
 2. 当用户给出主题 + 明确场景（如"销售训练营""年终汇报"）时，**信息已足够，直接输出 propose_plan**，不要再问"这是什么场景"。
 3. Agent 的每次回复都必须给出**明确的下一步**：要么直接输出定调摘要，要么告诉用户"再确认X和Y两点，我就立即开始生成"。**禁止把决策成本抛给用户**。
 4. 如果用户回复了"内部青年销售训练营。我要做成一个精美的 ppt"这类明确指令，你的 action 必须是 "propose_plan"，response 里直接给出定调摘要和结构建议。
+5. **【绝对规则·调整提案】当对话历史中已经存在一次 propose_plan（即用户已经看过定调摘要），且用户现在提出任何修改、补充、调整意见（如"再加一页"、"主题改成XX"、"结构不对"、"太长了"等），你必须：**
+   - **返回 action="propose_plan"**（绝对禁止返回 collect_content 或 answer 然后文字描述）
+   - **在 positioning 字段中输出更新后的完整定调摘要**，基于之前的 positioning 只修改用户要求改的部分
+   - **response 里用一两句话点出"我调整了 X"**，让用户一眼看出差异
+   - 示例：用户说"再加一个案例页"，你必须返回 `{{"action":"propose_plan","response":"已在前面的结构中加入案例页，亮点也同步更新。","positioning":{{...完整对象...}}}}`
 
 【输出 JSON 格式】
 {{
@@ -117,35 +217,50 @@ def _build_draft_prompt(has_documents: bool) -> str:
 - 必须只返回合法JSON，不要markdown代码块，不要任何解释性文字"""
 
 
-def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") -> str:
-    """视觉总监的 system prompt。"""
+def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "", num_proposals: int = 3) -> str:
+    """视觉总监的 system prompt。num_proposals: 本次将生成几套提案（1 或 3），需注入到 prompt 让 LLM 不要幻觉数字。"""
     asset_section = f"\n\n【用户已上传的设计素材】\n{assets_summary}\n" if assets_summary else ""
+
+    count_constraint = (
+        f"\n【方案数量硬约束】本次将生成 {num_proposals} 套风格提案。"
+        f"凡涉及方案数量的口径必须使用「{num_proposals} 套」，禁止换成其他数字（如：N=1 时禁说「3 套/三套/多套」；N=3 时禁说「1 套/一套」）。"
+        f"用户对方案数量很敏感，幻觉数字会让用户困惑。"
+    )
 
     # 根据是否有素材，调整首次介入的策略
     if assets_summary:
         first_interaction_rule = """- **首次介入时，用户已经上传了设计素材**。你的任务是：
-  1. 简要确认收到的素材（如"已收到你的Logo和3张风格参考"）
+  1. 简要确认收到的素材（如"已收到你的品牌 Logo、2个核心资产和3张风格参考"）
   2. 询问用户是否还有其他素材需要补充
   3. 如果素材已经足够，返回 action="propose_styles" 推进到风格提案生成
-  4. 如果系统上下文只告诉你"已上传参考图/模板"但没有给出图片的颜色、构图、字体等分析细节，你只能在 response 中说明将由后端读取素材并提取真实视觉特征，**不要自己编造 style_proposal 对象**
+  4. 如果系统上下文只告诉你"已上传风格参考/版式模板"但没有给出图片的颜色、构图、字体等分析细节，你只能在 response 中说明将由后端读取素材并提取真实视觉特征，**不要自己编造 style_proposal 对象**
   5. 如果用户想补充素材，等待补充后再提案"""
     else:
-        first_interaction_rule = """- **首次介入时，用户还没有上传任何设计素材**。你的首要任务是**引导用户上传设计素材**。回复结构：自我介绍（1句）+ 询问用户是否有以下素材可以上传：参考模板、参考图、Logo、文字风格描述（清晰列出4项）+ 说明上传这些素材如何帮助提案更精准。
+        first_interaction_rule = """- **首次介入时，用户还没有上传任何设计素材**。你的首要任务是**引导用户上传设计素材**。回复结构：自我介绍（1句）+ 按参考强度从高到低询问用户是否有以下素材可以上传：品牌 Logo、核心资产（产品/主 KV/人物/物料图）、风格参考、版式模板、文字风格描述（清晰列出5项）+ 说明上传这些素材如何帮助提案和后续画面更精准。
 - **绝对不能**在首次回复中直接给出配色方案、字体建议、风格判断或完整的视觉分析。你必须先确认用户的素材情况。"""
 
     return f"""你是 PPT GOD 的视觉总监。你有三重背景：顶尖平面设计师、品牌视觉顾问、演示设计专家。你不是模板推荐机器人，你是在帮客户制定视觉策略。
 
 【绝对规则】你必须且只能输出合法的 JSON 对象。不要输出任何解释性文字、markdown 代码块、HTML 标签或多余的自然语言。无论用户说什么，你的每一次回复都必须是且只能是一个可被直接解析的 JSON 对象。违反此规则会导致系统错误。
 
+【绝对长度上限】
+- "response" 字段是给用户的"聊天回复"，必须 ≤200 字。
+- 详细风格说明、配色逻辑、设计推理**不要写进 response**，写进 style_proposal.description（150-250 字）。
+- response 只用一两句话点明：风格名 + 一句调性 + 下一步指引。
+- 即使用户要求"详细一点"、"再具体说说"，response 仍 ≤200 字，把详细放进 style_proposal.description 或 style_proposal.mood 字段，绝不在 response 铺陈大段文字。
+- 违反此长度规则会导致 JSON 被截断、用户卡住，是严重故障。
+
 你的任务是根据客户的内容规划，为他们制定视觉策略、提案风格方案，并解答视觉相关咨询。**你不是问答机器人，你是流程推进者。每次回复都必须给用户明确的下一步指引，不能停在反问或让用户体验到"我不知道该做什么"。**
 
 【当前项目内容规划】
-{content_plan_summary}{asset_section}
+{content_plan_summary}{asset_section}{count_constraint}
 
 【素材优先级规则】
-- 如果用户上传了风格参考图，参考图是最高优先级的风格来源：提取其色彩关系、字体气质、材质、装饰密度和构图节奏，转成文字风格系统；不要把风格图当作每页生图垫图。
-- 如果用户上传了参考模板，模板用于拆分和匹配封面、目录、内容、结尾等页面类型；模板适度影响版式和视觉秩序，具体配图仍由每页文案决定。
-- 上传参考图/模板后，内容规划用于判断页面类型、信息密度和具体配图；不得根据内容里的行业热词推翻素材本身的视觉气质。
+- 如果用户上传了品牌 Logo，Logo 默认作为预览/PPTX 阶段的统一角标叠加，不作为每页生图垫图；只有用户选择融合模式且页面适合品牌招牌/主视觉标识时，才作为画面资产使用。
+- 如果用户上传了核心资产（产品图、主 KV、模特图、物料图等），它不是风格来源，而是后续画面生成的全局内容资产：只在相关页面智能调用，用于提高产品/人物/物料准确度。
+- 如果用户上传了风格参考，风格参考是最高优先级的风格来源：提取其色彩关系、字体气质、材质、装饰密度和构图节奏，转成文字风格系统；不要把风格参考当作每页生图垫图。
+- 如果用户上传了版式模板，模板用于拆分和匹配封面、目录、内容、结尾等页面类型；模板适度影响版式和视觉秩序，具体配图仍由每页文案决定。
+- 上传风格参考/版式模板后，内容规划用于判断页面类型、信息密度和具体配图；不得根据内容里的行业热词推翻素材本身的视觉气质。
 - 强视觉单页参考只用于定调。封面/章节/转场/金句页可以强化主色和装饰；内容/数据/表格/长文页必须优先可读，降低背景强度、减少装饰、增加留白。
 - 如果你无法看到图片细节，只能触发 action="propose_styles" 让后端图像分析生成，不要输出臆测的 style_proposal。
 
@@ -204,7 +319,14 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
 
 【规则】
 {first_interaction_rule}
-- **【绝对规则】当用户已提供足够素材、或明确表达了风格偏好（如描述了喜欢的配色、风格、场景）、或明确表示"直接提案吧/你推荐吧/生成风格提案/确认素材"时，必须返回 action="propose_styles"。如果素材是用户上传的参考图/模板且你看不到图片细节，不要输出 `style_proposal`，让后端图像分析生成；如果是用户用文字明确描述了风格，则在 `style_proposal` 字段中输出完整的结构化风格提案。禁止只返回 action="answer" 和文字描述。**
+- **【绝对规则】当用户已提供足够素材、或明确表达了风格偏好（如描述了喜欢的配色、风格、场景）、或明确表示"直接提案吧/你推荐吧/生成风格提案/确认素材"时，必须返回 action="propose_styles"。如果素材是用户上传的品牌 Logo、核心资产、风格参考或版式模板且你看不到图片细节，不要输出 `style_proposal`，让后端图像分析生成；如果是用户用文字明确描述了风格，则在 `style_proposal` 字段中输出完整的结构化风格提案。禁止只返回 action="answer" 和文字描述。**
+- **【绝对规则·调整提案】当系统上下文里已存在「当前已存在的风格提案」，且用户提出任何调整意见（如"换个色"、"太花哨了"、"不要三分式"、"更暖一点"、"加点深色"等），你必须：**
+  1. **返回 action="adjust_style"**（绝对禁止只返回 action="answer" 然后文字描述新方案）
+  2. **在 `style_proposal` 字段中输出一个完整的新提案对象**，name/palette（4色全部带 hex）/mood/font/description/source 一个不能少
+  3. **以"当前已存在的风格提案"为基础，只修改用户要求改的部分**（如用户说"换个色"，可以替换 palette；用户说"字体硬一点"，只改 font；其余字段保持不变或微调）
+  4. **response 里用一两句话点出"我把 X 改成了 Y"**，让用户一眼看出差异
+  5. 示例：用户说"主色太红了，换个温暖一点的"，你必须返回 `{{"action":"adjust_style","response":"我把主色从冷红 #E60012 换成了暖橘 #FF6B35，其余配色保持不变。","style_proposal":{{...完整对象...}}}}`
+- **当用户提出调整意见但当前还没有任何提案时**（即上下文里没有"当前已存在的风格提案"），你应当返回 action="propose_styles" 并按用户意见生成首次提案，而不是 adjust_style。
 - **每次回复都必须包含下一步行动指引**。比如：提案后告诉用户"满意请确认，不满意告诉我调整方向"；确认风格后告诉用户"正在进入画面设计阶段"；调整画面后告诉用户"调整已应用，可以确认生成图片"。禁止只回答用户当前问题而不给下一步方向。
 - **当用户明确确认选择某个风格时（如"ok"、"就用这个"、"确认"、"选这个"），必须返回 action="confirm_style"，并在 `style` 字段中输出完整的风格对象。不要只返回 "answer"。**
 - 说话要有设计师的品味，但不要说空话套话。具体、有观点。
@@ -217,8 +339,9 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "") ->
 - **当用户描述某个品牌/平台的风格偏好时（如"要小红书那种风格"、"想要温暖生活感的调性"），使用 action="answer"，在 response 中确认理解该风格特征，并给出基于此风格的专业建议。不要返回空内容。**
 - **【关键】每次回复的末尾，必须根据当前素材状态，明确告诉用户下一步可以点击什么按钮。格式：另起一行写 "👉 下一步：..."**
   - 如果用户已上传素材或描述了风格，但还没生成提案：👉 下一步：点击「确认素材已齐，生成风格提案」按钮，我立即开始
-  - 如果用户素材明显不够（只有文字描述，没有图）：👉 下一步：你可以继续上传参考图或 Logo，补完后点击「确认素材已齐，生成风格提案」
+  - 如果用户素材明显不够（只有文字描述，没有图）：👉 下一步：你可以继续上传品牌 Logo、核心资产、风格参考或版式模板，补完后点击「确认素材已齐，生成风格提案」
   - 如果风格提案已生成，等待用户选择：👉 下一步：请查看上方风格卡片，点击「选择此方案」确认，或告诉我你的调整意见（如「更暖一些」「更现代一点」）
+  - 如果你刚刚返回了 action="adjust_style"（即调整后的新提案）：👉 下一步：上方是调整后的新方案，满意请点「选择此方案」，不满意继续告诉我哪里需要再改
   - 如果用户在聊天中直接确认风格（如说"ok"、"选这个"）：返回 action="confirm_style"，👉 下一步：已确认，正在进入画面设计阶段
   - 如果用户已选风格，还没生成生图方案：👉 下一步：正在生成画面描述，请稍候
   - 如果是纯咨询问题：👉 下一步：如果还有其他视觉问题随时问我，或者点击按钮继续推进
@@ -321,6 +444,24 @@ def _build_finetune_prompt(current_slide_info: str = "") -> str:
 {{"action": "answer", "response": "你的回复"}}{slide_context}"""
 
 
+def _history_has_prior_proposal(history: list[dict], agent_role: str) -> bool:
+    """检查对话历史中是否已经存在过内容/视觉提案。用于兜底时判断用户是否在'反馈调整'阶段。"""
+    target_actions = {"propose_plan", "propose_styles", "adjust_style"}
+    for h in history:
+        if h.get("role") != "assistant":
+            continue
+        content = h.get("content", "")
+        if not isinstance(content, str):
+            continue
+        # 简单字符串匹配，不用 JSON 解析（历史消息可能不是 JSON）
+        if any(f'"action": "{a}"' in content for a in target_actions):
+            return True
+        # 兼容无引号或单引号的情况
+        if any(f"'action': '{a}'" in content for a in target_actions):
+            return True
+    return False
+
+
 def _stream_intent(user_message: str, project_context: dict, history: list[dict], documents: str = "", page_context: dict | None = None, agent_role: str = "content", content_plan_summary: str = "", assets_summary: str = ""):
     """流式解析用户意图，yield SSE 事件。"""
     import logging
@@ -333,9 +474,40 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
     has_documents = bool(documents and documents.strip())
     logger.info(f"Chat stream: project={project_context['title']}, role={agent_role}, is_draft={is_draft}, has_documents={has_documents}, doc_len={len(documents) if documents else 0}")
 
+    # 【关键】视觉总监按钮短路：用户点「素材已齐，开始生成」/「重新生成提案」按钮时，
+    # 前端发出固定魔法消息，后端直接短路跳过 LLM，确保稳定推进到 Celery 生图，避免被 LLM 卡住。
+    if agent_role == "visual":
+        # 提案数量：有素材 → 1 套；无素材 → 3 套
+        num_proposals = project_context.get("num_proposals", 3)
+        MAGIC_PROPOSE_FIRST = "请基于我已上传的素材帮我生成风格提案。"
+        MAGIC_PROPOSE_REGEN = "请基于当前最新的素材和我们之前的讨论，重新给我一套风格提案。"
+        msg_stripped = user_message.strip()
+        if msg_stripped == MAGIC_PROPOSE_FIRST:
+            logger.info(f"[Chat] Visual button short-circuit: first propose, num={num_proposals}")
+            yield {"type": "thinking", "delta": "用户点了「素材已齐，开始生成」按钮，直接进入提案生成。"}
+            yield {
+                "type": "result",
+                "data": {
+                    "action": "propose_styles",
+                    "response": f"好的，正在基于你上传的素材生成 {num_proposals} 套风格提案，请稍候片刻..."
+                }
+            }
+            return
+        if msg_stripped == MAGIC_PROPOSE_REGEN:
+            logger.info(f"[Chat] Visual button short-circuit: regen propose, num={num_proposals}")
+            yield {"type": "thinking", "delta": "用户点了「重新生成提案」按钮，基于最新素材重新生成。"}
+            yield {
+                "type": "result",
+                "data": {
+                    "action": "propose_styles",
+                    "response": f"好的，基于你最新上传的素材和我们的讨论，重新给你生成 {num_proposals} 套提案..."
+                }
+            }
+            return
+
     # 根据 agent_role 选择 system prompt
     if agent_role == "visual":
-        system_prompt = _build_visual_prompt(content_plan_summary, assets_summary)
+        system_prompt = _build_visual_prompt(content_plan_summary, assets_summary, num_proposals=project_context.get("num_proposals", 3))
     elif agent_role == "finetune":
         # 单页微调：构建当前页上下文
         current_slide_info = ""
@@ -436,6 +608,9 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
         model=settings.MINIMAX_LLM_MODEL,
         messages=messages,
         temperature=0.5 if is_draft and agent_role != "visual" else 0.4 if agent_role == "visual" else 0.1,
+        # 长度护栏：think 段 + JSON content 总上限。给 think 留 ~3000，给 JSON 留 ~1500。
+        # 防止 LLM 把整本规划塞进 response 字段导致流截断、JSON 残废、用户看到"响应未返回完整结果"。
+        max_tokens=4096,
         stream=True,
     )
 
@@ -561,13 +736,20 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             force_generate = any(k in user_msg_lower for k in ["直接生成", "开始生成", "就这样", "开始吧", "生成吧", "确认生成", "生成", "走起", "开搞", "开始制作"])
             force_propose = any(k in user_msg_lower for k in ["做个ppt", "做一个", "帮我做", "生成ppt", "做成ppt"])
 
+            # 关键上下文：用户是否已经在"反馈调整"阶段（历史中有过提案）
+            has_prior_proposal = _history_has_prior_proposal(history, agent_role)
+
             if clean and len(clean) > 5:
                 if agent_role == "visual":
-                    result = {"action": "answer", "response": clean}
+                    # 视觉：如果已经有提案，用户反馈应视为调整，而不是普通 answer
+                    result = {"action": "propose_styles" if has_prior_proposal else "answer", "response": clean}
                 else:
                     if is_draft and force_generate:
                         result = {"action": "generate_plan", "response": clean}
                     elif is_draft and force_propose:
+                        result = {"action": "propose_plan", "response": clean}
+                    elif is_draft and has_prior_proposal:
+                        # 内容：已经有提案，用户现在在提修改意见 → 必须重新 propose_plan，不能 collect_content
                         result = {"action": "propose_plan", "response": clean}
                     else:
                         result = {"action": "answer" if not is_draft else "collect_content", "response": clean}
@@ -578,6 +760,8 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
                     result = {"action": "generate_plan", "response": "好的，我立即为你开始生成内容规划。"}
                 elif is_draft and force_propose:
                     result = {"action": "propose_plan", "response": "好的，我基于你的需求输出内容定调摘要。"}
+                elif is_draft and has_prior_proposal:
+                    result = {"action": "propose_plan", "response": "已收到你的调整意见，正在重新输出定调摘要..."}
                 elif is_draft:
                     result = {"action": "collect_content", "response": "抱歉，我没太听懂，能再详细说说你的需求吗？比如主题是什么、给谁看、核心想传达什么？"}
                 else:
@@ -586,43 +770,15 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
     # 角色权限过滤：视觉总监不能返回内容规划相关 action
     if result and isinstance(result, dict):
         if agent_role == "visual":
-            allowed_actions = {
-                "collect_assets",
-                "propose_styles",
-                "adjust_style",
-                "confirm_style",
-                "reroll_page_visual_plan",
-                "update_slide_visual",
-                "update_all_slides_visual",
-                "request_generate_image",
-                "forward_to_content",
-                "answer",
-            }
+            allowed_actions = VISUAL_ACTIONS
             if result.get("action") not in allowed_actions:
                 result["action"] = "answer"
         elif agent_role == "content":
-            allowed_actions = {
-                "diagnose",
-                "collect_content",
-                "propose_plan",
-                "generate_plan",
-                "regenerate_pages",
-                "retry_failed",
-                "update_style",
-                "update_slide_content",
-                "update_all_slides",
-                "regenerate_plan",
-                "add_slide_before",
-                "add_slide_after",
-                "answer",
-            }
+            allowed_actions = CONTENT_ACTIONS
             if result.get("action") not in allowed_actions:
                 result["action"] = "answer"
         elif agent_role == "finetune":
-            allowed_actions = {
-                "refine_slide",
-                "answer",
-            }
+            allowed_actions = FINETUNE_ACTIONS
             if result.get("action") not in allowed_actions:
                 result["action"] = "answer"
     elif result and not isinstance(result, dict):
@@ -631,6 +787,57 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             result = {"action": "answer", "response": "抱歉，我没太理解你的视觉需求。你可以直接描述喜欢的风格（如「想要小红书那种温暖、生活感的调性」），或者上传参考图让我更精准地把握方向。"}
         else:
             result = {"action": "answer", "response": "抱歉，我不太理解您的指令，请尝试说\"重新生成第3页\"或\"重试失败的页面\"。"}
+
+    if result and isinstance(result, dict) and agent_role == "content":
+        coerced_result = _coerce_content_regenerate_action(result, user_message, project_context, is_draft)
+        if coerced_result.get("action") != result.get("action"):
+            logger.info(
+                "[Chat] Content feedback fallback: forced regenerate_plan from %s (msg=%r)",
+                result.get("action"),
+                user_message[:80],
+            )
+        result = coerced_result
+
+    # 【Fix-3】修改意见强制重生成：JSON 解析成功但 action 不对时，根据上下文强制纠正
+    # 场景：用户已经看过提案，现在给出修改意见，但 LLM 返回了 answer/collect_content（常见于流截断后的解析歧义）
+    if result and isinstance(result, dict):
+        current_action = result.get("action", "")
+        if current_action in ("answer", "collect_content"):
+            has_prior = _history_has_prior_proposal(history, agent_role)
+            if has_prior:
+                # 内容总监：强制 propose_plan，让用户能看到新的提案卡片
+                if agent_role == "content" and is_draft:
+                    logger.info(f"[Chat] Fix-3 triggered: forced propose_plan from {current_action} (user feedback after prior proposal)")
+                    result["action"] = "propose_plan"
+                    if not result.get("response"):
+                        result["response"] = "已收到你的调整意见，正在重新输出定调摘要..."
+                # 视觉总监：强制 adjust_style（有现成提案）或 propose_styles（无现成提案但用户要生成）
+                elif agent_role == "visual":
+                    logger.info(f"[Chat] Fix-3 triggered: forced adjust_style from {current_action} (user feedback after prior proposal)")
+                    result["action"] = "adjust_style"
+                    if not result.get("response"):
+                        result["response"] = "已根据你的反馈调整风格方案，请查看下方新卡片。"
+
+    # 安全网：确保 result 始终有非空 response 字段，防止前端显示 "..."
+    if result and isinstance(result, dict) and result.get("action") not in ("forward_to_visual", "forward_to_content"):
+        if not result.get("response"):
+            action = result.get("action", "")
+            fallback_map = {
+                "update_slide_content": "内容已更新，请查看左侧页面预览。",
+                "update_all_slides": "所有页面内容已更新，请查看左侧预览。",
+                "regenerate_pages": "页面正在重新生成。",
+                "regenerate_plan": "内容规划正在重新生成。",
+                "retry_failed": "正在重试失败的页面。",
+                "update_style": "风格已更新。",
+                "add_slide_before": "已在目标页前插入新页面。",
+                "add_slide_after": "已在目标页后插入新页面。",
+                "collect_content": "请继续告诉我更多细节。",
+                "propose_plan": "内容定调摘要已生成，请查看。",
+                "generate_plan": "内容规划生成中，请稍候。",
+                "diagnose": "分析完成，请查看我的建议。",
+                "answer": "",
+            }
+            result["response"] = fallback_map.get(action) or "操作已完成。"
 
     # 视觉总监 fallback：如果 JSON 解析失败导致返回了 answer，但用户明显表达了具体修改意图，
     # 再发一次低 temperature 请求强制输出 JSON，避免用户指令被忽略。
@@ -667,6 +874,21 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             except Exception as e:
                 logger.warning(f"[Chat] Visual director fallback failed: {e}")
 
+    # 【兜底】视觉总监关键词兜底：用户消息明确表达"生成提案/做风格"等意图，
+    # 但 LLM 返回了 answer/聊天文本，强制纠正为 propose_styles，确保推进到下一步。
+    if result and isinstance(result, dict) and agent_role == "visual" and result.get("action") == "answer":
+        propose_keywords = [
+            "生成提案", "开始生成", "重新生成", "重新提案",
+            "生成风格", "出方案", "出提案", "做风格", "出风格",
+            "素材已齐", "可以生成", "开始做"
+        ]
+        if any(k in user_message for k in propose_keywords):
+            logger.info(f"[Chat] Visual director keyword fallback: forced propose_styles from answer (msg={user_message[:50]!r})")
+            result = {
+                "action": "propose_styles",
+                "response": "好的，正在基于你的素材生成风格提案，请稍候..."
+            }
+
     logger.info(f"Chat stream: yielding result, action={result.get('action') if isinstance(result, dict) else 'n/a'}, content_len={len(result.get('response', '')) if isinstance(result, dict) else 0}")
     yield {"type": "result", "data": result}
 
@@ -680,13 +902,27 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
 
     slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
     completed = sum(1 for s in slides if s.status == "completed")
+    failed = sum(1 for s in slides if s.status == "failed")
+
+    # 风格提案数量：与 projects.py:188 的判定一致（有 logo/style_ref/template 任一即视为"有风格素材"，生成 1 套；否则 3 套）
+    has_style_assets = any(
+        ref.role in {"logo", "style_ref", "template"}
+        for ref in (project.reference_images or [])
+    )
+    num_proposals = 1 if has_style_assets else 3
 
     context = {
         "title": project.title,
         "status": project.status,
         "total_slides": len(slides),
         "completed_slides": completed,
+        "failed_slides": failed,
+        "has_failed_slides": failed > 0,
+        "has_selected_style": bool(project.selected_style),
+        "has_prompts": any(bool(s.prompt_text) for s in slides),
+        "has_images": any(bool(s.image_path) for s in slides),
         "content_plan_confirmed": project.content_plan_confirmed or False,
+        "num_proposals": num_proposals,
     }
 
     documents = load_project_documents(project_id)
@@ -707,23 +943,79 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
 
     # 构建素材摘要（视觉总监使用）
     assets_summary = ""
-    if body.agent_role == "visual" and project.reference_images:
-        asset_counts: dict[str, int] = {}
-        has_template = False
-        for ref in project.reference_images:
-            if ref.role == "template":
-                has_template = True
-            else:
-                asset_counts[ref.role] = asset_counts.get(ref.role, 0) + 1
-        parts = []
-        if asset_counts.get("logo", 0):
-            parts.append(f"- Logo：{asset_counts['logo']} 张")
-        if asset_counts.get("style_ref", 0):
-            parts.append(f"- 风格参考图：{asset_counts['style_ref']} 张")
-        if has_template:
-            parts.append("- 参考模板：已上传（含封面/目录/内容/封底种子页）")
-        if asset_counts.get("content_ref", 0):
-            parts.append(f"- 内容配图：{asset_counts['content_ref']} 张（页面级）")
+    if body.agent_role == "visual":
+        parts: list[str] = []
+
+        # 1. 当前已有的风格提案（锚点）—— 用户调整时必须基于此修改
+        if project.style_proposal and isinstance(project.style_proposal, dict):
+            proposals = project.style_proposal.get("proposals", [])
+            if proposals and isinstance(proposals, list):
+                current = proposals[0]
+                if isinstance(current, dict):
+                    name = current.get("name", "")
+                    mood = current.get("mood", "")
+                    font = current.get("font", "")
+                    palette = current.get("palette", [])
+                    palette_str = ""
+                    if isinstance(palette, list):
+                        palette_items = []
+                        for c in palette:
+                            if isinstance(c, dict):
+                                palette_items.append(
+                                    f"{c.get('name', '')}({c.get('hex', '')}, {c.get('role', '')})"
+                                )
+                        palette_str = "、".join(palette_items)
+                    parts.append("【当前已存在的风格提案（如用户提出调整，必须基于此修改）】")
+                    parts.append(f"  - 风格名：{name}")
+                    parts.append(f"  - 调性：{mood}")
+                    parts.append(f"  - 字体：{font}")
+                    if palette_str:
+                        parts.append(f"  - 配色：{palette_str}")
+                    desc = current.get("description", "")
+                    if desc:
+                        parts.append(f"  - 说明：{desc[:200]}")
+                    parts.append("")
+
+        # 2. 已上传素材
+        if project.reference_images:
+            asset_counts: dict[str, int] = {}
+            has_template = False
+            visual_asset_details: list[str] = []
+            for ref in project.reference_images:
+                if ref.role == "template":
+                    has_template = True
+                else:
+                    asset_counts[ref.role] = asset_counts.get(ref.role, 0) + 1
+                # 收集 visual_asset 的分析结果（已持久化的部分）
+                if ref.role == "visual_asset" and ref.asset_analysis and isinstance(ref.asset_analysis, dict):
+                    a = ref.asset_analysis
+                    name = ref.asset_name or a.get("subject", "核心资产")
+                    features = a.get("distinctive_features", "") or a.get("description", "")
+                    usage = a.get("recommended_usage", "")
+                    detail = f"  • {name}"
+                    if features:
+                        detail += f"：{str(features)[:80]}"
+                    if usage:
+                        detail += f"（建议用途：{str(usage)[:60]}）"
+                    visual_asset_details.append(detail)
+
+            asset_lines: list[str] = []
+            if asset_counts.get("logo", 0):
+                asset_lines.append(f"- 品牌 Logo：{asset_counts['logo']} 张（颜色/调性由后端提取，禁止臆测）")
+            if asset_counts.get("visual_asset", 0):
+                asset_lines.append(f"- 核心资产：{asset_counts['visual_asset']} 个（全局可用，按页面内容智能调用）")
+                asset_lines.extend(visual_asset_details)
+            if asset_counts.get("style_ref", 0):
+                asset_lines.append(f"- 风格参考：{asset_counts['style_ref']} 张（色彩/构图/字体由后端提取，禁止臆测）")
+            if has_template:
+                asset_lines.append("- 版式模板：已上传（含封面/目录/内容/封底页）")
+            if asset_counts.get("content_ref", 0):
+                asset_lines.append(f"- 内容配图：{asset_counts['content_ref']} 张（页面级）")
+            if asset_lines:
+                if parts:
+                    parts.append("【已上传素材】")
+                parts.extend(asset_lines)
+
         if parts:
             assets_summary = "\n".join(parts)
 
@@ -738,10 +1030,11 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
                 body.message, context, body.history, documents,
                 body.page_context, body.agent_role, content_plan_summary, assets_summary
             ):
-                line = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if event.get("type") == "result":
+                    event = {**event, "data": with_next_action(event.get("data"), context, body.agent_role)}
                     result_data = event.get("data")
                     _logger.info(f"Chat API: yielding result action={result_data.get('action') if isinstance(result_data, dict) else 'n/a'}")
+                line = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 yield line
         except Exception as e:
             _logger.error(f"Chat API: stream exception: {e}", exc_info=True)

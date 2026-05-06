@@ -18,25 +18,44 @@ from app.models.models import Project, Slide, ReferenceImage, SlideVersion
 from app.schemas.project import SlideResponse
 from app.core.llm_client import get_llm_client
 from app.utils.project_docs import load_project_documents
-from app.utils.reference_image import reference_process_mode_instruction
+from app.utils.text_cleaning import normalize_markdown_emphasis
+from app.utils.reference_image import (
+    ALLOWED_VISUAL_ASSET_KINDS,
+    default_visual_asset_process_mode,
+    normalize_visual_asset_kind,
+    reference_process_mode_instruction,
+)
 
 # 全局运行中任务跟踪（project_id -> asyncio.Task）
 _running_tasks: dict = {}
 _running_tasks_lock = asyncio.Lock()
 from app.core.config import settings
 from app.services.content_plan import generate_content_plan
+from app.services.logo_policy import (
+    DEFAULT_LOGO_ANCHOR,
+    LOGO_ANCHORS,
+    logo_anchor_from_ref,
+    normalize_logo_anchor,
+    should_show_logo,
+    should_use_logo_as_scene_asset,
+)
+from app.services.logo_assets import prepare_logo_overlay_image
 from app.services.visual_plan import generate_visual_plan
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
-from app.services.image_analyzer import analyze_reference_image
+from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
+from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset
 from app.tasks import generate_slides_task, redis_client
 from app.services.run_state import (
     cancel_active_run,
     create_project_run,
     finish_run,
     get_active_run,
+    get_latest_run,
     mark_run_running,
+    normalize_confirmed_project_stage,
     reconcile_project_state,
     serialize_run,
+    serialize_workflow_status,
     set_run_task,
     stale_active_run,
     target_counts,
@@ -52,7 +71,8 @@ logger = logging.getLogger(__name__)
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
-ALLOWED_UPLOAD_ROLES = {"style_ref", "logo", "template", "content_ref", "chart_ref", "finetune_ref"}
+ALLOWED_UPLOAD_ROLES = {"style_ref", "logo", "template", "visual_asset", "content_ref", "chart_ref", "finetune_ref"}
+MAX_VISUAL_ASSETS_PER_PROJECT = 30
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg",
     "image/png",
@@ -69,31 +89,51 @@ ALLOWED_IMAGE_TYPES = {
 
 
 def _style_text_from_selected_style(selected_style: dict | str | None) -> str | None:
-    if not selected_style:
+    return style_pack_from_selected_style(selected_style)
+
+
+def _style_override_from_text(style_text: str | None) -> dict | None:
+    if not style_text:
         return None
-    try:
-        style_obj = json.loads(selected_style) if isinstance(selected_style, str) else selected_style
-    except Exception:
-        return None
-    if not isinstance(style_obj, dict):
-        return None
-    palette = style_obj.get("palette", [])
-    mood = style_obj.get("mood", "")
-    font = style_obj.get("font", "")
-    description = style_obj.get("description", "")
-    adaptation = style_obj.get("page_type_adaptation", "")
-    reference_usage = style_obj.get("reference_usage", "")
-    return f"""Style: {style_obj.get('name', 'Custom')}
-Palette: {', '.join(str(c) for c in palette[:5]) if isinstance(palette, list) else str(palette)}
-Mood: {mood}
-Font: {font}
-Reference usage: {reference_usage or 'style text only unless template/page references are present'}
-Page type adaptation: {adaptation}
-Description: {description}"""
+    palette = []
+    mood = ""
+    style_name = "Content-derived style pack"
+    for line in style_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Style:"):
+            style_name = stripped.split(":", 1)[1].strip() or style_name
+        elif stripped.startswith("Palette:"):
+            palette = [p.strip() for p in stripped.split(":", 1)[1].split(",") if p.strip()][:5]
+        elif stripped.startswith("Mood:"):
+            mood = stripped.split(":", 1)[1].strip()
+    return {
+        "meta": {
+            "theme": style_name,
+            "style_name": style_name,
+            "palette": palette,
+            "mood": mood,
+        },
+        "body": style_text,
+    }
+
+
+def _derive_project_style_pack(project: Project, content_plan: list[dict]) -> str:
+    selected = _style_text_from_selected_style(project.selected_style)
+    if selected:
+        return selected
+    analyses = []
+    for ref in project.reference_images or []:
+        if ref.role != "style_ref" or ref.slide_id or not os.path.exists(ref.file_path):
+            continue
+        try:
+            analyses.append(analyze_reference_image(ref.file_path))
+        except Exception as exc:
+            logger.warning(f"StylePack: failed to analyze style_ref {ref.file_path}: {exc}")
+    return derive_style_pack_from_content(content_plan, reference_analyses=analyses)
 
 
 def _project_template_refs_for_prompt(project: Project) -> list[dict]:
-    """Only template pages are global prompt references; style_ref/logo are handled elsewhere."""
+    """Template pages are global layout references; style_ref is handled as text style."""
     refs = []
     for img in project.reference_images or []:
         if img.role != "template":
@@ -105,6 +145,217 @@ def _project_template_refs_for_prompt(project: Project) -> list[dict]:
             "description": img.file_path,
         })
     return refs
+
+
+def _project_logo_refs_for_prompt(project: Project, page_intent: dict | None = None) -> list[dict]:
+    refs = []
+    for img in project.reference_images or []:
+        if img.role != "logo" or img.slide_id:
+            continue
+        if not should_use_logo_as_scene_asset(page_intent or {}, img):
+            break
+        refs.append({
+            "id": img.id,
+            "role": "logo",
+            "process_mode": "blend",
+            "description": img.file_path,
+            "logo_anchor": logo_anchor_from_ref(img),
+        })
+        break
+    return refs
+
+
+def _project_logo_ref(project: Project) -> ReferenceImage | None:
+    return next(
+        (
+            img for img in project.reference_images or []
+            if img.role == "logo" and not img.slide_id
+        ),
+        None,
+    )
+
+
+def _logo_overlay_url(ref: ReferenceImage, project_id: str) -> str | None:
+    if ref.role != "logo" or not ref.file_path or not os.path.exists(ref.file_path):
+        return None
+    overlay_path = prepare_logo_overlay_image(ref.file_path)
+    if not overlay_path or not os.path.exists(overlay_path):
+        return None
+    return f"/uploads/{project_id}/{os.path.basename(overlay_path)}"
+
+
+def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dict | None:
+    if not isinstance(page_intent, dict):
+        return page_intent
+    logo_ref = _project_logo_ref(project)
+    if not logo_ref:
+        return page_intent
+    intent = copy.deepcopy(page_intent)
+    policy = intent.get("logo_policy") if isinstance(intent.get("logo_policy"), dict) else {}
+    page_type = str(intent.get("type") or "").lower()
+    if page_type not in {"cover", "ending"}:
+        policy["placement"] = logo_anchor_from_ref(logo_ref)
+    intent["logo_policy"] = policy
+    return intent
+
+
+def _visual_asset_summary(ref: ReferenceImage) -> str:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    parts = []
+    if ref.asset_name:
+        parts.append(f"name={ref.asset_name}")
+    if ref.asset_kind:
+        parts.append(f"kind={ref.asset_kind}")
+    if ref.usage_note:
+        parts.append(f"user_note={ref.usage_note}")
+    subject = analysis.get("subject")
+    if subject and subject != ref.asset_name:
+        parts.append(f"subject={subject}")
+    if analysis.get("description"):
+        parts.append(f"description={analysis['description']}")
+    identity_elements = analysis.get("identity_elements")
+    if isinstance(identity_elements, list) and identity_elements:
+        parts.append("identity_elements=" + "、".join(str(x) for x in identity_elements[:6]))
+    features = analysis.get("distinctive_features")
+    if isinstance(features, list) and features:
+        parts.append("features=" + "、".join(str(x) for x in features[:5]))
+    must_not_change = analysis.get("must_not_change")
+    if isinstance(must_not_change, list) and must_not_change:
+        parts.append("must_not_change=" + "、".join(str(x) for x in must_not_change[:6]))
+    keywords = analysis.get("suggested_keywords")
+    if isinstance(keywords, list) and keywords:
+        parts.append("keywords=" + "、".join(str(x) for x in keywords[:8]))
+    if analysis.get("recommended_usage"):
+        parts.append(f"recommended_usage={analysis['recommended_usage']}")
+    if analysis.get("fidelity_note"):
+        parts.append(f"fidelity={analysis['fidelity_note']}")
+    return "; ".join(parts)
+
+
+def _project_visual_assets_for_planning(project: Project) -> list[dict]:
+    assets = []
+    for ref in project.reference_images or []:
+        if ref.role != "visual_asset" or ref.slide_id:
+            continue
+        assets.append({
+            "id": ref.id,
+            "name": ref.asset_name or os.path.splitext(os.path.basename(ref.file_path or ""))[0],
+            "kind": ref.asset_kind or "other",
+            "process_mode": ref.process_mode or default_visual_asset_process_mode(ref.asset_kind),
+            "usage_note": ref.usage_note or "",
+            "analysis_summary": _visual_asset_summary(ref),
+        })
+    return assets
+
+
+def _project_refs_for_prompt(
+    project: Project,
+    visual_asset_ids: list[str] | None = None,
+    page_intent: dict | None = None,
+) -> list[dict]:
+    refs = []
+    wanted = set(visual_asset_ids or [])
+    if wanted:
+        for img in project.reference_images or []:
+            if img.role != "visual_asset" or img.id not in wanted:
+                continue
+            refs.append({
+                "id": img.id,
+                "role": img.role,
+                "process_mode": img.process_mode or default_visual_asset_process_mode(img.asset_kind),
+                "description": _visual_asset_summary(img) or img.file_path,
+                "asset_name": img.asset_name,
+                "asset_kind": img.asset_kind,
+                "usage_note": img.usage_note,
+            })
+    refs.extend(_project_logo_refs_for_prompt(project, page_intent))
+    refs.extend(_project_template_refs_for_prompt(project))
+    return refs
+
+
+def _invalidate_visual_asset_dependent_outputs(project: Project):
+    """
+    Core visual assets affect matching, prompts, and generated images, but not the
+    selected style. Keep the style choice intact and move downstream outputs back
+    to visual planning.
+    """
+    if project.status in {"prompt_ready", "prototype_ready", "completed", "failed"}:
+        project.status = "visual_ready"
+    for slide in project.slides or []:
+        if slide.prompt_text:
+            slide.prompt_text = None
+        if slide.status in {"prompt_ready", "completed", "failed"}:
+            slide.status = "visual_ready"
+
+
+def _clear_slide_generation_outputs(slide: Slide, *, clear_visual: bool):
+    if clear_visual:
+        slide.visual_json = {}
+    slide.prompt_text = None
+    slide.image_path = None
+    slide.error_msg = None
+
+
+def _invalidate_content_dependent_outputs(project: Project):
+    """Content edits require a fresh confirmation before visual work continues."""
+    project.content_plan_confirmed = False
+    project.style_proposal = None
+    project.selected_style = None
+    project.status = "planning" if project.slides else "draft"
+    for slide in project.slides or []:
+        _clear_slide_generation_outputs(slide, clear_visual=True)
+        slide.status = "pending"
+
+
+def _invalidate_style_dependent_outputs(project: Project):
+    """Style-source changes keep confirmed content, but invalidate visual outputs."""
+    project.style_proposal = None
+    project.selected_style = None
+    if project.slides:
+        project.status = "visual_ready" if project.content_plan_confirmed else "planning"
+    for slide in project.slides or []:
+        _clear_slide_generation_outputs(slide, clear_visual=True)
+        slide.status = "pending"
+
+
+def _invalidate_visual_plan_dependent_outputs(project: Project, slides: list[Slide]):
+    """Visual edits/page refs invalidate prompts and images, not confirmed content."""
+    if project.status in {"prompt_ready", "prototype_ready", "completed", "failed"}:
+        project.status = "visual_ready"
+    for slide in slides:
+        slide.prompt_text = None
+        slide.image_path = None
+        slide.error_msg = None
+        if slide.status in {"prompt_ready", "completed", "failed"}:
+            slide.status = "visual_ready"
+
+
+def _resolve_generation_page_nums(slides: list[Slide], requested_page_nums: list[int] | None, prototype: bool) -> list[int] | None:
+    """Resolve generation targets. Prototype without explicit pages samples the first 3 slides."""
+    if prototype and not requested_page_nums:
+        return [s.page_num for s in slides[:3]]
+    return requested_page_nums
+
+
+def _normalize_content_json_markdown(content_json: dict) -> dict:
+    """Normalize Markdown fields at API boundaries while preserving structure."""
+    if not isinstance(content_json, dict):
+        return content_json
+    content = copy.deepcopy(content_json)
+    text_content = content.get("text_content")
+    if isinstance(text_content, dict):
+        for key in ("headline", "subhead", "body"):
+            value = text_content.get(key)
+            if isinstance(value, str):
+                text_content[key] = normalize_markdown_emphasis(value)
+            elif isinstance(value, list):
+                text_content[key] = [
+                    normalize_markdown_emphasis(item) if isinstance(item, str) else item
+                    for item in value
+                ]
+    if isinstance(content.get("speaker_notes"), str):
+        content["speaker_notes"] = normalize_markdown_emphasis(content["speaker_notes"])
+    return content
 
 
 def _update_progress(project_id: str, data: dict, run_id: str | None = None):
@@ -262,6 +513,15 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
             on_progress=report_progress,
         )
         logger.info(f"[ContentPlan BG] Generated {len(outline)} pages")
+        update_run_progress(
+            db,
+            run_id,
+            stage="saving",
+            message="正在保存结果...",
+            total_count=len(outline),
+            completed_count=len(outline),
+        )
+        db.commit()
         _update_progress(project_id, {"stage": "saving", "message": "正在保存结果...", "current_page": len(outline), "total_pages": len(outline)}, run_id)
         # 删除旧的 slides（如果存在）
         db.query(Slide).filter(Slide.project_id == project_id).delete()
@@ -279,6 +539,9 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
             project.status = "planning"
+            project.content_plan_confirmed = False
+            project.style_proposal = None
+            project.selected_style = None
         finish_run(
             db,
             run_id,
@@ -286,6 +549,10 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
             message=f"内容规划已生成，共 {len(outline)} 页",
             completed_count=len(outline),
         )
+        # 内容规划生成完成，设置未读通知
+        if project:
+            project.has_unread_notification = True
+            project.unread_notification_message = "内容规划已生成"
         db.commit()
         logger.info(f"[ContentPlan BG] Completed for project={project_id}")
     except Exception as e:
@@ -384,7 +651,13 @@ def list_slides(project_id: str, db: Session = Depends(get_db)):
                     "id": ref.id,
                     "role": ref.role,
                     "process_mode": ref.process_mode or "blend",
+                    "asset_name": ref.asset_name,
+                    "asset_kind": ref.asset_kind,
+                    "usage_note": ref.usage_note,
+                    "asset_analysis": ref.asset_analysis,
+                    "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
                     "url": f"/uploads/{project_id}/{os.path.basename(ref.file_path)}",
+                    "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" else None,
                 }
                 for ref in refs_by_slide.get(s.id, [])
             ],
@@ -442,11 +715,16 @@ def create_visual_plan(
     # 获取参考图 ID（如果有）
     ref_images = project.reference_images
     ref_ids = [img.id for img in ref_images] if ref_images else None
+    global_visual_assets = _project_visual_assets_for_planning(project)
+    style_text_override = _derive_project_style_pack(project, content_plan)
+    style_override = _style_override_from_text(style_text_override)
 
     visual_plan = generate_visual_plan(
         content_plan=content_plan,
         style_id=project.style_id or "default",
         reference_image_ids=ref_ids,
+        style_override=style_override,
+        global_visual_assets=global_visual_assets,
     )
 
     # 保存 visual_plan 到每页 slide（只更新选中的页，或全部）
@@ -518,17 +796,28 @@ def create_prompts(
         if ref_user_hints.get(s.page_num):
             item["reference_user_hint"] = ref_user_hints[s.page_num]
         content_plan.append(item)
-    visual_plan = [s.visual_json for s in target_slides if s.visual_json]
+    visual_plan = [
+        _with_project_logo_policy(s.visual_json, project)
+        for s in target_slides
+        if s.visual_json
+    ]
 
-    # 仅模板作为项目级参考；style_ref/logo 已被转成 style_text，不作为参考图。
-    ref_images = _project_template_refs_for_prompt(project)
-    style_text_override = _style_text_from_selected_style(project.selected_style)
+    # style_ref 已被转成 style_text；Logo 按页面级 policy 融合，visual_asset 按页选择。
+    ref_images_by_page = {
+        s.page_num: _project_refs_for_prompt(
+            project,
+            (s.visual_json or {}).get("visual_asset_ids") if isinstance(s.visual_json, dict) else [],
+            _with_project_logo_policy(s.visual_json, project) if isinstance(s.visual_json, dict) else None,
+        )
+        for s in target_slides
+    }
+    style_text_override = _style_text_from_selected_style(project.selected_style) or _derive_project_style_pack(project, content_plan)
 
     prompts = generate_prompts_for_all_pages(
         visual_plan=visual_plan,
         content_plan=content_plan,
         style_id="default",
-        reference_images=ref_images or None,
+        reference_images_by_page=ref_images_by_page,
         style_text_override=style_text_override,
     )
 
@@ -580,22 +869,8 @@ async def create_visual_and_prompts(
     ref_images_project = project.reference_images
     ref_ids = [img.id for img in ref_images_project] if ref_images_project else None
 
-    style_override = None
-    style_text_override = _style_text_from_selected_style(project.selected_style)
-    if project.selected_style:
-        palette = project.selected_style.get("palette", [])
-        mood = project.selected_style.get("mood", "")
-        font = project.selected_style.get("font", "")
-        style_override = {
-            "meta": {
-                "palette": palette[:5] if isinstance(palette, list) else [],
-                "mood": mood,
-                "font": font,
-            },
-            "body": style_text_override,
-        }
-    ref_images = _project_template_refs_for_prompt(project)
-
+    style_text_override = _derive_project_style_pack(project, content_plan)
+    style_override = _style_override_from_text(style_text_override)
     target_page_nums = [s.page_num for s in target_slides] if body.page_nums else None
     try:
         run = create_project_run(
@@ -683,23 +958,11 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
 
         ref_images_project = project.reference_images
         ref_ids = [img.id for img in ref_images_project] if ref_images_project else None
+        global_visual_assets = _project_visual_assets_for_planning(project)
 
-        style_override = None
-        style_text_override = _style_text_from_selected_style(project.selected_style)
-        if project.selected_style:
-            palette = project.selected_style.get("palette", [])
-            mood = project.selected_style.get("mood", "")
-            font = project.selected_style.get("font", "")
-            style_override = {
-                "meta": {
-                    "palette": palette[:5] if isinstance(palette, list) else [],
-                    "mood": mood,
-                    "font": font,
-                },
-                "body": style_text_override,
-            }
-        ref_images = _project_template_refs_for_prompt(project)
-        # 注意：页面级参考图已通过 content_plan 的 reference_context 传递，不再塞进全局 reference_images
+        style_text_override = _derive_project_style_pack(project, content_plan)
+        style_override = _style_override_from_text(style_text_override)
+        # 注意：页面级参考图已通过 content_plan 的 reference_context 传递；visual_asset 按页选择。
 
         # Step 1: 生成 Visual Plan
         _update_progress(project_id, {
@@ -714,6 +977,7 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
             style_id=project.style_id or "default",
             reference_image_ids=ref_ids,
             style_override=style_override,
+            global_visual_assets=global_visual_assets,
             progress_callback=lambda progress: _update_progress(project_id, {
                 "stage": progress.get("stage", "visual_planning") if isinstance(progress, dict) else "visual_planning",
                 "message": progress.get("message", "正在生成视觉方案") if isinstance(progress, dict) else str(progress),
@@ -731,7 +995,11 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
         db.commit()
 
         # Step 2: 并发生成 Prompts（最多 5 个并发，避免 API 限流）
-        visual_plan_for_prompts = [s.visual_json for s in target_slides if s.visual_json]
+        visual_plan_for_prompts = [
+            _with_project_logo_policy(s.visual_json, project)
+            for s in target_slides
+            if s.visual_json
+        ]
         content_plan_for_prompts = content_plan
         content_by_page = {item["page_num"]: item.get("text_content", {}) for item in content_plan_for_prompts}
 
@@ -751,7 +1019,7 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
                         page_intent=intent,
                         content_text=content_text,
                         style_id=project.style_id or "default",
-                        reference_images=ref_images or None,
+                        reference_images=_project_refs_for_prompt(project, intent.get("visual_asset_ids") or [], intent) or None,
                         style_text_override=style_text_override,
                     )
                 async with progress_lock:
@@ -871,6 +1139,12 @@ async def get_generation_status(project_id: str, db: Session = Depends(get_db)):
     task = _running_tasks.get(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     active_run = get_active_run(db, project_id)
+    if project and not active_run:
+        slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
+        before_status = project.status
+        normalize_confirmed_project_stage(project, slides, active_run)
+        if project.status != before_status:
+            db.commit()
 
     # 检查 asyncio 后台任务
     if active_run and task and not task.done():
@@ -936,19 +1210,7 @@ def start_generation(
     if not slides:
         raise HTTPException(status_code=400, detail="No slides found. Generate content plan first.")
 
-    page_nums = body.page_nums
-
-    # 种子页打样：自动找出所有种子页
-    if body.prototype and not page_nums:
-        seed_pages = [
-            s.page_num for s in slides
-            if s.visual_json and s.visual_json.get("is_seed_recommended")
-        ]
-        if seed_pages:
-            page_nums = seed_pages
-        else:
-            # 没有种子页时，默认生成前 4 页作为打样
-            page_nums = [s.page_num for s in slides[:4]]
+    page_nums = _resolve_generation_page_nums(slides, body.page_nums, bool(body.prototype))
 
     # 记录本次生成的目标页码，供前端进度显示用
     target_slides = [s for s in slides if s.page_num in page_nums] if page_nums else slides
@@ -992,7 +1254,7 @@ def confirm_prototype(
     project_id: str,
     db: Session = Depends(get_db),
 ):
-    """确认种子页打样结果，启动全量生成。"""
+    """确认打样结果，启动全量生成。"""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1006,7 +1268,7 @@ def confirm_prototype(
             detail=f"当前状态为 {project.status}，不支持确认打样。请先完成打样生成。"
         )
 
-    # 找出所有未完成的页（排除已成功的种子页）
+    # 找出所有未完成或失败的页，打样成功的页面不重复生成。
     slides = (
         db.query(Slide)
         .filter(Slide.project_id == project_id)
@@ -1125,6 +1387,12 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
             "error_msg": s.error_msg,
         })
 
+    active_run = get_active_run(db, project_id)
+    before_status = project.status
+    normalize_confirmed_project_stage(project, slides, active_run)
+    if project.status != before_status:
+        db.commit()
+
     pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
     pptx_path = os.path.join(
         settings.OUTPUT_DIR or "./outputs",
@@ -1133,7 +1401,6 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
     )
     has_pptx = os.path.exists(pptx_path)
 
-    active_run = get_active_run(db, project_id)
     target_count, target_completed, target_failed = target_counts(active_run, slides)
     progress = generation_progress.get(project_id, {})
     return {
@@ -1151,6 +1418,45 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         "pptx_path": pptx_path if has_pptx else None,
         "slides": slide_status,
     }
+
+
+@router.get("/{project_id}/workflow-status")
+def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
+    """获取统一的项目阶段、任务进度和页面状态。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    slides = (
+        db.query(Slide)
+        .filter(Slide.project_id == project_id)
+        .order_by(Slide.page_num)
+        .all()
+    )
+
+    active_run = get_active_run(db, project_id)
+    latest_run = get_latest_run(db, project_id)
+    before_status = project.status
+    normalize_confirmed_project_stage(project, slides, active_run)
+    if project.status != before_status:
+        db.commit()
+
+    pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
+    pptx_path = os.path.join(
+        settings.OUTPUT_DIR or "./outputs",
+        project_id,
+        pptx_filename,
+    )
+    has_pptx = os.path.exists(pptx_path)
+
+    return serialize_workflow_status(
+        project,
+        slides,
+        active_run=active_run,
+        latest_run=latest_run,
+        has_pptx=has_pptx,
+        pptx_path=pptx_path,
+    )
 
 
 @router.get("/{project_id}/generation-progress")
@@ -1222,7 +1528,11 @@ def upload_file(
     file: UploadFile = File(...),
     role: str = Form("style_ref"),
     slide_id: Optional[str] = Form(None),
-    process_mode: str = Form("blend"),
+    process_mode: Optional[str] = Form(None),
+    asset_name: Optional[str] = Form(None),
+    asset_kind: Optional[str] = Form(None),
+    usage_note: Optional[str] = Form(None),
+    logo_anchor: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     """上传参考图或 Logo 到项目目录。支持按页上传（传 slide_id）。"""
@@ -1236,8 +1546,22 @@ def upload_file(
             detail=f"Invalid role '{role}'. Allowed: {', '.join(sorted(ALLOWED_UPLOAD_ROLES))}",
         )
 
-    if process_mode not in {"blend", "crop", "original"}:
+    explicit_process_mode = process_mode is not None
+    if process_mode is not None and process_mode not in {"blend", "crop", "original"}:
         raise HTTPException(status_code=400, detail="Invalid process_mode. Allowed: blend, crop, original")
+    normalized_logo_anchor = normalize_logo_anchor(logo_anchor)
+
+    normalized_asset_kind = None
+    if role == "visual_asset":
+        if slide_id:
+            raise HTTPException(status_code=400, detail="visual_asset must be uploaded as a project-level asset")
+        normalized_asset_kind = normalize_visual_asset_kind(asset_kind)
+        if process_mode is None:
+            process_mode = default_visual_asset_process_mode(normalized_asset_kind)
+    elif role == "logo" and process_mode is None:
+        process_mode = "original"
+    elif process_mode is None:
+        process_mode = "blend"
 
     # 如果传了 slide_id，校验该 slide 存在
     if slide_id:
@@ -1245,8 +1569,19 @@ def upload_file(
         if not slide:
             raise HTTPException(status_code=404, detail="Slide not found")
 
-    # 数量限制：单页长期参考图最多 10 张；微调附件属于聊天上下文，不占长期参考图额度。
-    if role != "finetune_ref":
+    # 数量限制：单页长期参考图最多 10 张；全局视觉资产单独限额。
+    if role == "visual_asset" and not slide_id:
+        existing_count = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.slide_id.is_(None),
+            ReferenceImage.role == "visual_asset",
+        ).count()
+        if existing_count >= MAX_VISUAL_ASSETS_PER_PROJECT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"该项目已有 {existing_count} 张视觉资产，上限 {MAX_VISUAL_ASSETS_PER_PROJECT} 张",
+            )
+    elif role != "finetune_ref":
         existing_count = db.query(ReferenceImage).filter(
             ReferenceImage.project_id == project_id,
             ReferenceImage.slide_id == slide_id,
@@ -1300,21 +1635,66 @@ def upload_file(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"图片格式无法处理: {e}")
 
+    old_refs_to_remove: list[ReferenceImage] = []
+    if not slide_id and role == "logo":
+        old_refs_to_remove = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.slide_id.is_(None),
+            ReferenceImage.role == "logo",
+        ).all()
+
+    asset_analysis = None
+    cleaned_asset_name = (asset_name or "").strip() or None
+    cleaned_usage_note = (usage_note or "").strip() or None
+    if role == "visual_asset":
+        try:
+            asset_analysis = analyze_visual_asset(
+                file_path,
+                asset_name=cleaned_asset_name or os.path.splitext(os.path.basename(safe_name))[0],
+                asset_kind=normalized_asset_kind or "other",
+                usage_note=cleaned_usage_note or "",
+            )
+        except Exception as e:
+            logger.warning(f"Visual asset analysis failed for {file_path}: {e}")
+            asset_analysis = None
+        if not asset_kind and isinstance(asset_analysis, dict):
+            normalized_asset_kind = normalize_visual_asset_kind(asset_analysis.get("detected_kind"))
+            if not explicit_process_mode:
+                process_mode = default_visual_asset_process_mode(normalized_asset_kind)
+        if not cleaned_asset_name:
+            analyzed_subject = asset_analysis.get("subject") if isinstance(asset_analysis, dict) else None
+            cleaned_asset_name = analyzed_subject or os.path.splitext(os.path.basename(safe_name))[0]
+
     ref_image = ReferenceImage(
         project_id=project_id,
         slide_id=slide_id,
         file_path=file_path,
         role=role,
         process_mode=process_mode,
+        asset_name=cleaned_asset_name if role == "visual_asset" else None,
+        asset_kind=normalized_asset_kind if role == "visual_asset" else None,
+        usage_note=cleaned_usage_note if role == "visual_asset" else None,
+        asset_analysis=asset_analysis if role == "visual_asset" else None,
+        logo_anchor=normalized_logo_anchor if role == "logo" else None,
     )
     db.add(ref_image)
+    for old_ref in old_refs_to_remove:
+        db.delete(old_ref)
     if not slide_id and role in {"style_ref", "logo", "template"}:
-        project.style_proposal = None
-        project.selected_style = None
-        if role == "style_ref":
-            project.status = "planning" if project.slides else project.status
+        _invalidate_style_dependent_outputs(project)
+    if role == "visual_asset":
+        _invalidate_visual_asset_dependent_outputs(project)
+    if slide_id and role != "finetune_ref" and slide:
+        _invalidate_visual_plan_dependent_outputs(project, [slide])
     db.commit()
     db.refresh(ref_image)
+    for old_ref in old_refs_to_remove:
+        try:
+            if old_ref.file_path != file_path and os.path.exists(old_ref.file_path):
+                os.remove(old_ref.file_path)
+                logger.info(f"Deleted old logo file: {old_ref.file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete old logo file {old_ref.file_path}: {e}")
 
     return {
         "id": ref_image.id,
@@ -1322,7 +1702,13 @@ def upload_file(
         "role": role,
         "slide_id": slide_id,
         "process_mode": process_mode,
+        "asset_name": ref_image.asset_name,
+        "asset_kind": ref_image.asset_kind,
+        "usage_note": ref_image.usage_note,
+        "asset_analysis": ref_image.asset_analysis,
+        "logo_anchor": ref_image.logo_anchor,
         "url": f"/uploads/{project_id}/{filename}",
+        "overlay_url": _logo_overlay_url(ref_image, project_id) if role == "logo" else None,
     }
 
 
@@ -1352,8 +1738,14 @@ def list_reference_images(
             "role": img.role,
             "slide_id": img.slide_id,
             "process_mode": img.process_mode or "blend",
+            "asset_name": img.asset_name,
+            "asset_kind": img.asset_kind,
+            "usage_note": img.usage_note,
+            "asset_analysis": img.asset_analysis,
+            "logo_anchor": img.logo_anchor or (DEFAULT_LOGO_ANCHOR if img.role == "logo" else None),
             "file_exists": os.path.exists(img.file_path),
             "url": f"/uploads/{project_id}/{os.path.basename(img.file_path)}",
+            "overlay_url": _logo_overlay_url(img, project_id) if img.role == "logo" else None,
         }
         for img in images
     ]
@@ -1467,6 +1859,7 @@ def delete_reference_image(
         if project.selected_template_recommendations:
             project.selected_template_recommendations = None
             logger.info(f"Cleared template recommendations for project {project_id}")
+        _invalidate_style_dependent_outputs(project)
         db.commit()
         # 数据库提交成功后再删物理文件，文件删失败不影响事务
         for t_ref in all_template_refs:
@@ -1479,6 +1872,25 @@ def delete_reference_image(
         return {"message": "Deleted all template pages", "count": len(all_template_refs)}
 
     # 普通参考图/Logo 删除
+    if ref.role in {"style_ref", "logo"} and not ref.slide_id:
+        _invalidate_style_dependent_outputs(project)
+    if ref.slide_id and ref.role != "finetune_ref":
+        slide = db.query(Slide).filter(Slide.id == ref.slide_id, Slide.project_id == project_id).first()
+        if slide:
+            _invalidate_visual_plan_dependent_outputs(project, [slide])
+    if ref.role == "visual_asset":
+        slides = db.query(Slide).filter(Slide.project_id == project_id).all()
+        for slide in slides:
+            visual = copy.deepcopy(slide.visual_json) or {}
+            ids = visual.get("visual_asset_ids")
+            if isinstance(ids, list) and ref_id in ids:
+                visual["visual_asset_ids"] = [x for x in ids if x != ref_id]
+                usage = visual.get("visual_asset_usage")
+                if isinstance(usage, dict):
+                    usage.pop(ref_id, None)
+                    visual["visual_asset_usage"] = usage
+                slide.visual_json = visual
+        _invalidate_visual_asset_dependent_outputs(project)
     db.delete(ref)
     db.commit()
     try:
@@ -1497,10 +1909,17 @@ def update_reference_image(
     payload: dict = Body(...),
     db: Session = Depends(get_db),
 ):
-    """更新参考图的处理模式（blend/crop/original）。"""
+    """更新参考图的处理模式（blend/crop/original）和视觉资产元信息。"""
     process_mode = payload.get("process_mode")
-    if not process_mode or process_mode not in {"blend", "crop", "original"}:
+    if process_mode is not None and process_mode not in {"blend", "crop", "original"}:
         raise HTTPException(status_code=400, detail="Invalid process_mode. Allowed: blend, crop, original")
+    logo_anchor = payload.get("logo_anchor")
+    if logo_anchor is not None and str(logo_anchor).strip().lower().replace("_", "-") not in LOGO_ANCHORS:
+        raise HTTPException(status_code=400, detail="Invalid logo_anchor. Allowed: top-left, top-right, bottom-left, bottom-right")
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
 
     ref = db.query(ReferenceImage).filter(
         ReferenceImage.id == ref_id,
@@ -1509,13 +1928,60 @@ def update_reference_image(
     if not ref:
         raise HTTPException(status_code=404, detail="Reference image not found")
 
-    ref.process_mode = process_mode
+    changed_visual_asset = False
+    changed_logo = False
+    if process_mode is not None:
+        ref.process_mode = process_mode
+        changed_visual_asset = ref.role == "visual_asset"
+        changed_logo = ref.role == "logo"
+
+    if ref.role == "logo" and logo_anchor is not None:
+        ref.logo_anchor = normalize_logo_anchor(logo_anchor)
+        changed_logo = True
+
+    if ref.role == "visual_asset":
+        if "asset_name" in payload:
+            ref.asset_name = (payload.get("asset_name") or "").strip() or None
+            changed_visual_asset = True
+        if "asset_kind" in payload:
+            ref.asset_kind = normalize_visual_asset_kind(payload.get("asset_kind"))
+            changed_visual_asset = True
+        if "usage_note" in payload:
+            ref.usage_note = (payload.get("usage_note") or "").strip() or None
+            changed_visual_asset = True
+        if payload.get("reanalyze"):
+            try:
+                ref.asset_analysis = analyze_visual_asset(
+                    ref.file_path,
+                    asset_name=ref.asset_name or "",
+                    asset_kind=ref.asset_kind or "other",
+                    usage_note=ref.usage_note or "",
+                )
+            except Exception as e:
+                logger.warning(f"Visual asset reanalysis failed for {ref.file_path}: {e}")
+            changed_visual_asset = True
+
+    if not process_mode and not changed_visual_asset and not changed_logo:
+        raise HTTPException(status_code=400, detail="No supported fields to update")
+
+    if changed_visual_asset and ref.role == "visual_asset":
+        _invalidate_visual_asset_dependent_outputs(project)
+    elif ref.slide_id and ref.role != "finetune_ref":
+        slide = db.query(Slide).filter(Slide.id == ref.slide_id, Slide.project_id == project_id).first()
+        if slide:
+            _invalidate_visual_plan_dependent_outputs(project, [slide])
     db.commit()
     db.refresh(ref)
     return {
         "id": ref.id,
         "process_mode": ref.process_mode,
+        "asset_name": ref.asset_name,
+        "asset_kind": ref.asset_kind,
+        "usage_note": ref.usage_note,
+        "asset_analysis": ref.asset_analysis,
+        "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
         "url": f"/uploads/{project_id}/{os.path.basename(ref.file_path)}",
+        "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" else None,
     }
 
 
@@ -1598,10 +2064,14 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
         "type": visual_json.get("type") or content_json.get("type", "content"),
         "layout": visual_json.get("layout"),
         "visual_summary": visual_json.get("visual_summary", ""),
+        "visual_evidence": visual_json.get("visual_evidence", ""),
         "visual_description": visual_json.get("visual_description", ""),
         "design_notes": visual_json.get("design_notes", ""),
-        "seed_family": visual_json.get("seed_family"),
+        "visual_asset_ids": visual_json.get("visual_asset_ids", []),
+        "visual_asset_usage": visual_json.get("visual_asset_usage", {}),
+        "logo_policy": visual_json.get("logo_policy"),
     }
+    page_intent = _with_project_logo_policy(page_intent, project) or page_intent
 
     content_text = content_json.get("text_content", {})
     if isinstance(content_text, dict):
@@ -1613,18 +2083,22 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
     else:
         content_text = {"headline": "", "subhead": "", "body": ""}
 
-    # 收集参考图描述
-    reference_images = []
+    # 收集参考图描述：项目级核心资产优先，页面级参考图随后补充。
+    reference_images = _project_refs_for_prompt(project, visual_json.get("visual_asset_ids") or [], page_intent)
     if slide.reference_images:
         for ref in slide.reference_images:
             reference_images.append({
+                "id": ref.id,
                 "role": ref.role,
-                "description": ref.description or "",
+                "description": os.path.basename(ref.file_path or ""),
                 "process_mode": ref.process_mode or "blend",
             })
 
-    # 获取项目级风格覆盖；style_ref/logo 不作为参考图，只通过文字风格系统影响 prompt。
-    style_text_override = _style_text_from_selected_style(project.selected_style)
+    # 获取项目级风格覆盖；没有确认风格时从内容推导紧凑 style pack。
+    style_text_override = _style_text_from_selected_style(project.selected_style) or _derive_project_style_pack(
+        project,
+        [{"type": slide.type or "content", "text_content": content_text}],
+    )
 
     prompt = generate_prompt_for_page(
         page_intent=page_intent,
@@ -1649,7 +2123,48 @@ class FinetuneRequest(BaseModel):
     attachment_ids: Optional[List[str]] = None
 
 
-def _build_direct_finetune_prompt(slide: Slide, instruction: str, attachment_count: int = 0) -> str:
+def _finetune_should_attach_project_product_assets(instruction: str) -> bool:
+    text = (instruction or "").lower()
+    action_terms = ("换成", "替换", "换上", "改成", "改为", "replace", "use the uploaded", "上传")
+    asset_terms = (
+        "核心资产", "客户", "产品", "油瓶", "瓶", "包装",
+        "visual asset", "product", "bottle", "packaging",
+    )
+    return any(term in text for term in action_terms) and any(term in text for term in asset_terms)
+
+
+def _project_visual_asset_ids_for_finetune(project: Project, slide: Slide, instruction: str) -> List[str]:
+    if not _finetune_should_attach_project_product_assets(instruction):
+        return []
+
+    selected_ids: list[str] = []
+    if slide.visual_json and isinstance(slide.visual_json, dict):
+        raw_ids = slide.visual_json.get("visual_asset_ids") or []
+        if isinstance(raw_ids, list):
+            selected_ids = [str(x) for x in raw_ids]
+
+    candidate_refs = [
+        ref for ref in (project.reference_images or [])
+        if ref.role == "visual_asset"
+        and not ref.slide_id
+        and str(ref.asset_kind or "").lower() in {"product", "material"}
+        and os.path.exists(ref.file_path)
+    ]
+    candidate_refs.sort(
+        key=lambda ref: (
+            selected_ids.index(ref.id) if ref.id in selected_ids else 999,
+            ref.asset_name or "",
+        )
+    )
+    return [ref.id for ref in candidate_refs[:3]]
+
+
+def _build_direct_finetune_prompt(
+    slide: Slide,
+    instruction: str,
+    attachment_count: int = 0,
+    project_visual_asset_count: int = 0,
+) -> str:
     """Compose a direct image-edit prompt for single-slide finetuning."""
     content = slide.content_json or {}
     text_content = content.get("text_content") if isinstance(content, dict) else {}
@@ -1665,13 +2180,21 @@ def _build_direct_finetune_prompt(slide: Slide, instruction: str, attachment_cou
         else:
             body = str(raw_body)
 
-    ref_count = attachment_count
+    ref_count = attachment_count + project_visual_asset_count
     ref_note = (
         f"\nThere are {ref_count} additional reference image(s) after the current slide. "
         "These additional images are the user's current-turn references. "
         "When the user says 'this image', 'the image', 'this person', or similar wording, resolve it to the most prominent subject in these current-turn reference images, not to anything already printed on the slide, product packaging, labels, icons, or earlier page assets. "
         "Use them only when they help satisfy the user's request. Infer natural placement, scale, and cropping from the slide layout."
         if ref_count
+        else ""
+    )
+    project_asset_note = (
+        "\nProject visual asset rule: the last "
+        f"{project_visual_asset_count} additional reference image(s) are protected project product/material assets. "
+        "If the request asks to replace a product, bottle, packaging, or client asset, use these protected project asset images as the authoritative source. "
+        "Do not keep, copy, or regenerate any conflicting brand/product already visible in the current slide image."
+        if project_visual_asset_count
         else ""
     )
 
@@ -1688,6 +2211,7 @@ Rules:
 - Keep the final result as a polished 16:9 presentation slide, not a mockup.
 - Keep text readable and do not invent new copy unless the user explicitly asked for it.
 {ref_note}
+{project_asset_note}
 
 Slide text context for preservation:
 Headline: {headline}
@@ -1744,11 +2268,18 @@ def finetune_slide(
             found_ids = {ref.id for ref in refs}
             valid_attachment_ids = [ref_id for ref_id in attachment_ids if ref_id in found_ids]
 
-        slide.prompt_text = _build_direct_finetune_prompt(slide, instruction, len(valid_attachment_ids))
+        project_visual_asset_ids = _project_visual_asset_ids_for_finetune(project, slide, instruction)
+        slide.prompt_text = _build_direct_finetune_prompt(
+            slide,
+            instruction,
+            len(valid_attachment_ids),
+            len(project_visual_asset_ids),
+        )
         visual_json = copy.deepcopy(slide.visual_json) or {}
         visual_json["finetune_base_image_path"] = archived_version.image_path
         visual_json["finetune_instruction"] = instruction
         visual_json["finetune_attachment_ids"] = valid_attachment_ids
+        visual_json["finetune_visual_asset_ids"] = project_visual_asset_ids
         slide.visual_json = visual_json
     else:
         slide.prompt_text = new_prompt
@@ -1866,7 +2397,7 @@ def update_slide_content(
 
     # 必须用深拷贝，否则 SQLAlchemy 检测不到 JSON 字段的变更
     existing = copy.deepcopy(slide.content_json) or {}
-    new_content = body.content_json
+    new_content = _normalize_content_json_markdown(body.content_json)
 
     # 安全 merge：只替换 text_content 和 speaker_notes，保留其他字段
     if "text_content" in new_content:
@@ -1879,6 +2410,7 @@ def update_slide_content(
         existing["speaker_notes"] = new_content["speaker_notes"]
 
     slide.content_json = existing
+    _invalidate_content_dependent_outputs(project)
     db.commit()
 
     return {
@@ -1914,12 +2446,13 @@ def update_slide_visual(
     new_visual = body.visual_json
 
     # 安全 merge：替换传入的字段，保留其他字段
-    allowed_fields = {"visual_description", "design_notes", "layout", "seed_family"}
+    allowed_fields = {"visual_evidence", "visual_description", "visual_summary", "design_notes", "layout"}
     for key in allowed_fields:
         if key in new_visual:
             existing[key] = new_visual[key]
 
     slide.visual_json = existing
+    _invalidate_visual_plan_dependent_outputs(project, [slide])
     db.commit()
 
     return {
@@ -1968,6 +2501,7 @@ def delete_slide(
             updated["page_num"] = s.page_num
             s.visual_json = updated
 
+    _invalidate_content_dependent_outputs(project)
     db.commit()
     return {"message": "Slide deleted", "slide_id": slide_id, "deleted_page_num": deleted_page_num}
 
@@ -2021,6 +2555,7 @@ def create_slide(
         content_json=new_content,
     )
     db.add(new_slide)
+    _invalidate_content_dependent_outputs(project)
     db.commit()
     db.refresh(new_slide)
 
@@ -2067,81 +2602,9 @@ def reorder_slides(
             updated["page_num"] = new_idx
             slide.content_json = updated
 
+    _invalidate_content_dependent_outputs(project)
     db.commit()
     return {"message": "Slides reordered", "new_order": body.page_nums}
-
-
-@router.post("/{project_id}/slides/{slide_id}/set-seed")
-def set_seed_page(
-    project_id: str,
-    slide_id: str,
-    db: Session = Depends(get_db),
-):
-    """将指定 slide 设为其 Seed Family 的种子页，同 Family 其他页自动取消。"""
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
-    if not slide:
-        raise HTTPException(status_code=404, detail="Slide not found")
-
-    visual = slide.visual_json or {}
-    if not visual:
-        raise HTTPException(status_code=400, detail="Slide has no visual plan")
-
-    family = visual.get("seed_family")
-    if not family:
-        from app.services.visual_plan import _infer_seed_family
-        family = _infer_seed_family(slide.type or "content")
-
-    # 取消同 Family 其他页的种子推荐
-    all_slides = db.query(Slide).filter(Slide.project_id == project_id).all()
-    for s in all_slides:
-        if s.id == slide_id:
-            continue
-        s_visual = s.visual_json or {}
-        s_family = s_visual.get("seed_family")
-        if not s_family:
-            from app.services.visual_plan import _infer_seed_family
-            s_family = _infer_seed_family(s.type or "content")
-        if s_family == family and s_visual.get("is_seed_recommended"):
-            updated = copy.deepcopy(s_visual)
-            updated["is_seed_recommended"] = False
-            s.visual_json = updated
-
-    # 设置当前页为种子推荐
-    updated = copy.deepcopy(visual)
-    updated["is_seed_recommended"] = True
-    slide.visual_json = updated
-
-    db.commit()
-    return {"message": f"Slide {slide.page_num} set as seed for {family}", "family": family, "page_num": slide.page_num}
-
-
-@router.post("/{project_id}/slides/{slide_id}/unset-seed")
-def unset_seed_page(
-    project_id: str,
-    slide_id: str,
-    db: Session = Depends(get_db),
-):
-    """取消指定 slide 的种子页推荐状态。"""
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
-    if not slide:
-        raise HTTPException(status_code=404, detail="Slide not found")
-
-    visual = slide.visual_json or {}
-    if visual.get("is_seed_recommended"):
-        updated = copy.deepcopy(visual)
-        updated["is_seed_recommended"] = False
-        slide.visual_json = updated
-        db.commit()
-
-    return {"message": f"Slide {slide.page_num} unset as seed", "page_num": slide.page_num}
 
 
 @router.post("/{project_id}/extract-template")
@@ -2175,6 +2638,13 @@ def extract_template(
         logger.error(f"模板提取失败: {e}")
         raise HTTPException(status_code=500, detail=f"模板提取失败: {str(e)}")
 
+    old_template_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.role == "template",
+    ).all()
+    for old_ref in old_template_refs:
+        db.delete(old_ref)
+
     # 获取 Content Plan 用于更智能的推荐
     slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
     content_plan = [s.content_json for s in slides]
@@ -2195,6 +2665,7 @@ def extract_template(
         k: ({"page_num": v["page_num"], "file_path": v["file_path"], "category": v.get("category", "content")} if v else None)
         for k, v in recommendations.items()
     }
+    _invalidate_style_dependent_outputs(project)
     db.commit()
 
     return {
