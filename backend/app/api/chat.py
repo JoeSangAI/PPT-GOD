@@ -10,6 +10,7 @@ from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.core.llm_client import get_llm_client
 from app.core.config import settings
+from app.core.provider_credentials import get_minimax_llm_model
 from app.utils.project_docs import load_project_documents
 from app.services.search_service import get_knowledge_augmenter
 from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VISUAL_ACTIONS, with_next_action
@@ -605,7 +606,7 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
     messages.append({"role": "user", "content": user_content})
 
     stream = client.chat.completions.create(
-        model=settings.MINIMAX_LLM_MODEL,
+        model=get_minimax_llm_model(),
         messages=messages,
         temperature=0.5 if is_draft and agent_role != "visual" else 0.4 if agent_role == "visual" else 0.1,
         # 长度护栏：think 段 + JSON content 总上限。给 think 留 ~3000，给 JSON 留 ~1500。
@@ -861,7 +862,7 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
                     ),
                 })
                 fallback_response = client.chat.completions.create(
-                    model=settings.MINIMAX_LLM_MODEL,
+                    model=get_minimax_llm_model(),
                     messages=fallback_messages,
                     temperature=0.1,
                 )
@@ -981,18 +982,27 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
             asset_counts: dict[str, int] = {}
             has_template = False
             visual_asset_details: list[str] = []
+            max_visual_asset_details = 12
             for ref in project.reference_images:
                 if ref.role == "template":
                     has_template = True
                 else:
                     asset_counts[ref.role] = asset_counts.get(ref.role, 0) + 1
                 # 收集 visual_asset 的分析结果（已持久化的部分）
-                if ref.role == "visual_asset" and ref.asset_analysis and isinstance(ref.asset_analysis, dict):
+                if (
+                    ref.role == "visual_asset"
+                    and len(visual_asset_details) < max_visual_asset_details
+                    and ref.asset_analysis
+                    and isinstance(ref.asset_analysis, dict)
+                ):
                     a = ref.asset_analysis
                     name = ref.asset_name or a.get("subject", "核心资产")
                     features = a.get("distinctive_features", "") or a.get("description", "")
                     usage = a.get("recommended_usage", "")
+                    source_page = a.get("pptx_source_page_num")
                     detail = f"  • {name}"
+                    if source_page:
+                        detail += f"（原PPT第{source_page}页）"
                     if features:
                         detail += f"：{str(features)[:80]}"
                     if usage:
@@ -1003,8 +1013,13 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
             if asset_counts.get("logo", 0):
                 asset_lines.append(f"- 品牌 Logo：{asset_counts['logo']} 张（颜色/调性由后端提取，禁止臆测）")
             if asset_counts.get("visual_asset", 0):
-                asset_lines.append(f"- 核心资产：{asset_counts['visual_asset']} 个（全局可用，按页面内容智能调用）")
+                asset_lines.append(
+                    f"- 核心资产：{asset_counts['visual_asset']} 个（后台资源库全量保留；按原PPT页码、标签和页面内容智能调用）"
+                )
                 asset_lines.extend(visual_asset_details)
+                hidden_count = asset_counts["visual_asset"] - len(visual_asset_details)
+                if hidden_count > 0:
+                    asset_lines.append(f"  • 另有 {hidden_count} 个核心资产未展开，避免聊天上下文过重；后端仍可按内容召回。")
             if asset_counts.get("style_ref", 0):
                 asset_lines.append(f"- 风格参考：{asset_counts['style_ref']} 张（色彩/构图/字体由后端提取，禁止臆测）")
             if has_template:

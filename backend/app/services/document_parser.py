@@ -1,6 +1,6 @@
 import os
 from io import BytesIO
-from typing import Tuple
+import re
 
 
 def parse_document(file_bytes: bytes, filename: str) -> str:
@@ -12,7 +12,7 @@ def parse_document(file_bytes: bytes, filename: str) -> str:
     elif ext in (".docx", ".doc"):
         return _parse_docx(file_bytes)
     elif ext in (".pptx", ".ppt"):
-        return _parse_pptx(file_bytes)
+        return _parse_pptx(file_bytes, filename)
     elif ext in (".md", ".txt", ".json", ".csv", ".html", ".htm"):
         return _parse_text(file_bytes)
     else:
@@ -41,19 +41,31 @@ def _parse_docx(file_bytes: bytes) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _parse_pptx(file_bytes: bytes) -> str:
+def _parse_pptx(file_bytes: bytes, filename: str = "") -> str:
     from pptx import Presentation
 
     prs = Presentation(BytesIO(file_bytes))
     text_parts = []
+    text_parts.append(f'--- PPT_SOURCE filename="{filename}" pages={len(prs.slides)} ---')
     for i, slide in enumerate(prs.slides, 1):
         slide_texts = []
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text.strip():
                 slide_texts.append(shape.text.strip())
-        if slide_texts:
-            text_parts.append(f"--- 第{i}页 ---\n" + "\n".join(slide_texts))
+        text_parts.append(f"--- 第{i}页 ---\n" + "\n".join(slide_texts))
     return "\n\n".join(text_parts)
+
+
+def detect_ppt_sources(documents_text: str) -> list[dict]:
+    """Return PPT upload metadata embedded in extracted document text."""
+    sources = []
+    pattern = r'---\s*PPT_SOURCE(?:\s+filename="([^"]*)")?\s+pages=(\d+)\s*---'
+    for match in re.finditer(pattern, documents_text or ""):
+        sources.append({
+            "filename": match.group(1) or "",
+            "pages": int(match.group(2)),
+        })
+    return sources
 
 
 def _parse_text(file_bytes: bytes) -> str:

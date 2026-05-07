@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.api import projects as projects_api
+from app.api import documents as documents_api
 from app.api import slides as slides_api
 from app.services import generation_pipeline
 from app.schemas.project import ProjectUpdate
@@ -28,10 +29,13 @@ from app.services.visual_plan import (
     _recall_visual_assets_for_page,
     _safe_parse_json,
 )
+from app.services.content_plan import _normalize_content_markdown
 from app.services.style_proposal import _build_content_style_direction
 from types import SimpleNamespace
 
 from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches
 
 
 def make_session():
@@ -46,6 +50,55 @@ def png_upload(name="asset.png"):
     Image.new("RGB", (10, 10), "white").save(buf, "PNG")
     buf.seek(0)
     return SimpleNamespace(filename=name, file=buf, content_type="image/png")
+
+
+def pptx_upload_with_picture(name="source.pptx"):
+    image_buf = io.BytesIO()
+    img = Image.new("RGB", (240, 140), "white")
+    for x in range(20, 220):
+        for y in range(25, 115):
+            img.putpixel((x, y), (20, 120, 210))
+    img.save(image_buf, "PNG")
+    image_buf.seek(0)
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.6), Inches(0.5), Inches(5.0), Inches(0.6)).text = "原 PPT 第 1 页标题"
+    slide.shapes.add_picture(image_buf, Inches(1.0), Inches(1.4), width=Inches(3.0))
+
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
+def _patterned_png(color):
+    buf = io.BytesIO()
+    img = Image.new("RGB", (180, 120), "white")
+    for x in range(180):
+        for y in range(120):
+            if (x // 12 + y // 12) % 2 == 0:
+                img.putpixel((x, y), color)
+            elif 30 < x < 150 and 25 < y < 95:
+                img.putpixel((x, y), (30, 30, 30))
+    img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+
+
+def pptx_upload_with_many_pictures(name="many.pptx", count=5):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.4), Inches(0.3), Inches(6.0), Inches(0.6)).text = "渠道策略 产品矩阵 终端陈列"
+    colors = [(210, 40, 40), (40, 140, 210), (40, 180, 90), (210, 150, 40), (150, 80, 210)]
+    for idx in range(count):
+        x = Inches(0.5 + (idx % 3) * 2.0)
+        y = Inches(1.1 + (idx // 3) * 1.6)
+        slide.shapes.add_picture(_patterned_png(colors[idx % len(colors)]), x, y, width=Inches(1.5))
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
 def test_logo_overlay_preprocess_trims_white_background(tmp_path):
@@ -120,6 +173,54 @@ def test_fallback_visual_plan_uses_concrete_visual_evidence():
     assert plan[0]["is_seed_recommended"] is True
 
 
+def test_punchline_page_content_is_normalized_to_one_line():
+    outline = _normalize_content_markdown([
+        {
+            "page_num": 3,
+            "type": "hero",
+            "text_content": {
+                "headline": "管理就是把复杂留给自己",
+                "subhead": "",
+                "body": "- 第一条解释\n- 第二条解释",
+            },
+            "speaker_notes": "用于章节转折。",
+            "visual_suggestion": "内容页信息图，展示三点列表",
+        }
+    ])
+
+    page = outline[0]
+    assert page["text_content"]["headline"] == "管理就是把复杂留给自己"
+    assert page["text_content"]["subhead"] == ""
+    assert page["text_content"]["body"] == ""
+    assert "原金句页正文素材" in page["speaker_notes"]
+    assert "金句页" in page["visual_suggestion"]
+    assert "整套 PPT" in page["visual_suggestion"]
+
+
+def test_fallback_visual_plan_treats_hero_as_punchline_slide():
+    plan = _fallback_visual_plan(
+        [
+            {
+                "page_num": 5,
+                "type": "hero",
+                "text_content": {
+                    "headline": "现金流就是公司的氧气",
+                    "subhead": "来自 Q3 经营复盘",
+                    "body": "",
+                },
+            }
+        ],
+        [],
+    )
+
+    assert plan[0]["layout"] == "hero"
+    assert plan[0]["seed_family"] == "hero"
+    assert "金句排版" in plan[0]["visual_evidence"]
+    assert "可选署名/上下文" in plan[0]["visual_evidence"]
+    assert "只保留核心短句" in plan[0]["visual_description"]
+    assert plan[0]["logo_policy"]["show_logo"] is False
+
+
 def test_visual_plan_json_repair_handles_multiline_llm_strings():
     raw = '{"6": {"visual_evidence": "终端货架", "visual_description": "第一行\n第二行", "visual_asset_ids": [], "visual_asset_usage": {}}}'
 
@@ -153,6 +254,33 @@ def test_prompt_keeps_exact_text_contract_and_visual_evidence(monkeypatch):
     assert 'Body: "联动权威机构举办发布会"' in prompt
     assert "Visual:\n行业标准白皮书、官方印章和发布会背板" in prompt
     assert "FONT REQUIREMENT" not in prompt
+
+
+def test_prompt_for_punchline_page_uses_punchline_treatment(monkeypatch):
+    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda _: "unused")
+
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 4,
+            "type": "hero",
+            "layout": "hero",
+            "visual_evidence": "金句排版、作者署名与纯色纹理背景",
+            "visual_description": "中央大字金句，右下角小号署名，背景只有细微纸纹。",
+        },
+        content_text={
+            "headline": "少即是多",
+            "subhead": "—— 路德维希·密斯·凡德罗",
+            "body": "这句名言的解释不应该出现在画面正文里",
+        },
+        style_text_override="Style: 冷静现代\nVisual rhythm: 内容页浅底高可读，金句页更沉浸",
+    )
+
+    assert 'Headline: "少即是多"' in prompt
+    assert 'Subhead: "—— 路德维希·密斯·凡德罗"' in prompt
+    assert "Body:" not in prompt
+    assert "Punchline slide treatment" in prompt
+    assert "same project typeface feel" in prompt
+    assert "dense panels" in prompt
 
 
 def test_prompt_includes_selected_global_visual_asset(monkeypatch):
@@ -708,6 +836,56 @@ def test_visual_plan_auto_adds_recalled_product_asset_when_llm_misses(monkeypatc
     assert "胡姬花花生油瓶" not in plan[0]["visual_asset_usage"]["asset-1"]
 
 
+def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"1": {'
+                                        '"visual_evidence": "校园驿站场景", '
+                                        '"visual_summary": "驿站场景", '
+                                        '"visual_description": "用校园驿站场景组织画面。", '
+                                        '"visual_asset_ids": ["auto-1"], '
+                                        '"visual_asset_usage": {"auto-1": "右侧补充"}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 1,
+                "type": "content",
+                "text_content": {"headline": "校园驿站", "body": "取件机与回收场景"},
+                "manual_visual_asset_ids": ["manual-1"],
+                "manual_visual_asset_usage": {"manual-1": "用户指定放在左侧"},
+            }
+        ],
+        global_visual_assets=[
+            {"id": "manual-1", "name": "指定驿站图", "kind": "scene", "analysis_summary": "校园驿站"},
+            {"id": "auto-1", "name": "自动候选图", "kind": "scene", "analysis_summary": "取件机"},
+        ],
+    )
+
+    assert plan[0]["manual_visual_asset_ids"] == ["manual-1"]
+    assert plan[0]["visual_asset_ids"][:2] == ["manual-1", "auto-1"]
+    assert plan[0]["visual_asset_usage"]["manual-1"] == "用户指定放在左侧"
+
+
 def test_prototype_without_selected_pages_samples_first_three_and_ignores_seed_flags():
     slides = [
         Slide(page_num=1, visual_json={"is_seed_recommended": False}),
@@ -957,6 +1135,107 @@ def test_visual_asset_upload_rejects_slide_level_asset(tmp_path, monkeypatch):
     assert "project-level" in exc.value.detail
 
 
+def test_pptx_document_upload_extracts_page_refs_and_visual_assets(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = documents_api.upload_document(
+        project.id,
+        pptx_upload_with_picture("source.pptx"),
+        db=db,
+    )
+
+    assert result["extracted_assets"]["page_refs"] == 1
+    assert result["extracted_assets"]["visual_assets"] == 1
+    page_ref = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    visual_asset = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "visual_asset",
+    ).one()
+    assert page_ref.slide_id == slide.id
+    assert page_ref.asset_analysis["source_document"] == "source.pptx"
+    assert page_ref.asset_analysis["pptx_source_page_num"] == 1
+    assert visual_asset.slide_id is None
+    assert visual_asset.asset_analysis["source_document"] == "source.pptx"
+    assert "asset_lock" in visual_asset.asset_analysis
+    assert "原 PPT 第 1 页标题" in visual_asset.asset_analysis["source_slide_text"]
+    assert "PPT" in visual_asset.asset_analysis["suggested_keywords"]
+
+
+def test_pptx_upload_keeps_full_background_asset_library_while_limiting_page_refs(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = documents_api.upload_document(
+        project.id,
+        pptx_upload_with_many_pictures("many.pptx", count=5),
+        db=db,
+    )
+
+    page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+    library_assets = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "visual_asset",
+        ReferenceImage.slide_id.is_(None),
+    ).all()
+
+    assert result["extracted_assets"]["total"] == 5
+    assert len(page_refs) == 3
+    assert len(library_assets) == 5
+    assert all(asset.asset_analysis["asset_lock"]["scope"] == "pptx_source_page" for asset in library_assets)
+
+
+def test_pending_pptx_page_refs_link_after_content_plan_exists(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_picture("source.pptx"),
+        db=db,
+    )
+    pending = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    assert pending.slide_id is None
+
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    linked = slides_api._link_pending_pptx_page_refs(project.id, db)
+    db.commit()
+
+    assert linked == 1
+    db.refresh(pending)
+    assert pending.slide_id == slide.id
+
+
 def test_delete_visual_asset_cleans_slide_selection_and_invalidates_outputs(tmp_path):
     db = make_session()
     asset_path = tmp_path / "asset.png"
@@ -978,7 +1257,12 @@ def test_delete_visual_asset_cleans_slide_selection_and_invalidates_outputs(tmp_
         project_id=project.id,
         page_num=1,
         status="completed",
-        visual_json={"visual_asset_ids": [asset.id], "visual_asset_usage": {asset.id: "右侧展示"}},
+        visual_json={
+            "manual_visual_asset_ids": [asset.id],
+            "manual_visual_asset_usage": {asset.id: "锁定到本页"},
+            "visual_asset_ids": [asset.id],
+            "visual_asset_usage": {asset.id: "右侧展示"},
+        },
         prompt_text="old prompt",
     )
     db.add(slide)
@@ -991,6 +1275,151 @@ def test_delete_visual_asset_cleans_slide_selection_and_invalidates_outputs(tmp_
     assert result["message"] == "Deleted"
     assert refreshed_slide.visual_json["visual_asset_ids"] == []
     assert refreshed_slide.visual_json["visual_asset_usage"] == {}
+    assert refreshed_slide.visual_json["manual_visual_asset_ids"] == []
+    assert refreshed_slide.visual_json["manual_visual_asset_usage"] == {}
     assert refreshed_slide.prompt_text is None
     assert refreshed_slide.status == "visual_ready"
     assert refreshed_project.status == "visual_ready"
+
+
+def test_asset_pins_replace_reorder_and_survive_visual_merge(tmp_path):
+    db = make_session()
+    project = Project(title="Pins", status="completed")
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        visual_json={"visual_asset_ids": ["old-auto"], "visual_asset_usage": {"old-auto": "旧自动"}},
+        prompt_text="old",
+    )
+    db.add(slide)
+    assets = []
+    for idx in range(2):
+        path = tmp_path / f"asset_{idx}.png"
+        Image.new("RGB", (10, 10), "white").save(path)
+        asset = ReferenceImage(
+            project_id=project.id,
+            role="visual_asset",
+            file_path=str(path),
+            process_mode="crop",
+            asset_name=f"素材{idx}",
+            asset_kind="scene",
+        )
+        db.add(asset)
+        assets.append(asset)
+    db.commit()
+
+    result = slides_api.update_slide_asset_pins(
+        project.id,
+        slide.id,
+        slides_api.AssetPinsRequest(
+            asset_ids=[assets[1].id, assets[0].id],
+            usage={assets[1].id: "放在左侧"},
+        ),
+        db=db,
+    )
+    db.refresh(slide)
+
+    assert result["manual_visual_asset_ids"] == [assets[1].id, assets[0].id]
+    assert slide.visual_json["visual_asset_ids"][:2] == [assets[1].id, assets[0].id]
+    assert slide.visual_json["manual_visual_asset_usage"][assets[1].id] == "放在左侧"
+    assert slide.prompt_text is None
+    assert slide.status == "visual_ready"
+
+    merged = slides_api._merge_manual_pins_into_visual_json(
+        {"visual_asset_ids": ["auto-1"], "visual_asset_usage": {"auto-1": "自动"}},
+        slide.visual_json,
+    )
+    assert merged["visual_asset_ids"][:3] == [assets[1].id, assets[0].id, "auto-1"]
+
+
+def test_pipeline_loads_manual_pins_before_auto_assets(tmp_path):
+    db = make_session()
+    project = Project(title="Pipeline pins", status="prompt_ready")
+    db.add(project)
+    db.flush()
+    paths = []
+    for idx, color in enumerate(["red", "blue"]):
+        path = tmp_path / f"asset_{idx}.png"
+        Image.new("RGB", (20, 20), color).save(path)
+        paths.append(path)
+    manual = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(paths[0]),
+        process_mode="blend",
+        asset_name="手动锁定",
+        asset_kind="other",
+    )
+    auto = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(paths[1]),
+        process_mode="blend",
+        asset_name="自动候选",
+        asset_kind="product",
+    )
+    db.add_all([manual, auto])
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        prompt_text="prompt",
+        visual_json={
+            "manual_visual_asset_ids": [manual.id],
+            "visual_asset_ids": [auto.id, manual.id],
+        },
+    )
+    db.add(slide)
+    db.commit()
+
+    loaded_slide = db.query(Slide).filter(Slide.id == slide.id).one()
+    refs = _load_reference_images(loaded_slide)
+
+    assert refs[0]["id"] == manual.id
+    assert refs[0]["manual_pin"] is True
+    assert [ref["id"] for ref in refs[:2]] == [manual.id, auto.id]
+
+
+def test_reference_image_library_filters_and_facets(tmp_path):
+    db = make_session()
+    project = Project(title="Library", status="visual_ready")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=3, status="visual_ready")
+    db.add(slide)
+    asset_path = tmp_path / "station.png"
+    Image.new("RGB", (10, 10), "white").save(asset_path)
+    asset = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(asset_path),
+        process_mode="blend",
+        asset_name="菜鸟驿站取件机",
+        asset_kind="scene",
+        asset_analysis={
+            "source_document": "媒体介绍.pptx",
+            "pptx_source_page_num": 6,
+            "asset_tags": ["驿站", "取件机", "低碳"],
+            "source_slide_text": "校园驿站低碳行为",
+        },
+    )
+    db.add(asset)
+    db.commit()
+
+    library = slides_api.list_reference_images(
+        project.id,
+        q="取件机",
+        source_document="媒体介绍.pptx",
+        source_page_num=6,
+        recommend_slide_id=slide.id,
+        db=db,
+    )
+
+    assert library["total"] == 1
+    assert library["items"][0]["id"] == asset.id
+    assert library["items"][0]["source_document"] == "媒体介绍.pptx"
+    assert "媒体介绍.pptx" in library["facets"]["source_documents"]

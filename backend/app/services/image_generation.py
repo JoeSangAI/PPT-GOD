@@ -19,6 +19,7 @@ from openai import (
 from PIL import Image, ImageOps
 
 from app.core.config import settings
+from app.core.provider_credentials import get_deer_image_model, get_provider_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,15 @@ _real_image_calls_this_run = 0
 
 def _get_image_client() -> OpenAI:
     global _image_client
+    credentials = get_provider_credentials()
+    if credentials.deer_api_key != (settings.DEER_API_KEY or settings.MINIMAX_API_KEY) or credentials.deer_api_base != settings.DEER_API_BASE.rstrip("/"):
+        timeout = httpx.Timeout(1800.0, connect=30.0)
+        return OpenAI(
+            api_key=credentials.deer_api_key,
+            base_url=credentials.deer_api_base,
+            timeout=timeout,
+            max_retries=0,
+        )
     if _image_client is None:
         with _image_client_lock:
             if _image_client is None:
@@ -81,7 +91,7 @@ def _cache_key(
     aspect_ratio: str,
 ) -> str:
     h = hashlib.sha256()
-    h.update(settings.DEER_IMAGE_MODEL.encode("utf-8"))
+    h.update(get_deer_image_model().encode("utf-8"))
     h.update(resolution.encode("utf-8"))
     h.update(aspect_ratio.encode("utf-8"))
     h.update(prompt.encode("utf-8"))
@@ -164,13 +174,32 @@ def _prepare_reference_image_for_upload(ref: Image.Image) -> Image.Image:
 def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesIO, str, int]:
     img = _prepare_reference_image_for_upload(ref)
     buf = io.BytesIO()
-    # Reference images can contain identity-bearing micro-details such as labels,
-    # marks, packaging graphics, or face/clothing cues. Keep them lossless before
-    # the model sees them; generation can still integrate the asset naturally.
-    img.save(buf, format="PNG", optimize=True)
+    png_buf = io.BytesIO()
+    img.save(png_buf, format="PNG", optimize=True)
+    png_size = png_buf.tell()
+
+    # PPT-extracted references are often full-slide photos or screenshots. Sending
+    # several lossless PNGs can dominate request time and make the image API upload
+    # fail before generation starts. Prefer a high-quality JPEG for normal RGB
+    # references, while keeping tiny PNGs lossless for marks/screenshots where PNG is
+    # already compact.
+    jpeg_quality = max(60, min(95, int(settings.IMAGE_REFERENCE_JPEG_QUALITY or 85)))
+    if png_size <= 512 * 1024:
+        png_buf.seek(0)
+        buf = png_buf
+        size_bytes = png_size
+        return f"ref_{index}.png", buf, "image/png", size_bytes
+
+    img.save(
+        buf,
+        format="JPEG",
+        quality=jpeg_quality,
+        optimize=True,
+        progressive=True,
+    )
     size_bytes = buf.tell()
     buf.seek(0)
-    return f"ref_{index}.png", buf, "image/png", size_bytes
+    return f"ref_{index}.jpg", buf, "image/jpeg", size_bytes
 
 
 def _is_connection_timeout(exc: Exception) -> bool:
@@ -188,7 +217,7 @@ def _call_gpt_image_2_generate(
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     resp = client.images.generate(
-        model=settings.DEER_IMAGE_MODEL,
+        model=get_deer_image_model(),
         prompt=prompt,
         size=size,
         quality="high",
@@ -222,12 +251,13 @@ def _call_gpt_image_2_edit(
         upload_bytes += size_bytes
         files.append(("additional_images[]", (filename, buf, mime_type)))
     data = {
-        "model": settings.DEER_IMAGE_MODEL,
+        "model": get_deer_image_model(),
         "prompt": prompt,
         "size": size,
         "n": "1",
     }
-    headers = {"Authorization": f"Bearer {settings.DEER_API_KEY or settings.MINIMAX_API_KEY}"}
+    credentials = get_provider_credentials()
+    headers = {"Authorization": f"Bearer {credentials.deer_api_key}"}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     logger.info(
@@ -237,7 +267,7 @@ def _call_gpt_image_2_edit(
     )
     try:
         resp = requests.post(
-            f"{settings.DEER_API_BASE}/images/edits",
+            f"{credentials.deer_api_base}/images/edits",
             headers=headers,
             data=data,
             files=files,
@@ -281,7 +311,7 @@ def _call_gemini_chat_generate(
             "image_url": {"url": f"data:image/png;base64,{img_b64}"}
         })
     resp = client.chat.completions.create(
-        model=settings.DEER_IMAGE_MODEL,
+        model=get_deer_image_model(),
         messages=messages,
         extra_body={
             "image_config": {
@@ -305,7 +335,7 @@ def _generate_real_slide_image(
     resolution: str = "4K",
     aspect_ratio: str = "16:9",
 ) -> Image.Image:
-    model = settings.DEER_IMAGE_MODEL.lower()
+    model = get_deer_image_model().lower()
     # GPT-Image / DALL-E 支持的标准尺寸
     if aspect_ratio == "16:9":
         size = "1792x1024"
@@ -335,7 +365,7 @@ def _generate_real_slide_image(
                 img = _call_gemini_chat_generate(
                     prompt, reference_images, aspect_ratio, resolution
                 )
-            logger.info(f"ImageGen: success, model={settings.DEER_IMAGE_MODEL}, size={img.size}")
+            logger.info(f"ImageGen: success, model={get_deer_image_model()}, size={img.size}")
             return img
         except Exception as e:
             req_id = getattr(e, "request_id", None)

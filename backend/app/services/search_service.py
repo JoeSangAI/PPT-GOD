@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 import requests
 
 from app.core.config import settings
+from app.core.provider_credentials import get_provider_credentials
 from app.core.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
@@ -146,8 +147,9 @@ def search_via_minimax(query: str, top_n: int = 3) -> List[Dict]:
     if not query or not query.strip():
         return []
 
-    api_key = settings.MINIMAX_API_KEY
-    api_host = settings.MINIMAX_API_BASE.rstrip("/")
+    credentials = get_provider_credentials()
+    api_key = credentials.minimax_api_key
+    api_host = credentials.minimax_api_base.rstrip("/")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -186,5 +188,4 @@ def search_via_minimax(query: str, top_n: int = 3) -> List[Dict]:
 
     logger.info(f"MiniMax search: query={query.strip()!r}, results={len(results)}")
     return results
-
 

@@ -8,6 +8,7 @@ import json_repair
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import get_minimax_llm_model
 from app.services.logo_policy import logo_policy_for_page
 from app.services.prompt_engine import _sanitize_product_reference_text
 from app.services.style_pack import derive_style_pack_from_content
@@ -29,6 +30,9 @@ ASSET_RECALL_SUMMARY_KEYS = {
     "features",
     "must_not_change",
     "keywords",
+    "source",
+    "source_slide_text",
+    "tags",
 }
 LOW_CONFIDENCE_ASSET_TERMS = {
     "品牌",
@@ -45,6 +49,10 @@ LOW_CONFIDENCE_ASSET_TERMS = {
 }
 
 
+def _is_punchline_page_type(page_type: str) -> bool:
+    return str(page_type or "").strip().lower() in {"hero", "quote"}
+
+
 def _infer_seed_family(page_type: str) -> str:
     """推断页面所属"家族"，用于版式一致性锚定。
 
@@ -54,7 +62,7 @@ def _infer_seed_family(page_type: str) -> str:
     """
     if page_type in ("cover", "ending"):
         return "bookend"
-    if page_type in ("hero",):
+    if _is_punchline_page_type(page_type):
         return "hero"
     if page_type in ("toc",):
         return "section"
@@ -82,10 +90,11 @@ def _annotate_seed_family(visual_plan: List[Dict]) -> None:
 
 def _load_style(style_id: str) -> Dict:
     """加载风格模板，解析 frontmatter 和正文。"""
-    path = os.path.join("templates", "styles", f"{style_id}.md")
+    templates_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "templates", "styles"))
+    path = os.path.join(templates_dir, f"{style_id}.md")
     if not os.path.exists(path):
         logger.warning(f"风格模板 {style_id} 不存在，使用 default")
-        path = os.path.join("templates", "styles", "default.md")
+        path = os.path.join(templates_dir, "default.md")
 
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -110,6 +119,7 @@ def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subh
         "cover": "cover",
         "toc": "toc",
         "hero": "hero",
+        "quote": "hero",
         "data": "data",
         "ending": "ending",
     }
@@ -152,9 +162,24 @@ def _fallback_visual_evidence(page: Dict) -> str:
         return "区域市场地图、机会箭头和竞争态势标记"
     if any(k in source for k in ("资本", "利润", "定价权", "增长", "估值", "8个亿")):
         return "增长曲线、利润阶梯和品牌资产护城河示意"
-    if page.get("type") in ("cover", "ending", "hero"):
+    if _is_punchline_page_type(page.get("type", "")):
+        return f"围绕「{headline}」的金句排版、可选署名/上下文与象征性背景"
+    if page.get("type") in ("cover", "ending"):
         return f"围绕「{headline}」的品牌主视觉和核心记忆符号"
     return f"支撑「{headline}」这一页观点的核心场景、物件或结构图"
+
+
+def _fallback_visual_description(page: Dict, visual_evidence: str) -> str:
+    if _is_punchline_page_type(page.get("type", "")):
+        return (
+            f"以「{visual_evidence}」作为金句页主视觉，只保留核心短句和必要的轻量辅助信息；"
+            "版面使用大量留白和低干扰背景，可用纹理、光效、象征物、人物或场景承托，"
+            "并严格沿用全局风格的配色、字体气质和材质语言。"
+        )
+    return (
+        f"以「{visual_evidence}」作为本页画面证据，"
+        "根据页面信息密度安排文字区和配图区，使用全局风格色彩与材质做克制统一的包装。"
+    )
 
 
 def _page_search_text(page: Dict) -> str:
@@ -285,6 +310,26 @@ def _default_visual_asset_usage(asset: Dict, page: Dict) -> str:
     if kind == "person":
         return f"在本页相关视觉区域使用「{name}」作为人物画面证据；只说明位置与叙事作用，人物外观以上传图为准。"
     return f"在本页相关视觉区域使用「{name}」作为画面证据；只说明位置与叙事作用，外观以上传图为准。"
+
+
+def _manual_visual_asset_ids(page: Dict, valid_asset_ids: set[str]) -> list[str]:
+    raw = page.get("manual_visual_asset_ids") or []
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for asset_id in raw:
+        value = str(asset_id)
+        if value in valid_asset_ids and value not in result:
+            result.append(value)
+    return result
+
+
+def _manual_visual_asset_usage(page: Dict, manual_ids: list[str]) -> dict[str, str]:
+    raw = page.get("manual_visual_asset_usage") or {}
+    if not isinstance(raw, dict):
+        return {}
+    allowed = set(manual_ids)
+    return {str(k): str(v) for k, v in raw.items() if str(k) in allowed and v}
 
 
 def _safe_parse_json(raw: str, batch_num: int) -> Optional[Dict]:
@@ -422,7 +467,8 @@ def _build_batch_prompt(
     page_type_style_rules = """
 【页面类型适配规则 — 必须遵守】
 参考图/风格方案只提供“风格基因”，不是每页画面模板。具体每页画什么，必须由该页文案内容决定。
-- cover / section / ending / 金句页：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
+- cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
+- hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
 - content / data / table / 对比分析页：优先保证阅读效率。信息越密集，背景越应降饱和、提亮度、减少装饰；品牌主色只用于标题、页眉、编号、强调块和少量装饰。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
 - 如果参考图本身是强视觉封面、海报、广告KV或单页主视觉，必须先抽象为色彩/材质/装饰/构图原则，再按页面类型调节强度，不能把单页主视觉机械扩散到全 deck。
@@ -458,12 +504,14 @@ Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠
 
 【质量标准】
 1. visual_evidence 必须具体。优先选择白皮书、直播间、达人矩阵、终端货架、企业楼宇、地图、增长曲线、VS 对比、产品/工艺场景等能证明观点的对象。
+   - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠。
 2. 禁止输出“现代商务风格画面”“与主题相关的视觉元素”“品牌调性背景”等空泛句。
 3. visual_summary 必须极简，只说「画面是什么」（有参考图时可点出「基于用户参考路线图」等）。
 4. visual_description 必须先服务 visual_evidence，再体现风格系统。不要堆叠每页重复的纹样、光效、材质细节。
 5. 必须体现风格系统的配色和调性（无参考图页尤其重要），但只描述整体色调强弱，不写过多具体装饰元素。
 6. 如果 existing_visual_suggestion 有内容，以它为基础扩展；如果为空，根据内容自行设计。
 7. 不要规定具体字体名与字号；不要写出必须在页面上出现的正文原句。
+   - hero / quote / 金句页不要引入与全局风格冲突的字体方向；只描述“同一套字体气质下更大、更克制/更有张力的排版层级”。
 8. ⚠️ 每页的 visual_description 只能描述该页自己的画面。严禁引用其他页面的参考图或视觉元素。
 9. 如果本页选择了产品/物料/人物视觉资产，visual_evidence、visual_description 和 visual_asset_usage 不要描述该资产的名称、外观或身份细节；只写 uploaded product/person/material image 以及位置、大小、与背景关系。资产身份由上传图决定。
 
@@ -493,16 +541,14 @@ def _fallback_visual_plan(
             body_count = len(body)
         text_content = page.get("text_content", {})
         headline = text_content.get("headline", "")
+        visual_evidence = _fallback_visual_evidence(page)
         visual_plan.append({
             "page_num": page.get("page_num", 0),
             "type": page_type,
             "layout": _assign_layout(page_type, body_count, headline, text_content.get("subhead", "")),
-            "visual_evidence": _fallback_visual_evidence(page),
-            "visual_summary": _fallback_visual_evidence(page),
-            "visual_description": (
-                f"以「{_fallback_visual_evidence(page)}」作为本页画面证据，"
-                "根据页面信息密度安排文字区和配图区，使用全局风格色彩与材质做克制统一的包装。"
-            ),
+            "visual_evidence": visual_evidence,
+            "visual_summary": visual_evidence,
+            "visual_description": _fallback_visual_description(page, visual_evidence),
             "design_notes": f"布局: {_assign_layout(page_type, body_count, headline, text_content.get('subhead', ''))}",
             "reference_image_ids": reference_image_ids or [],
             "visual_asset_ids": [],
@@ -594,7 +640,7 @@ def _do_generate_visual_plan(
 
         try:
             response = client.chat.completions.create(
-                model=settings.MINIMAX_LLM_MODEL,
+                model=get_minimax_llm_model(),
                 messages=[
                     {
                         "role": "system",
@@ -663,12 +709,14 @@ def _do_generate_visual_plan(
             for asset in (global_visual_assets or [])
             if asset.get("id")
         }
+        manual_asset_ids = _manual_visual_asset_ids(page, valid_asset_ids)
+        manual_asset_usage = _manual_visual_asset_usage(page, manual_asset_ids)
         if not isinstance(visual_asset_ids, list):
             visual_asset_ids = []
         visual_asset_ids = [
             str(asset_id)
             for asset_id in visual_asset_ids
-            if str(asset_id) in valid_asset_ids
+            if str(asset_id) in valid_asset_ids and str(asset_id) not in set(manual_asset_ids)
         ][:3]
         if not isinstance(visual_asset_usage, dict):
             visual_asset_usage = {}
@@ -677,21 +725,25 @@ def _do_generate_visual_plan(
             for k, v in visual_asset_usage.items()
             if str(k) in set(visual_asset_ids) and v
         }
+        visual_asset_ids = [*manual_asset_ids, *visual_asset_ids]
+        visual_asset_usage = {**manual_asset_usage, **visual_asset_usage}
 
         recalled_assets = recalled_assets_by_page.get(int(page.get("page_num", 0) or 0), [])
         if recalled_assets:
             # Safety net: if the LLM missed a recalled core product/person/material asset,
             # include it without constraining composition. This keeps recall high while
             # leaving visual execution to the model.
+            auto_added_count = len([asset_id for asset_id in visual_asset_ids if asset_id not in set(manual_asset_ids)])
             for recalled in recalled_assets:
                 asset_id = str(recalled.get("id") or "")
-                if not asset_id or asset_id in visual_asset_ids or len(visual_asset_ids) >= 3:
+                if not asset_id or asset_id in visual_asset_ids or auto_added_count >= 3:
                     continue
                 asset_obj = next(
                     (asset for asset in (global_visual_assets or []) if str(asset.get("id")) == asset_id),
                     recalled,
                 )
                 visual_asset_ids.append(asset_id)
+                auto_added_count += 1
                 visual_asset_usage[asset_id] = _default_visual_asset_usage(asset_obj, page)
                 logger.info(
                     "VisualPlan: page %s auto-added recalled visual asset %s (%s)",
@@ -729,10 +781,7 @@ def _do_generate_visual_plan(
 
         if not visual_desc:
             logger.warning(f"VisualPlan: 第 {page_num} 页缺失 visual_description，使用默认")
-            visual_desc = (
-                f"以「{visual_evidence}」作为本页画面证据，"
-                "围绕该证据组织画面主体、文字区域和辅助信息层级，并按全局风格控制色彩强度。"
-            )
+            visual_desc = _fallback_visual_description(page, visual_evidence)
 
         hint = (page.get("reference_user_hint") or "").strip()
         if hint:
@@ -760,6 +809,8 @@ def _do_generate_visual_plan(
             "visual_description": visual_desc,
             "design_notes": f"布局: {_assign_layout(page_type, body_count, text_content.get('headline', ''), text_content.get('subhead', ''))}",
             "reference_image_ids": reference_image_ids or [],
+            "manual_visual_asset_ids": manual_asset_ids,
+            "manual_visual_asset_usage": manual_asset_usage,
             "visual_asset_ids": visual_asset_ids,
             "visual_asset_usage": visual_asset_usage,
             "style_pack_snapshot": style_pack_snapshot,

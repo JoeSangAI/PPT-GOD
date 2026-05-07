@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import get_minimax_llm_model
 from app.services.logo_policy import logo_prompt_instruction, logo_reservation_instruction
 from app.services.style_pack import derive_style_pack_from_content
 from app.utils.text_cleaning import clean_llm_output, normalize_markdown_emphasis
@@ -147,6 +148,12 @@ def _is_product_ref(ref: Dict) -> bool:
     if (ref or {}).get("role") != "visual_asset":
         return False
     return str((ref or {}).get("asset_kind") or "").lower() in {"product", "material"}
+
+
+def _is_punchline_page(page_intent: Dict) -> bool:
+    page_type = str((page_intent or {}).get("type") or "").strip().lower()
+    layout = str((page_intent or {}).get("layout") or "").strip().lower()
+    return page_type in {"hero", "quote"} or layout == "hero"
 
 
 def _has_product_ref(reference_images: Optional[List[Dict]]) -> bool:
@@ -439,7 +446,7 @@ def _call_llm_for_final_prompt(rich_brief: str) -> str:
     """调用 LLM 将 Rich Brief 翻译为自然流畅的 Final Prompt。"""
     client = get_llm_client()
     response = client.chat.completions.create(
-        model=settings.MINIMAX_LLM_MODEL,
+        model=get_minimax_llm_model(),
         messages=[
             {
                 "role": "system",
@@ -493,6 +500,7 @@ def generate_prompt_for_page(
         return text.replace("\\", "")
 
     text_directives = []
+    is_punchline_page = _is_punchline_page(page_intent)
     if content_text.get("headline"):
         h = _escape(_strip_markdown(content_text["headline"]))
         text_directives.append(f'Headline: "{h}"')
@@ -500,7 +508,7 @@ def generate_prompt_for_page(
         s = _escape(_strip_markdown(content_text["subhead"]))
         text_directives.append(f'Subhead: "{s}"')
     body = content_text.get("body")
-    if body:
+    if body and not is_punchline_page:
         if isinstance(body, str):
             lines = [line.strip() for line in body.splitlines() if line.strip()]
             for item in lines:
@@ -515,6 +523,14 @@ def generate_prompt_for_page(
 
     if text_directives:
         text_directives.append("All listed text must appear, clearly rendered and highly legible.")
+
+    punchline_treatment = ""
+    if is_punchline_page:
+        punchline_treatment = (
+            "Punchline slide treatment: render only one dominant short line/phrase/word plus minimal context if useful; "
+            "do not add bullets, explanatory body copy, charts, dense panels, or unrelated typography. "
+            "Use the same project typeface feel, palette, material texture, and decoration language, only with stronger scale and negative space."
+        )
 
     protected_block = _protected_assets_block(reference_images)
     protected_section = f"{protected_block}\n\n" if protected_block else ""
@@ -545,6 +561,7 @@ def generate_prompt_for_page(
             + "\n\n"
             + "Layout:\n"
             + str(layout_intent)
+            + (f"\n{punchline_treatment}" if punchline_treatment else "")
             + logo_section
             + "\n\n"
             + "Render one 16:9 presentation slide. Keep text legible."
@@ -566,6 +583,7 @@ def generate_prompt_for_page(
             + str(visual_evidence)
             + "\n\nLayout:\n"
             + str(layout_intent)
+            + (f"\n{punchline_treatment}" if punchline_treatment else "")
             + logo_section
             + "\n\nRender one 16:9 presentation slide."
         )

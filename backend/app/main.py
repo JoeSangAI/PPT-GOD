@@ -1,15 +1,41 @@
 import os
+import re
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, text
 
 from app.core.config import settings
-from app.api import projects, slides, chat, documents
-from app.models.base import engine
+from app.core.provider_credentials import ProviderCredentials, reset_provider_credentials, set_provider_credentials
+from app.core.tester_auth import TESTER_ID_HEADER, reset_current_tester_id, set_current_tester_id
+from app.api import auth, projects, slides, chat, documents
+from app.models.base import SessionLocal, engine
 from app.models import models
 
 models.Base.metadata.create_all(bind=engine)
+
+
+def _ensure_runtime_mvp_schema() -> None:
+    """Keep local SQLite/Postgres dev DBs usable when create_all cannot add columns."""
+    inspector = inspect(engine)
+    if "projects" not in inspector.get_table_names():
+        return
+    project_columns = {col["name"] for col in inspector.get_columns("projects")}
+    if "tester_id" in project_columns:
+        return
+    with engine.begin() as conn:
+        dialect = engine.dialect.name
+        if dialect == "postgresql":
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS tester_id VARCHAR"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
+        else:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN tester_id VARCHAR"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
+
+
+_ensure_runtime_mvp_schema()
 
 # Startup validation: warn about missing API keys in real mode
 if settings.IMAGE_GEN_MODE == "real":
@@ -28,14 +54,46 @@ if settings.IMAGE_GEN_MODE == "real":
 
 app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
 
+
+def _cors_origins() -> list[str]:
+    return [origin.strip() for origin in (settings.CORS_ORIGINS or "").split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:8000", "http://127.0.0.1:8000", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:5175"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+_project_path_re = re.compile(r"^/projects/([^/]+)")
+
+
+@app.middleware("http")
+async def mvp_context_and_project_guard(request: Request, call_next):
+    provider_token = set_provider_credentials(ProviderCredentials.from_headers(request.headers))
+    tester_id = (request.headers.get(TESTER_ID_HEADER) or request.query_params.get("tester_id") or "").strip() or None
+    tester_token = set_current_tester_id(tester_id)
+    try:
+        match = None if request.method == "OPTIONS" else _project_path_re.match(request.url.path)
+        if match:
+            project_id = match.group(1)
+            db = SessionLocal()
+            try:
+                project = db.query(models.Project).filter(models.Project.id == project_id).first()
+                if project and project.tester_id and project.tester_id != tester_id:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "这个项目属于其他测试账号，请切换账号后再试"},
+                    )
+            finally:
+                db.close()
+        return await call_next(request)
+    finally:
+        reset_current_tester_id(tester_token)
+        reset_provider_credentials(provider_token)
+
+app.include_router(auth.router)
 app.include_router(projects.router)
 app.include_router(slides.router)
 app.include_router(chat.router)

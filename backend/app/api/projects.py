@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
+from app.core.tester_auth import require_tester_id, tester_id_from_header, verify_project_access
+from app.core.provider_credentials import store_current_provider_credentials
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.run_state import cancel_active_run, create_project_run, get_active_run, normalize_confirmed_project_stage, serialize_run
 from celery.result import AsyncResult
@@ -16,12 +18,16 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 @router.post("", response_model=ProjectResponse)
-def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
+def create_project(
+    payload: ProjectCreate,
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
     title = payload.title.strip() if payload.title else "未命名项目"
     if len(title) > 100:
         raise HTTPException(status_code=400, detail="项目标题不能超过100个字符")
 
-    project = Project(title=title, style_id=payload.style_id)
+    project = Project(title=title, style_id=payload.style_id, tester_id=tester_id)
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -30,8 +36,13 @@ def create_project(payload: ProjectCreate, db: Session = Depends(get_db)):
 
 
 @router.get("", response_model=list[ProjectResponse])
-def list_projects(db: Session = Depends(get_db)):
-    projects = db.query(Project).order_by(Project.created_at.desc()).all()
+def list_projects(tester_id: str = Depends(require_tester_id), db: Session = Depends(get_db)):
+    projects = (
+        db.query(Project)
+        .filter(Project.tester_id == tester_id)
+        .order_by(Project.created_at.desc())
+        .all()
+    )
     changed = False
     for project in projects:
         before = project.status
@@ -43,10 +54,9 @@ def list_projects(db: Session = Depends(get_db)):
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
-def get_project(project_id: str, db: Session = Depends(get_db)):
+def get_project(project_id: str, tester_id: str = Depends(tester_id_from_header), db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
     before = project.status
     normalize_confirmed_project_stage(project, list(project.slides or []), get_active_run(db, project_id))
     # 用户已进入项目详情，清除未读通知
@@ -60,10 +70,14 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
-def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depends(get_db)):
+def update_project(
+    project_id: str,
+    payload: ProjectUpdate,
+    tester_id: str = Depends(tester_id_from_header),
+    db: Session = Depends(get_db),
+):
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
     if payload.title is not None:
         new_title = payload.title.strip()
         if len(new_title) > 100:
@@ -81,10 +95,9 @@ def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depend
 
 
 @router.delete("/{project_id}")
-def delete_project(project_id: str, db: Session = Depends(get_db)):
+def delete_project(project_id: str, tester_id: str = Depends(tester_id_from_header), db: Session = Depends(get_db)):
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
     db.delete(project)
     db.commit()
     return {"message": "Project deleted"}
@@ -98,11 +111,11 @@ class StyleUpdateRequest(BaseModel):
 def update_project_style(
     project_id: str,
     payload: StyleUpdateRequest,
+    tester_id: str = Depends(tester_id_from_header),
     db: Session = Depends(get_db),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
     if payload.selected_style is not None:
         project.selected_style = payload.selected_style
         project.content_plan_confirmed = True
@@ -122,14 +135,16 @@ def update_project_style(
 def create_style_proposals(
     project_id: str,
     force: bool = False,
+    tester_id: str = Depends(tester_id_from_header),
     db: Session = Depends(get_db),
 ):
     """基于 Content Plan 生成 3 套风格提案并保存到 project.style_proposal。
     支持异步后台生成，前端通过轮询 project.style_proposal 获取结果。
     force=true 时强制重新生成（忽略缓存）。"""
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
+    if not project.content_plan_confirmed or project.selected_style:
+        raise HTTPException(status_code=409, detail="当前阶段不能生成风格提案，请先确认内容或回退到视觉方案。")
     if get_active_run(db, project_id):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
@@ -210,7 +225,8 @@ def create_style_proposals(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    task = generate_style_proposals_task.delay(project_id, run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id)
     run.task_id = task.id
     db.commit()
     return {"status": "generating", "proposals": None, "run": serialize_run(run)}
@@ -224,12 +240,12 @@ class TemplateRecommendationsRequest(BaseModel):
 def update_template_recommendations(
     project_id: str,
     payload: TemplateRecommendationsRequest,
+    tester_id: str = Depends(tester_id_from_header),
     db: Session = Depends(get_db),
 ):
     """保存用户确认的模板页面推荐（cover/toc/content/ending）。"""
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
     if payload.recommendations is not None:
         project.selected_template_recommendations = payload.recommendations
     db.commit()
@@ -245,20 +261,36 @@ class RollbackRequest(BaseModel):
 def rollback_project(
     project_id: str,
     payload: RollbackRequest,
+    tester_id: str = Depends(tester_id_from_header),
     db: Session = Depends(get_db),
 ):
     """按目标阶段回退项目，清理下游数据。"""
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    verify_project_access(project, tester_id)
 
     target = payload.target_stage
     valid_stages = {"planning", "visual_ready", "prompt_ready", "prototype_ready"}
     if target not in valid_stages:
         raise HTTPException(status_code=400, detail=f"无效的回退目标阶段，可选: {valid_stages}")
 
-    # 根据目标阶段清理下游数据
-    cancel_active_run(db, project_id, "用户回退流程")
+    # 根据目标阶段清理下游数据，并尽量取消所有已知后台执行体。
+    active_run = cancel_active_run(db, project_id, "用户回退流程")
+    if active_run and active_run.task_id:
+        try:
+            AsyncResult(active_run.task_id).revoke(terminate=True)
+            logger.info(f"Rollback: revoked run task {active_run.task_id} for project {project_id}")
+        except Exception as e:
+            logger.warning(f"Rollback: failed to revoke run task {active_run.task_id}: {e}")
+    try:
+        from app.api.slides import _running_tasks
+
+        running_task = _running_tasks.pop(project_id, None)
+        if running_task and not running_task.done():
+            running_task.cancel()
+            logger.info(f"Rollback: cancelled asyncio visual task for project {project_id}")
+    except Exception as e:
+        logger.warning(f"Rollback: failed to cancel asyncio visual task for project {project_id}: {e}")
+
     if target == "planning":
         project.status = "planning"
         project.content_plan_confirmed = False
@@ -274,24 +306,35 @@ def rollback_project(
         project.status = "visual_ready"
         project.content_plan_confirmed = True
         project.selected_style = None
+        project.style_proposal = None
         for slide in project.slides:
+            slide.visual_json = {}
             slide.prompt_text = None
             slide.image_path = None
-            slide.status = "visual_ready" if slide.visual_json else "pending"
+            slide.status = "pending"
             slide.error_msg = None
     elif target == "prompt_ready":
         project.status = "prompt_ready"
         project.content_plan_confirmed = True
         for slide in project.slides:
             slide.image_path = None
-            slide.status = "prompt_ready"
+            if slide.prompt_text:
+                slide.status = "prompt_ready"
+            else:
+                slide.status = "visual_ready" if slide.visual_json else "pending"
             slide.error_msg = None
     elif target == "prototype_ready":
         project.status = "prototype_ready"
         project.content_plan_confirmed = True
+        # 回到效果预览表示查看已有打样结果，不再清空 image_path。
+        # 如果用户要重新打样，应回到 prompt_ready 或直接触发新的 prototype run。
         for slide in project.slides:
-            slide.image_path = None
-            slide.status = "prompt_ready"
+            if slide.image_path:
+                slide.status = "completed"
+            elif slide.prompt_text:
+                slide.status = "prompt_ready"
+            else:
+                slide.status = "visual_ready" if slide.visual_json else "pending"
             slide.error_msg = None
 
     db.commit()

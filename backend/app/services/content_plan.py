@@ -6,6 +6,8 @@ from typing import Callable, Dict, List
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import get_minimax_llm_model
+from app.services.document_parser import detect_ppt_sources
 from app.services.search_service import get_knowledge_augmenter
 from app.utils.text_cleaning import normalize_markdown_emphasis
 
@@ -42,6 +44,40 @@ def _soft_page_bounds(page_count: int) -> tuple[int, int]:
     lower = max(1, int(target * 0.7))
     upper = max(target, int(target * 1.3 + 0.999)) + 1
     return lower, upper
+
+
+def _is_ppt_transform_request(topic: str) -> bool:
+    text = (topic or "").lower()
+    patterns = (
+        r"扩展到\s*\d+\s*页",
+        r"拓展到\s*\d+\s*页",
+        r"缩减到\s*\d+\s*页",
+        r"压缩到\s*\d+\s*页",
+        r"减少到\s*\d+\s*页",
+        r"提取",
+        r"融合",
+        r"合并",
+        r"重组",
+        r"改写",
+        r"重新规划",
+        r"只要",
+        r"某个主题",
+        r"特定主题",
+        r"expand to\s+\d+\s+pages?",
+        r"reduce to\s+\d+\s+pages?",
+        r"extract",
+        r"merge",
+        r"combine",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def infer_page_count_from_single_ppt(documents: str, topic: str = "") -> int | None:
+    sources = detect_ppt_sources(documents)
+    if len(sources) != 1 or _is_ppt_transform_request(topic):
+        return None
+    pages = int(sources[0].get("pages") or 0)
+    return pages if pages > 0 else None
 
 
 def _normalize_outline_page_count(outline: List[Dict], page_count: int, strict_page_count: bool = False) -> List[Dict]:
@@ -81,7 +117,59 @@ def _normalize_content_markdown(outline: List[Dict]) -> List[Dict]:
         notes = page.get("speaker_notes")
         if isinstance(notes, str):
             page["speaker_notes"] = normalize_markdown_emphasis(notes)
+        _normalize_punchline_page_content(page)
     return outline
+
+
+def _first_text_line(value) -> str:
+    if isinstance(value, list):
+        candidates = [str(item) for item in value if str(item).strip()]
+    else:
+        candidates = str(value or "").splitlines()
+    for line in candidates:
+        cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(line)).strip()
+        cleaned = normalize_markdown_emphasis(cleaned).strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _normalize_punchline_page_content(page: Dict) -> None:
+    """Keep hero/quote slides as punchline slides, not lightweight content slides."""
+    page_type = str(page.get("type") or "").strip().lower()
+    if page_type not in {"hero", "quote"}:
+        return
+
+    text_content = page.get("text_content")
+    if not isinstance(text_content, dict):
+        return
+
+    headline = _first_text_line(text_content.get("headline"))
+    subhead = _first_text_line(text_content.get("subhead"))
+    body = text_content.get("body")
+    body_line = _first_text_line(body)
+
+    if not headline and body_line:
+        headline = body_line
+
+    body_text = "\n".join(str(x) for x in body) if isinstance(body, list) else str(body or "")
+    if body_text.strip():
+        notes = str(page.get("speaker_notes") or "").strip()
+        preserved = f"原金句页正文素材：{normalize_markdown_emphasis(body_text.strip())}"
+        page["speaker_notes"] = f"{notes}\n\n{preserved}".strip() if notes else preserved
+
+    text_content["headline"] = headline
+    text_content["subhead"] = subhead
+    text_content["body"] = ""
+
+    suggestion = str(page.get("visual_suggestion") or "").strip()
+    if not suggestion or any(term in suggestion for term in ("内容页", "信息图", "列表", "要点")):
+        page["visual_suggestion"] = (
+            "真正的金句页：只突出一句话、一个短语或一个词；"
+            "可走引用、口号、结论、转场判断、数据洞察等方向，"
+            "视觉用克制背景、象征物、人物/场景或纯色纹理承托，"
+            "必须沿用整套 PPT 的配色、字体气质和材质语言。"
+        )
 
 
 def generate_content_plan(
@@ -108,6 +196,22 @@ def generate_content_plan(
 
     doc_section = ""
     if has_docs:
+        ppt_sources = detect_ppt_sources(documents)
+        ppt_policy = ""
+        if len(ppt_sources) == 1:
+            ppt = ppt_sources[0]
+            ppt_policy = f"""
+【上传 PPT 的特殊处理】
+系统识别到用户上传了 1 个 PPT：{ppt.get("filename") or "未命名 PPT"}，原始页数 {ppt.get("pages")} 页。
+- 如果用户没有明确要求扩展、缩减、提取特定主题、融合或重组，你必须按原 PPT 逐页复刻内容结构：输出页数等于 {ppt.get("pages")} 页，第 i 个 JSON 页面对应原 PPT 第 i 页。
+- 逐页复刻时，文字内容应尽量保留原页标题、要点、数据和备注，不要压缩成摘要，也不要重新发明叙事。
+- 如果用户明确要求扩展/缩减/提取/融合/加入新想法，则按用户意图动态调整页数和结构。
+"""
+        elif len(ppt_sources) > 1:
+            ppt_policy = """
+【上传多个 PPT 的特殊处理】
+系统识别到用户上传了多个 PPT。不要机械相加页数；先理解用户意图：融合、提取、重组、对比或加入新想法。除非用户指定页数，否则按内容逻辑生成合适页数。
+"""
         doc_section = f"""
 【用户上传的文档素材】
 {documents}
@@ -116,6 +220,7 @@ def generate_content_plan(
 1. 以上文档是用户提供的核心素材，你必须基于文档内容设计 PPT 大纲。
 2. 文档中的关键论点、数据、结构必须体现在大纲中。
 3. 页数是软目标，不一定严格限制在 {page_count} 页；如果拆页能显著提升叙事和视觉表达，可在 {min_pages}-{max_pages} 页范围内调整。
+{ppt_policy}
 """
 
     # 【新增】内容规划阶段也触发实时搜索，避免模型对前沿话题产生幻觉
@@ -147,7 +252,7 @@ def generate_content_plan(
 1. 设计清晰的叙事结构（起承转合）。
 2. 每页必须包含：
    - page_num: 页码
-   - type: 页面类型（cover/目录 toc/content/hero/data/ending）
+   - type: 页面类型（cover/目录 toc/content/hero/data/ending）。其中 hero 是“金句页/punchline slide”，不是普通内容页。
    - section_title: 所属章节
    - text_content.headline: 大标题（有力、简洁的断言句）
    - text_content.subhead: 副标题（可选）
@@ -165,6 +270,11 @@ def generate_content_plan(
 5. 标题多用设问或断言，少平铺直叙。
 6. 如果一个页面同时包含多个强画面证据/大事件，请主动拆页，而不是硬塞进同一页。例如：白皮书发布会、名企合作、直播间/达人矩阵、资本价值、终端体验、B端团购等应优先独立成页。
 7. 普通“期望页数/约 X 页”是软目标；只有用户明确说“必须/严格/固定/只能 X 页”时才严格等于 X 页。
+8. 金句页（type="hero"）必须像真正的 punchline slide：
+   - 只承载一句极短、有记忆点的话、一个短语或一个词；可以是名言/引用，也可以是口号、结论、转场判断、数据洞察、用户原话、核心命题。
+   - text_content.headline 放金句本身；text_content.subhead 只在确有必要时放来源/场景/轻量解释；text_content.body 必须为空字符串。
+   - 不要把三条建议、解释段落、普通论点伪装成金句页；这些应保持 content/data 页。
+   - visual_suggestion 要体现金句页的停顿感和记忆点，但不要固定成某一种形式；必须沿用整套 PPT 的配色和字体气质。
 
 【JSON 格式】
 严格输出 JSON 数组，不要包含 Markdown 代码块标记：
@@ -186,7 +296,7 @@ def generate_content_plan(
 
     client = get_llm_client()
     stream = client.chat.completions.create(
-        model=settings.MINIMAX_LLM_MODEL,
+        model=get_minimax_llm_model(),
         messages=[
             {"role": "system", "content": "你是世界一流的 PPT 架构师。必须且只能输出合法的 JSON 数组，严禁添加任何额外说明文本。"},
             {"role": "user", "content": prompt},

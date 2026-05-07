@@ -10,6 +10,7 @@ import yaml
 
 from app.core.config import settings
 from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import get_minimax_llm_model
 
 logger = logging.getLogger(__name__)
 
@@ -648,7 +649,7 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 """
 
     response = client.chat.completions.create(
-        model=settings.MINIMAX_LLM_MODEL,
+        model=get_minimax_llm_model(),
         messages=[
             {
                 "role": "system",
@@ -801,7 +802,7 @@ def _generate_asset_based_proposal(
 5. **命名不跑偏**：风格名只取调性，不混入行业词，也不混入版式词（参考输出格式 name 字段的示范）"""
 
     response = client.chat.completions.create(
-        model=settings.MINIMAX_LLM_MODEL,
+        model=get_minimax_llm_model(),
         messages=[
             {
                 "role": "system",

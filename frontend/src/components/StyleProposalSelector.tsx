@@ -153,7 +153,7 @@ export default function StyleProposalSelector({
               disabled={loading || disabled}
               className="text-sm text-gray-500 hover:text-gray-700 underline disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? "正在重新提案..." : "都不满意，让 Agent 重新提案"}
+              {loading ? "正在重新提案..." : "都不满意，让智能助手重新提案"}
             </button>
           </div>
         </>

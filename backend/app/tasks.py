@@ -7,10 +7,11 @@ from app.celery_app import celery_app
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.provider_credentials import load_task_provider_credentials, provider_credentials_context
 from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.generation_pipeline import run_generation_pipeline
-from app.services.run_state import finish_run, mark_run_running, update_run_progress
+from app.services.run_state import finish_run, is_run_active, mark_run_running, update_run_progress
 from app.services.style_proposal import generate_style_proposals
 from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from datetime import datetime, timezone
@@ -101,8 +102,15 @@ def _cleanup_stale_generating_slides(project_id: str, page_nums: list):
 
 
 @celery_app.task
-def generate_slides_task(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None):
+def generate_slides_task(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None, credential_id: str = None):
     """Celery task: 执行幻灯片生成流水线（页级别锁，允许不同页并发生成）。"""
+    credentials = load_task_provider_credentials(redis_client, credential_id)
+    with provider_credentials_context(credentials):
+        return _generate_slides_task_inner(project_id, page_nums, prototype, run_id)
+
+
+def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None):
+    """Celery task body with provider credentials installed in context."""
     target_pages = _resolve_target_pages(project_id, page_nums)
     if not target_pages:
         logger.warning(f"No pages to generate for project {project_id}")
@@ -172,8 +180,15 @@ def generate_slides_task(project_id: str, page_nums: list = None, prototype: boo
 
 
 @celery_app.task(bind=True, max_retries=2)
-def generate_style_proposals_task(self, project_id: str, run_id: str = None):
+def generate_style_proposals_task(self, project_id: str, run_id: str = None, credential_id: str = None):
     """Celery task: 生成风格提案。"""
+    credentials = load_task_provider_credentials(redis_client, credential_id)
+    with provider_credentials_context(credentials):
+        return _generate_style_proposals_task_inner(self, project_id, run_id)
+
+
+def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = None):
+    """Style proposal task body with provider credentials installed in context."""
     db = SessionLocal()
     try:
         logger.info(f"[StyleProposals Celery] Starting for project={project_id}")
@@ -244,6 +259,15 @@ def generate_style_proposals_task(self, project_id: str, run_id: str = None):
                         logger.warning(f"[StyleProposals Celery] Template analysis failed: {e}")
 
         proposals = generate_style_proposals(content_plan, assets=assets if assets else None)
+        db.expire_all()
+        if not is_run_active(db, run_id):
+            logger.info(f"[StyleProposals Celery] Run {run_id} is no longer active; skipping stale writeback")
+            return {"project_id": project_id, "status": "stale"}
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            finish_run(db, run_id, status="failed", message="项目不存在", error_msg="project_not_found")
+            db.commit()
+            return {"project_id": project_id, "status": "not_found"}
         asset_based = any(
             p.get("source") == "asset_clone" or p.get("clone_mode") == "strict_reference"
             for p in proposals

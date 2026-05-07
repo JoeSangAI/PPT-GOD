@@ -23,6 +23,7 @@ class Project(Base):
     )
 
     id = Column(String, primary_key=True, default=gen_uuid)
+    tester_id = Column(String, ForeignKey("tester_users.id"), nullable=True, index=True)
     title = Column(String, nullable=False)
     status = Column(String, default="draft")
     content_plan_confirmed = Column(Boolean, default=False, nullable=False)
@@ -35,9 +36,23 @@ class Project(Base):
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
+    tester = relationship("TesterUser", back_populates="projects")
     slides = relationship("Slide", back_populates="project", cascade="all, delete-orphan")
     reference_images = relationship("ReferenceImage", back_populates="project", cascade="all, delete-orphan")
     runs = relationship("ProjectRun", back_populates="project", cascade="all, delete-orphan")
+
+
+class TesterUser(Base):
+    __tablename__ = "tester_users"
+
+    id = Column(String, primary_key=True, default=gen_uuid)
+    display_name = Column(String, nullable=False)
+    login_key = Column(String, nullable=False, unique=True, index=True)
+    passcode_hash = Column(String, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    last_login_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+    projects = relationship("Project", back_populates="tester")
 
 
 class ProjectRun(Base):

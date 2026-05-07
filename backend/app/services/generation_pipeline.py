@@ -14,7 +14,7 @@ from app.services.image_generation import generate_slide_image, save_slide_image
 from app.services.logo_assets import prepare_logo_overlay_image
 from app.services.logo_policy import should_use_logo_as_scene_asset
 from app.services.pptx_assembler import assemble_pptx
-from app.services.run_state import finish_run, mark_run_running, update_run_progress, cleanup_generation_progress
+from app.services.run_state import cleanup_generation_progress, finish_run, is_run_active, mark_run_running, update_run_progress
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ MAX_REFERENCE_INPUTS = 14
 def _reference_input_priority(ref: Dict) -> int:
     role = ref.get("role")
     kind = str(ref.get("asset_kind") or "").lower()
+    if ref.get("manual_pin"):
+        return -1
     if role == "visual_asset" and kind in {"product", "material"}:
         return 0
     if role == "logo":
@@ -92,6 +94,7 @@ def _load_reference_images(
 
     # 1. 页面级参考图优先：Prompt 中的 Reference Image 1/2/3 必须与
     # 生图 API 的图片输入顺序一致，便于模型按用户意图使用这些图。
+    already_loaded_paths = set()
     if slide.reference_images:
         finetune_attachment_ids = set()
         if slide.visual_json and isinstance(slide.visual_json, dict):
@@ -106,6 +109,9 @@ def _load_reference_images(
                     continue
             elif ref.role == "finetune_ref":
                 continue
+            if ref.file_path in already_loaded_paths:
+                logger.info(f"Slide {slide.page_num}: 跳过重复页面参考图 {ref.file_path}")
+                continue
             if os.path.exists(ref.file_path):
                 try:
                     refs.append({
@@ -119,6 +125,7 @@ def _load_reference_images(
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
                     })
+                    already_loaded_paths.add(ref.file_path)
                 except Exception as e:
                     logger.warning(f"无法加载页面参考图 {ref.file_path}: {e}")
             else:
@@ -195,10 +202,18 @@ def _load_reference_images(
 
     # 3. 全局视觉资产：只加载 visual plan 为当前页选中的资产。
     selected_asset_ids = []
+    manual_asset_ids = set()
     if slide.visual_json and isinstance(slide.visual_json, dict):
         raw_ids = slide.visual_json.get("visual_asset_ids") or []
         if isinstance(raw_ids, list):
-            selected_asset_ids = [str(x) for x in raw_ids][:3]
+            selected_asset_ids = []
+            for x in raw_ids:
+                value = str(x)
+                if value and value not in selected_asset_ids:
+                    selected_asset_ids.append(value)
+        manual_raw = slide.visual_json.get("manual_visual_asset_ids") or []
+        if isinstance(manual_raw, list):
+            manual_asset_ids = {str(x) for x in manual_raw if x}
 
     if selected_asset_ids and slide.project and slide.project.reference_images:
         selected_set = set(selected_asset_ids)
@@ -210,6 +225,9 @@ def _load_reference_images(
         for idx, ref in enumerate(project_assets, start=1):
             if len(refs) >= MAX_REFERENCE_INPUTS:
                 break
+            if ref.file_path in already_loaded_paths:
+                logger.info(f"Slide {slide.page_num}: 跳过重复视觉资产 {ref.file_path}")
+                continue
             if os.path.exists(ref.file_path):
                 try:
                     refs.append({
@@ -222,7 +240,9 @@ def _load_reference_images(
                         "asset_name": getattr(ref, "asset_name", None),
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
+                        "manual_pin": ref.id in manual_asset_ids,
                     })
+                    already_loaded_paths.add(ref.file_path)
                     logger.info(f"Slide {slide.page_num}: 加载视觉资产 {ref.file_path}")
                 except Exception as e:
                     logger.warning(f"无法加载视觉资产 {ref.file_path}: {e}")
@@ -273,6 +293,14 @@ def _load_reference_images(
                     logger.warning(f"无法加载模板参考图 {tmpl_path}: {e}")
 
     refs = sorted(refs, key=_reference_input_priority)
+    if len(refs) > MAX_REFERENCE_INPUTS:
+        logger.warning(
+            "Slide %s: 参考图 %s 张超过 API 上限 %s，仅前 %s 张进入本次生图",
+            slide.page_num,
+            len(refs),
+            MAX_REFERENCE_INPUTS,
+            MAX_REFERENCE_INPUTS,
+        )
     logger.info(f"Slide {slide.page_num}: 共加载 {len(refs)} 张参考图（种子: {'有' if seed_loaded else '无'}）")
     return refs[:MAX_REFERENCE_INPUTS]
 
@@ -299,7 +327,7 @@ def _slide_family(slide: Slide) -> Optional[str]:
     slide_type = (slide.type or "content").lower()
     if slide_type in ("cover", "ending"):
         return "bookend"
-    if slide_type == "hero":
+    if slide_type in {"hero", "quote"}:
         return "hero"
     if slide_type == "toc":
         return "section"
@@ -507,6 +535,15 @@ def run_generation_pipeline(
         logger.error(f"Pipeline: 项目 {project_id} 没有幻灯片")
         return
 
+    def current_run_active() -> bool:
+        db.expire_all()
+        return is_run_active(db, run_id)
+
+    if not current_run_active():
+        logger.info(f"Pipeline: run {run_id} is no longer active before generation; skipping")
+        cleanup_generation_progress(project_id)
+        return
+
     # 过滤目标页
     target_slides = slides
     if page_nums:
@@ -534,6 +571,9 @@ def run_generation_pipeline(
     slide_images = []
 
     def record_generation_result(result: Dict) -> None:
+        if not current_run_active():
+            logger.info(f"Pipeline: run {run_id} is no longer active; skipping stale slide writeback")
+            return
         slide = result["slide"]
         if result.get("error"):
             slide.status = "failed"
@@ -756,6 +796,11 @@ def run_generation_pipeline(
         if s.status == "failed" and s.error_msg and str(s.error_msg).strip()
     ]
     failure_summary = target_errors[0] if target_errors else "部分页面生成失败"
+
+    if not current_run_active():
+        logger.info(f"Pipeline: run {run_id} is no longer active before final writeback; skipping")
+        cleanup_generation_progress(project_id)
+        return
 
     if prototype:
         project.status = "prototype_ready" if target_completed > 0 else "prompt_ready"

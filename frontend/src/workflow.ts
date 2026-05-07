@@ -10,6 +10,7 @@ export interface WorkflowInput {
   activeRun?: WorkflowRun | null;
   contentPlanConfirmed?: boolean;
   showPrototypePreview?: boolean;
+  hasSelectedStyle?: boolean;
   selectedPageCount?: number;
   staleSummary?: {
     hasContentOrVisualStale: boolean;
@@ -49,7 +50,49 @@ export interface WorkflowState {
   templatePageCount: number;
   isBusy: boolean;
   contentPlanConfirmed: boolean;
+  hasSelectedStyle: boolean;
   activeRun: WorkflowRun | null;
+}
+
+export type WorkflowGate =
+  | "draft"
+  | "content"
+  | "visual"
+  | "visual_design"
+  | "prototype"
+  | "batch";
+
+export type MainStageMode =
+  | "brief_studio"
+  | "deck_content"
+  | "deck_style"
+  | "deck_visual"
+  | "deck_prototype"
+  | "deck_final";
+
+export type GateActionKey =
+  | "send_brief"
+  | "generate_content_plan"
+  | "confirm_content"
+  | "switch_to_content"
+  | "switch_to_visual"
+  | "generate_style_proposals"
+  | "confirm_style"
+  | "generate_visual_prompts"
+  | "start_prototype"
+  | "resample_prototype"
+  | "confirm_prototype"
+  | "start_generation"
+  | "retry_failed"
+  | "download"
+  | "templates";
+
+export interface GateContext {
+  gate: WorkflowGate;
+  gateRevision: number;
+  mainStageMode: MainStageMode;
+  activeAgentRole: "content" | "visual" | "finetune";
+  allowedActions: GateActionKey[];
 }
 
 export const WORKFLOW_STEPS = [
@@ -63,6 +106,7 @@ export const WORKFLOW_STEPS = [
 export const STATUS_LABEL: Record<string, string> = {
   draft: "草稿",
   planning: "内容规划",
+  content_plan_ready: "内容待确认",
   visual_ready: "视觉方案",
   prompt_ready: "画面设计",
   prototype: "效果预览中",
@@ -81,6 +125,7 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
   const hasFailedSlide = slides.some((s) => s.status === "failed");
   const stepIndex = getStepIndex(projectStatus, {
     contentPlanConfirmed: input.contentPlanConfirmed,
+    hasSelectedStyle: input.hasSelectedStyle,
     hasGeneratedImage,
     hasPrompt,
   }, activeRun);
@@ -103,7 +148,23 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     templatePageCount: input.templatePageCount || 0,
     isBusy: Boolean(input.isBusy),
     contentPlanConfirmed: Boolean(input.contentPlanConfirmed),
+    hasSelectedStyle: Boolean(input.hasSelectedStyle),
     activeRun,
+  };
+}
+
+export function buildGateContext(state: WorkflowState, revision = 0): GateContext {
+  const gate = getGate(state);
+  const mainStageMode = getMainStageMode(state, gate);
+  const activeAgentRole = getActiveAgentRole(state, gate);
+  const allowedActions = getAllowedGateActions(state, gate);
+
+  return {
+    gate,
+    gateRevision: revision,
+    mainStageMode,
+    activeAgentRole,
+    allowedActions,
   };
 }
 
@@ -113,7 +174,7 @@ export function isActiveRun(run?: WorkflowRun | null) {
 
 function getStepIndex(
   projectStatus: string,
-  facts: { contentPlanConfirmed?: boolean; hasGeneratedImage: boolean; hasPrompt: boolean },
+  facts: { contentPlanConfirmed?: boolean; hasSelectedStyle?: boolean; hasGeneratedImage: boolean; hasPrompt: boolean },
   activeRun?: WorkflowRun | null
 ) {
   const activeStep = getStepIndexForRun(activeRun);
@@ -123,8 +184,10 @@ function getStepIndex(
     case "draft":
       return 0;
     case "planning":
+    case "content_plan_ready":
       return facts.contentPlanConfirmed ? 1 : 0;
     case "visual_ready":
+      if (facts.hasSelectedStyle) return 2;
       return 1;
     case "prompt_ready":
       return 2;
@@ -186,6 +249,7 @@ export function getGuidanceText(state: WorkflowState) {
       if (state.contentPlanConfirmed) return "内容已确认，请与视觉总监沟通风格偏好";
       return "内容规划已完成，请检查并确认";
     case "visual_ready":
+      if (state.hasSelectedStyle) return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
       return "请选择视觉风格方案，或告诉视觉总监你的偏好";
     case "prompt_ready":
       return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
@@ -222,11 +286,8 @@ export function getSecondaryActionKeys(state: WorkflowState) {
   if (state.projectStatus === "planning" && state.templatePageCount > 0) {
     actions.push("templates");
   }
-  if (state.projectStatus === "prompt_ready" || state.projectStatus === "failed") {
-    actions.push("generate-all");
-  }
   if (state.projectStatus === "prototype_ready") {
-    actions.push("toggle-prototype-view", "resample");
+    actions.push("resample");
   }
   if (state.hasFailedSlide) {
     actions.push("retry-failed");
@@ -236,5 +297,78 @@ export function getSecondaryActionKeys(state: WorkflowState) {
   if (state.projectStatus === "completed") {
     actions.push("regenerate");
   }
+  return actions;
+}
+
+function getGate(state: WorkflowState): WorkflowGate {
+  if (state.activeRun?.kind === "content_plan") return "content";
+  if (state.activeRun?.kind === "style_proposal") return "visual";
+  if (state.activeRun?.kind === "visual_prompts") return "visual_design";
+  if (state.activeRun?.kind === "prototype_generation") return "prototype";
+  if (state.activeRun) return "batch";
+
+  switch (state.projectStatus) {
+    case "draft":
+      return "draft";
+    case "planning":
+    case "content_plan_ready":
+      return state.contentPlanConfirmed ? "visual" : "content";
+    case "visual_ready":
+      return state.hasSelectedStyle ? "visual_design" : "visual";
+    case "prompt_ready":
+    case "failed":
+      return "visual_design";
+    case "prototype":
+    case "prototype_ready":
+      return "prototype";
+    case "generating":
+    case "completed":
+      return "batch";
+    default:
+      return "content";
+  }
+}
+
+function getMainStageMode(state: WorkflowState, gate: WorkflowGate): MainStageMode {
+  if (gate === "draft") return "brief_studio";
+  if (gate === "content") return "deck_content";
+  if (gate === "visual") return "deck_style";
+  if (gate === "visual_design") return "deck_visual";
+  if (gate === "prototype") return "deck_prototype";
+  if (gate === "batch") return "deck_final";
+  return state.hasGeneratedImage ? "deck_final" : "deck_content";
+}
+
+function getActiveAgentRole(_state: WorkflowState, gate: WorkflowGate): "content" | "visual" | "finetune" {
+  if (gate === "draft" || gate === "content") return "content";
+  return "visual";
+}
+
+function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateActionKey[] {
+  const actions: GateActionKey[] = [];
+  if (gate === "draft") {
+    actions.push("send_brief", "generate_content_plan");
+  }
+  if (gate === "content") {
+    actions.push("switch_to_content");
+    if (state.projectStatus !== "draft" && !state.contentPlanConfirmed) actions.push("confirm_content");
+    if (state.templatePageCount > 0) actions.push("templates");
+  }
+  if (gate === "visual") {
+    actions.push("switch_to_visual", "generate_style_proposals");
+    if (!state.isBusy) actions.push("confirm_style");
+  }
+  if (gate === "visual_design") {
+    actions.push("generate_visual_prompts");
+    if (state.hasPrompt) actions.push("start_prototype", "start_generation");
+  }
+  if (gate === "prototype") {
+    actions.push("resample_prototype", "confirm_prototype");
+  }
+  if (gate === "batch") {
+    actions.push("download");
+    if (state.projectStatus !== "generating") actions.push("start_generation");
+  }
+  if (state.hasFailedSlide) actions.push("retry_failed");
   return actions;
 }

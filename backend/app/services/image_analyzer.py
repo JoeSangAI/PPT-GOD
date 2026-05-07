@@ -9,6 +9,7 @@ from PIL import Image as PILImage
 import requests
 
 from app.core.config import settings
+from app.core.provider_credentials import get_provider_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ def extract_image_palette(image_path: str, max_colors: int = 6) -> list[Dict]:
 
 
 def _minimax_coding_plan_url() -> str:
-    base = settings.MINIMAX_API_BASE.rstrip("/")
+    base = get_provider_credentials().minimax_api_base.rstrip("/")
     if base.endswith("/v1"):
         return f"{base}/coding_plan/vlm"
     return f"{base}/v1/coding_plan/vlm"
@@ -89,7 +90,7 @@ def _call_vision_model(image_path: str, prompt: str) -> str:
         resp = requests.post(
             _minimax_coding_plan_url(),
             headers={
-                "Authorization": f"Bearer {settings.MINIMAX_API_KEY}",
+                "Authorization": f"Bearer {get_provider_credentials().minimax_api_key}",
                 "Content-Type": "application/json",
                 "MM-API-Source": "Minimax-MCP",
             },

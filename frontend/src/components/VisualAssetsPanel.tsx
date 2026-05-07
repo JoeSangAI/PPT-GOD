@@ -11,11 +11,21 @@ export interface ReferenceImage {
   asset_kind?: "product" | "person" | "scene" | "material" | "other" | null;
   usage_note?: string | null;
   asset_analysis?: any;
+  source_document?: string | null;
+  source_page_num?: number | null;
+  tags?: string[];
   logo_anchor?: "top-left" | "top-right" | "bottom-left" | "bottom-right" | null;
 }
 
 interface VisualAssetsPanelProps {
   referenceImages: ReferenceImage[];
+  activeSlide?: {
+    id: string;
+    page_num: number;
+    type?: string;
+    content_json?: any;
+    visual_json?: any;
+  } | null;
   templateRecommendations?: any | null;
   templatePages?: any[];
   onDelete: (refId: string) => void;
@@ -32,6 +42,8 @@ interface VisualAssetsPanelProps {
     process_mode?: string;
     logo_anchor?: string;
   }) => Promise<void> | void;
+  onPinAsset?: (slideId: string, assetId: string) => Promise<void> | void;
+  onUnpinAsset?: (slideId: string, assetId: string) => Promise<void> | void;
   showInVisualStage?: boolean;
 }
 
@@ -49,7 +61,7 @@ function AssetCard({
   onDelete: () => void;
 }) {
   return (
-    <div className="relative group bg-white rounded-lg border border-gray-200 p-2 flex flex-col items-center gap-1.5 w-[140px] h-[140px]">
+    <div className="pg-asset-card relative group bg-white rounded-lg border border-gray-200 p-2 flex flex-col items-center gap-1.5 w-[140px] h-[140px]">
       {label && (
         <span className="text-2xs text-gray-500 font-medium leading-none h-3 flex items-center">
           {label}
@@ -60,7 +72,7 @@ function AssetCard({
       </div>
       <button
         onClick={onDelete}
-        className="absolute top-1 right-1 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600 z-10"
+        className="pg-danger-icon-button absolute top-1 right-1 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-sm hover:bg-red-600 z-10"
         title="删除"
       >
         X
@@ -84,7 +96,7 @@ function AddAssetButton({
     <button
       onClick={onClick}
       title={description || `点击上传 ${label}，支持 ${formats}`}
-      className="flex-shrink-0 bg-white rounded-lg border border-dashed border-purple-200 p-2 flex flex-col items-center justify-center gap-0.5 w-[140px] h-[140px] hover:border-purple-400 hover:bg-purple-50 transition-colors group"
+      className="pg-add-asset-button flex-shrink-0 bg-white rounded-lg border border-dashed border-purple-200 p-2 flex flex-col items-center justify-center gap-0.5 w-[140px] h-[140px] hover:border-purple-400 hover:bg-purple-50 transition-colors group"
     >
       <span className="text-lg text-purple-400 group-hover:text-purple-500 transition-colors">+</span>
       <span className="text-2xs text-gray-600 font-medium">{label}</span>
@@ -95,6 +107,7 @@ function AddAssetButton({
 
 export default function VisualAssetsPanel({
   referenceImages,
+  activeSlide,
   templateRecommendations,
   templatePages,
   onDelete,
@@ -105,10 +118,16 @@ export default function VisualAssetsPanel({
   onUploadTemplate,
   onUploadVisualAsset,
   onUpdateVisualAsset,
+  onPinAsset,
+  onUnpinAsset,
   showInVisualStage = false,
 }: VisualAssetsPanelProps) {
   const [showTemplatePages, setShowTemplatePages] = useState(false);
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [kindFilter, setKindFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [modeFilter, setModeFilter] = useState("all");
   const [assetDraft, setAssetDraft] = useState({
     asset_name: "",
     asset_kind: "other",
@@ -120,6 +139,22 @@ export default function VisualAssetsPanel({
   const styleRefs = referenceImages.filter((r) => r.role === "style_ref");
   const template = referenceImages.find((r) => r.role === "template");
   const visualAssets = referenceImages.filter((r) => r.role === "visual_asset");
+  const manualPinnedIds: string[] = Array.isArray(activeSlide?.visual_json?.manual_visual_asset_ids)
+    ? activeSlide!.visual_json.manual_visual_asset_ids.map(String)
+    : [];
+  const selectedIds: string[] = Array.isArray(activeSlide?.visual_json?.visual_asset_ids)
+    ? activeSlide!.visual_json.visual_asset_ids.map(String)
+    : [];
+  const activeText = [
+    activeSlide?.content_json?.text_content?.headline,
+    activeSlide?.content_json?.text_content?.subhead,
+    typeof activeSlide?.content_json?.text_content?.body === "string"
+      ? activeSlide?.content_json?.text_content?.body
+      : Array.isArray(activeSlide?.content_json?.text_content?.body)
+      ? activeSlide?.content_json?.text_content?.body.join(" ")
+      : "",
+    activeSlide?.visual_json?.visual_description,
+  ].filter(Boolean).join(" ").toLowerCase();
 
   const shouldShow = showInVisualStage || referenceImages.length > 0;
   if (!shouldShow) return null;
@@ -138,6 +173,60 @@ export default function VisualAssetsPanel({
     material: "物料",
     other: "其他",
   };
+  const sourceDocuments = Array.from(new Set(
+    visualAssets
+      .map((asset) => asset.source_document || asset.asset_analysis?.source_document)
+      .filter(Boolean)
+  )).sort();
+  const normalizedQuery = query.trim().toLowerCase();
+
+  const assetSearchText = (asset: ReferenceImage) => [
+    asset.asset_name,
+    asset.asset_kind,
+    asset.process_mode,
+    asset.usage_note,
+    asset.source_document,
+    asset.source_page_num,
+    asset.asset_analysis?.source_document,
+    asset.asset_analysis?.pptx_source_page_num,
+    asset.asset_analysis?.source_slide_text,
+    ...(Array.isArray(asset.asset_analysis?.asset_tags) ? asset.asset_analysis.asset_tags : []),
+    ...(Array.isArray(asset.asset_analysis?.suggested_keywords) ? asset.asset_analysis.suggested_keywords : []),
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  const relevanceScore = (asset: ReferenceImage) => {
+    if (!activeSlide) return 0;
+    const text = assetSearchText(asset);
+    let score = selectedIds.includes(asset.id) ? 10 : 0;
+    for (const token of activeText.split(/[\s,，。；;、|/]+/).filter((x) => x.length >= 2)) {
+      if (text.includes(token)) score += 1;
+    }
+    return score;
+  };
+
+  const filteredVisualAssets = visualAssets.filter((asset) => {
+    const text = assetSearchText(asset);
+    if (normalizedQuery && !text.includes(normalizedQuery)) return false;
+    if (kindFilter !== "all" && (asset.asset_kind || "other") !== kindFilter) return false;
+    if (modeFilter !== "all" && (asset.process_mode || "blend") !== modeFilter) return false;
+    const source = asset.source_document || asset.asset_analysis?.source_document || "";
+    if (sourceFilter !== "all" && source !== sourceFilter) return false;
+    return true;
+  });
+  const pinnedAssets = activeSlide
+    ? manualPinnedIds
+        .map((id) => visualAssets.find((asset) => asset.id === id))
+        .filter(Boolean) as ReferenceImage[]
+    : [];
+  const recommendedAssets = activeSlide
+    ? filteredVisualAssets
+        .filter((asset) => !manualPinnedIds.includes(asset.id) && relevanceScore(asset) > 0)
+        .sort((a, b) => relevanceScore(b) - relevanceScore(a))
+        .slice(0, 12)
+    : [];
+  const allLibraryAssets = filteredVisualAssets.filter(
+    (asset) => !manualPinnedIds.includes(asset.id) && !recommendedAssets.some((rec) => rec.id === asset.id)
+  );
 
   const renderVisualAssetCard = (asset: ReferenceImage) => {
     const name = asset.asset_name || asset.asset_analysis?.subject || "未命名资产";
@@ -145,7 +234,7 @@ export default function VisualAssetsPanel({
 
     if (isEditing) {
       return (
-        <div key={asset.id} className="flex-shrink-0 bg-white rounded-lg border border-purple-200 p-3 w-[280px]">
+        <div key={asset.id} className="pg-asset-editor-card flex-shrink-0 bg-white rounded-lg border border-purple-200 p-3 w-[280px]">
           <div className="relative h-24 bg-gray-50 rounded overflow-hidden mb-2">
             <img
               src={getImageUrl(apiBase, asset.url)}
@@ -158,7 +247,7 @@ export default function VisualAssetsPanel({
             />
             <button
               onClick={() => onDelete(asset.id)}
-              className="absolute top-1 right-1 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center shadow-sm hover:bg-red-600 z-10"
+              className="pg-danger-icon-button absolute top-1 right-1 w-5 h-5 bg-red-500 text-white rounded-full text-2xs flex items-center justify-center shadow-sm hover:bg-red-600 z-10"
               title="删除"
             >
               X
@@ -202,7 +291,7 @@ export default function VisualAssetsPanel({
             />
             <div className="flex gap-1">
               <button
-                className="flex-1 text-2xs bg-purple-600 text-white rounded px-2 py-1 hover:bg-purple-700"
+                className="pg-action pg-action-primary flex-1 text-2xs bg-purple-600 text-white rounded px-2 py-1 hover:bg-purple-700"
                 onClick={async () => {
                   await onUpdateVisualAsset?.(asset.id, assetDraft);
                   setEditingAssetId(null);
@@ -211,7 +300,7 @@ export default function VisualAssetsPanel({
                 保存
               </button>
               <button
-                className="flex-1 text-2xs bg-gray-100 text-gray-600 rounded px-2 py-1 hover:bg-gray-200"
+                className="pg-action pg-action-secondary flex-1 text-2xs bg-gray-100 text-gray-600 rounded px-2 py-1 hover:bg-gray-200"
                 onClick={() => setEditingAssetId(null)}
               >
                 取消
@@ -222,6 +311,9 @@ export default function VisualAssetsPanel({
       );
     }
 
+    const source = asset.source_document || asset.asset_analysis?.source_document;
+    const pageNum = asset.source_page_num || asset.asset_analysis?.pptx_source_page_num;
+    const isPinned = manualPinnedIds.includes(asset.id);
     return (
       <div key={asset.id} className="flex flex-col items-center gap-1">
         <AssetCard label="" onDelete={() => onDelete(asset.id)}>
@@ -241,33 +333,70 @@ export default function VisualAssetsPanel({
         <div className="text-2xs text-gray-400 text-center">
           {kindLabel[asset.asset_kind || "other"]} · {asset.process_mode || "blend"}
         </div>
+        {(source || pageNum) && (
+          <div className="text-2xs text-gray-400 text-center max-w-[140px] truncate" title={`${source || ""}${pageNum ? ` 第${pageNum}页` : ""}`}>
+            {pageNum ? `P${pageNum}` : "来源"} {source || ""}
+          </div>
+        )}
         {asset.usage_note && (
           <div className="text-2xs text-gray-400 text-center max-w-[140px] truncate" title={asset.usage_note}>
             {asset.usage_note}
           </div>
         )}
         {onUpdateVisualAsset && (
-          <button
-            className="text-2xs text-purple-600 hover:text-purple-700"
-            onClick={() => {
-              setEditingAssetId(asset.id);
-              setAssetDraft({
-                asset_name: asset.asset_name || "",
-                asset_kind: asset.asset_kind || "other",
-                usage_note: asset.usage_note || "",
-                process_mode: asset.process_mode || "blend",
-              });
-            }}
-          >
-            编辑
-          </button>
+          <div className="flex items-center gap-1">
+            {activeSlide && (isPinned ? (
+              <button
+                className="pg-subtle-link text-2xs text-emerald-700 hover:text-emerald-800"
+                onClick={() => onUnpinAsset?.(activeSlide.id, asset.id)}
+                title="取消锁定到当前页"
+              >
+                已锁定
+              </button>
+            ) : (
+              <button
+                className="pg-subtle-link text-2xs text-blue-600 hover:text-blue-700"
+                onClick={() => onPinAsset?.(activeSlide.id, asset.id)}
+                title="锁定到当前页"
+              >
+                Pin 到本页
+              </button>
+            ))}
+            <button
+              className="pg-subtle-link text-2xs text-purple-600 hover:text-purple-700"
+              onClick={() => {
+                setEditingAssetId(asset.id);
+                setAssetDraft({
+                  asset_name: asset.asset_name || "",
+                  asset_kind: asset.asset_kind || "other",
+                  usage_note: asset.usage_note || "",
+                  process_mode: asset.process_mode || "blend",
+                });
+              }}
+            >
+              编辑
+            </button>
+          </div>
         )}
       </div>
     );
   };
 
+  const renderAssetSection = (title: string, assets: ReferenceImage[], emptyText: string) => (
+    <div className="mb-3">
+      <div className="text-2xs text-gray-500 font-semibold mb-1.5">{title} · {assets.length}</div>
+      {assets.length > 0 ? (
+        <div className="flex flex-wrap items-start gap-3 pb-1">{assets.map(renderVisualAssetCard)}</div>
+      ) : (
+        <div className="text-2xs text-gray-400 bg-white border border-dashed border-gray-200 rounded px-3 py-2">
+          {emptyText}
+        </div>
+      )}
+    </div>
+  );
+
   return (
-    <div className="bg-gray-50 border-b border-gray-200 px-3 py-2">
+    <div className="pg-visual-assets-panel bg-gray-50 border-b border-gray-200 px-3 py-2">
       {(!hasAnyAssets && showInVisualStage) && (
         <div className="text-2xs text-gray-400 mb-2">
           按参考强度从高到低上传：品牌 Logo、核心资产、风格参考、版式模板
@@ -276,6 +405,38 @@ export default function VisualAssetsPanel({
       <div className="text-2xs text-gray-400 mb-2">
         Logo 由系统按页面智能处理；核心资产按页进入生图；风格参考只提取视觉气质；版式模板只参考页面结构。
       </div>
+      {activeSlide && (
+        <div className="mb-2 flex items-center gap-2 text-2xs text-blue-700 bg-blue-50 border border-blue-100 rounded px-2 py-1">
+          <span className="font-medium">当前页 P{activeSlide.page_num}</span>
+          <span>手动锁定 {manualPinnedIds.length} 张</span>
+          {manualPinnedIds.length > 5 && <span className="text-amber-700">参考图较多，可能降低生图稳定性</span>}
+        </div>
+      )}
+
+      {visualAssets.length > 0 && (
+        <div className="mb-3 grid grid-cols-1 md:grid-cols-4 gap-2">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索素材、标签、页码"
+            className="text-xs border border-gray-200 rounded px-2 py-1 bg-white"
+          />
+          <select value={kindFilter} onChange={(e) => setKindFilter(e.target.value)} className="text-xs border border-gray-200 rounded px-2 py-1 bg-white">
+            <option value="all">全部类型</option>
+            {Object.entries(kindLabel).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select>
+          <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)} className="text-xs border border-gray-200 rounded px-2 py-1 bg-white">
+            <option value="all">全部来源</option>
+            {sourceDocuments.map((source) => <option key={String(source)} value={String(source)}>{String(source)}</option>)}
+          </select>
+          <select value={modeFilter} onChange={(e) => setModeFilter(e.target.value)} className="text-xs border border-gray-200 rounded px-2 py-1 bg-white">
+            <option value="all">全部模式</option>
+            <option value="blend">融合</option>
+            <option value="crop">身份保真</option>
+            <option value="original">原图</option>
+          </select>
+        </div>
+      )}
 
       <div className="flex flex-wrap items-start gap-3 pb-1">
         {/* Logo */}
@@ -298,7 +459,7 @@ export default function VisualAssetsPanel({
                 return (
                   <button
                     key={anchor}
-                    className={`text-2xs rounded px-1 py-0.5 border ${
+                    className={`pg-asset-anchor-button text-2xs rounded px-1 py-0.5 border ${
                       active
                         ? "bg-purple-600 text-white border-purple-600"
                         : "bg-white text-gray-500 border-gray-200 hover:border-purple-300"
@@ -325,7 +486,6 @@ export default function VisualAssetsPanel({
         ) : null}
 
         {/* Core visual assets */}
-        {visualAssets.map(renderVisualAssetCard)}
         {showInVisualStage && onUploadVisualAsset && (
           <AddAssetButton
             label="核心资产"
@@ -334,7 +494,13 @@ export default function VisualAssetsPanel({
             onClick={onUploadVisualAsset}
           />
         )}
+      </div>
 
+      {renderAssetSection("已锁定到本页", activeSlide ? pinnedAssets : [], "当前页还没有手动锁定素材")}
+      {renderAssetSection("推荐候选", activeSlide ? recommendedAssets : [], "没有根据当前页内容命中的候选素材")}
+      {renderAssetSection("全部素材", allLibraryAssets, visualAssets.length ? "没有符合筛选条件的素材" : "素材库为空")}
+
+      <div className="flex flex-wrap items-start gap-3 pb-1">
         {/* Style references */}
         {styleRefs.map((ref, idx) => (
           <AssetCard
@@ -404,7 +570,7 @@ export default function VisualAssetsPanel({
             return (
               <div
                 key={page.page_num}
-                className={`relative flex-shrink-0 bg-white rounded border p-1.5 ${
+              className={`pg-template-card relative flex-shrink-0 bg-white rounded border p-1.5 ${
                   isRecommended
                     ? "border-purple-300 ring-1 ring-purple-200"
                     : "border-gray-200"

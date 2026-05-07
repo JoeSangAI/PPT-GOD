@@ -107,6 +107,13 @@ def get_run(db: Session, run_id: str | None) -> ProjectRun | None:
     return db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
 
 
+def is_run_active(db: Session, run_id: str | None) -> bool:
+    if not run_id:
+        return True
+    run = get_run(db, run_id)
+    return bool(run and run.status in ACTIVE_RUN_STATUSES)
+
+
 def mark_run_running(
     db: Session,
     run_id: str | None,
@@ -163,6 +170,8 @@ def finish_run(
 ) -> ProjectRun | None:
     run = get_run(db, run_id)
     if run:
+        if run.status not in ACTIVE_RUN_STATUSES and run.status != status:
+            return run
         run.status = status
         if message is not None:
             run.message = message

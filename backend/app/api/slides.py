@@ -17,6 +17,12 @@ from app.models.base import get_db, SessionLocal
 from app.models.models import Project, Slide, ReferenceImage, SlideVersion
 from app.schemas.project import SlideResponse
 from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import (
+    get_minimax_llm_model,
+    get_raw_provider_credentials,
+    provider_credentials_context,
+    store_current_provider_credentials,
+)
 from app.utils.project_docs import load_project_documents
 from app.utils.text_cleaning import normalize_markdown_emphasis
 from app.utils.reference_image import (
@@ -30,7 +36,7 @@ from app.utils.reference_image import (
 _running_tasks: dict = {}
 _running_tasks_lock = asyncio.Lock()
 from app.core.config import settings
-from app.services.content_plan import generate_content_plan
+from app.services.content_plan import generate_content_plan, infer_page_count_from_single_ppt
 from app.services.logo_policy import (
     DEFAULT_LOGO_ANCHOR,
     LOGO_ANCHORS,
@@ -40,7 +46,7 @@ from app.services.logo_policy import (
     should_use_logo_as_scene_asset,
 )
 from app.services.logo_assets import prepare_logo_overlay_image
-from app.services.visual_plan import generate_visual_plan
+from app.services.visual_plan import generate_visual_plan, _recall_visual_assets_for_page
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset
@@ -51,6 +57,7 @@ from app.services.run_state import (
     finish_run,
     get_active_run,
     get_latest_run,
+    is_run_active,
     mark_run_running,
     normalize_confirmed_project_stage,
     reconcile_project_state,
@@ -72,7 +79,6 @@ logger = logging.getLogger(__name__)
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
 ALLOWED_UPLOAD_ROLES = {"style_ref", "logo", "template", "visual_asset", "content_ref", "chart_ref", "finetune_ref"}
-MAX_VISUAL_ASSETS_PER_PROJECT = 30
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg",
     "image/png",
@@ -130,6 +136,107 @@ def _derive_project_style_pack(project: Project, content_plan: list[dict]) -> st
         except Exception as exc:
             logger.warning(f"StylePack: failed to analyze style_ref {ref.file_path}: {exc}")
     return derive_style_pack_from_content(content_plan, reference_analyses=analyses)
+
+
+def _reference_upload_url(project_id: str, file_path: str | None) -> str:
+    """Build a stable URL for root uploads and nested PPTX asset files."""
+    path = (file_path or "").replace("\\", "/")
+    marker = f"/{project_id}/"
+    if marker in path:
+        suffix = path.split(marker, 1)[1]
+    else:
+        suffix = os.path.basename(path)
+    return f"/uploads/{project_id}/{suffix}"
+
+
+def _asset_source_document(ref: ReferenceImage) -> str:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    return str(analysis.get("source_document") or "").strip()
+
+
+def _asset_source_page_num(ref: ReferenceImage) -> int | None:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    page_num = analysis.get("pptx_source_page_num")
+    return page_num if isinstance(page_num, int) else None
+
+
+def _manual_asset_ids(visual_json: dict | None) -> list[str]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    raw = visual.get("manual_visual_asset_ids") or []
+    if not isinstance(raw, list):
+        return []
+    ids: list[str] = []
+    for asset_id in raw:
+        value = str(asset_id)
+        if value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _manual_asset_usage(visual_json: dict | None) -> dict[str, str]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    raw = visual.get("manual_visual_asset_usage") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if k and v}
+
+
+def _merge_asset_ids(manual_ids: list[str], auto_ids: list[str] | None) -> list[str]:
+    merged: list[str] = []
+    for asset_id in [*manual_ids, *(auto_ids or [])]:
+        value = str(asset_id)
+        if value and value not in merged:
+            merged.append(value)
+    return merged
+
+
+def _merge_manual_pins_into_visual_json(visual_json: dict | None, existing_visual_json: dict | None) -> dict:
+    visual = copy.deepcopy(visual_json) if isinstance(visual_json, dict) else {}
+    existing = existing_visual_json if isinstance(existing_visual_json, dict) else {}
+    manual_ids = _manual_asset_ids(existing)
+    manual_usage = _manual_asset_usage(existing)
+    if not manual_ids:
+        return visual
+    visual["manual_visual_asset_ids"] = manual_ids
+    visual["manual_visual_asset_usage"] = manual_usage
+    visual["visual_asset_ids"] = _merge_asset_ids(manual_ids, visual.get("visual_asset_ids") or [])
+    usage = visual.get("visual_asset_usage") if isinstance(visual.get("visual_asset_usage"), dict) else {}
+    visual["visual_asset_usage"] = {**manual_usage, **{str(k): str(v) for k, v in usage.items() if k and v}}
+    return visual
+
+
+def _serialize_reference_image(
+    img: ReferenceImage,
+    project_id: str,
+    *,
+    pinned_slide_ids: list[str] | None = None,
+    is_pinned: bool = False,
+    relevance: dict | None = None,
+) -> dict:
+    analysis = img.asset_analysis if isinstance(img.asset_analysis, dict) else {}
+    source_page_num = _asset_source_page_num(img)
+    source_document = _asset_source_document(img)
+    return {
+        "id": img.id,
+        "role": img.role,
+        "slide_id": img.slide_id,
+        "process_mode": img.process_mode or "blend",
+        "asset_name": img.asset_name,
+        "asset_kind": img.asset_kind,
+        "usage_note": img.usage_note,
+        "asset_analysis": img.asset_analysis,
+        "source_document": source_document or None,
+        "source_page_num": source_page_num,
+        "tags": analysis.get("asset_tags") or analysis.get("suggested_keywords") or [],
+        "pinned_slide_ids": pinned_slide_ids or [],
+        "is_pinned": is_pinned,
+        "matched_terms": (relevance or {}).get("matched_terms", []),
+        "relevance_reason": (relevance or {}).get("reason"),
+        "logo_anchor": img.logo_anchor or (DEFAULT_LOGO_ANCHOR if img.role == "logo" else None),
+        "file_exists": os.path.exists(img.file_path),
+        "url": _reference_upload_url(project_id, img.file_path),
+        "overlay_url": _logo_overlay_url(img, project_id) if img.role == "logo" else None,
+    }
 
 
 def _project_template_refs_for_prompt(project: Project) -> list[dict]:
@@ -224,7 +331,17 @@ def _visual_asset_summary(ref: ReferenceImage) -> str:
         parts.append("must_not_change=" + "、".join(str(x) for x in must_not_change[:6]))
     keywords = analysis.get("suggested_keywords")
     if isinstance(keywords, list) and keywords:
-        parts.append("keywords=" + "、".join(str(x) for x in keywords[:8]))
+        parts.append("keywords=" + "、".join(str(x) for x in keywords[:16]))
+    source_page = analysis.get("pptx_source_page_num")
+    source_doc = analysis.get("source_document")
+    if source_doc and source_page:
+        parts.append(f"source=来自上传 PPT「{source_doc}」第{source_page}页")
+    source_text = analysis.get("source_slide_text")
+    if isinstance(source_text, str) and source_text.strip():
+        parts.append(f"source_slide_text={source_text[:240]}")
+    tags = analysis.get("asset_tags")
+    if isinstance(tags, list) and tags:
+        parts.append("tags=" + "、".join(str(x) for x in tags[:16]))
     if analysis.get("recommended_usage"):
         parts.append(f"recommended_usage={analysis['recommended_usage']}")
     if analysis.get("fidelity_note"):
@@ -413,6 +530,32 @@ def _format_reference_analysis(analysis: dict) -> str:
     return "; ".join(parts)
 
 
+def _format_pptx_reference_analysis(ref: ReferenceImage) -> str | None:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    if not analysis.get("source_document"):
+        return None
+    parts = []
+    if ref.asset_name:
+        parts.append(f"asset={ref.asset_name}")
+    source_doc = analysis.get("source_document")
+    source_page = analysis.get("pptx_source_page_num")
+    if source_doc and source_page:
+        parts.append(f"source=来自上传PPT「{source_doc}」第{source_page}页")
+    if analysis.get("classification"):
+        parts.append(f"classification={analysis['classification']}")
+    if analysis.get("area_ratio") is not None:
+        parts.append(f"area_ratio={analysis['area_ratio']}")
+    tags = analysis.get("asset_tags") or analysis.get("suggested_keywords")
+    if isinstance(tags, list) and tags:
+        parts.append("tags=" + "、".join(str(x) for x in tags[:12]))
+    source_text = analysis.get("source_slide_text")
+    if isinstance(source_text, str) and source_text.strip():
+        parts.append(f"source_slide_text={source_text[:240]}")
+    if ref.usage_note:
+        parts.append(f"usage={ref.usage_note}")
+    return "; ".join(parts) if parts else None
+
+
 def _build_slide_reference_contexts(
     slides: list[Slide],
 ) -> tuple[dict[int, list[str]], dict[int, str]]:
@@ -436,8 +579,10 @@ def _build_slide_reference_contexts(
             logger.info(f"RefContext: slide {slide.page_num} ref {idx} file={ref.file_path} exists={file_exists} role={ref.role}")
             if not file_exists:
                 continue
-            analysis = analyze_reference_image(ref.file_path)
-            summary = _format_reference_analysis(analysis)
+            summary = _format_pptx_reference_analysis(ref)
+            if not summary:
+                analysis = analyze_reference_image(ref.file_path)
+                summary = _format_reference_analysis(analysis)
             page_contexts.append(
                 f"Reference Image {idx}: role={ref.role}; process_mode={ref.process_mode or 'blend'}; "
                 f"intent={reference_process_mode_instruction(ref.process_mode)};"
@@ -454,6 +599,34 @@ def _build_slide_reference_contexts(
 
     logger.info(f"RefContext: built contexts for pages={list(contexts.keys())}, hints for pages={list(user_hints.keys())}")
     return contexts, user_hints
+
+
+def _link_pending_pptx_page_refs(project_id: str, db: Session) -> int:
+    """Attach PPT-extracted page refs uploaded before slides existed."""
+    slides = db.query(Slide).filter(Slide.project_id == project_id).all()
+    slide_by_page = {slide.page_num: slide for slide in slides}
+    if not slide_by_page:
+        return 0
+
+    pending_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.slide_id.is_(None),
+        ReferenceImage.role == "content_ref",
+    ).all()
+    linked = 0
+    for ref in pending_refs:
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+        page_num = analysis.get("pptx_source_page_num")
+        if not isinstance(page_num, int):
+            continue
+        slide = slide_by_page.get(page_num)
+        if not slide:
+            continue
+        ref.slide_id = slide.id
+        linked += 1
+    if linked:
+        logger.info(f"Linked {linked} PPTX-extracted page refs to slides for project={project_id}")
+    return linked
 
 
 class PageNumsRequest(BaseModel):
@@ -483,6 +656,11 @@ class UpdateVisualRequest(BaseModel):
     visual_json: dict
 
 
+class AssetPinsRequest(BaseModel):
+    asset_ids: List[str]
+    usage: dict[str, str] = {}
+
+
 class ReorderRequest(BaseModel):
     page_nums: List[int]
 
@@ -502,6 +680,10 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
         documents = load_project_documents(project_id)
         if documents:
             logger.info(f"[ContentPlan BG] Loaded documents, length={len(documents)}")
+            inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
+            if page_count is None and inferred_page_count:
+                page_count = inferred_page_count
+                logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
 
         def report_progress(data: dict):
             _update_progress(project_id, data, run_id)
@@ -512,6 +694,10 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
             documents=documents,
             on_progress=report_progress,
         )
+        db.expire_all()
+        if not is_run_active(db, run_id):
+            logger.info(f"[ContentPlan BG] Run {run_id} is no longer active; skipping stale writeback")
+            return
         logger.info(f"[ContentPlan BG] Generated {len(outline)} pages")
         update_run_progress(
             db,
@@ -523,6 +709,17 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
         )
         db.commit()
         _update_progress(project_id, {"stage": "saving", "message": "正在保存结果...", "current_page": len(outline), "total_pages": len(outline)}, run_id)
+        # PPT 上传早于/晚于内容规划都要能重新挂回新生成的页面。
+        # 生成新 slides 前，先把从 PPT 拆出的页面参考图解绑，避免旧 slide 被删除后素材丢失在孤儿关系里。
+        pptx_refs = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.role == "content_ref",
+        ).all()
+        for ref in pptx_refs:
+            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+            if isinstance(analysis.get("pptx_source_page_num"), int):
+                ref.slide_id = None
+        db.flush()
         # 删除旧的 slides（如果存在）
         db.query(Slide).filter(Slide.project_id == project_id).delete()
         # 保存新的 slides
@@ -536,6 +733,8 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
                 content_json=item,
             )
             db.add(slide)
+        db.flush()
+        linked_refs = _link_pending_pptx_page_refs(project_id, db)
         project = db.query(Project).filter(Project.id == project_id).first()
         if project:
             project.status = "planning"
@@ -546,7 +745,7 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
             db,
             run_id,
             status="succeeded",
-            message=f"内容规划已生成，共 {len(outline)} 页",
+            message=f"内容规划已生成，共 {len(outline)} 页" + (f"，已绑定 {linked_refs} 张原 PPT 页面素材" if linked_refs else ""),
             completed_count=len(outline),
         )
         # 内容规划生成完成，设置未读通知
@@ -584,6 +783,8 @@ def create_content_plan(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project.status not in {"draft", "planning", "content_plan_ready"} or project.content_plan_confirmed:
+        raise HTTPException(status_code=409, detail="当前阶段不能重新生成内容规划，请先回退到内容规划。")
     if get_active_run(db, project_id):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
@@ -594,6 +795,10 @@ def create_content_plan(
     documents = load_project_documents(project_id)
     if documents:
         logger.info(f"[ContentPlan] Loaded documents for project={project_id}, length={len(documents)}")
+        inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
+        if page_count is None and inferred_page_count:
+            page_count = inferred_page_count
+            logger.info(f"[ContentPlan] Inferred page_count={page_count} from single uploaded PPT")
 
     try:
         run = create_project_run(
@@ -656,7 +861,7 @@ def list_slides(project_id: str, db: Session = Depends(get_db)):
                     "usage_note": ref.usage_note,
                     "asset_analysis": ref.asset_analysis,
                     "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
-                    "url": f"/uploads/{project_id}/{os.path.basename(ref.file_path)}",
+                    "url": _reference_upload_url(project_id, ref.file_path),
                     "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" else None,
                 }
                 for ref in refs_by_slide.get(s.id, [])
@@ -702,6 +907,8 @@ def create_visual_plan(
     for s in slides:
         item = copy.deepcopy(s.content_json) or {}
         item["page_num"] = s.page_num
+        item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
+        item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
         if ref_contexts.get(s.page_num):
             item["reference_context"] = "\n".join(ref_contexts[s.page_num])
         if ref_user_hints.get(s.page_num):
@@ -734,7 +941,10 @@ def create_visual_plan(
         target_slides = [s for s in slides if s.page_num in body.page_nums]
 
     for slide in target_slides:
-        slide.visual_json = visual_by_page.get(slide.page_num, {})
+        slide.visual_json = _merge_manual_pins_into_visual_json(
+            visual_by_page.get(slide.page_num, {}),
+            slide.visual_json,
+        )
         if slide.status in ("pending", "planning"):
             slide.status = "visual_ready"
 
@@ -791,6 +1001,8 @@ def create_prompts(
     for s in target_slides:
         item = copy.deepcopy(s.content_json) or {}
         item["page_num"] = s.page_num
+        item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
+        item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
         if ref_contexts.get(s.page_num):
             item["reference_context"] = "\n".join(ref_contexts[s.page_num])
         if ref_user_hints.get(s.page_num):
@@ -864,6 +1076,8 @@ async def create_visual_and_prompts(
     for s in target_slides:
         item = copy.deepcopy(s.content_json) or {}
         item["page_num"] = s.page_num
+        item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
+        item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
         content_plan.append(item)
 
     ref_images_project = project.reference_images
@@ -896,16 +1110,26 @@ async def create_visual_and_prompts(
             except asyncio.CancelledError:
                 pass
 
+        task_credentials = get_raw_provider_credentials()
         task = asyncio.create_task(
-            _do_generate_visual_and_prompts(project_id, target_page_nums, run.id)
+            _do_generate_visual_and_prompts(project_id, target_page_nums, run.id, task_credentials)
         )
         _running_tasks[project_id] = task
 
     return {"status": "started", "message": "视觉方案和生图 Prompt 生成已启动，请稍候。", "run": serialize_run(run)}
 
 
-async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[List[int]] = None, run_id: str | None = None):
+async def _do_generate_visual_and_prompts(
+    project_id: str,
+    page_nums: Optional[List[int]] = None,
+    run_id: str | None = None,
+    provider_credentials=None,
+):
     """后台任务：生成视觉方案和 Prompt，完成后更新数据库。"""
+    if provider_credentials is not None:
+        with provider_credentials_context(provider_credentials):
+            return await _do_generate_visual_and_prompts(project_id, page_nums, run_id, None)
+
     db = SessionLocal()
     try:
         project = db.query(Project).filter(Project.id == project_id).first()
@@ -915,6 +1139,9 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
 
         mark_run_running(db, run_id, stage="visual_planning", message="正在分析内容结构，为每一页设计视觉方案...")
         db.commit()
+        if not is_run_active(db, run_id):
+            logger.info(f"VisualPrompts BG: run {run_id} is no longer active before work; skipping")
+            return
 
         slides = (
             db.query(Slide)
@@ -950,6 +1177,8 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
         for s in target_slides:
             item = copy.deepcopy(s.content_json) or {}
             item["page_num"] = s.page_num
+            item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
+            item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
             if ref_contexts.get(s.page_num):
                 item["reference_context"] = "\n".join(ref_contexts[s.page_num])
             if ref_user_hints.get(s.page_num):
@@ -985,11 +1214,21 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
                 "total_pages": progress.get("total_pages", len(target_slides)) if isinstance(progress, dict) else len(target_slides),
             }, run_id),
         )
+        db.expire_all()
+        if not is_run_active(db, run_id):
+            logger.info(f"VisualPrompts BG: run {run_id} is no longer active after visual plan; skipping stale writeback")
+            return
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
 
         # 更新数据库：visual plan（先提交，避免后续 prompt 失败导致 visual plan 也被回滚）
         visual_by_page = {v["page_num"]: v for v in visual_plan}
         for slide in target_slides:
-            slide.visual_json = visual_by_page.get(slide.page_num, {})
+            slide.visual_json = _merge_manual_pins_into_visual_json(
+                visual_by_page.get(slide.page_num, {}),
+                slide.visual_json,
+            )
             if slide.status in ("pending", "planning"):
                 slide.status = "visual_ready"
         db.commit()
@@ -1045,6 +1284,13 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
 
         tasks = [_gen_one(intent) for intent in visual_plan_for_prompts]
         prompts = await asyncio.gather(*tasks, return_exceptions=False)
+        db.expire_all()
+        if not is_run_active(db, run_id):
+            logger.info(f"VisualPrompts BG: run {run_id} is no longer active after prompts; skipping stale writeback")
+            return
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
         _update_progress(project_id, {
             "stage": "saving",
             "message": "正在保存结果...",
@@ -1082,19 +1328,12 @@ async def _do_generate_visual_and_prompts(project_id: str, page_nums: Optional[L
         logger.info(f"Visual plan and prompts generated for project {project_id}")
     except asyncio.CancelledError:
         logger.info(f"VisualPrompts BG: project={project_id} task was cancelled")
-        # 任务被取消时回滚未提交变更，并恢复状态
+        # 任务被取消时只标记 run，不再根据旧 slides 推断并写回项目阶段。
+        # 回退接口已经决定了目标阶段，取消分支晚返回时不能覆盖它。
         try:
             db.rollback()
-            project = db.query(Project).filter(Project.id == project_id).first()
-            if project:
-                if all(s.visual_json for s in project.slides):
-                    project.status = "visual_ready"
-                elif all(s.content_json for s in project.slides):
-                    project.status = "planning"
-                else:
-                    project.status = "draft"
-                finish_run(db, run_id, status="cancelled", message="任务被取消", error_msg="任务被取消")
-                db.commit()
+            finish_run(db, run_id, status="cancelled", message="任务被取消", error_msg="任务被取消")
+            db.commit()
         except Exception as status_err:
             logger.warning(f"Failed to reset project status after cancellation: {status_err}")
         _update_progress(project_id, {
@@ -1214,6 +1453,16 @@ def start_generation(
 
     # 记录本次生成的目标页码，供前端进度显示用
     target_slides = [s for s in slides if s.page_num in page_nums] if page_nums else slides
+    missing_prompt_pages = [
+        s.page_num
+        for s in target_slides
+        if not s.prompt_text or not str(s.prompt_text).strip()
+    ]
+    if missing_prompt_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, missing_prompt_pages))} 页缺少生图 Prompt，请先生成画面描述。"
+        )
     run_kind = "prototype_generation" if body.prototype else ("page_generation" if page_nums else "batch_generation")
     run_stage = "prototype_generation" if body.prototype else "batch_generation"
     run = create_project_run(
@@ -1232,7 +1481,8 @@ def start_generation(
     }, run.id)
 
     # 使用 Celery 异步任务（Celery worker 内部有 Redis 锁兜底防重）
-    task = generate_slides_task.delay(project_id, page_nums, prototype=body.prototype, run_id=run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_slides_task.delay(project_id, page_nums, prototype=body.prototype, run_id=run.id, credential_id=credential_id)
     set_run_task(db, run.id, task.id)
     db.commit()
     # 保存 task_id 到 Redis，供 stop-generation 撤销用
@@ -1288,6 +1538,17 @@ def confirm_prototype(
         db.commit()
         return {"message": "All slides already completed", "status": "completed"}
 
+    missing_prompt_pages = [
+        s.page_num
+        for s in pending_slides + failed_slides
+        if not s.prompt_text or not str(s.prompt_text).strip()
+    ]
+    if missing_prompt_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, missing_prompt_pages))} 页缺少生图 Prompt，请先生成画面描述。"
+        )
+
     run = create_project_run(
         db,
         project_id,
@@ -1299,7 +1560,8 @@ def confirm_prototype(
     )
     db.commit()
 
-    task = generate_slides_task.delay(project_id, target_page_nums, run_id=run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_slides_task.delay(project_id, target_page_nums, run_id=run.id, credential_id=credential_id)
     set_run_task(db, run.id, task.id)
     db.commit()
     redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
@@ -1569,19 +1831,8 @@ def upload_file(
         if not slide:
             raise HTTPException(status_code=404, detail="Slide not found")
 
-    # 数量限制：单页长期参考图最多 10 张；全局视觉资产单独限额。
-    if role == "visual_asset" and not slide_id:
-        existing_count = db.query(ReferenceImage).filter(
-            ReferenceImage.project_id == project_id,
-            ReferenceImage.slide_id.is_(None),
-            ReferenceImage.role == "visual_asset",
-        ).count()
-        if existing_count >= MAX_VISUAL_ASSETS_PER_PROJECT:
-            raise HTTPException(
-                status_code=400,
-                detail=f"该项目已有 {existing_count} 张视觉资产，上限 {MAX_VISUAL_ASSETS_PER_PROJECT} 张",
-            )
-    elif role != "finetune_ref":
+    # 数量限制：页面级长期参考图最多 10 张；项目级素材库不设硬上限。
+    if role != "visual_asset" and role != "finetune_ref":
         existing_count = db.query(ReferenceImage).filter(
             ReferenceImage.project_id == project_id,
             ReferenceImage.slide_id == slide_id,
@@ -1707,7 +1958,7 @@ def upload_file(
         "usage_note": ref_image.usage_note,
         "asset_analysis": ref_image.asset_analysis,
         "logo_anchor": ref_image.logo_anchor,
-        "url": f"/uploads/{project_id}/{filename}",
+        "url": _reference_upload_url(project_id, file_path),
         "overlay_url": _logo_overlay_url(ref_image, project_id) if role == "logo" else None,
     }
 
@@ -1716,9 +1967,18 @@ def upload_file(
 def list_reference_images(
     project_id: str,
     slide_id: Optional[str] = None,
+    q: Optional[str] = None,
+    asset_kind: Optional[str] = None,
+    source_document: Optional[str] = None,
+    source_page_num: Optional[int] = None,
+    process_mode: Optional[str] = None,
+    pinned_slide_id: Optional[str] = None,
+    recommend_slide_id: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    """列出项目已上传的参考图。支持按 slide_id 过滤页面级参考图。"""
+    """列出项目参考图；带筛选参数时作为项目素材库查询。"""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -1732,23 +1992,100 @@ def list_reference_images(
 
     query = query.filter(ReferenceImage.role != "finetune_ref")
     images = query.all()
-    return [
-        {
-            "id": img.id,
-            "role": img.role,
-            "slide_id": img.slide_id,
-            "process_mode": img.process_mode or "blend",
-            "asset_name": img.asset_name,
-            "asset_kind": img.asset_kind,
-            "usage_note": img.usage_note,
-            "asset_analysis": img.asset_analysis,
-            "logo_anchor": img.logo_anchor or (DEFAULT_LOGO_ANCHOR if img.role == "logo" else None),
-            "file_exists": os.path.exists(img.file_path),
-            "url": f"/uploads/{project_id}/{os.path.basename(img.file_path)}",
-            "overlay_url": _logo_overlay_url(img, project_id) if img.role == "logo" else None,
-        }
-        for img in images
+
+    slides = db.query(Slide).filter(Slide.project_id == project_id).all()
+    pinned_by_asset: dict[str, list[str]] = {}
+    for slide in slides:
+        for asset_id in _manual_asset_ids(slide.visual_json):
+            pinned_by_asset.setdefault(asset_id, []).append(slide.id)
+
+    recommend_lookup: dict[str, dict] = {}
+    if recommend_slide_id:
+        rec_slide = next((s for s in slides if s.id == recommend_slide_id), None)
+        if rec_slide:
+            rec_page = copy.deepcopy(rec_slide.content_json) or {}
+            rec_page["page_num"] = rec_slide.page_num
+            rec_page["type"] = rec_slide.type or rec_page.get("type", "content")
+            global_assets = _project_visual_assets_for_planning(project)
+            for item in _recall_visual_assets_for_page(rec_page, global_assets):
+                if item.get("id"):
+                    recommend_lookup[str(item["id"])] = item
+
+    def _matches(img: ReferenceImage) -> bool:
+        analysis = img.asset_analysis if isinstance(img.asset_analysis, dict) else {}
+        haystack_parts = [
+            img.asset_name or "",
+            img.asset_kind or "",
+            img.usage_note or "",
+            os.path.basename(img.file_path or ""),
+            _asset_source_document(img),
+            str(_asset_source_page_num(img) or ""),
+            str(analysis.get("source_slide_text") or ""),
+            " ".join(str(x) for x in (analysis.get("asset_tags") or analysis.get("suggested_keywords") or [])),
+        ]
+        if q and str(q).strip().lower() not in "\n".join(haystack_parts).lower():
+            return False
+        if asset_kind and (img.asset_kind or "other") != asset_kind:
+            return False
+        if source_document and _asset_source_document(img) != source_document:
+            return False
+        if source_page_num is not None and _asset_source_page_num(img) != source_page_num:
+            return False
+        if process_mode and (img.process_mode or "blend") != process_mode:
+            return False
+        if pinned_slide_id and pinned_slide_id not in pinned_by_asset.get(img.id, []):
+            return False
+        return True
+
+    filtered = [img for img in images if _matches(img)]
+    filtered.sort(
+        key=lambda img: (
+            0 if img.id in pinned_by_asset else 1,
+            0 if img.id in recommend_lookup else 1,
+            _asset_source_document(img),
+            _asset_source_page_num(img) or 10_000,
+            img.asset_name or os.path.basename(img.file_path or ""),
+        )
+    )
+
+    facets = {
+        "source_documents": sorted({doc for doc in (_asset_source_document(img) for img in images) if doc}),
+        "asset_kinds": sorted({(img.asset_kind or "other") for img in images if img.role == "visual_asset"}),
+        "process_modes": sorted({(img.process_mode or "blend") for img in images}),
+        "source_page_nums": sorted({page for page in (_asset_source_page_num(img) for img in images) if page is not None}),
+    }
+
+    total = len(filtered)
+    start = max(0, int(offset or 0))
+    if limit is None:
+        paged = filtered[start:]
+    else:
+        paged = filtered[start:start + max(1, min(int(limit), 200))]
+    items = [
+        _serialize_reference_image(
+            img,
+            project_id,
+            pinned_slide_ids=pinned_by_asset.get(img.id, []),
+            is_pinned=bool(pinned_slide_id and pinned_slide_id in pinned_by_asset.get(img.id, [])),
+            relevance=recommend_lookup.get(img.id),
+        )
+        for img in paged
     ]
+
+    has_library_params = any([
+        q,
+        asset_kind,
+        source_document,
+        source_page_num is not None,
+        process_mode,
+        pinned_slide_id,
+        recommend_slide_id,
+        limit is not None,
+        offset,
+    ])
+    if has_library_params:
+        return {"items": items, "total": total, "facets": facets}
+    return items
 
 
 @router.post("/{project_id}/suggest-reference-images")
@@ -1805,7 +2142,7 @@ def suggest_reference_images(
     try:
         client = get_llm_client()
         resp = client.chat.completions.create(
-            model=settings.MINIMAX_LLM_MODEL,
+            model=get_minimax_llm_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1889,7 +2226,14 @@ def delete_reference_image(
                 if isinstance(usage, dict):
                     usage.pop(ref_id, None)
                     visual["visual_asset_usage"] = usage
-                slide.visual_json = visual
+            manual_ids = visual.get("manual_visual_asset_ids")
+            if isinstance(manual_ids, list) and ref_id in manual_ids:
+                visual["manual_visual_asset_ids"] = [x for x in manual_ids if x != ref_id]
+                manual_usage = visual.get("manual_visual_asset_usage")
+                if isinstance(manual_usage, dict):
+                    manual_usage.pop(ref_id, None)
+                    visual["manual_visual_asset_usage"] = manual_usage
+            slide.visual_json = visual
         _invalidate_visual_asset_dependent_outputs(project)
     db.delete(ref)
     db.commit()
@@ -1980,8 +2324,72 @@ def update_reference_image(
         "usage_note": ref.usage_note,
         "asset_analysis": ref.asset_analysis,
         "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
-        "url": f"/uploads/{project_id}/{os.path.basename(ref.file_path)}",
+        "url": _reference_upload_url(project_id, ref.file_path),
         "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" else None,
+    }
+
+
+@router.patch("/{project_id}/slides/{slide_id}/asset-pins")
+def update_slide_asset_pins(
+    project_id: str,
+    slide_id: str,
+    payload: AssetPinsRequest,
+    db: Session = Depends(get_db),
+):
+    """Replace one slide's manually pinned project visual assets."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    requested_ids: list[str] = []
+    for asset_id in payload.asset_ids or []:
+        value = str(asset_id)
+        if value and value not in requested_ids:
+            requested_ids.append(value)
+
+    if requested_ids:
+        valid_assets = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.slide_id.is_(None),
+            ReferenceImage.role == "visual_asset",
+            ReferenceImage.id.in_(requested_ids),
+        ).all()
+        valid_ids = {asset.id for asset in valid_assets}
+        missing = [asset_id for asset_id in requested_ids if asset_id not in valid_ids]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Invalid visual_asset ids: {', '.join(missing[:5])}")
+
+    visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+    manual_usage = {
+        str(k): str(v)
+        for k, v in (payload.usage or {}).items()
+        if str(k) in requested_ids and v
+    }
+    existing_usage = visual.get("visual_asset_usage") if isinstance(visual.get("visual_asset_usage"), dict) else {}
+    auto_ids = [
+        str(asset_id)
+        for asset_id in (visual.get("visual_asset_ids") or [])
+        if str(asset_id) not in requested_ids
+    ]
+    visual["manual_visual_asset_ids"] = requested_ids
+    visual["manual_visual_asset_usage"] = manual_usage
+    visual["visual_asset_ids"] = _merge_asset_ids(requested_ids, auto_ids)
+    visual["visual_asset_usage"] = {
+        **{str(k): str(v) for k, v in existing_usage.items() if k and v and str(k) not in manual_usage},
+        **manual_usage,
+    }
+    slide.visual_json = visual
+    _invalidate_visual_plan_dependent_outputs(project, [slide])
+    db.commit()
+    db.refresh(slide)
+    return {
+        "slide_id": slide.id,
+        "page_num": slide.page_num,
+        "visual_json": slide.visual_json or {},
+        "manual_visual_asset_ids": _manual_asset_ids(slide.visual_json),
     }
 
 
@@ -2036,7 +2444,8 @@ def retry_failed_slides(
         "target_count": len(page_nums),
     }, run.id)
 
-    task = generate_slides_task.delay(project_id, page_nums, run_id=run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_slides_task.delay(project_id, page_nums, run_id=run.id, credential_id=credential_id)
     set_run_task(db, run.id, task.id)
     db.commit()
     redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
@@ -2302,7 +2711,8 @@ def finetune_slide(
         "target_count": 1,
     }, run.id)
 
-    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id, credential_id=credential_id)
     set_run_task(db, run.id, task.id)
     db.commit()
     redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
@@ -2364,7 +2774,8 @@ def retry_slide(
         "target_count": 1,
     }, run.id)
 
-    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id)
+    credential_id = store_current_provider_credentials(redis_client)
+    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id, credential_id=credential_id)
     set_run_task(db, run.id, task.id)
     db.commit()
     redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
