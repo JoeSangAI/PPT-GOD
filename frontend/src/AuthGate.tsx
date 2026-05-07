@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import App from "./App";
 import {
   API_BASE,
@@ -12,7 +12,6 @@ import {
   type MvpAuth,
   type ProviderSettings,
 } from "./api/client";
-import PptGodLogo from "./components/PptGodLogo";
 
 function providerName(baseUrl: string, fallback: string) {
   try {
@@ -51,121 +50,187 @@ function feedbackTemplate(auth: MvpAuth | null) {
   ].join("\n");
 }
 
-function ProviderFields({
+function ProviderSetup({
   value,
   onChange,
+  defaultAdvancedOpen = false,
 }: {
   value: ProviderSettings;
   onChange: (next: ProviderSettings) => void;
+  defaultAdvancedOpen?: boolean;
 }) {
   const [presetNotice, setPresetNotice] = useState("");
+  const [advancedOpen, setAdvancedOpen] = useState(defaultAdvancedOpen);
+  const advancedPanelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!advancedOpen || defaultAdvancedOpen) return;
+    window.requestAnimationFrame(() => {
+      advancedPanelRef.current?.scrollIntoView({ block: "nearest", behavior: "auto" });
+    });
+  }, [advancedOpen, defaultAdvancedOpen]);
+
   const update = (key: keyof ProviderSettings, nextValue: string) => {
     setPresetNotice("");
     onChange({ ...value, [key]: nextValue });
   };
-  const applyPreset = (preset: "deer-image" | "minimax-deer") => {
-    if (preset === "deer-image") {
-      onChange({
-        ...value,
-        deerApiBase: DEFAULT_PROVIDER_SETTINGS.deerApiBase,
-        deerImageModel: DEFAULT_PROVIDER_SETTINGS.deerImageModel,
-      });
-      setPresetNotice("已套用图片接口：Deer API + gpt-image-2-all。API Key 保持不变。");
-      return;
-    }
-    if (preset === "minimax-deer") {
-      onChange({
-        ...value,
-        minimaxApiBase: "https://api.minimaxi.com/v1",
-        minimaxLlmModel: "MiniMax-M2.7",
-        deerApiBase: "https://api.deerapi.com/v1",
-        deerImageModel: "gpt-image-2-all",
-      });
-      setPresetNotice("已套用示例组合：MiniMax 文本 + Deer 生图。API Key 保持不变。");
-    }
+  const restoreDefaultProvider = () => {
+    onChange({
+      ...value,
+      minimaxApiBase: DEFAULT_PROVIDER_SETTINGS.minimaxApiBase,
+      minimaxLlmModel: DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel,
+      deerApiBase: DEFAULT_PROVIDER_SETTINGS.deerApiBase,
+      deerImageModel: DEFAULT_PROVIDER_SETTINGS.deerImageModel,
+    });
+    setPresetNotice("已恢复默认 MiniMax + Deer API 配置。你填写的 Key 不会被改动。");
   };
-  const inputClass = "pg-input w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100";
-  const labelClass = "text-xs font-semibold text-slate-600";
-  const presetButtonClass = "pg-action pg-action-secondary rounded-md border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-200";
 
   return (
-    <div className="grid gap-4">
-      <div className="pg-provider-note rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
-        兼容 OpenAI-style 接口：填入 Base URL、API Key 和模型名即可。默认图片接口使用 Deer API + gpt-image-2-all；GRSAI、OpenRouter、各种中转站只要接口兼容也可以填在这里。
-      </div>
-      <div className="grid gap-2">
-        <div className="text-xs font-semibold text-slate-600">快速填充</div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button type="button" className={presetButtonClass} onClick={() => applyPreset("deer-image")}>
-            图片接口：Deer API 默认
-          </button>
-          <button type="button" className={presetButtonClass} onClick={() => applyPreset("minimax-deer")}>
-            示例组合：MiniMax 文本 + Deer 图片
-          </button>
-          <span className="text-xs text-slate-500">自定义平台请直接修改下面的 URL / Key / 模型名。</span>
+    <div className="pg-provider-setup">
+      <div className="pg-provider-header">
+        <div>
+          <div className="pg-provider-title">API Key</div>
+          <p>默认使用 MiniMax 做内容生成、Deer API 做图片生成。如果你用的是这两个平台，只填下面两枚 Key 就可以。</p>
         </div>
-        {presetNotice && <div className="pg-provider-note rounded-md bg-blue-50 px-3 py-2 text-xs text-blue-700">{presetNotice}</div>}
-      </div>
-      <div className="grid gap-2">
-        <div className="flex items-center justify-between gap-3">
-          <div className={labelClass}>文本/规划接口 API Key</div>
-          <span className="text-xs text-slate-400">例如 MiniMax / GRSAI / OpenRouter</span>
-        </div>
-        <input
-          className={inputClass}
-          value={value.minimaxApiKey}
-          onChange={(e) => update("minimaxApiKey", e.target.value)}
-          placeholder="填文本模型 API Key，例如 MiniMax / GRSAI / OpenRouter"
-          type="password"
-          autoComplete="off"
-        />
-      </div>
-      <div className="grid grid-cols-1 md:grid-cols-[1fr_180px] gap-3">
-        <div className="grid gap-2">
-          <div className={labelClass}>文本/规划接口 Base URL</div>
-          <input className={inputClass} value={value.minimaxApiBase} onChange={(e) => update("minimaxApiBase", e.target.value)} />
-        </div>
-        <div className="grid gap-2">
-          <div className={labelClass}>文本模型</div>
-          <input className={inputClass} value={value.minimaxLlmModel} onChange={(e) => update("minimaxLlmModel", e.target.value)} />
-        </div>
+        <div className="pg-provider-summary">默认：MiniMax + Deer API</div>
       </div>
 
-      <div className="h-px bg-slate-200" />
-
-      <div className="grid gap-2">
-        <div className="flex items-center justify-between gap-3">
-          <div className={labelClass}>图片接口 API Key</div>
-          <span className="text-xs text-slate-400">默认 Deer API</span>
-        </div>
-        <input
-          className={inputClass}
-          value={value.deerApiKey}
-          onChange={(e) => update("deerApiKey", e.target.value)}
-          placeholder="填图片模型 API Key，例如 Deer API / GRSAI / 兼容图片接口"
-          type="password"
-          autoComplete="off"
-        />
-      </div>
-      <div className="grid grid-cols-1 md:grid-cols-[1fr_180px] gap-3">
-        <div className="grid gap-2">
-          <div className={labelClass}>图片接口 Base URL</div>
-          <input className={inputClass} value={value.deerApiBase} onChange={(e) => update("deerApiBase", e.target.value)} />
-        </div>
-        <div className="grid gap-2">
-          <div className={labelClass}>图片模型</div>
+      <div className="pg-key-grid">
+        <label className="pg-auth-field">
+          <span>MiniMax API Key</span>
+          <em>用于内容规划、文案和页面结构。</em>
           <input
-            className={inputClass}
-            value={value.deerImageModel}
-            onChange={(e) => update("deerImageModel", e.target.value)}
-            placeholder="例如：gpt-image-2-all"
+            className="pg-auth-input"
+            value={value.minimaxApiKey}
+            onChange={(e) => update("minimaxApiKey", e.target.value)}
+            placeholder="粘贴 MiniMax API Key"
+            type="password"
+            autoComplete="off"
           />
+        </label>
+
+        <label className="pg-auth-field">
+          <span>Deer API Key</span>
+          <em>用于生成封面、配图和视觉素材。</em>
+          <input
+            className="pg-auth-input"
+            value={value.deerApiKey}
+            onChange={(e) => update("deerApiKey", e.target.value)}
+            placeholder="粘贴 Deer API Key"
+            type="password"
+            autoComplete="off"
+          />
+        </label>
+      </div>
+
+      <div className="pg-connection-card">
+        <div>
+          <div className="pg-connection-title">不是 MiniMax 或 Deer API？</div>
+          <p>展开后填写你实际平台的 API URL 和模型名称，否则后面生成时可能会因为配置不匹配而报错。</p>
         </div>
+        <button
+          type="button"
+          className="pg-connection-button"
+          onClick={() => setAdvancedOpen((open) => !open)}
+          aria-expanded={advancedOpen}
+        >
+          {advancedOpen ? "收起设置" : "核对 / 修改"}
+        </button>
       </div>
-      <div className="pg-provider-note pg-provider-warning rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
-        图片模型名会原样传给接口。默认使用 Deer API 的 gpt-image-2-all；如果同事换平台，要以对方平台后台/文档显示的模型 ID 为准，避免填到高价模型。
-      </div>
+
+      {advancedOpen && (
+        <div className="pg-advanced-panel" ref={advancedPanelRef}>
+          <div className="pg-provider-actions">
+            <button type="button" className="pg-subtle-button" onClick={restoreDefaultProvider}>
+              恢复默认 MiniMax + Deer API 配置
+            </button>
+          </div>
+          {presetNotice && <div className="pg-provider-notice">{presetNotice}</div>}
+
+          <section className="pg-endpoint-group">
+            <div className="pg-endpoint-head">
+              <span>内容生成接口</span>
+              <p>用于大纲、文案、页面规划。</p>
+            </div>
+            <div className="pg-advanced-grid">
+              <label className="pg-auth-field pg-field-wide">
+                <span>API URL</span>
+                <input
+                  className="pg-auth-input"
+                  value={value.minimaxApiBase}
+                  onChange={(e) => update("minimaxApiBase", e.target.value)}
+                  placeholder="https://api.minimaxi.com/v1"
+                />
+              </label>
+              <label className="pg-auth-field">
+                <span>模型名称</span>
+                <input
+                  className="pg-auth-input"
+                  value={value.minimaxLlmModel}
+                  onChange={(e) => update("minimaxLlmModel", e.target.value)}
+                  placeholder="MiniMax-M2.7"
+                />
+              </label>
+            </div>
+          </section>
+
+          <section className="pg-endpoint-group">
+            <div className="pg-endpoint-head">
+              <span>图片生成接口</span>
+              <p>用于封面、配图和视觉素材。</p>
+            </div>
+            <div className="pg-advanced-grid">
+              <label className="pg-auth-field pg-field-wide">
+                <span>API URL</span>
+                <input
+                  className="pg-auth-input"
+                  value={value.deerApiBase}
+                  onChange={(e) => update("deerApiBase", e.target.value)}
+                  placeholder="https://api.deerapi.com/v1"
+                />
+              </label>
+              <label className="pg-auth-field">
+                <span>模型名称</span>
+                <input
+                  className="pg-auth-input"
+                  value={value.deerImageModel}
+                  onChange={(e) => update("deerImageModel", e.target.value)}
+                  placeholder="gpt-image-2-all"
+                />
+              </label>
+            </div>
+          </section>
+
+          <div className="pg-provider-footnote">
+            只要你没有改用其他平台，这里保持默认即可。更换平台时，请确认 API URL、模型名称和 Key 来自同一个平台。
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function RestoreDefaultsButton({
+  provider,
+  onRestore,
+}: {
+  provider: ProviderSettings;
+  onRestore: (next: ProviderSettings) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="pg-action pg-action-secondary rounded-md bg-slate-100 px-4 py-2 text-sm text-slate-700 hover:bg-slate-200"
+      onClick={() =>
+        onRestore({
+          ...DEFAULT_PROVIDER_SETTINGS,
+          minimaxApiKey: provider.minimaxApiKey,
+          deerApiKey: provider.deerApiKey,
+        })
+      }
+    >
+      恢复接口默认
+    </button>
   );
 }
 
@@ -180,12 +245,14 @@ export default function AuthGate() {
   const [copied, setCopied] = useState(false);
 
   const canEnter = useMemo(() => {
-    return (
+    return Boolean(
       displayName.trim() &&
+      provider.minimaxApiBase.trim() &&
       provider.minimaxApiKey.trim() &&
       provider.minimaxLlmModel.trim() &&
+      provider.deerApiBase.trim() &&
       provider.deerApiKey.trim() &&
-      provider.deerImageModel.trim()
+      provider.deerImageModel.trim(),
     );
   }, [displayName, provider]);
 
@@ -214,6 +281,12 @@ export default function AuthGate() {
     await navigator.clipboard.writeText(feedbackTemplate(auth));
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
+  };
+
+  const handleLoginSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canEnter || busy) return;
+    void submit();
   };
 
   if (auth) {
@@ -260,8 +333,8 @@ export default function AuthGate() {
           </button>
         </div>
         {settingsOpen && (
-          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 px-4">
-            <div className="pg-modal-card w-full max-w-2xl rounded-lg bg-white p-6 shadow-2xl">
+          <div className="pg-settings-backdrop">
+            <div className="pg-settings-modal">
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div>
                   <h2 className="text-lg font-semibold text-slate-900">测试设置</h2>
@@ -271,21 +344,11 @@ export default function AuthGate() {
                   关闭
                 </button>
               </div>
-              <ProviderFields value={provider} onChange={setProvider} />
+              <ProviderSetup value={provider} onChange={setProvider} defaultAdvancedOpen />
               <div className="mt-5 flex justify-end gap-2">
+                <RestoreDefaultsButton provider={provider} onRestore={setProvider} />
                 <button
-                  className="pg-action pg-action-secondary rounded-md bg-slate-100 px-4 py-2 text-sm text-slate-700 hover:bg-slate-200"
-                  onClick={() =>
-                    setProvider({
-                      ...DEFAULT_PROVIDER_SETTINGS,
-                      minimaxApiKey: provider.minimaxApiKey,
-                      deerApiKey: provider.deerApiKey,
-                    })
-                  }
-                >
-                  恢复接口默认
-                </button>
-                <button
+                  type="button"
                   className="pg-action pg-action-primary rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
                   onClick={() => {
                     saveProviderSettings(provider);
@@ -303,53 +366,56 @@ export default function AuthGate() {
   }
 
   return (
-    <div className="pg-auth min-h-screen w-screen overflow-auto bg-slate-950 text-slate-900">
-      <div className="mx-auto grid min-h-screen max-w-6xl grid-cols-1 items-center gap-8 px-6 py-8 lg:grid-cols-[420px_1fr]">
-        <section className="pg-auth-copy text-white">
-          <div className="pg-auth-brand text-sm font-semibold uppercase tracking-[0.18em] text-blue-300">
-            <PptGodLogo subtitle="古希腊掌管 PPT 的神" />
-          </div>
-          <h1 className="mt-4 text-4xl font-bold leading-tight">进入专业创作工作台</h1>
-          <p className="mt-4 text-base leading-7 text-slate-300">
-            用一个稳定的用户名登录。下次关闭标签页再回来，浏览器会自动回到你的项目；换设备时输入同样的用户名也能找回。
+    <div className="pg-auth pg-auth-v2">
+      <div className="pg-auth-backdrop" aria-hidden="true" />
+      <main className="pg-auth-shell">
+        <section className="pg-auth-story">
+          <h1>PPT God</h1>
+          <div className="pg-auth-slogan">古希腊掌管 PPT 的神</div>
+          <p className="pg-auth-lead">
+            从真实资料出发，先整理叙事逻辑，再完成页面设计与视觉生成；导出前，你可以在工作台里持续调整结构、内容和风格。
           </p>
-          <div className="pg-auth-note mt-6 rounded-lg border border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-300">
-            <div className="font-semibold text-white">注意事项</div>
-            <p className="mt-2">API Key 会保存在当前浏览器，并通过 HTTPS 发给后端调用你填写的平台。不要在公共电脑保存 Key。</p>
-            <p className="mt-2">模型调用费用走你自己的 API 账号；服务器只负责项目保存、排队和文件生成。</p>
-            <p className="mt-2">遇到问题先截图，再复制反馈模板发给 Joe。</p>
+          <div className="pg-auth-value">
+            <p>
+              它不是简单套模板，而是把内容策划、视觉方向和整套 PPT 生成串成一个完整流程，帮助你更稳定地做出可交付的演示稿。
+            </p>
           </div>
         </section>
 
-        <section className="pg-auth-card rounded-lg bg-white p-6 shadow-2xl">
-          <div className="mb-5">
-            <h2 className="text-xl font-semibold">登录信息</h2>
-            <p className="mt-1 text-sm text-slate-500">开放测试阶段只用用户名区分项目空间，请使用一个不会和同事撞名的名字。</p>
+        <section className="pg-auth-card pg-auth-card-v2" aria-label="登录到 PPT God">
+          <div className="pg-auth-card-head">
+            <h2>进入 PPT God</h2>
+            <p>
+              目前还是过渡测试阶段，所以需要你填写一个固定用户名和两枚 API Key。用户名用来识别你的测试空间；
+              API Key 用来调用内容和图片模型。
+            </p>
           </div>
-          <div className="grid gap-4">
-            <div className="grid gap-2">
-              <label className="text-xs font-semibold text-slate-600">用户名</label>
+
+          <form className="pg-login-form" onSubmit={handleLoginSubmit}>
+            <label className="pg-auth-field">
+              <span>固定用户名</span>
+              <em>只用于识别你的项目记录。每次用同一个用户名登录，才能看到之前生成的资料；换用户名就会进入另一个空间。</em>
               <input
-                className="pg-input w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                className="pg-auth-input"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="例如：张三-市场部"
+                placeholder="输入一个你会持续使用的用户名"
+                autoComplete="name"
               />
-            </div>
-          </div>
+            </label>
 
-          <div className="my-6 h-px bg-slate-200" />
-          <ProviderFields value={provider} onChange={setProvider} />
-          {error && <div className="mt-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
-          <button
-            disabled={!canEnter || busy}
-            onClick={submit}
-            className="pg-primary-button mt-6 w-full rounded-md bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {busy ? "正在进入..." : "进入 PPT God"}
-          </button>
+            <ProviderSetup value={provider} onChange={setProvider} />
+
+            {error && <div className="pg-auth-error">{error}</div>}
+            <button disabled={!canEnter || busy} className="pg-primary-button pg-login-submit">
+              {busy ? "正在进入..." : "进入 PPT God"}
+            </button>
+            <div className="pg-auth-assurance">
+              你的 Key 只保存在当前浏览器，并通过 HTTPS 用于本次生成。公共电脑上请不要保存 Key。
+            </div>
+          </form>
         </section>
-      </div>
+      </main>
     </div>
   );
 }

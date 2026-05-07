@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Project, Slide
 from app.services.image_generation import generate_slide_image, save_slide_image
-from app.services.logo_assets import prepare_logo_overlay_image
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
 from app.services.logo_policy import should_use_logo_as_scene_asset
+from app.services.overlay_layers import exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import cleanup_generation_progress, finish_run, is_run_active, mark_run_running, update_run_progress
 from app.utils.reference_image import default_visual_asset_process_mode
@@ -170,46 +171,43 @@ def _load_reference_images(
     # 2. 项目级 Logo：默认不进生图，后续用程序 overlay。
     # 只有用户把 Logo 设为 blend 且页面适合做场景标识时，才作为画面元素参考。
     if slide.project and slide.project.reference_images and len(refs) < MAX_REFERENCE_INPUTS:
-        logo_ref = next(
-            (
-                ref for ref in slide.project.reference_images
-                if (
-                    ref.role == "logo"
-                    and not ref.slide_id
-                    and os.path.exists(ref.file_path)
-                    and should_use_logo_as_scene_asset(slide, ref)
-                )
-            ),
-            None,
-        )
-        if logo_ref:
+        logo_refs = [
+            ref for ref in slide.project.reference_images
+            if (
+                ref.role == "logo"
+                and not ref.slide_id
+                and os.path.exists(ref.file_path)
+            )
+        ]
+        if logo_refs and any(should_use_logo_as_scene_asset(slide, ref) for ref in logo_refs):
             try:
-                logo_path = prepare_logo_overlay_image(logo_ref.file_path)
+                logo_path = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) or prepare_logo_overlay_image(logo_refs[0].file_path)
                 refs.append({
                     "image": Image.open(logo_path),
                     "process_mode": "blend",
                     "role": "logo",
-                    "label": "Protected Brand Logo",
+                    "label": "Protected Brand Logo Lockup" if len(logo_refs) > 1 else "Protected Brand Logo",
                     "file_path": logo_path,
-                    "id": getattr(logo_ref, "id", None),
-                    "asset_name": getattr(logo_ref, "asset_name", None),
-                    "asset_kind": getattr(logo_ref, "asset_kind", None),
-                    "usage_note": getattr(logo_ref, "usage_note", None),
+                    "id": ",".join(str(getattr(ref, "id", "")) for ref in logo_refs if getattr(ref, "id", None)),
+                    "asset_name": "Co-brand lockup" if len(logo_refs) > 1 else getattr(logo_refs[0], "asset_name", None),
+                    "asset_kind": None,
+                    "usage_note": "Use the uploaded co-brand lockup as one protected mark." if len(logo_refs) > 1 else getattr(logo_refs[0], "usage_note", None),
                 })
                 logger.info(f"Slide {slide.page_num}: 加载受保护 Logo {logo_path}")
             except Exception as e:
-                logger.warning(f"无法加载 Logo {logo_ref.file_path}: {e}")
+                logger.warning(f"无法加载 Logo lockup: {e}")
 
     # 3. 全局视觉资产：只加载 visual plan 为当前页选中的资产。
     selected_asset_ids = []
     manual_asset_ids = set()
+    overlay_asset_ids = exact_overlay_asset_ids(slide.visual_json if isinstance(slide.visual_json, dict) else {})
     if slide.visual_json and isinstance(slide.visual_json, dict):
         raw_ids = slide.visual_json.get("visual_asset_ids") or []
         if isinstance(raw_ids, list):
             selected_asset_ids = []
             for x in raw_ids:
                 value = str(x)
-                if value and value not in selected_asset_ids:
+                if value and value not in overlay_asset_ids and value not in selected_asset_ids:
                     selected_asset_ids.append(value)
         manual_raw = slide.visual_json.get("manual_visual_asset_ids") or []
         if isinstance(manual_raw, list):
@@ -751,24 +749,31 @@ def run_generation_pipeline(
                     pptx_path = os.path.join(output_dir, project_id, "presentation.pptx")
                 os.makedirs(os.path.dirname(pptx_path), exist_ok=True)
 
-                logo_ref = next(
-                    (
-                        ref for ref in project.reference_images or []
-                        if ref.role == "logo" and not ref.slide_id and os.path.exists(ref.file_path)
-                    ),
-                    None,
-                )
+                logo_refs = [
+                    ref for ref in project.reference_images or []
+                    if ref.role == "logo" and not ref.slide_id and os.path.exists(ref.file_path)
+                ]
                 logo_config = (
                     {
-                        "file_path": logo_ref.file_path,
-                        "anchor": getattr(logo_ref, "logo_anchor", None) or "top-right",
+                        "file_paths": [ref.file_path for ref in logo_refs],
+                        "anchor": getattr(logo_refs[0], "logo_anchor", None) or "top-right",
                     }
-                    if logo_ref else None
+                    if logo_refs else None
                 )
+                overlay_assets = {
+                    ref.id: {
+                        "file_path": ref.file_path,
+                        "asset_name": ref.asset_name,
+                        "asset_kind": ref.asset_kind,
+                    }
+                    for ref in project.reference_images or []
+                    if ref.role == "visual_asset" and not ref.slide_id and os.path.exists(ref.file_path)
+                }
                 assemble_pptx(
                     slide_images=all_completed_images,
                     output_path=pptx_path,
                     logo_config=logo_config,
+                    overlay_assets=overlay_assets,
                 )
                 logger.info(f"Pipeline: PPTX 组装完成 {pptx_path}")
             except Exception as e:

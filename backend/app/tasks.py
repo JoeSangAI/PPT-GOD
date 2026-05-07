@@ -11,6 +11,7 @@ from app.core.provider_credentials import load_task_provider_credentials, provid
 from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.generation_pipeline import run_generation_pipeline
+from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.run_state import finish_run, is_run_active, mark_run_running, update_run_progress
 from app.services.style_proposal import generate_style_proposals
 from app.services.image_analyzer import analyze_logo, analyze_reference_image
@@ -220,8 +221,11 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
 
             if logo_refs:
                 try:
-                    logger.info(f"[StyleProposals Celery] Analyzing logo for project={project_id}")
-                    assets["logo_analysis"] = analyze_logo(logo_refs[0].file_path)
+                    logger.info(f"[StyleProposals Celery] Analyzing logo lockup for project={project_id}")
+                    existing_logo_paths = [r.file_path for r in logo_refs if os.path.exists(r.file_path)]
+                    logo_path = prepare_logo_lockup_image(existing_logo_paths) if existing_logo_paths else None
+                    if logo_path:
+                        assets["logo_analysis"] = analyze_logo(logo_path)
                 except Exception as e:
                     logger.warning(f"[StyleProposals Celery] Logo analysis failed: {e}")
 

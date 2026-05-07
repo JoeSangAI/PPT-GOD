@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from typing import List, Optional
@@ -45,7 +46,13 @@ from app.services.logo_policy import (
     should_show_logo,
     should_use_logo_as_scene_asset,
 )
-from app.services.logo_assets import prepare_logo_overlay_image
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
+from app.services.overlay_layers import (
+    exact_overlay_asset_ids,
+    merge_overlay_layers_into_visual_json,
+    normalize_overlay_layers,
+    remove_asset_from_overlay_layers,
+)
 from app.services.visual_plan import generate_visual_plan, _recall_visual_assets_for_page
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
@@ -92,6 +99,85 @@ ALLOWED_IMAGE_TYPES = {
 }
 
 # 全局生成进度存储（内存级，项目重启后丢失），定义在 run_state.py，此处引用
+
+UNTITLED_PROJECT_TITLES = {"未命名项目", "新建项目", "Untitled Project", "Untitled"}
+
+
+def _should_autoname_project(project: Project | None) -> bool:
+    """Only auto-name projects that still use a default placeholder title."""
+    if not project:
+        return False
+    title = str(project.title or "").strip()
+    if not title:
+        return True
+    return title in UNTITLED_PROJECT_TITLES or title.startswith("未命名项目")
+
+
+def _first_plain_text(value) -> str:
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return " ".join(parts)
+    if isinstance(value, dict):
+        parts = [str(item).strip() for item in value.values() if str(item).strip()]
+        return " ".join(parts)
+    return str(value or "").strip()
+
+
+def _clean_project_title(value: str) -> str:
+    text = normalize_markdown_emphasis(str(value or ""))
+    text = re.sub(r"\[\[PPTGOD_ATTACHMENT:[^\]]+\]\]", " ", text)
+    text = re.sub(r"【(?:文件|图片|附件|用户上传材料)[^】]*】", " ", text)
+    text = re.sub(r"\b(?:PDF|Word|PPT|PPTX|Markdown|TXT)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[#*_`>\[\](){}<>|]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n，。；：、,.!?！？—-")
+    for _ in range(3):
+        cleaned = re.sub(r"^(?:请|帮我|帮忙|做一份|生成一份|制作一份|我要做|我想做|把|用这个文件|参考)\s*", "", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    text = re.sub(r"(?:的)?(?:PPT|ppt|演示文稿|幻灯片|汇报|报告)$", "", text).strip(" \t\r\n，。；：、,.!?！？—-")
+    if not text:
+        return ""
+
+    # Keep the sidebar name scannable; avoid long brief sentences becoming project titles.
+    split = re.split(r"[，,。；;！!?？\n\r]", text, maxsplit=1)
+    text = split[0].strip(" \t\r\n，。；：、,.!?！？—-") or text
+    text = re.sub(r"(?:的)?(?:PPT|ppt|演示文稿|幻灯片|汇报|报告)$", "", text).strip(" \t\r\n，。；：、,.!?！？—-")
+    if len(text) > 24:
+        text = text[:24].rstrip(" \t\r\n，。；：、,.!?！？—-")
+    return text
+
+
+def _derive_project_title(topic: str, outline: list[dict]) -> str | None:
+    candidates: list[str] = []
+    if isinstance(outline, list):
+        for item in outline[:4]:
+            if not isinstance(item, dict):
+                continue
+            text_content = item.get("text_content") if isinstance(item.get("text_content"), dict) else {}
+            candidates.extend(
+                [
+                    _first_plain_text(text_content.get("headline")),
+                    _first_plain_text(text_content.get("subhead")),
+                    _first_plain_text(item.get("title")),
+                    _first_plain_text(item.get("section_title")),
+                ]
+            )
+
+    for line in str(topic or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("[[PPTGOD_ATTACHMENT:", "【用户上传材料】", "【文件", "【图片", "已上传文档", "已上传图片")):
+            continue
+        candidates.append(stripped)
+
+    for candidate in candidates:
+        title = _clean_project_title(candidate)
+        if len(title) >= 2 and title not in UNTITLED_PROJECT_TITLES:
+            return title
+    return None
 
 
 def _style_text_from_selected_style(selected_style: dict | str | None) -> str | None:
@@ -195,6 +281,7 @@ def _merge_manual_pins_into_visual_json(visual_json: dict | None, existing_visua
     existing = existing_visual_json if isinstance(existing_visual_json, dict) else {}
     manual_ids = _manual_asset_ids(existing)
     manual_usage = _manual_asset_usage(existing)
+    visual = merge_overlay_layers_into_visual_json(visual, existing)
     if not manual_ids:
         return visual
     visual["manual_visual_asset_ids"] = manual_ids
@@ -254,32 +341,34 @@ def _project_template_refs_for_prompt(project: Project) -> list[dict]:
     return refs
 
 
+def _project_logo_refs(project: Project) -> list[ReferenceImage]:
+    return [
+        img for img in project.reference_images or []
+        if img.role == "logo" and not img.slide_id
+    ]
+
+
 def _project_logo_refs_for_prompt(project: Project, page_intent: dict | None = None) -> list[dict]:
-    refs = []
-    for img in project.reference_images or []:
-        if img.role != "logo" or img.slide_id:
-            continue
-        if not should_use_logo_as_scene_asset(page_intent or {}, img):
-            break
-        refs.append({
-            "id": img.id,
-            "role": "logo",
-            "process_mode": "blend",
-            "description": img.file_path,
-            "logo_anchor": logo_anchor_from_ref(img),
-        })
-        break
-    return refs
+    logo_refs = _project_logo_refs(project)
+    if not logo_refs or not any(should_use_logo_as_scene_asset(page_intent or {}, img) for img in logo_refs):
+        return []
+
+    logo_path = prepare_logo_lockup_image([img.file_path for img in logo_refs]) if logo_refs else None
+    if not logo_path:
+        logo_path = logo_refs[0].file_path
+    return [{
+        "id": ",".join(str(img.id) for img in logo_refs),
+        "role": "logo",
+        "process_mode": "blend",
+        "description": logo_path,
+        "asset_name": "联合标识" if len(logo_refs) > 1 else logo_refs[0].asset_name,
+        "logo_anchor": logo_anchor_from_ref(logo_refs[0]),
+    }]
 
 
 def _project_logo_ref(project: Project) -> ReferenceImage | None:
-    return next(
-        (
-            img for img in project.reference_images or []
-            if img.role == "logo" and not img.slide_id
-        ),
-        None,
-    )
+    refs = _project_logo_refs(project)
+    return refs[0] if refs else None
 
 
 def _logo_overlay_url(ref: ReferenceImage, project_id: str) -> str | None:
@@ -288,7 +377,7 @@ def _logo_overlay_url(ref: ReferenceImage, project_id: str) -> str | None:
     overlay_path = prepare_logo_overlay_image(ref.file_path)
     if not overlay_path or not os.path.exists(overlay_path):
         return None
-    return f"/uploads/{project_id}/{os.path.basename(overlay_path)}"
+    return _reference_upload_url(project_id, overlay_path)
 
 
 def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dict | None:
@@ -349,19 +438,93 @@ def _visual_asset_summary(ref: ReferenceImage) -> str:
     return "; ".join(parts)
 
 
+PPTX_LEGACY_IDENTITY_ASSET_TERMS = (
+    "产品", "包装", "瓶", "sku", "SKU", "货架", "终端", "陈列", "样品", "实物",
+    "设备", "取件机", "快递柜", "人物", "模特", "代言人", "团队", "肖像",
+    "物料", "主视觉", "KV", "品牌物料", "产品物料", "海报", "立牌", "展架",
+    "吊旗", "标识", "导视",
+)
+PPTX_LEGACY_LOW_VALUE_TERMS = (
+    "背景", "氛围", "氛围感", "风景", "插画", "装饰", "纹理", "光效", "底图", "配图",
+)
+
+
+def _float_metadata(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _visual_asset_planning_score(ref: ReferenceImage) -> float:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    if not analysis.get("source_document"):
+        return 100.0
+    score = _float_metadata(analysis.get("importance_score"), 0.0)
+    if score:
+        return score
+    kind = str(ref.asset_kind or analysis.get("detected_kind") or "other").lower()
+    if kind in {"product", "material", "person"}:
+        return 55.0
+    return 0.0
+
+
+def _is_planning_visual_asset(ref: ReferenceImage) -> bool:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    if not analysis.get("source_document"):
+        return True
+    tier = str(analysis.get("selection_tier") or "").lower()
+    if tier:
+        return tier == "core_global"
+
+    # Legacy PPT assets created before the selection-tier metadata existed were
+    # over-inclusive. Keep only brand/product identity assets; charts,
+    # screenshots, maps, and diagrams stay page-level evidence.
+    kind = str(ref.asset_kind or analysis.get("detected_kind") or "other").lower()
+    area_ratio = _float_metadata(analysis.get("area_ratio"), 0.0)
+    source_text = " ".join([
+        str(ref.asset_name or ""),
+        str(analysis.get("source_slide_text") or ""),
+        " ".join(str(tag) for tag in (analysis.get("asset_tags") or []) if tag),
+    ])
+    source_lower = source_text.lower()
+    has_identity_term = any(term.lower() in source_lower for term in PPTX_LEGACY_IDENTITY_ASSET_TERMS)
+    has_low_value_term = any(term.lower() in source_lower for term in PPTX_LEGACY_LOW_VALUE_TERMS)
+    if kind in {"product", "person"}:
+        return (not area_ratio or area_ratio >= 0.006) and has_identity_term
+    if kind == "material":
+        if area_ratio and area_ratio < 0.006:
+            return False
+        if has_low_value_term and not has_identity_term:
+            return False
+        return has_identity_term
+    if kind == "scene":
+        return False
+    if kind == "other":
+        return False
+    return False
+
+
 def _project_visual_assets_for_planning(project: Project) -> list[dict]:
     assets = []
     for ref in project.reference_images or []:
         if ref.role != "visual_asset" or ref.slide_id:
             continue
+        if not _is_planning_visual_asset(ref):
+            continue
+        importance_score = _visual_asset_planning_score(ref)
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
         assets.append({
             "id": ref.id,
             "name": ref.asset_name or os.path.splitext(os.path.basename(ref.file_path or ""))[0],
             "kind": ref.asset_kind or "other",
             "process_mode": ref.process_mode or default_visual_asset_process_mode(ref.asset_kind),
             "usage_note": ref.usage_note or "",
+            "selection_tier": analysis.get("selection_tier") or ("manual" if not analysis.get("source_document") else "legacy_candidate"),
+            "importance_score": importance_score,
             "analysis_summary": _visual_asset_summary(ref),
         })
+    assets.sort(key=lambda item: (-float(item.get("importance_score") or 0), str(item.get("name") or "")))
     return assets
 
 
@@ -372,6 +535,8 @@ def _project_refs_for_prompt(
 ) -> list[dict]:
     refs = []
     wanted = set(visual_asset_ids or [])
+    overlay_wanted = exact_overlay_asset_ids(page_intent or {})
+    wanted = {asset_id for asset_id in wanted if asset_id not in overlay_wanted}
     if wanted:
         for img in project.reference_images or []:
             if img.role != "visual_asset" or img.id not in wanted:
@@ -661,6 +826,21 @@ class AssetPinsRequest(BaseModel):
     usage: dict[str, str] = {}
 
 
+class OverlayLayerRequest(BaseModel):
+    id: Optional[str] = None
+    asset_id: str
+    enabled: bool = True
+    preset: str = "right-card"
+    fit: str = "contain"
+    mode: str = "exact_card"
+    usage_note: Optional[str] = None
+    z_index: Optional[int] = None
+
+
+class OverlayLayersRequest(BaseModel):
+    layers: List[OverlayLayerRequest] = []
+
+
 class ReorderRequest(BaseModel):
     page_nums: List[int]
 
@@ -673,17 +853,23 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
     db = SessionLocal()
     try:
         logger.info(f"[ContentPlan BG] Starting for project={project_id}, topic={topic[:30]}...")
-        mark_run_running(db, run_id, stage="content_plan", message="开始生成 Content Plan...")
+        mark_run_running(db, run_id, stage="document_parse", message="正在读取上传材料...")
         db.commit()
-        _update_progress(project_id, {"stage": "content_plan", "message": "开始生成 Content Plan...", "current_page": 0, "total_pages": page_count or 10}, run_id)
+        _update_progress(project_id, {"stage": "document_parse", "message": "正在读取上传材料...", "current_page": 0, "total_pages": page_count or 10}, run_id)
 
-        documents = load_project_documents(project_id)
+        documents = load_project_documents(project_id, parse_missing=True)
         if documents:
             logger.info(f"[ContentPlan BG] Loaded documents, length={len(documents)}")
             inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
             if page_count is None and inferred_page_count:
                 page_count = inferred_page_count
+                update_run_progress(db, run_id, total_count=page_count)
+                db.commit()
                 logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
+
+        mark_run_running(db, run_id, stage="content_plan", message="开始生成 Content Plan...")
+        db.commit()
+        _update_progress(project_id, {"stage": "content_plan", "message": "开始生成 Content Plan...", "current_page": 0, "total_pages": page_count or 10}, run_id)
 
         def report_progress(data: dict):
             _update_progress(project_id, data, run_id)
@@ -741,6 +927,10 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
             project.content_plan_confirmed = False
             project.style_proposal = None
             project.selected_style = None
+            if _should_autoname_project(project):
+                derived_title = _derive_project_title(topic, outline)
+                if derived_title:
+                    project.title = derived_title
         finish_run(
             db,
             run_id,
@@ -791,14 +981,6 @@ def create_content_plan(
     # 优先使用用户传入的 topic，否则用项目标题
     topic = body.topic.strip() if body.topic else project.title
     page_count = body.page_count
-
-    documents = load_project_documents(project_id)
-    if documents:
-        logger.info(f"[ContentPlan] Loaded documents for project={project_id}, length={len(documents)}")
-        inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
-        if page_count is None and inferred_page_count:
-            page_count = inferred_page_count
-            logger.info(f"[ContentPlan] Inferred page_count={page_count} from single uploaded PPT")
 
     try:
         run = create_project_run(
@@ -1538,9 +1720,38 @@ def confirm_prototype(
         db.commit()
         return {"message": "All slides already completed", "status": "completed"}
 
+    target_slides = pending_slides + failed_slides
+    missing_prompt_slides = [
+        s
+        for s in target_slides
+        if not s.prompt_text or not str(s.prompt_text).strip()
+    ]
+    missing_visual_pages = [
+        s.page_num
+        for s in missing_prompt_slides
+        if not isinstance(s.visual_json, dict) or not str(s.visual_json.get("visual_description") or "").strip()
+    ]
+    if missing_visual_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, missing_visual_pages))} 页缺少画面描述，请先生成画面方案。"
+        )
+
+    if missing_prompt_slides:
+        logger.info(
+            "ConfirmPrototype: project=%s 自动补齐缺失 Prompt pages=%s",
+            project_id,
+            [s.page_num for s in missing_prompt_slides],
+        )
+        for slide in missing_prompt_slides:
+            prompt = _regenerate_slide_prompt(slide, project, db)
+            if prompt:
+                slide.status = "prompt_ready"
+        db.flush()
+
     missing_prompt_pages = [
         s.page_num
-        for s in pending_slides + failed_slides
+        for s in target_slides
         if not s.prompt_text or not str(s.prompt_text).strip()
     ]
     if missing_prompt_pages:
@@ -1886,14 +2097,6 @@ def upload_file(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"图片格式无法处理: {e}")
 
-    old_refs_to_remove: list[ReferenceImage] = []
-    if not slide_id and role == "logo":
-        old_refs_to_remove = db.query(ReferenceImage).filter(
-            ReferenceImage.project_id == project_id,
-            ReferenceImage.slide_id.is_(None),
-            ReferenceImage.role == "logo",
-        ).all()
-
     asset_analysis = None
     cleaned_asset_name = (asset_name or "").strip() or None
     cleaned_usage_note = (usage_note or "").strip() or None
@@ -1929,8 +2132,6 @@ def upload_file(
         logo_anchor=normalized_logo_anchor if role == "logo" else None,
     )
     db.add(ref_image)
-    for old_ref in old_refs_to_remove:
-        db.delete(old_ref)
     if not slide_id and role in {"style_ref", "logo", "template"}:
         _invalidate_style_dependent_outputs(project)
     if role == "visual_asset":
@@ -1939,13 +2140,6 @@ def upload_file(
         _invalidate_visual_plan_dependent_outputs(project, [slide])
     db.commit()
     db.refresh(ref_image)
-    for old_ref in old_refs_to_remove:
-        try:
-            if old_ref.file_path != file_path and os.path.exists(old_ref.file_path):
-                os.remove(old_ref.file_path)
-                logger.info(f"Deleted old logo file: {old_ref.file_path}")
-        except Exception as e:
-            logger.warning(f"Failed to delete old logo file {old_ref.file_path}: {e}")
 
     return {
         "id": ref_image.id,
@@ -1983,6 +2177,18 @@ def list_reference_images(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    has_library_params = any([
+        q,
+        asset_kind,
+        source_document,
+        source_page_num is not None,
+        process_mode,
+        pinned_slide_id,
+        recommend_slide_id,
+        limit is not None,
+        offset,
+    ])
+
     query = db.query(ReferenceImage).filter(ReferenceImage.project_id == project_id)
     if slide_id:
         query = query.filter(ReferenceImage.slide_id == slide_id)
@@ -1992,6 +2198,11 @@ def list_reference_images(
 
     query = query.filter(ReferenceImage.role != "finetune_ref")
     images = query.all()
+    if not slide_id and not has_library_params:
+        images = [
+            img for img in images
+            if img.role != "visual_asset" or _is_planning_visual_asset(img)
+        ]
 
     slides = db.query(Slide).filter(Slide.project_id == project_id).all()
     pinned_by_asset: dict[str, list[str]] = {}
@@ -2072,17 +2283,6 @@ def list_reference_images(
         for img in paged
     ]
 
-    has_library_params = any([
-        q,
-        asset_kind,
-        source_document,
-        source_page_num is not None,
-        process_mode,
-        pinned_slide_id,
-        recommend_slide_id,
-        limit is not None,
-        offset,
-    ])
     if has_library_params:
         return {"items": items, "total": total, "facets": facets}
     return items
@@ -2233,6 +2433,7 @@ def delete_reference_image(
                 if isinstance(manual_usage, dict):
                     manual_usage.pop(ref_id, None)
                     visual["manual_visual_asset_usage"] = manual_usage
+            visual = remove_asset_from_overlay_layers(visual, ref_id)
             slide.visual_json = visual
         _invalidate_visual_asset_dependent_outputs(project)
     db.delete(ref)
@@ -2377,6 +2578,12 @@ def update_slide_asset_pins(
     visual["manual_visual_asset_ids"] = requested_ids
     visual["manual_visual_asset_usage"] = manual_usage
     visual["visual_asset_ids"] = _merge_asset_ids(requested_ids, auto_ids)
+    if isinstance(visual.get("overlay_layers"), list):
+        requested_set = set(requested_ids)
+        visual["overlay_layers"] = [
+            layer for layer in normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+            if str(layer.get("asset_id")) in requested_set
+        ]
     visual["visual_asset_usage"] = {
         **{str(k): str(v) for k, v in existing_usage.items() if k and v and str(k) not in manual_usage},
         **manual_usage,
@@ -2390,6 +2597,61 @@ def update_slide_asset_pins(
         "page_num": slide.page_num,
         "visual_json": slide.visual_json or {},
         "manual_visual_asset_ids": _manual_asset_ids(slide.visual_json),
+    }
+
+
+@router.patch("/{project_id}/slides/{slide_id}/overlay-layers")
+def update_slide_overlay_layers(
+    project_id: str,
+    slide_id: str,
+    payload: OverlayLayersRequest,
+    db: Session = Depends(get_db),
+):
+    """Replace one slide's exact overlay layers."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    raw_layers = [
+        layer.model_dump() if hasattr(layer, "model_dump") else layer.dict()
+        for layer in (payload.layers or [])
+    ]
+    requested_asset_ids = {
+        str(layer.get("asset_id"))
+        for layer in raw_layers
+        if layer.get("asset_id")
+    }
+    valid_assets = []
+    if requested_asset_ids:
+        valid_assets = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.slide_id.is_(None),
+            ReferenceImage.role == "visual_asset",
+            ReferenceImage.id.in_(requested_asset_ids),
+        ).all()
+    valid_ids = {
+        asset.id for asset in valid_assets
+        if asset.file_path and os.path.exists(asset.file_path)
+    }
+    missing = [asset_id for asset_id in requested_asset_ids if asset_id not in valid_ids]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Invalid overlay visual_asset ids: {', '.join(missing[:5])}")
+
+    normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
+    visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+    visual["overlay_layers"] = normalized_layers
+    slide.visual_json = visual
+    _invalidate_visual_plan_dependent_outputs(project, [slide])
+    db.commit()
+    db.refresh(slide)
+    return {
+        "slide_id": slide.id,
+        "page_num": slide.page_num,
+        "visual_json": slide.visual_json or {},
+        "overlay_layers": normalized_layers,
     }
 
 
@@ -2478,6 +2740,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
         "design_notes": visual_json.get("design_notes", ""),
         "visual_asset_ids": visual_json.get("visual_asset_ids", []),
         "visual_asset_usage": visual_json.get("visual_asset_usage", {}),
+        "overlay_layers": visual_json.get("overlay_layers", []),
         "logo_policy": visual_json.get("logo_policy"),
     }
     page_intent = _with_project_logo_policy(page_intent, project) or page_intent

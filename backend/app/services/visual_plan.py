@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.services.logo_policy import logo_policy_for_page
+from app.services.overlay_layers import normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
 from app.services.style_pack import derive_style_pack_from_content
 from app.utils.text_cleaning import clean_llm_output
@@ -200,6 +201,12 @@ def _page_search_text(page: Dict) -> str:
 
 def _asset_search_terms(asset: Dict) -> set[str]:
     terms: set[str] = set()
+    tier = str(asset.get("selection_tier") or "").lower()
+    try:
+        importance_score = float(asset.get("importance_score") or 0)
+    except (TypeError, ValueError):
+        importance_score = 0
+    allow_source_terms = not tier or tier in {"manual", "core_global"} or importance_score >= 45
     for key in ("name",):
         value = asset.get(key)
         if value:
@@ -209,7 +216,10 @@ def _asset_search_terms(asset: Dict) -> set[str]:
     for part in summary.split(";"):
         if "=" in part:
             key, value = part.split("=", 1)
-            if key.strip() not in ASSET_RECALL_SUMMARY_KEYS:
+            summary_key = key.strip()
+            if summary_key not in ASSET_RECALL_SUMMARY_KEYS:
+                continue
+            if summary_key in {"source_slide_text", "tags"} and not allow_source_terms:
                 continue
             summary_chunks.append(value)
         elif not summary_chunks:
@@ -227,6 +237,19 @@ def _asset_search_terms(asset: Dict) -> set[str]:
             if len(token) >= 2:
                 terms.add(token)
     return terms
+
+
+def _asset_is_recallable(asset: Dict) -> bool:
+    tier = str(asset.get("selection_tier") or "").lower()
+    if tier in {"page_ref_only", "low_value", "decorative"}:
+        return False
+    try:
+        score = float(asset.get("importance_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if tier and tier not in {"manual", "core_global", "legacy_candidate"} and score < 45:
+        return False
+    return True
 
 
 def _asset_kind_triggers(kind: str) -> tuple[str, ...]:
@@ -277,6 +300,8 @@ def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[Li
     for asset in global_visual_assets:
         asset_id = asset.get("id")
         if not asset_id:
+            continue
+        if not _asset_is_recallable(asset):
             continue
         kind = str(asset.get("kind") or "other").lower()
         terms = _asset_search_terms(asset)
@@ -330,6 +355,11 @@ def _manual_visual_asset_usage(page: Dict, manual_ids: list[str]) -> dict[str, s
         return {}
     allowed = set(manual_ids)
     return {str(k): str(v) for k, v in raw.items() if str(k) in allowed and v}
+
+
+def _manual_overlay_layers(page: Dict, valid_asset_ids: set[str]) -> list[dict]:
+    raw = page.get("overlay_layers") or []
+    return normalize_overlay_layers(raw, valid_asset_ids=valid_asset_ids, strict_assets=True)
 
 
 def _safe_parse_json(raw: str, batch_num: int) -> Optional[Dict]:
@@ -468,6 +498,10 @@ def _build_batch_prompt(
 【页面类型适配规则 — 必须遵守】
 参考图/风格方案只提供“风格基因”，不是每页画面模板。具体每页画什么，必须由该页文案内容决定。
 - cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
+- cover / 封面：只负责定调和命名，不承载正文论证；标题、副标题和主视觉必须形成单一焦点，避免信息堆叠。
+- toc / 目录页：只有导航功能，不承担内容论证。画面必须像清爽的路线图：3-6 个短章节名、明确编号、足够留白、少装饰；不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
+- data / 数据页：只有当页面正文给出真实数字、标签或表格时才画图；必须围绕这些数据做大数字、简单图表或高可读表格，不要编造数值、趋势或坐标轴。
+- ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
 - hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
 - content / data / table / 对比分析页：优先保证阅读效率。信息越密集，背景越应降饱和、提亮度、减少装饰；品牌主色只用于标题、页眉、编号、强调块和少量装饰。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
@@ -504,6 +538,9 @@ Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠
 
 【质量标准】
 1. visual_evidence 必须具体。优先选择白皮书、直播间、达人矩阵、终端货架、企业楼宇、地图、增长曲线、VS 对比、产品/工艺场景等能证明观点的对象。
+   - toc / 目录页例外：visual_evidence 应写成「章节路线图 / 导航结构」，不要编造商业证据或场景图。
+   - data / 数据页例外：visual_evidence 应写成「正文给出的具体数字/图表对象」，不要写没有数据支撑的抽象增长曲线。
+   - ending / 封底例外：visual_evidence 应写成「收束画面 / CTA / 联系方式区域」，不要引入新的证明素材。
    - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠。
 2. 禁止输出“现代商务风格画面”“与主题相关的视觉元素”“品牌调性背景”等空泛句。
 3. visual_summary 必须极简，只说「画面是什么」（有参考图时可点出「基于用户参考路线图」等）。
@@ -711,6 +748,7 @@ def _do_generate_visual_plan(
         }
         manual_asset_ids = _manual_visual_asset_ids(page, valid_asset_ids)
         manual_asset_usage = _manual_visual_asset_usage(page, manual_asset_ids)
+        overlay_layers = _manual_overlay_layers(page, valid_asset_ids)
         if not isinstance(visual_asset_ids, list):
             visual_asset_ids = []
         visual_asset_ids = [
@@ -811,6 +849,7 @@ def _do_generate_visual_plan(
             "reference_image_ids": reference_image_ids or [],
             "manual_visual_asset_ids": manual_asset_ids,
             "manual_visual_asset_usage": manual_asset_usage,
+            "overlay_layers": overlay_layers,
             "visual_asset_ids": visual_asset_ids,
             "visual_asset_usage": visual_asset_usage,
             "style_pack_snapshot": style_pack_snapshot,

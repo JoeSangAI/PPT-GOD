@@ -45,6 +45,45 @@ class _ImageOccurrence:
         return max(0, self.width) * max(0, self.height) / slide_area
 
 
+@dataclass
+class _LibraryPromotion:
+    promote: bool
+    score: int
+    tier: str
+    reason: str
+    kind: str | None = None
+
+
+@dataclass
+class _ContentRefCandidate:
+    priority: float
+    asset: PptxImageAsset
+
+
+PRODUCT_CONTEXT_TERMS = (
+    "产品", "主产品", "包装", "瓶", "瓶身", "sku", "SKU", "货架", "终端", "陈列",
+    "样品", "实物", "设备", "取件机", "快递柜", "商品", "礼盒", "门店物料",
+)
+PERSON_CONTEXT_TERMS = ("人物", "模特", "代言人", "创始人", "讲师", "专家", "团队", "肖像", "合影")
+MATERIAL_CONTEXT_TERMS = (
+    "物料", "主视觉", "KV", "key visual", "品牌物料", "产品物料", "海报",
+    "立牌", "展架", "吊旗", "标识", "导视", "贴片",
+)
+CONTENT_GRAPHIC_CONTEXT_TERMS = (
+    "图表", "数据", "表格", "截图", "界面", "系统", "小程序", "大屏", "看板", "流程",
+    "路径", "动线", "地图", "矩阵", "架构", "模型", "漏斗", "时间轴", "二维码",
+)
+LOW_VALUE_CONTEXT_TERMS = (
+    "背景", "氛围", "氛围感", "风景", "插画", "装饰", "纹理", "光效", "底图",
+    "配图", "意境", "校园风景", "天空", "草地",
+)
+CORE_ASSET_CONTEXT_TERMS = (
+    *PRODUCT_CONTEXT_TERMS,
+    *PERSON_CONTEXT_TERMS,
+    *MATERIAL_CONTEXT_TERMS,
+)
+
+
 def _safe_stem(filename: str) -> str:
     stem = os.path.splitext(os.path.basename(filename or "pptx"))[0]
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
@@ -118,7 +157,155 @@ def _asset_kind_for_occ(occ: _ImageOccurrence, has_transparency: bool) -> str:
     return "other"
 
 
-def _classify_asset(occurrences: list[_ImageOccurrence], dominant_share: float, channel_std: float, has_transparency: bool) -> tuple[str, str, str | None]:
+def _is_cover_logo_candidate(
+    occ: _ImageOccurrence,
+    slide_count: int,
+    dominant_share: float,
+    channel_std: float,
+    has_transparency: bool,
+) -> bool:
+    if occ.page_num not in {1, slide_count}:
+        return False
+    if occ.area_ratio < 0.0015 or occ.area_ratio > 0.05:
+        return False
+    aspect = occ.width / max(1, occ.height)
+    if aspect > 10 or aspect < 0.1:
+        return False
+    y_mid = (occ.top + occ.height / 2) / max(1, occ.slide_height)
+    in_brand_zone = y_mid <= 0.30 or y_mid >= 0.72
+    if not in_brand_zone:
+        return False
+    # Logo marks are usually flat, transparent, or text-like. This rejects many
+    # photographic cover thumbnails while still allowing multi-color brand marks.
+    if not has_transparency and dominant_share < 0.48 and channel_std > 45:
+        return False
+    return True
+
+
+def _text_has_any(text: str, terms: tuple[str, ...]) -> bool:
+    lower = (text or "").lower()
+    return any(term.lower() in lower for term in terms)
+
+
+def _is_full_slide_background(occ: _ImageOccurrence) -> bool:
+    if occ.area_ratio >= 0.62:
+        return True
+    slide_w = max(1, occ.slide_width)
+    slide_h = max(1, occ.slide_height)
+    return (
+        occ.left <= slide_w * 0.025
+        and occ.top <= slide_h * 0.025
+        and occ.width >= slide_w * 0.92
+        and occ.height >= slide_h * 0.90
+    )
+
+
+def _suggest_promoted_kind(kind: str, source_text: str) -> str:
+    if kind and kind != "other":
+        return kind
+    if _text_has_any(source_text, PRODUCT_CONTEXT_TERMS):
+        return "product"
+    if _text_has_any(source_text, PERSON_CONTEXT_TERMS):
+        return "person"
+    if _text_has_any(source_text, MATERIAL_CONTEXT_TERMS):
+        return "material"
+    return kind or "other"
+
+
+def _library_promotion_for_asset(
+    occurrences: list[_ImageOccurrence],
+    kind: str,
+    dominant_share: float,
+    channel_std: float,
+    has_transparency: bool,
+    unique_image_count_on_page: int,
+) -> _LibraryPromotion:
+    first = occurrences[0]
+    repeated_pages = {occ.page_num for occ in occurrences}
+    source_text = " ".join(first.slide_text.split())
+    has_identity_context = _text_has_any(source_text, CORE_ASSET_CONTEXT_TERMS)
+    has_low_value_context = _text_has_any(source_text, LOW_VALUE_CONTEXT_TERMS)
+    has_content_graphic_context = _text_has_any(source_text, CONTENT_GRAPHIC_CONTEXT_TERMS)
+
+    if _is_full_slide_background(first):
+        return _LibraryPromotion(False, 0, "page_ref_only", "full-slide/background image", kind)
+    if len(repeated_pages) >= 2 and first.area_ratio >= 0.18:
+        return _LibraryPromotion(False, 0, "page_ref_only", "large repeated template/background image", kind)
+    if kind == "scene":
+        return _LibraryPromotion(False, 8, "page_ref_only", "large scene kept only as page reference", kind)
+    if has_content_graphic_context and not has_identity_context:
+        return _LibraryPromotion(False, 18, "page_ref_only", "content graphic kept as page-level evidence", kind)
+    if has_low_value_context and not has_identity_context:
+        return _LibraryPromotion(False, 0, "low_value", "ambient/decorative context", kind)
+
+    score = 0
+    reasons: list[str] = []
+    if has_transparency and 0.006 <= first.area_ratio <= 0.16 and has_identity_context:
+        score += 45
+        reasons.append("transparent identity/material asset with matching slide context")
+    if len(repeated_pages) >= 2 and first.area_ratio <= 0.12 and has_identity_context and not has_low_value_context:
+        score += 35
+        reasons.append("small/medium repeated identity asset")
+    if (
+        has_identity_context
+        and unique_image_count_on_page <= 2
+        and 0.035 <= first.area_ratio <= 0.20
+        and channel_std >= 12
+        and dominant_share <= 0.96
+    ):
+        score += 35
+        reasons.append("primary identity/product image on a relevant slide")
+    if dominant_share > 0.94 and channel_std < 12:
+        score -= 30
+        reasons.append("mostly flat/solid image")
+    if has_low_value_context:
+        score -= 20
+        reasons.append("low-value visual context")
+
+    promoted_kind = _suggest_promoted_kind(kind, source_text)
+    if score >= 35:
+        return _LibraryPromotion(True, score, "core_global", "; ".join(reasons), promoted_kind)
+    return _LibraryPromotion(False, max(0, score), "page_ref_only", "; ".join(reasons) or "not distinctive enough for global library", kind)
+
+
+def _content_ref_priority(
+    occ: _ImageOccurrence,
+    kind: str,
+    dominant_share: float,
+    channel_std: float,
+    has_transparency: bool,
+) -> float:
+    source_text = " ".join(occ.slide_text.split())
+    if _is_full_slide_background(occ):
+        base = 5.0
+    else:
+        base = min(40.0, occ.area_ratio * 260)
+    has_identity_context = _text_has_any(source_text, CORE_ASSET_CONTEXT_TERMS)
+    has_content_graphic_context = _text_has_any(source_text, CONTENT_GRAPHIC_CONTEXT_TERMS)
+    if has_identity_context:
+        base += 18
+    elif has_content_graphic_context:
+        base += 14
+    if kind in {"material", "product", "person"}:
+        base += 16
+    if kind == "scene":
+        base -= 8
+    if has_transparency:
+        base += 8
+    if _text_has_any(source_text, LOW_VALUE_CONTEXT_TERMS) and not (has_identity_context or has_content_graphic_context):
+        base -= 18
+    if dominant_share > 0.95 and channel_std < 12:
+        base -= 20
+    return base
+
+
+def _classify_asset(
+    occurrences: list[_ImageOccurrence],
+    dominant_share: float,
+    channel_std: float,
+    has_transparency: bool,
+    slide_count: int,
+) -> tuple[str, str, str | None]:
     first = occurrences[0]
     repeated_pages = {occ.page_num for occ in occurrences}
     if _is_decorative(first, dominant_share, channel_std):
@@ -131,6 +318,8 @@ def _classify_asset(occurrences: list[_ImageOccurrence], dominant_share: float, 
         return "logo", "logo", None
     if len(repeated_pages) >= 4 and first.area_ratio <= 0.004:
         return "logo", "logo", None
+    if _is_cover_logo_candidate(first, slide_count, dominant_share, channel_std, has_transparency):
+        return "logo_candidate", "logo", None
     kind = _asset_kind_for_occ(first, has_transparency)
     return "useful", "content_ref", kind
 
@@ -299,9 +488,15 @@ def extract_pptx_image_assets(
             )
 
     assets: list[PptxImageAsset] = []
+    content_ref_candidates: list[_ContentRefCandidate] = []
     per_slide_count: dict[int, int] = {}
     source_stem = _safe_stem(source_filename)
+    unique_image_count_by_page: dict[int, int] = {}
+    for occurrences in occurrences_by_hash.values():
+        for page_num in {occ.page_num for occ in occurrences}:
+            unique_image_count_by_page[page_num] = unique_image_count_by_page.get(page_num, 0) + 1
 
+    slide_count = len(prs.slides)
     for digest, occurrences in occurrences_by_hash.items():
         occurrences.sort(key=lambda occ: (occ.page_num, -occ.area_ratio))
         first = occurrences[0]
@@ -310,7 +505,7 @@ def extract_pptx_image_assets(
         except Exception:
             continue
 
-        classification, role, kind = _classify_asset(occurrences, dominant_share, channel_std, has_transparency)
+        classification, role, kind = _classify_asset(occurrences, dominant_share, channel_std, has_transparency, slide_count)
         if role == "ignore":
             continue
 
@@ -345,33 +540,48 @@ def extract_pptx_image_assets(
                     process_mode="original",
                     asset_kind=None,
                     asset_name=f"{source_stem} extracted logo",
-                    usage_note="从上传 PPT 中识别出的重复 Logo，作为全局品牌标识使用。",
+                    usage_note="从上传 PPT 中识别出的 Logo / 联合标识，作为全局品牌标识使用。",
                     metadata=base_metadata,
                 )
             )
             continue
 
-        assets.append(
-            PptxImageAsset(
-                file_path=file_path,
-                source_page_num=first.page_num,
-                repeated_page_nums=page_nums,
-                classification="library_asset",
-                role="visual_asset",
-                process_mode="crop" if kind in {"material", "other"} else "blend",
-                asset_kind=kind,
-                asset_name=f"{source_stem} p{first.page_num} image",
-                usage_note="从上传 PPT 中提取的后台资源库素材；页面内容或用户后续调整相关时自动召回。",
-                metadata={**base_metadata, "library_role": "global_recall_asset"},
-            )
+        promotion = _library_promotion_for_asset(
+            occurrences,
+            kind or "other",
+            dominant_share,
+            channel_std,
+            has_transparency,
+            unique_image_count_by_page.get(first.page_num, 1),
         )
+        promoted_kind = promotion.kind or kind
+        process_mode = "crop" if promoted_kind in {"product", "material", "other"} else "blend"
+
+        if promotion.promote:
+            assets.append(
+                PptxImageAsset(
+                    file_path=file_path,
+                    source_page_num=first.page_num,
+                    repeated_page_nums=page_nums,
+                    classification="library_asset",
+                    role="visual_asset",
+                    process_mode=process_mode,
+                    asset_kind=promoted_kind,
+                    asset_name=f"{source_stem} p{first.page_num} core asset",
+                    usage_note="从上传 PPT 中筛选出的高价值核心素材；仅在页面内容明确相关时自动召回。",
+                    metadata={
+                        **base_metadata,
+                        "classification": "library_asset",
+                        "library_role": "core_global_asset",
+                        "selection_tier": promotion.tier,
+                        "importance_score": promotion.score,
+                        "selection_reason": promotion.reason,
+                        "unique_image_count_on_page": unique_image_count_by_page.get(first.page_num, 1),
+                    },
+                )
+            )
 
         for occ in occurrences:
-            if max_total_assets is not None and len(assets) >= max_total_assets:
-                break
-            if per_slide_count.get(occ.page_num, 0) >= max_assets_per_slide:
-                continue
-            per_slide_count[occ.page_num] = per_slide_count.get(occ.page_num, 0) + 1
             metadata = _base_metadata(
                 source_filename,
                 digest,
@@ -382,19 +592,45 @@ def extract_pptx_image_assets(
                 pixel_h,
                 dominant_share,
             )
-            assets.append(
-                PptxImageAsset(
-                    file_path=file_path,
-                    source_page_num=occ.page_num,
-                    repeated_page_nums=page_nums,
-                    classification=classification,
-                    role="content_ref",
-                    process_mode="crop" if kind in {"material", "other"} else "blend",
-                    asset_kind=kind,
-                    asset_name=f"{source_stem} p{occ.page_num} image",
-                    usage_note="从上传 PPT 对应页提取的有用图片，优先作为本页参考图使用。",
-                    metadata=metadata,
+            priority = _content_ref_priority(occ, promoted_kind or kind or "other", dominant_share, channel_std, has_transparency)
+            content_ref_candidates.append(
+                _ContentRefCandidate(
+                    priority=priority,
+                    asset=PptxImageAsset(
+                        file_path=file_path,
+                        source_page_num=occ.page_num,
+                        repeated_page_nums=page_nums,
+                        classification=classification,
+                        role="content_ref",
+                        process_mode="crop" if (promoted_kind or kind) in {"product", "material", "other"} else "blend",
+                        asset_kind=promoted_kind or kind,
+                        asset_name=f"{source_stem} p{occ.page_num} image",
+                        usage_note="从上传 PPT 对应页提取的有用图片，优先作为本页参考图使用。",
+                        metadata={
+                            **metadata,
+                            "selection_tier": "page_ref",
+                            "importance_score": round(priority, 2),
+                            "selection_reason": promotion.reason,
+                        },
+                    ),
                 )
             )
+
+    content_ref_candidates.sort(
+        key=lambda item: (
+            item.asset.source_page_num,
+            -item.priority,
+            -float(item.asset.metadata.get("area_ratio") or 0),
+            item.asset.file_path,
+        )
+    )
+    for candidate in content_ref_candidates:
+        if max_total_assets is not None and len(assets) >= max_total_assets:
+            break
+        asset = candidate.asset
+        if per_slide_count.get(asset.source_page_num, 0) >= max_assets_per_slide:
+            continue
+        per_slide_count[asset.source_page_num] = per_slide_count.get(asset.source_page_num, 0) + 1
+        assets.append(asset)
 
     return assets[:max_total_assets] if max_total_assets is not None else assets

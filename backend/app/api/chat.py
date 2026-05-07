@@ -18,11 +18,27 @@ from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VI
 router = APIRouter(prefix="/projects", tags=["chat"])
 
 
+CONTENT_MUTATION_PAYLOAD_KEYS = {
+    "regenerate_plan": "topic",
+    "update_slide_content": "updated_content",
+    "update_all_slides": "updated_slides",
+    "add_slide_before": "new_slide",
+    "add_slide_after": "new_slide",
+}
+CONTENT_MUTATION_ACTIONS = frozenset(CONTENT_MUTATION_PAYLOAD_KEYS)
+CONTENT_CONTRACT_REVIEW_ACTIONS = frozenset({
+    "answer",
+    "collect_content",
+    "forward_to_visual",
+    *CONTENT_MUTATION_ACTIONS,
+})
+
+
 class ChatMessage(BaseModel):
     message: str
     history: list[dict] = []
     page_context: dict | None = None
-    agent_role: str = "content"  # "content" | "visual"
+    agent_role: str = "content"  # "content" | "visual" | "finetune"
 
     @field_validator("agent_role")
     @classmethod
@@ -33,106 +49,226 @@ class ChatMessage(BaseModel):
         return v
 
 
-def _has_content_edit_intent(message: str) -> bool:
-    """判断用户消息是否包含明确的内容编辑/修改意图。"""
-    msg = message.strip().lower()
-    edit_keywords = {
-        "修改", "调整", "改写", "重写", "编辑", "更新",
-        "添加", "插入", "增加", "追加",
-        "删除", "移除", "删掉", "去掉",
-        "换", "改", "加", "删", "增", "减", "变",
-        "页面", "第", "页",
-        "大纲", "结构", "章节", "标题", "内容",
-    }
-    return any(kw in msg for kw in edit_keywords)
+def _infer_requested_page_count(message: str) -> int | None:
+    explicit = re.search(r"(\d{1,3})\s*页", message.strip())
+    if not explicit:
+        return None
+    try:
+        value = int(explicit.group(1))
+    except ValueError:
+        return None
+    return value if 1 <= value <= 80 else None
 
 
-def _has_content_regenerate_intent(message: str) -> bool:
-    """判断用户是否在要求重做/扩写当前内容规划，而不是普通问答。"""
-    msg = message.strip().lower()
-    if not msg:
-        return False
-
-    page_count_feedback = {
-        "页数太少", "页太少", "内容太少", "太少了", "不够多", "不够丰富",
-        "太简略", "太粗略", "太薄", "扩充", "丰富", "完整一点", "更完整",
-        "多加几页", "增加页数", "加页", "加一页", "补一页", "扩写",
-    }
-    source_feedback = {
-        "没用原文", "没有用原文", "不用原文", "不是原文", "按原文",
-        "按照原文", "基于原文", "用原文", "还原原文", "按文档",
-        "按照文档", "基于文档", "用文档", "没按文档", "没有按文档",
-    }
-    structure_feedback = {
-        "结构不对", "逻辑不对", "顺序不对", "章节不对", "大纲不对",
-        "重新排", "换个结构", "重新组织", "跑题", "偏题", "主题不对",
-        "没覆盖", "没有覆盖", "遗漏", "漏了", "少了", "缺少", "补充",
-        "案例页", "数据页", "总结页", "目录页", "封面", "封底",
-    }
-    regenerate_verbs = {
-        "重做", "重新做", "重新生成", "重新规划", "再生成", "重新来",
-        "按原来的", "按大纲重新",
-    }
-    return any(k in msg for k in page_count_feedback | source_feedback | structure_feedback | regenerate_verbs)
-
-
-def _infer_regenerate_page_count(message: str, current_total: int) -> int | None:
-    """从用户反馈中提取或保守推断新的内容规划页数。"""
-    msg = message.strip()
-    explicit = re.search(r"(\d{1,3})\s*页", msg)
-    if explicit:
-        try:
-            value = int(explicit.group(1))
-            if 1 <= value <= 80:
-                return value
-        except ValueError:
-            pass
-
-    if any(k in msg for k in ("页数太少", "页太少", "内容太少", "太少了", "不够丰富", "扩充", "增加页数", "多加几页")):
-        if current_total > 0:
-            return min(60, max(current_total + 6, current_total * 2))
-    return None
-
-
-def _coerce_content_regenerate_action(
-    result: dict,
-    user_message: str,
-    project_context: dict,
-    is_draft: bool,
-) -> dict:
-    """把口头承诺式回复纠正为真正会执行的内容规划 action。"""
-    if is_draft:
-        return result
+def _content_action_payload_complete(result: dict) -> bool:
     action = result.get("action")
-    if not _has_content_regenerate_intent(user_message):
-        return result
-    incomplete_payload_actions = {
-        "regenerate_plan": "topic",
-        "update_slide_content": "updated_content",
-        "update_all_slides": "updated_slides",
-        "add_slide_before": "new_slide",
-        "add_slide_after": "new_slide",
-    }
-    can_coerce = action in {"answer", "collect_content"} or (
-        action in incomplete_payload_actions and not result.get(incomplete_payload_actions[action])
-    )
-    if not can_coerce:
-        return result
+    payload_key = CONTENT_MUTATION_PAYLOAD_KEYS.get(action)
+    if not payload_key:
+        return True
+    payload = result.get(payload_key)
+    if isinstance(payload, list):
+        return len(payload) > 0
+    if isinstance(payload, dict):
+        return bool(payload)
+    return bool(payload)
 
+
+def _content_result_needs_contract_review(result: dict, is_draft: bool) -> bool:
+    if is_draft or not isinstance(result, dict):
+        return False
+    action = result.get("action")
+    if action not in CONTENT_CONTRACT_REVIEW_ACTIONS:
+        return False
+    return action in {"answer", "collect_content", "forward_to_visual"} or not _content_action_payload_complete(result)
+
+
+def _fallback_regenerate_plan(user_message: str, project_context: dict, response: str | None = None) -> dict:
     title = project_context.get("title") or "当前项目"
-    page_count = _infer_regenerate_page_count(user_message, int(project_context.get("total_slides") or 0))
+    feedback = user_message.strip().rstrip("。.!！？? ")
+    page_count = _infer_requested_page_count(user_message)
     coerced = {
-        **result,
         "action": "regenerate_plan",
         "topic": (
-            f"{title}。用户反馈：{user_message}。"
-            "请重新生成内容规划，优先基于已上传原文/文档展开，保留原文中的关键论点、结构、数据和表达，不要只做概括。"
+            f"{title}。用户反馈：{feedback}。"
+            "请重新生成内容规划，把用户的自然语言指令落实为整套 PPT 的内容结构、页面节奏和文字表达改动。"
         ),
-        "response": result.get("response") or "明白，我会基于原文重新生成更完整的内容规划。",
+        "response": response or "明白，我会把这条反馈落实到内容规划里重新生成。",
     }
     if page_count:
         coerced["page_count"] = page_count
     return coerced
+
+
+def _parse_json_object(text: str) -> dict | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text.startswith("json"):
+            text = text[4:].strip()
+    try:
+        parsed = json_repair.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json_repair.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return None
+
+
+def _compact_for_contract(value, text_limit: int = 1800):
+    if isinstance(value, str):
+        return value if len(value) <= text_limit else value[:text_limit] + "..."
+    if isinstance(value, list):
+        return [_compact_for_contract(item, text_limit) for item in value]
+    if isinstance(value, dict):
+        return {k: _compact_for_contract(v, text_limit) for k, v in value.items()}
+    return value
+
+
+def _build_content_contract_prompt() -> str:
+    return """你是 PPT GOD 的「内容指令编译器」。你的职责不是聊天，而是把用户的自然语言指令编译成对当前 PPT 内容的结构化操作。
+
+硬性工作流合同：
+1. 只要用户的话可以被理解为要求、建议、反馈、抱怨或暗示要改变 PPT 的内容、页面、标题、正文、故事线、逻辑、结构、页数、顺序、表达方式，就必须返回一个可执行 mutation action。
+2. 严禁用 action="answer" 口头承诺“我会修改/我建议调整/可以重构”。凡是会改变 PPT 内容的回复，都必须带上具体 action 和 payload。
+3. 只有纯咨询、纯解释、寒暄、明显视觉问题、或确实无法判断要改哪里时，才允许 action="answer"，并必须提供 no_change_reason。
+4. 如果用户只是确认内容已经可以进入视觉阶段，返回 action="forward_to_visual"。
+5. 如果用户给的是整体质量反馈，或者局部补丁风险较高，优先返回 action="regenerate_plan"，把用户反馈写进 topic，让后台重新生成内容规划。
+6. 如果用户指定单页且当前页内容足够明确，返回 action="update_slide_content"，updated_content 必须是该页完整 content_json。
+7. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
+8. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
+
+只输出合法 JSON 对象。允许的 action：
+- regenerate_plan
+- update_slide_content
+- update_all_slides
+- add_slide_before
+- add_slide_after
+- forward_to_visual
+- answer
+
+输出字段：
+- response: 给用户看的简短中文反馈
+- topic: regenerate_plan 必填
+- page_count: regenerate_plan 可选
+- updated_content / updated_slides / new_slide: 对应 action 必填
+- no_change_reason: 仅 answer 必填"""
+
+
+def _compile_content_instruction_with_llm(
+    *,
+    client,
+    user_message: str,
+    project_context: dict,
+    documents: str,
+    page_context: dict | None,
+    slides_context: list[dict] | None,
+    initial_result: dict,
+) -> dict | None:
+    payload = {
+        "project_context": project_context,
+        "user_message": user_message,
+        "initial_agent_result": initial_result,
+        "page_context_from_frontend": page_context,
+        "current_deck_content": slides_context or [],
+        "uploaded_documents_excerpt": (documents or "")[:12000],
+    }
+    response = client.chat.completions.create(
+        model=get_minimax_llm_model(),
+        messages=[
+            {"role": "system", "content": _build_content_contract_prompt()},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.1,
+        max_tokens=3500,
+    )
+    return _parse_json_object(response.choices[0].message.content or "")
+
+
+def _content_contract_result_usable(result: dict | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    action = result.get("action")
+    if action not in CONTENT_ACTIONS:
+        return False
+    if action == "answer":
+        return bool(result.get("response")) and bool(result.get("no_change_reason"))
+    if action == "forward_to_visual":
+        return bool(result.get("response"))
+    if action in CONTENT_MUTATION_ACTIONS:
+        return _content_action_payload_complete(result)
+    return False
+
+
+def _enforce_content_action_contract(
+    *,
+    result: dict,
+    user_message: str,
+    project_context: dict,
+    client=None,
+    documents: str = "",
+    page_context: dict | None = None,
+    slides_context: list[dict] | None = None,
+    compiler=None,
+    logger=None,
+) -> dict:
+    if not _content_result_needs_contract_review(result, is_draft=False):
+        return result
+
+    try:
+        if compiler:
+            compiled = compiler(
+                user_message=user_message,
+                project_context=project_context,
+                documents=documents,
+                page_context=page_context,
+                slides_context=slides_context,
+                initial_result=result,
+            )
+        else:
+            compiled = _compile_content_instruction_with_llm(
+                client=client,
+                user_message=user_message,
+                project_context=project_context,
+                documents=documents,
+                page_context=page_context,
+                slides_context=slides_context,
+                initial_result=result,
+            )
+    except Exception as exc:
+        if logger:
+            logger.warning("[Chat] Content action contract compiler failed: %s", exc)
+        compiled = None
+
+    if _content_contract_result_usable(compiled):
+        if logger:
+            logger.info(
+                "[Chat] Content action contract compiled %s -> %s",
+                result.get("action"),
+                compiled.get("action"),
+            )
+        return compiled
+
+    if result.get("action") in CONTENT_MUTATION_ACTIONS and not _content_action_payload_complete(result):
+        return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
+    if result.get("action") in {"answer", "collect_content"}:
+        return {
+            "action": "answer",
+            "response": "我没有把这条指令落成可执行的内容改动，因此没有修改 PPT。请明确要改哪一页，或告诉我是否要重做整套内容规划。",
+            "no_change_reason": "content_instruction_compiler_failed",
+        }
+    return result
 
 
 def _build_draft_prompt(has_documents: bool) -> str:
@@ -369,6 +505,7 @@ def _build_normal_prompt() -> str:
 - "重试失败" / "重新生成失败的页" → action="retry_failed"
 - 用户明确要求修改某一页 → action="update_slide_content"
 - 用户要求修改全部页面、全局调整、整体改写文字 → action="update_all_slides"
+- **用户反馈整体内容质量问题时（叙事/主线/脉络/结构/逻辑/节奏/论证不完整、不清楚、不连贯、像罗列素材、没有递进或缺少转折）→ action="regenerate_plan"，不要只口头答应；topic 中必须写明需要重构整体内容规划，并补足缺失的铺垫、冲突、转折、证据或结尾。**
 - **用户提到"按照 content plan"、"按照原文/文档"、"完全按照...来"、"按原来的大纲"等，意图是让现有页面内容对齐文档/大纲时 → action="update_all_slides"，不要只口头答应**
 - **用户要求"重新生成内容规划"、"重新规划页面"、"按大纲重新来"、页数需要增减变化时 → action="regenerate_plan"，并在 topic 字段中输出完整的主题描述（用于重新生成内容规划）**
 - 用户说"在第X页前面加一页"、"在前面插入一页"、"加一页" → action="add_slide_before"
@@ -463,7 +600,17 @@ def _history_has_prior_proposal(history: list[dict], agent_role: str) -> bool:
     return False
 
 
-def _stream_intent(user_message: str, project_context: dict, history: list[dict], documents: str = "", page_context: dict | None = None, agent_role: str = "content", content_plan_summary: str = "", assets_summary: str = ""):
+def _stream_intent(
+    user_message: str,
+    project_context: dict,
+    history: list[dict],
+    documents: str = "",
+    page_context: dict | None = None,
+    agent_role: str = "content",
+    content_plan_summary: str = "",
+    assets_summary: str = "",
+    slides_context: list[dict] | None = None,
+):
     """流式解析用户意图，yield SSE 事件。"""
     import logging
     logger = logging.getLogger(__name__)
@@ -529,21 +676,6 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
         else:
             system_prompt = _build_normal_prompt()
 
-    # 【关键】内容已确认时，强制内容总监引导用户进入视觉阶段
-    # 不依赖 LLM 判断，直接硬编码返回，确保流程推进的可靠性
-    if agent_role == "content" and project_context.get("content_plan_confirmed"):
-        # 用户有明确的内容修改意图时，允许内容总监继续处理
-        if not _has_content_edit_intent(user_message):
-            yield {"type": "thinking", "delta": "内容规划已确认，直接引导用户切换到视觉总监。"}
-            yield {
-                "type": "result",
-                "data": {
-                    "action": "forward_to_visual",
-                    "response": "内容已确认，现在进入视觉设计阶段。请点击上方切换到「视觉总监」，我会为你制定整体视觉风格和画面方案。"
-                }
-            }
-            return
-
     # 把文档内容放到系统 prompt 中（内容总监和视觉总监都需要）
     if has_documents and agent_role != "visual":
         system_prompt += f"\n\n=== 用户已上传的文档内容（你必须基于这些文档回答） ===\n{documents}\n=== 文档结束 ==="
@@ -595,14 +727,7 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
             role = "assistant"
         messages.append({"role": role, "content": h.get("content", "")})
 
-    # 内容已确认时，在 user message 中重复强调，确保 LLM 不会忽略
-    if agent_role == "content" and project_context.get("content_plan_confirmed"):
-        if _has_content_edit_intent(user_message):
-            user_content = f"上下文：{context}\n\n【系统指令】内容规划已确认，但用户提出了明确的内容编辑请求。请先处理用户的编辑请求，执行相应操作，然后在 response 末尾提示用户：内容调整完成后，可点击上方切换到视觉总监继续。\n用户：{user_message}"
-        else:
-            user_content = f"上下文：{context}\n\n【系统指令】内容规划已确认，用户没有提出明确的内容编辑请求。返回 action='forward_to_visual' 引导用户切换到视觉总监。禁止反问用户下一步想做什么。\n用户：{user_message}"
-    else:
-        user_content = f"上下文：{context}\n用户：{user_message}"
+    user_content = f"上下文：{context}\n用户：{user_message}"
     messages.append({"role": "user", "content": user_content})
 
     stream = client.chat.completions.create(
@@ -789,15 +914,17 @@ def _stream_intent(user_message: str, project_context: dict, history: list[dict]
         else:
             result = {"action": "answer", "response": "抱歉，我不太理解您的指令，请尝试说\"重新生成第3页\"或\"重试失败的页面\"。"}
 
-    if result and isinstance(result, dict) and agent_role == "content":
-        coerced_result = _coerce_content_regenerate_action(result, user_message, project_context, is_draft)
-        if coerced_result.get("action") != result.get("action"):
-            logger.info(
-                "[Chat] Content feedback fallback: forced regenerate_plan from %s (msg=%r)",
-                result.get("action"),
-                user_message[:80],
-            )
-        result = coerced_result
+    if result and isinstance(result, dict) and agent_role == "content" and not is_draft:
+        result = _enforce_content_action_contract(
+            result=result,
+            user_message=user_message,
+            project_context=project_context,
+            client=client,
+            documents=documents,
+            page_context=page_context,
+            slides_context=slides_context or [],
+            logger=logger,
+        )
 
     # 【Fix-3】修改意见强制重生成：JSON 解析成功但 action 不对时，根据上下文强制纠正
     # 场景：用户已经看过提案，现在给出修改意见，但 LLM 返回了 answer/collect_content（常见于流截断后的解析歧义）
@@ -942,6 +1069,16 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
             summary_parts.append(f"  第{s.page_num}页（{ptype}）：{headline}")
         content_plan_summary = "\n".join(summary_parts)
 
+    slides_context = []
+    if body.agent_role == "content" and slides:
+        for s in slides:
+            slides_context.append({
+                "page_num": s.page_num,
+                "slide_id": s.id,
+                "type": s.type or "content",
+                "content_json": _compact_for_contract(s.content_json or {}),
+            })
+
     # 构建素材摘要（视觉总监使用）
     assets_summary = ""
     if body.agent_role == "visual":
@@ -1014,7 +1151,7 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
                 asset_lines.append(f"- 品牌 Logo：{asset_counts['logo']} 张（颜色/调性由后端提取，禁止臆测）")
             if asset_counts.get("visual_asset", 0):
                 asset_lines.append(
-                    f"- 核心资产：{asset_counts['visual_asset']} 个（后台资源库全量保留；按原PPT页码、标签和页面内容智能调用）"
+                    f"- 核心资产：{asset_counts['visual_asset']} 个（仅保留高价值可复用素材；按资产标签和页面内容智能调用）"
                 )
                 asset_lines.extend(visual_asset_details)
                 hidden_count = asset_counts["visual_asset"] - len(visual_asset_details)
@@ -1043,7 +1180,7 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
         try:
             for event in _stream_intent(
                 body.message, context, body.history, documents,
-                body.page_context, body.agent_role, content_plan_summary, assets_summary
+                body.page_context, body.agent_role, content_plan_summary, assets_summary, slides_context
             ):
                 if event.get("type") == "result":
                     event = {**event, "data": with_next_action(event.get("data"), context, body.agent_role)}

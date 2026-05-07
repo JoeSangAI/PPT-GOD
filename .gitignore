@@ -21,9 +21,13 @@ frontend/dist/
 backend/uploads/
 backend/outputs/
 outputs/
+output/
+frontend/test-output/
 
 # Local browser/debug artifacts
 .playwright-cli/
+.logs/
+.pytest_cache/
 
 # IDE
 .vscode/
@@ -48,4 +52,11 @@ venv/
 # Logs
 *.log
 backend/1
+frontend/1
+backend/celery.pid
 backend/celery*.log
+test-e2e-output.log
+test-results.log
+
+# Local launchers
+*.command

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 from functools import lru_cache
 
@@ -8,6 +10,30 @@ def _overlay_cache_path(source_path: str) -> str:
     directory = os.path.dirname(source_path)
     stem, _ = os.path.splitext(os.path.basename(source_path))
     return os.path.join(directory, f"logo_overlay_{stem}.png")
+
+
+def _valid_logo_paths(source_paths: list[str] | tuple[str, ...] | None) -> list[str]:
+    valid: list[str] = []
+    for path in source_paths or []:
+        if not path or not os.path.exists(path):
+            continue
+        normalized = os.path.abspath(path)
+        if normalized not in valid:
+            valid.append(normalized)
+    return valid
+
+
+def _lockup_cache_path(source_paths: list[str]) -> str:
+    directory = os.path.dirname(source_paths[0])
+    signature = []
+    for path in source_paths:
+        try:
+            stat = os.stat(path)
+            signature.append([path, stat.st_mtime_ns, stat.st_size])
+        except OSError:
+            signature.append([path, None, None])
+    digest = hashlib.sha1(json.dumps(signature, ensure_ascii=False).encode("utf-8")).hexdigest()[:14]
+    return os.path.join(directory, f"logo_lockup_{digest}.png")
 
 
 def _border_background_color(img: Image.Image) -> tuple[int, int, int]:
@@ -85,6 +111,79 @@ def prepare_logo_overlay_image(source_path: str) -> str:
         return output_path
     except Exception:
         return source_path
+
+
+def prepare_logo_lockup_image(source_paths: list[str] | tuple[str, ...] | None) -> str | None:
+    """
+    Build a cached transparent co-brand lockup from one or more uploaded logos.
+
+    Multiple logos need a stable visual signature instead of being placed
+    independently on every page. Each logo is first trimmed/transparentized,
+    then scaled to a shared optical height with separators between marks.
+    """
+    valid_paths = _valid_logo_paths(source_paths)
+    if not valid_paths:
+        return None
+    if len(valid_paths) == 1:
+        return prepare_logo_overlay_image(valid_paths[0])
+
+    output_path = _lockup_cache_path(valid_paths)
+    try:
+        newest_source = max(os.path.getmtime(path) for path in valid_paths)
+        if os.path.exists(output_path) and os.path.getmtime(output_path) >= newest_source:
+            return output_path
+    except OSError:
+        return prepare_logo_overlay_image(valid_paths[0])
+
+    opened: list[Image.Image] = []
+    try:
+        for path in valid_paths:
+            logo_path = prepare_logo_overlay_image(path)
+            if not logo_path or not os.path.exists(logo_path):
+                continue
+            with Image.open(logo_path) as source:
+                img = source.convert("RGBA")
+                if img.width <= 0 or img.height <= 0:
+                    continue
+                opened.append(img.copy())
+    except Exception:
+        return prepare_logo_overlay_image(valid_paths[0])
+
+    if not opened:
+        return prepare_logo_overlay_image(valid_paths[0])
+    if len(opened) == 1:
+        opened[0].save(output_path, "PNG")
+        return output_path
+
+    target_height = 160
+    gap = int(target_height * 0.24)
+    separator_width = max(2, int(target_height * 0.018))
+    separator_height = int(target_height * 0.58)
+
+    scaled: list[Image.Image] = []
+    for img in opened:
+        ratio = img.width / max(img.height, 1)
+        width = max(1, int(target_height * ratio))
+        scaled.append(img.resize((width, target_height), Image.Resampling.LANCZOS))
+
+    total_width = sum(img.width for img in scaled) + gap * (len(scaled) - 1) + separator_width * (len(scaled) - 1)
+    canvas = Image.new("RGBA", (max(1, total_width), target_height), (255, 255, 255, 0))
+    x = 0
+    for idx, img in enumerate(scaled):
+        canvas.alpha_composite(img, (x, 0))
+        x += img.width
+        if idx < len(scaled) - 1:
+            sep_x = x + gap // 2
+            sep_y = (target_height - separator_height) // 2
+            separator = Image.new("RGBA", (separator_width, separator_height), (42, 52, 65, 118))
+            canvas.alpha_composite(separator, (sep_x, sep_y))
+            x += gap + separator_width
+
+    try:
+        canvas.save(output_path, "PNG")
+        return output_path
+    except Exception:
+        return prepare_logo_overlay_image(valid_paths[0])
 
 
 @lru_cache(maxsize=256)

@@ -4,10 +4,13 @@ from typing import Dict, List
 
 from PIL import Image
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.dml.color import RGBColor
 from pptx.util import Inches
 
-from app.services.logo_assets import prepare_logo_overlay_image
+from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.logo_policy import LOGO_HEIGHT_RATIOS, LOGO_WIDTH_RATIOS, normalize_logo_placement, should_show_logo
+from app.services.overlay_layers import contained_picture_box, enabled_overlay_layers, overlay_box
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,7 @@ def assemble_pptx(
     slide_images: List[Dict],
     output_path: str,
     logo_config: Dict | None = None,
+    overlay_assets: Dict[str, Dict] | None = None,
 ) -> str:
     """
     将生成的图片组装为 PPTX。
@@ -65,6 +69,14 @@ def assemble_pptx(
 
     # 安全获取空白布局：优先索引 6，不足时回退到最后一个
     blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[-1]
+    logo_paths = []
+    if logo_config:
+        raw_paths = logo_config.get("file_paths")
+        if isinstance(raw_paths, list):
+            logo_paths.extend(str(path) for path in raw_paths if path)
+        elif logo_config.get("file_path"):
+            logo_paths.append(str(logo_config["file_path"]))
+    logo_path_for_overlay = prepare_logo_lockup_image(logo_paths) if logo_paths else None
 
     for slide_data in sorted_slides:
         slide = prs.slides.add_slide(blank_layout)
@@ -80,23 +92,58 @@ def assemble_pptx(
                 height=prs.slide_height,
             )
 
+        overlay_layers = enabled_overlay_layers(slide_data.get("visual_json") or {})
+        for layer in overlay_layers:
+            asset = (overlay_assets or {}).get(str(layer.get("asset_id")))
+            asset_path = asset.get("file_path") if isinstance(asset, dict) else None
+            if not asset_path or not os.path.exists(asset_path):
+                logger.warning(
+                    "Assembler: overlay asset missing for page %s asset=%s",
+                    slide_data.get("page_num"),
+                    layer.get("asset_id"),
+                )
+                continue
+            left, top, width, height = overlay_box(prs, str(layer.get("preset") or "right-card"))
+            if layer.get("mode") == "exact_card":
+                card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(255, 255, 255)
+                card.line.color.rgb = RGBColor(218, 226, 235)
+                card.line.width = Inches(0.008)
+                inset = int(min(width, height) * 0.055)
+                pic_left, pic_top, pic_width, pic_height = contained_picture_box(
+                    asset_path,
+                    left + inset,
+                    top + inset,
+                    max(1, width - inset * 2),
+                    max(1, height - inset * 2),
+                )
+            else:
+                pic_left, pic_top, pic_width, pic_height = contained_picture_box(asset_path, left, top, width, height)
+            slide.shapes.add_picture(
+                asset_path,
+                left=pic_left,
+                top=pic_top,
+                width=pic_width,
+                height=pic_height,
+            )
+
         if (
             logo_config
-            and logo_config.get("file_path")
-            and os.path.exists(logo_config["file_path"])
+            and logo_path_for_overlay
+            and os.path.exists(logo_path_for_overlay)
             and should_show_logo(slide_data)
         ):
-            logo_path = prepare_logo_overlay_image(logo_config["file_path"])
             policy = (slide_data.get("visual_json") or {}).get("logo_policy") or {}
             left, top, width, height = _logo_geometry(
                 prs,
-                logo_path,
+                logo_path_for_overlay,
                 str(slide_data.get("type") or "content").lower(),
                 policy.get("placement") or logo_config.get("anchor") or "top-right",
                 policy.get("scale") or "small",
             )
             slide.shapes.add_picture(
-                logo_path,
+                logo_path_for_overlay,
                 left=left,
                 top=top,
                 width=width,

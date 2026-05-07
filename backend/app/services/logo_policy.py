@@ -102,7 +102,7 @@ def logo_prompt_instruction(page: Any) -> str:
     scale = "about 5% of slide width" if policy["scale"] == "small" else "modest brand signature size"
     placement = ANCHOR_LABELS[normalize_logo_placement(policy.get("placement"))]
     return (
-        "Use the exact uploaded logo as a quiet brand signature in the "
+        "Use the exact uploaded logo or co-brand lockup as a quiet brand signature in the "
         f"{placement}; keep this same position across slides, keep it {scale}, "
         "and never let it compete with the slide text or main visual evidence."
     )
@@ -116,7 +116,7 @@ def logo_reservation_instruction(page: Any, anchor: str | None = None) -> str:
     placement = ANCHOR_LABELS[placement_key]
     size = "small" if policy["scale"] == "small" else "modest"
     return (
-        f"Keep the {placement} clean for a {size} logo overlay: no required text, "
+        f"Keep the {placement} clean for a {size} logo/lockup overlay: no required text, "
         "no key subject, and no dense detail in that area."
     )
 

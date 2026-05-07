@@ -133,13 +133,14 @@ async function checkRes(res: Response) {
       throw new Error(`HTTP ${res.status}: ${title || "服务器错误"}`);
     }
     // FastAPI 返回 { detail: "..." }，尝试提取
+    let json: any = null;
     try {
-      const json = JSON.parse(text);
-      if (json.detail) {
-        throw new Error(`HTTP ${res.status}: ${json.detail}`);
-      }
+      json = JSON.parse(text);
     } catch {
-      // 不是 JSON，继续用原文
+      json = null;
+    }
+    if (json?.detail) {
+      throw new Error(`HTTP ${res.status}: ${json.detail}`);
     }
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
@@ -346,6 +347,19 @@ export async function updateSlideAssetPins(
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ asset_ids: assetIds, usage }),
+  });
+  return (await checkRes(res)).json();
+}
+
+export async function updateSlideOverlayLayers(
+  projectId: string,
+  slideId: string,
+  layers: any[]
+) {
+  const res = await apiFetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/overlay-layers`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ layers }),
   });
   return (await checkRes(res)).json();
 }

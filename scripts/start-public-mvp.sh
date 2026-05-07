@@ -16,10 +16,14 @@ find_free_port() {
 
 PORT="${PPTGOD_PORT:-$(find_free_port 8000)}"
 BACKEND_URL="http://127.0.0.1:${PORT}"
+TUNNEL_PROTOCOL="${PPTGOD_TUNNEL_PROTOCOL:-auto}"
 BACKEND_LOG="$LOG_DIR/backend-${PORT}.log"
 CELERY_LOG="$LOG_DIR/celery-${PORT}.log"
 TUNNEL_LOG="$LOG_DIR/cloudflared-${PORT}.log"
 PID_FILE="$LOG_DIR/pids-${PORT}.txt"
+PUBLIC_URL_FILE="$LOG_DIR/latest-url-${PORT}.txt"
+TUNNEL_HEALTH_INTERVAL="${PPTGOD_TUNNEL_HEALTH_INTERVAL:-30}"
+TUNNEL_HEALTH_FAILURES="${PPTGOD_TUNNEL_HEALTH_FAILURES:-3}"
 
 if ! command -v cloudflared >/dev/null 2>&1; then
   echo "cloudflared is required for the public MVP link."
@@ -56,11 +60,89 @@ PY
 fi
 
 : > "$PID_FILE"
+rm -f "$PUBLIC_URL_FILE"
+
+start_tunnel() {
+  local label="${1:-initial}"
+  if [[ "$label" == "initial" ]]; then
+    TUNNEL_LOG="$LOG_DIR/cloudflared-${PORT}.log"
+  else
+    TUNNEL_LOG="$LOG_DIR/cloudflared-${PORT}-${label}-$(date +%Y%m%d-%H%M%S).log"
+  fi
+
+  echo "==> Opening Cloudflare Tunnel (${TUNNEL_PROTOCOL})"
+  cloudflared tunnel --url "$BACKEND_URL" --protocol "$TUNNEL_PROTOCOL" --no-autoupdate >"$TUNNEL_LOG" 2>&1 &
+  TUNNEL_PID=$!
+  echo "$TUNNEL_PID" >> "$PID_FILE"
+}
+
+wait_for_public_url() {
+  PUBLIC_URL=""
+  for _ in $(seq 1 90); do
+    PUBLIC_URL="$(grep -Eo 'https://[-a-zA-Z0-9.]+\.trycloudflare\.com' "$TUNNEL_LOG" | tail -n 1 || true)"
+    if [[ -n "$PUBLIC_URL" ]] && grep -q "Registered tunnel connection" "$TUNNEL_LOG"; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ -z "$PUBLIC_URL" ]] || ! grep -q "Registered tunnel connection" "$TUNNEL_LOG"; then
+    echo "Failed to create a reachable public URL. See: $TUNNEL_LOG"
+    echo
+    tail -n 40 "$TUNNEL_LOG" || true
+    return 1
+  fi
+
+  echo "==> Verifying public URL"
+  for _ in $(seq 1 30); do
+    if curl -fsS "${PUBLIC_URL}/health" >/dev/null 2>&1; then
+      printf '%s\n' "$PUBLIC_URL" > "$PUBLIC_URL_FILE"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Public URL was created but did not pass health check: $PUBLIC_URL"
+  echo "See: $TUNNEL_LOG"
+  return 1
+}
+
+announce_public_url() {
+  echo
+  echo "PPT GOD public MVP is live:"
+  echo "$PUBLIC_URL"
+  echo
+  echo "Share this URL with testers. Keep this script running while they use it."
+  echo "Latest URL file: $PUBLIC_URL_FILE"
+  echo "Logs:"
+  echo "  Backend: $BACKEND_LOG"
+  echo "  Celery:  $CELERY_LOG"
+  echo "  Tunnel:  $TUNNEL_LOG"
+}
+
+restart_tunnel() {
+  while true; do
+    echo
+    echo "Cloudflare quick Tunnel became unreachable. Restarting it now..."
+    kill "$TUNNEL_PID" >/dev/null 2>&1 || true
+    wait "$TUNNEL_PID" >/dev/null 2>&1 || true
+    start_tunnel "restart"
+    if wait_for_public_url; then
+      announce_public_url
+      return 0
+    fi
+
+    echo "Cloudflare quick Tunnel restart failed. Retrying in 15 seconds..."
+    kill "$TUNNEL_PID" >/dev/null 2>&1 || true
+    wait "$TUNNEL_PID" >/dev/null 2>&1 || true
+    sleep 15
+  done
+}
 
 echo "==> Starting backend on ${BACKEND_URL}"
 (
   cd "$ROOT_DIR/backend"
-  python -m uvicorn app.main:app --host 127.0.0.1 --port "$PORT"
+  exec python -m uvicorn app.main:app --host 127.0.0.1 --port "$PORT"
 ) >"$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" >> "$PID_FILE"
@@ -76,42 +158,39 @@ curl -fsS "${BACKEND_URL}/health" >/dev/null
 echo "==> Starting Celery worker"
 (
   cd "$ROOT_DIR/backend"
-  python -m celery -A app.celery_app worker -l info
+  exec python -m celery -A app.celery_app worker -l info -n "pptgod-public-${PORT}@%h"
 ) >"$CELERY_LOG" 2>&1 &
 CELERY_PID=$!
 echo "$CELERY_PID" >> "$PID_FILE"
 
-echo "==> Opening Cloudflare Tunnel"
-cloudflared tunnel --url "$BACKEND_URL" --protocol http2 --no-autoupdate >"$TUNNEL_LOG" 2>&1 &
-TUNNEL_PID=$!
-echo "$TUNNEL_PID" >> "$PID_FILE"
-
-PUBLIC_URL=""
-for _ in $(seq 1 90); do
-  PUBLIC_URL="$(grep -Eo 'https://[-a-zA-Z0-9.]+\.trycloudflare\.com' "$TUNNEL_LOG" | tail -n 1 || true)"
-  if [[ -n "$PUBLIC_URL" ]]; then
-    break
-  fi
-  sleep 1
-done
-
-if [[ -z "$PUBLIC_URL" ]]; then
-  echo "Failed to create public URL. See: $TUNNEL_LOG"
-  exit 1
-fi
-
-echo
-echo "PPT GOD public MVP is live:"
-echo "$PUBLIC_URL"
-echo
-echo "Share this URL with testers. Keep this script running while they use it."
-echo "Logs:"
-echo "  Backend: $BACKEND_LOG"
-echo "  Celery:  $CELERY_LOG"
-echo "  Tunnel:  $TUNNEL_LOG"
+start_tunnel "initial"
+wait_for_public_url
+announce_public_url
 
 if command -v open >/dev/null 2>&1; then
   open "$PUBLIC_URL"
 fi
 
-wait "$TUNNEL_PID"
+tunnel_failures=0
+while true; do
+  sleep "$TUNNEL_HEALTH_INTERVAL"
+
+  if ! kill -0 "$TUNNEL_PID" >/dev/null 2>&1; then
+    wait "$TUNNEL_PID" >/dev/null 2>&1 || true
+    restart_tunnel
+    tunnel_failures=0
+    continue
+  fi
+
+  if curl -fsS "${PUBLIC_URL}/health" >/dev/null 2>&1; then
+    tunnel_failures=0
+    continue
+  fi
+
+  tunnel_failures=$((tunnel_failures + 1))
+  echo "Warning: public URL health check failed (${tunnel_failures}/${TUNNEL_HEALTH_FAILURES}): $PUBLIC_URL"
+  if [[ "$tunnel_failures" -ge "$TUNNEL_HEALTH_FAILURES" ]]; then
+    restart_tunnel
+    tunnel_failures=0
+  fi
+done

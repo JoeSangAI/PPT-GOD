@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.services.logo_policy import logo_prompt_instruction, logo_reservation_instruction
+from app.services.overlay_layers import overlay_reservation_instruction
 from app.services.style_pack import derive_style_pack_from_content
 from app.utils.text_cleaning import clean_llm_output, normalize_markdown_emphasis
 
@@ -296,9 +297,9 @@ def _protected_assets_block(reference_images: Optional[List[Dict]]) -> str:
     for idx, ref in enumerate(protected, start=1):
         role = ref.get("role", "")
         if role == "logo":
-            label = "Logo"
+            label = ref.get("asset_name") or "Logo / lockup"
             rule = (
-                "use the exact uploaded mark as a small, quiet brand signature."
+                "use the exact uploaded mark or co-brand lockup as a small, quiet brand signature."
             )
         elif _is_product_ref(ref):
             label = ref.get("asset_name") or "Product"
@@ -335,7 +336,7 @@ def _reference_descriptions_for_prompt(
             elif role == "logo":
                 logo_instruction = logo_prompt_instruction(page_intent)
                 reference_descriptions.append(
-                    f"Logo: exact uploaded mark. {logo_instruction}"
+                    f"Logo / lockup: exact uploaded mark. {logo_instruction}"
                 )
             elif role == "content_ref":
                 reference_descriptions.append(
@@ -406,6 +407,8 @@ None"""
     style_pack = _compact_style_pack(style_text)
     logo_reservation = logo_reservation_instruction(page_intent)
     logo_section = f"\n【Logo Overlay Reservation】\n{logo_reservation}\n" if logo_reservation else ""
+    overlay_reservation = overlay_reservation_instruction(page_intent)
+    overlay_section = f"\n【Exact Overlay Reservation】\n{overlay_reservation}\n" if overlay_reservation else ""
 
     brief = f"""【Content — 本页核心主题，决定视觉主体画什么】
 Headline: {_strip_markdown(content_text.get("headline", ""))}
@@ -429,12 +432,13 @@ Body: {_format_body(content_text.get("body"))}
 
 {refs_section}
 {logo_section}
+{overlay_section}
 
 【Requirements】
 - 16:9 aspect ratio (1792x1024), landscape orientation
 - Single presentation slide background image
 - No watermark, UI elements, frames, or page numbers
-- Do not invent or redraw brand marks. If a protected user-uploaded Logo is listed in References, integrate that exact logo with high fidelity.
+- Do not invent or redraw brand marks. If a protected user-uploaded Logo / lockup is listed in References, integrate that exact mark with high fidelity.
 - The visual must make the Visual Evidence visible. Do not replace it with generic decoration.
 - Use style as a wrapper, not the subject. Page content decides the scene/object/chart.
 - Magazine-quality, award-winning design
@@ -547,6 +551,8 @@ def generate_prompt_for_page(
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
         logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
+        overlay_reservation = overlay_reservation_instruction(page_intent)
+        overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
         final_prompt = (
             "Text:\n"
             + text_block
@@ -563,6 +569,7 @@ def generate_prompt_for_page(
             + str(layout_intent)
             + (f"\n{punchline_treatment}" if punchline_treatment else "")
             + logo_section
+            + overlay_section
             + "\n\n"
             + "Render one 16:9 presentation slide. Keep text legible."
         )
@@ -574,6 +581,8 @@ def generate_prompt_for_page(
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
         logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
+        overlay_reservation = overlay_reservation_instruction(page_intent)
+        overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
         final_prompt = (
             protected_section
             + (refs_section.strip() + "\n\n" if refs_section else "")
@@ -585,6 +594,7 @@ def generate_prompt_for_page(
             + str(layout_intent)
             + (f"\n{punchline_treatment}" if punchline_treatment else "")
             + logo_section
+            + overlay_section
             + "\n\nRender one 16:9 presentation slide."
         )
 

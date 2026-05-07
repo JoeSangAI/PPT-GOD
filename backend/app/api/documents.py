@@ -1,14 +1,25 @@
 import os
 import logging
+import time
+import json
+from concurrent.futures import Future, ThreadPoolExecutor
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
-from app.models.base import get_db
+from app.models.base import SessionLocal, get_db
 from app.models.models import Project, ReferenceImage, Slide
 from app.core.config import settings
-from app.services.document_parser import parse_document, extract_text_preview
 from app.services.pptx_asset_extractor import PptxImageAsset, extract_pptx_image_assets
+from app.utils.project_docs import (
+    document_parse_status_path,
+    document_text_path,
+    extract_document_text,
+    get_project_docs_dir,
+    iter_project_document_filenames,
+    read_document_parse_status,
+    write_document_parse_status,
+)
 from app.utils.reference_image import default_visual_asset_process_mode
 
 router = APIRouter(prefix="/projects", tags=["documents"])
@@ -17,16 +28,67 @@ logger = logging.getLogger(__name__)
 ALLOWED_DOC_EXTENSIONS = {".pdf", ".docx", ".doc", ".pptx", ".ppt", ".md", ".txt", ".markdown"}
 
 
+def _document_worker_count() -> int:
+    try:
+        return int(os.getenv("PPTGOD_DOCUMENT_WORKERS", "4"))
+    except ValueError:
+        return 4
+
+
+DOCUMENT_WORKERS = max(2, min(8, _document_worker_count()))
+DOCUMENT_PROCESSING_POOL = ThreadPoolExecutor(max_workers=DOCUMENT_WORKERS, thread_name_prefix="pptgod-doc")
+
+
 def _get_docs_dir(project_id: str) -> str:
-    docs_dir = os.path.join(settings.UPLOAD_DIR, project_id, "docs")
-    os.makedirs(docs_dir, exist_ok=True)
-    return docs_dir
+    return get_project_docs_dir(project_id, create=True)
 
 
 def _get_pptx_assets_dir(project_id: str) -> str:
     assets_dir = os.path.join(settings.UPLOAD_DIR, project_id, "pptx_assets")
     os.makedirs(assets_dir, exist_ok=True)
     return assets_dir
+
+
+def _asset_status_path(project_id: str, filename: str) -> str:
+    return os.path.join(_get_docs_dir(project_id), f"{filename}.assets.json")
+
+
+def _write_asset_status(
+    project_id: str,
+    filename: str,
+    status: str,
+    *,
+    stats: dict | None = None,
+    error: str | None = None,
+) -> None:
+    payload = {
+        "status": status,
+        "updated_at": time.time(),
+        "stats": stats or {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0},
+    }
+    if error:
+        payload["error"] = error[:500]
+    try:
+        with open(_asset_status_path(project_id, filename), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning("Failed to write PPTX asset status: project=%s file=%s error=%s", project_id, filename, exc)
+
+
+def _read_asset_status(project_id: str, filename: str) -> dict:
+    path = _asset_status_path(project_id, filename)
+    if not os.path.exists(path):
+        return {"status": "not_applicable", "stats": {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault("status", "not_applicable")
+            data.setdefault("stats", {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0})
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"status": "unknown", "stats": {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0}}
 
 
 def _slide_by_page(project_id: str, db: Session) -> dict[int, Slide]:
@@ -71,11 +133,16 @@ def _attach_extracted_pptx_assets(
         for ref in existing_global_refs
         if isinstance(ref.asset_analysis, dict) and ref.asset_analysis.get("pptx_image_sha1")
     }
-    has_logo = db.query(ReferenceImage).filter(
+    existing_logo_refs = db.query(ReferenceImage).filter(
         ReferenceImage.project_id == project.id,
         ReferenceImage.slide_id.is_(None),
         ReferenceImage.role == "logo",
-    ).first() is not None
+    ).all()
+    existing_logo_hashes = {
+        str(ref.asset_analysis.get("pptx_image_sha1"))
+        for ref in existing_logo_refs
+        if isinstance(ref.asset_analysis, dict) and ref.asset_analysis.get("pptx_image_sha1")
+    }
 
     stats = {"logos": 0, "page_refs": 0, "visual_assets": 0}
     affected_slides: set[str] = set()
@@ -83,7 +150,8 @@ def _attach_extracted_pptx_assets(
     for asset in assets:
         analysis = _asset_analysis(asset)
         if asset.role == "logo":
-            if has_logo:
+            digest = str(analysis.get("pptx_image_sha1") or "")
+            if digest and digest in existing_logo_hashes:
                 continue
             db.add(ReferenceImage(
                 project_id=project.id,
@@ -93,7 +161,8 @@ def _attach_extracted_pptx_assets(
                 process_mode="original",
                 asset_analysis=analysis,
             ))
-            has_logo = True
+            if digest:
+                existing_logo_hashes.add(digest)
             stats["logos"] += 1
             continue
 
@@ -150,13 +219,94 @@ def _attach_extracted_pptx_assets(
     return stats
 
 
+def _extract_pptx_assets_for_document(
+    project_id: str,
+    source_path: str,
+    source_filename: str,
+    db: Session | None = None,
+) -> dict:
+    """Extract PPTX images after text upload is already available.
+
+    When called by FastAPI BackgroundTasks this opens its own DB session. Tests
+    can pass an existing session to keep synchronous assertions simple.
+    """
+    owns_session = db is None
+    db = db or SessionLocal()
+    started_at = time.perf_counter()
+    try:
+        _write_asset_status(project_id, source_filename, "running")
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            logger.warning("PPTX asset extraction skipped: project not found project=%s", project_id)
+            return {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0, "status": "not_found"}
+        with open(source_path, "rb") as f:
+            file_bytes = f.read()
+        assets = extract_pptx_image_assets(
+            file_bytes=file_bytes,
+            source_filename=source_filename,
+            output_dir=_get_pptx_assets_dir(project_id),
+        )
+        stats = _attach_extracted_pptx_assets(project, assets, db)
+        db.commit()
+        unique_asset_count = len({
+            str(asset.metadata.get("pptx_image_sha1") or asset.file_path)
+            for asset in assets
+        })
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "PPTX asset extraction completed: project=%s file=%s total=%s stats=%s elapsed=%.2fs",
+            project_id,
+            source_filename,
+            unique_asset_count,
+            stats,
+            elapsed,
+        )
+        completed = {"total": unique_asset_count, **stats, "status": "completed"}
+        _write_asset_status(project_id, source_filename, "completed", stats=completed)
+        return completed
+    except Exception as e:
+        db.rollback()
+        # 文档文本仍然可用；图片拆解失败不应让用户整个上传失败。
+        logger.warning("PPTX 图片素材拆解失败: project=%s file=%s error=%s", project_id, source_filename, e)
+        failed = {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0, "status": "failed", "error": str(e)}
+        _write_asset_status(project_id, source_filename, "failed", stats=failed, error=str(e))
+        return failed
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _log_document_future_result(label: str, future: Future) -> None:
+    try:
+        future.result()
+    except Exception as exc:
+        logger.exception("Document background task crashed: task=%s error=%s", label, exc)
+
+
+def _submit_document_task(label: str, fn, *args) -> None:
+    future = DOCUMENT_PROCESSING_POOL.submit(fn, *args)
+    future.add_done_callback(lambda done: _log_document_future_result(label, done))
+
+
+def _dispatch_document_processing(project_id: str, source_path: str, source_filename: str, ext: str) -> None:
+    """Kick off independent document processing tasks without gating upload."""
+    _submit_document_task("text_parse", extract_document_text, project_id, source_path, source_filename)
+    if ext == ".pptx":
+        status = _read_asset_status(project_id, source_filename).get("status")
+        if status in {"running", "completed"}:
+            return
+        _write_asset_status(project_id, source_filename, "queued")
+        _submit_document_task("pptx_asset_extract", _extract_pptx_assets_for_document, project_id, source_path, source_filename)
+
+
 @router.post("/{project_id}/upload-document")
 def upload_document(
     project_id: str,
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
 ):
-    """上传文档并提取文字内容。支持 PDF、Word、PPT、Markdown、TXT 等。"""
+    """上传文档并立即入库；文字和 PPT 图片素材在后台分步解析。"""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -173,14 +323,6 @@ def upload_document(
             detail=f"不支持的文件格式 '{ext}'。允许: PDF, Word, PPT, Markdown, TXT",
         )
 
-    # 解析文档
-    try:
-        text = parse_document(file_bytes, file.filename)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文档解析失败: {e}")
-
     docs_dir = _get_docs_dir(project_id)
 
     # 保存原始文件
@@ -188,38 +330,30 @@ def upload_document(
     with open(original_path, "wb") as f:
         f.write(file_bytes)
 
-    # 保存提取的文本
-    text_filename = f"{file.filename}.extracted.txt"
-    text_path = os.path.join(docs_dir, text_filename)
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(text)
+    for stale_path in [document_text_path(project_id, file.filename), _asset_status_path(project_id, file.filename)]:
+        if os.path.exists(stale_path):
+            try:
+                os.remove(stale_path)
+            except OSError:
+                logger.warning("Failed to remove stale document derivative: %s", stale_path)
 
-    extracted_assets = []
-    extracted_stats = {"logos": 0, "page_refs": 0, "visual_assets": 0}
+    extracted_stats = {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0}
+    asset_extraction_status = "not_applicable"
+    write_document_parse_status(project_id, file.filename, "queued")
     if ext == ".pptx":
-        try:
-            extracted_assets = extract_pptx_image_assets(
-                file_bytes=file_bytes,
-                source_filename=file.filename,
-                output_dir=_get_pptx_assets_dir(project_id),
-            )
-            extracted_stats = _attach_extracted_pptx_assets(project, extracted_assets, db)
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            # 文档文本仍然可用；图片拆解失败不应让用户整个上传失败。
-            logger.warning(f"PPTX 图片素材拆解失败: {e}")
+        _write_asset_status(project_id, file.filename, "queued")
+        asset_extraction_status = "queued"
 
-    unique_asset_count = len({
-        str(asset.metadata.get("pptx_image_sha1") or asset.file_path)
-        for asset in extracted_assets
-    })
+    if background_tasks is not None:
+        _dispatch_document_processing(project_id, original_path, file.filename, ext)
+
     return {
         "filename": file.filename,
-        "char_count": len(text),
-        "text_preview": extract_text_preview(text, 300),
+        "char_count": 0,
+        "text_parse_status": "queued",
+        "text_preview": "",
+        "asset_extraction_status": asset_extraction_status,
         "extracted_assets": {
-            "total": unique_asset_count,
             **extracted_stats,
         },
     }
@@ -237,19 +371,17 @@ def list_documents(project_id: str, db: Session = Depends(get_db)):
         return []
 
     documents = []
-    for filename in os.listdir(docs_dir):
-        if filename.endswith(".extracted.txt"):
-            original_name = filename[:-14]  # 去掉 .extracted.txt
-            text_path = os.path.join(docs_dir, filename)
-            char_count = 0
-            try:
-                char_count = os.path.getsize(text_path)
-            except OSError:
-                pass
-            documents.append({
-                "filename": original_name,
-                "char_count": char_count,
-            })
+    for filename in iter_project_document_filenames(project_id):
+        parse_status = read_document_parse_status(project_id, filename)
+        asset_status = _read_asset_status(project_id, filename)
+        documents.append({
+            "filename": filename,
+            "char_count": parse_status.get("char_count", 0),
+            "text_parse_status": parse_status.get("status"),
+            "text_preview": parse_status.get("text_preview", ""),
+            "asset_extraction_status": asset_status.get("status"),
+            "extracted_assets": asset_status.get("stats") or {},
+        })
 
     return documents
 
@@ -272,9 +404,11 @@ def delete_document(
     docs_dir = _get_docs_dir(project_id)
     original_path = os.path.join(docs_dir, filename)
     text_path = os.path.join(docs_dir, f"{filename}.extracted.txt")
+    parse_status_path = document_parse_status_path(project_id, filename)
+    asset_status_path = _asset_status_path(project_id, filename)
 
     deleted = False
-    for path in [original_path, text_path]:
+    for path in [original_path, text_path, parse_status_path, asset_status_path]:
         if os.path.exists(path):
             os.remove(path)
             deleted = True
