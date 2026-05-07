@@ -3899,7 +3899,10 @@ function App() {
         await handleSendChat();
         return;
       case "generate_content_plan": {
-        const topic = payload?.topic || chatInput.trim();
+        const userBrief = payload?.topic || chatInput.trim();
+        const topic = [userBrief, briefAttachmentSummary ? `【用户上传材料】\n${briefAttachmentSummary}` : ""]
+          .filter(Boolean)
+          .join("\n\n");
         if (!topic) {
           showToast("请先输入 PPT 主题或 Brief", "info");
           chatInputRef.current?.focus();
@@ -4188,6 +4191,18 @@ function App() {
   const canStartPromptBasedGeneration =
     selectedPromptTargets.length > 0 &&
     selectedPromptTargets.every((slide) => slide.prompt_text && String(slide.prompt_text).trim());
+  const briefImageAttachments = referenceImages.filter((ref: any) => {
+    const analysis = ref.asset_analysis || {};
+    return ref.role === "content_ref" && !ref.slide_id && !analysis.pptx_source_page_num;
+  });
+  const hasBriefAttachments =
+    pendingAttachments.length > 0 ||
+    documents.length > 0 ||
+    briefImageAttachments.length > 0;
+  const briefAttachmentSummary = [
+    documents.length ? `已上传文档：${documents.map((doc: any) => doc.filename).join("、")}` : "",
+    briefImageAttachments.length ? `已上传图片：${briefImageAttachments.map((ref: any) => ref.asset_name || ref.url?.split("/").pop() || "图片").join("、")}` : "",
+  ].filter(Boolean).join("\n");
 
   useEffect(() => {
     if (gateContext.mainStageMode !== "deck_visual") {
@@ -4830,7 +4845,7 @@ function App() {
                     <span>点击后才会开始生成内容规划；上传材料会一并纳入判断。</span>
                     <button
                       onClick={() => dispatchGateAction("generate_content_plan")}
-                      disabled={!selectedProject || chatLoading || isBusy || (!chatInput.trim() && pendingAttachments.length === 0)}
+                      disabled={!selectedProject || chatLoading || isBusy || (!chatInput.trim() && !hasBriefAttachments)}
                       className="pg-action pg-action-primary bg-slate-950 text-white px-4 py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
                     >
                       {chatLoading || isBusy ? "规划中..." : "生成内容规划"}
