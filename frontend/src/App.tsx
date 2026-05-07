@@ -249,9 +249,22 @@ const CONTENT_PLAN_TIMEOUT_MS = 300_000; // 内容规划 LLM 调用预留 5 分�
 const VISUAL_PROMPT_MAX_POLL_ERRORS = 5;
 const GENERATION_MAX_POLL_ERRORS = 5;
 const IMAGE_URL_SESSION_KEY = Date.now();
+const BRIEF_IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".tif", ".tiff", ".heic"]);
 
 function isRunActive(run: any) {
   return !!run && (run.status === "queued" || run.status === "running");
+}
+
+function isBriefImageFile(file: File) {
+  const lowerName = file.name.toLowerCase();
+  const ext = lowerName.includes(".") ? lowerName.slice(lowerName.lastIndexOf(".")) : "";
+  return file.type.startsWith("image/") || BRIEF_IMAGE_EXTENSIONS.has(ext);
+}
+
+function formatBriefFileSize(bytes?: number) {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function isTransientRunMessage(message: ChatMessage) {
@@ -2718,38 +2731,69 @@ function App() {
     input.click();
   };
 
+  const uploadBriefFiles = async (files: File[]) => {
+    if (!selectedProject || files.length === 0) return;
+    setUploadingDoc(true);
+    let uploadedDocs = 0;
+    let uploadedImages = 0;
+    try {
+      for (const file of files) {
+        try {
+          if (isBriefImageFile(file)) {
+            await uploadFile(selectedProject.id, file, "content_ref", undefined, "blend", {
+              usage_note: "用户在 Brief Studio 上传，作为内容规划和后续视觉设计参考",
+            });
+            uploadedImages += 1;
+          } else {
+            const data = await uploadDocument(selectedProject.id, file);
+            if (data.detail) {
+              showToast(`"${file.name}" 上传失败：${data.detail}`, "error");
+            } else {
+              uploadedDocs += 1;
+              setPendingAttachments((prev) =>
+                prev.includes(data.filename) ? prev : [...prev, data.filename]
+              );
+            }
+          }
+        } catch (err: any) {
+          showToast(`"${file.name}" 上传失败：${err.message || "未知错误"}`, "error");
+        }
+      }
+      if (uploadedDocs > 0) await loadDocuments(selectedProject.id);
+      if (uploadedImages > 0) await loadReferenceImages(selectedProject.id);
+      if (uploadedDocs || uploadedImages) {
+        addSystemLog(`用户在 Brief Studio 上传了 ${uploadedDocs} 个文档、${uploadedImages} 张图片`);
+      }
+    } finally {
+      setUploadingDoc(false);
+    }
+  };
+
   const handleUploadDocument = async () => {
     const input = docInputRef.current;
     if (!input || !input.files || input.files.length === 0) return;
+    await uploadBriefFiles(Array.from(input.files));
+    input.value = "";
+  };
+
+  const handleRemoveBriefDocument = async (filename: string) => {
     if (!selectedProject) return;
-    const file = input.files[0];
-    setUploadingDoc(true);
     try {
-      const data = await uploadDocument(selectedProject.id, file);
-      if (data.detail) {
-        showToast("上传失败：" + data.detail, "error");
-      } else {
-        await loadDocuments(selectedProject.id);
-        setPendingAttachments((prev) => [...prev, data.filename]);
-        addSystemLog(`用户上传了文档「${file.name}」`);
-        const extracted = data.extracted_assets;
-        const assetSummary = extracted?.total
-          ? `\n\n已从 PPT 中拆解出 ${extracted.total} 个图片素材：${extracted.page_refs || 0} 张页面参考图、${extracted.visual_assets || 0} 个可复用核心素材${extracted.logos ? `、${extracted.logos} 个 Logo` : ""}。`
-          : "";
-        setContentChatHistory((prev) => [
-          ...prev,
-          {
-            role: "agent",
-            content: `📎 文档「${file.name}」已上传成功。${assetSummary}\n\n👉 请继续描述你的 PPT 需求（如主题、受众、场景），我会结合文档内容为你规划。`,
-            agentRole: "content",
-          },
-        ]);
-      }
+      await deleteDocument(selectedProject.id, filename);
+      setPendingAttachments((prev) => prev.filter((item) => item !== filename));
+      await loadDocuments(selectedProject.id);
     } catch (err: any) {
-      showToast("上传失败：" + (err.message || "未知错误"), "error");
-    } finally {
-      setUploadingDoc(false);
-      input.value = "";
+      showToast("删除失败：" + (err.message || "未知错误"), "error");
+    }
+  };
+
+  const handleRemoveBriefImage = async (refId: string) => {
+    if (!selectedProject) return;
+    try {
+      await deleteReferenceImage(selectedProject.id, refId);
+      await loadReferenceImages(selectedProject.id);
+    } catch (err: any) {
+      showToast("删除失败：" + (err.message || "未知错误"), "error");
     }
   };
 
@@ -4052,20 +4096,7 @@ function App() {
         return;
       }
     }
-    for (const file of Array.from(files)) {
-      setUploadingDoc(true);
-      try {
-        const data = await uploadDocument(selectedProject.id, file);
-        if (!data.detail) {
-          await loadDocuments(selectedProject.id);
-          setPendingAttachments((prev) => [...prev, data.filename]);
-        }
-      } catch (err: any) {
-        showToast(`"${file.name}" 上传失败：${err.message || "未知错误"}`, "error");
-      } finally {
-        setUploadingDoc(false);
-      }
-    }
+    await uploadBriefFiles(Array.from(files));
   };
 
   const typeLabel: Record<string, string> = {
