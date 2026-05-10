@@ -20,7 +20,7 @@ const sandbox = {
 sandbox.module.exports = sandbox.exports;
 vm.runInNewContext(compiled, sandbox, { filename: sourcePath });
 
-const { buildGateContext, buildWorkflowState } = sandbox.module.exports;
+const { buildGateContext, buildWorkflowState, getPrimaryActionKey } = sandbox.module.exports;
 
 function context(input) {
   return buildGateContext(buildWorkflowState(input), input.revision ?? 0);
@@ -60,6 +60,12 @@ assert.equal(selectedStyleWithoutPrompt.mainStageMode, "deck_visual");
 assert.ok(selectedStyleWithoutPrompt.allowedActions.includes("generate_visual_prompts"));
 assert.ok(!selectedStyleWithoutPrompt.allowedActions.includes("start_prototype"));
 assert.ok(!selectedStyleWithoutPrompt.allowedActions.includes("start_generation"));
+assert.equal(getPrimaryActionKey(buildWorkflowState({
+  projectStatus: "visual_ready",
+  slides: [{ status: "pending" }],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: true,
+})), "generate-visual-prompts");
 
 const promptReady = context({
   projectStatus: "prompt_ready",
@@ -69,6 +75,12 @@ const promptReady = context({
 });
 assert.equal(promptReady.gate, "visual_design");
 assert.ok(promptReady.allowedActions.includes("start_prototype"));
+assert.equal(getPrimaryActionKey(buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [{ status: "prompt_ready", prompt_text: "prompt" }],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: true,
+})), "start-prototype");
 
 const prototype = context({
   projectStatus: "prototype_ready",

@@ -26,6 +26,7 @@ export interface WorkflowRun {
   status?: string;
   stage?: string;
   message?: string | null;
+  target_page_nums?: number[] | null;
   total_count?: number;
   completed_count?: number;
   failed_count?: number;
@@ -246,11 +247,12 @@ export function getGuidanceText(state: WorkflowState) {
     case "draft":
       return "新建项目，请输入 PPT 主题或上传文档开始";
     case "planning":
-      if (state.contentPlanConfirmed) return "内容已确认，请与视觉总监沟通风格偏好";
+      if (state.contentPlanConfirmed) return "内容已确认，请进入视觉总监生成视觉方向";
       return "内容规划已完成，请检查并确认";
     case "visual_ready":
+      if (state.hasSelectedStyle && !state.hasPrompt) return "视觉方向已确认，请先生成每页画面方案";
       if (state.hasSelectedStyle) return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
-      return "请选择视觉风格方案，或告诉视觉总监你的偏好";
+      return "生成或选择视觉方向，也可以告诉视觉总监你的偏好";
     case "prompt_ready":
       return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
     case "prototype":
@@ -260,7 +262,7 @@ export function getGuidanceText(state: WorkflowState) {
     case "generating":
       return "正在批量生成所有页面";
     case "completed":
-      return "PPT 已生成完成，可点击右上角下载";
+      return "PPT 已生成完成，可点击「下载 PPTX」获取文件";
     case "failed":
       return "部分页面生成失败，可点击「一键重试失败页」或单页重试";
     default:
@@ -269,6 +271,19 @@ export function getGuidanceText(state: WorkflowState) {
 }
 
 export function getPrimaryActionKey(state: WorkflowState) {
+  if (state.activeRun) {
+    return null;
+  }
+  if (state.projectStatus === "visual_ready" && !state.hasSelectedStyle) {
+    return "generate-style-proposals";
+  }
+  if (
+    (state.projectStatus === "visual_ready" || state.projectStatus === "failed") &&
+    state.hasSelectedStyle &&
+    !state.hasPrompt
+  ) {
+    return "generate-visual-prompts";
+  }
   if (state.projectStatus === "prompt_ready" || state.projectStatus === "failed") {
     return "start-prototype";
   }
@@ -351,7 +366,8 @@ function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateAc
   }
   if (gate === "content") {
     actions.push("switch_to_content");
-    if (state.projectStatus !== "draft" && !state.contentPlanConfirmed) actions.push("confirm_content");
+    if (!state.contentPlanConfirmed) actions.push("generate_content_plan");
+    if (state.projectStatus !== "draft" && !state.contentPlanConfirmed) actions.push("confirm_content", "switch_to_visual");
     if (state.templatePageCount > 0) actions.push("templates");
   }
   if (gate === "visual") {
@@ -359,13 +375,16 @@ function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateAc
     if (!state.isBusy) actions.push("confirm_style");
   }
   if (gate === "visual_design") {
+    if (!state.isBusy) actions.push("confirm_style");
     actions.push("generate_visual_prompts");
     if (state.hasPrompt) actions.push("start_prototype", "start_generation");
   }
   if (gate === "prototype") {
+    if (!state.isBusy) actions.push("confirm_style");
     actions.push("resample_prototype", "confirm_prototype");
   }
   if (gate === "batch") {
+    if (!state.isBusy && state.projectStatus !== "generating") actions.push("confirm_style");
     actions.push("download");
     if (state.projectStatus !== "generating") actions.push("start_generation");
   }

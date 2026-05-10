@@ -30,7 +30,8 @@ def reference_process_mode_instruction(mode: str | None) -> str:
         )
     if mode == "original":
         return (
-            "Original mode: preserve the reference image exactly as-is. Do not crop, stretch, rotate, or alter it. "
-            "Reserve intact layout space for it and do not composite other visuals on top."
+            "Original-reference mode: preserve the reference image as faithfully as the image model allows. "
+            "Do not intentionally crop, stretch, rotate, or alter it. If exact pixel-level preservation is required, "
+            "the page should use an exact overlay layer instead of relying on image generation."
         )
     return f"Respect custom reference mode: {mode}."

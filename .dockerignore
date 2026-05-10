@@ -1,0 +1,13 @@
+.git
+.DS_Store
+
+frontend/node_modules
+frontend/dist
+
+backend/.env
+backend/uploads
+backend/outputs
+backend/__pycache__
+backend/.pytest_cache
+
+*.log

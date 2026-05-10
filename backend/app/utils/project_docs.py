@@ -182,8 +182,9 @@ def load_project_documents(project_id: str, *, parse_missing: bool = False) -> s
                         text = result.get("text") or ""
             if not text:
                 continue
-            if len(text) > 8000:
-                text = text[:8000] + "\n\n[文档内容过长，已截断]"
+            max_chars = 40_000 if "--- PPT_SOURCE" in text[:500] else 12_000
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n\n[文档内容过长，已截断]"
             parts.append(f"--- 文档: {filename} ---\n{text}")
         except Exception:
             continue

@@ -3,9 +3,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from app.core.config import settings
 from app.core.provider_credentials import get_provider_credentials
-from app.core.llm_client import get_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -188,4 +186,3 @@ def search_via_minimax(query: str, top_n: int = 3) -> List[Dict]:
 
     logger.info(f"MiniMax search: query={query.strip()!r}, results={len(results)}")
     return results
-

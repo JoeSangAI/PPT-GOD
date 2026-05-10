@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, SyntheticEvent } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
@@ -119,11 +119,11 @@ import {
   confirmPrototype,
   fetchWorkflowStatus,
   getDownloadUrl,
+  getContentPlanMarkdownUrl,
   uploadFile,
   fetchReferenceImages,
   deleteReferenceImage,
   updateReferenceImage,
-  updateReferenceImageMode,
   updateSlideAssetPins,
   updateSlideOverlayLayers,
   suggestReferenceImages,
@@ -168,6 +168,16 @@ interface Project {
   completed_slides?: number;
 }
 
+function clearProjectNotification(project: Project): Project {
+  if (!project.has_unread_notification && !project.unread_notification_message) return project;
+  return { ...project, has_unread_notification: false, unread_notification_message: null };
+}
+
+function normalizeProjectsForActiveSelection(projects: Project[], activeProjectId: string | null): Project[] {
+  if (!activeProjectId) return projects;
+  return projects.map((project) => (project.id === activeProjectId ? clearProjectNotification(project) : project));
+}
+
 interface Slide {
   id: string;
   page_num: number;
@@ -180,6 +190,43 @@ interface Slide {
   error_msg?: string | null;
   reference_images?: { id: string; role: string; url: string }[];
 }
+
+const PROTOTYPE_FAMILY_ORDER = ["bookend", "toc", "section", "hero", "data", "content"];
+
+const inferPrototypeFamily = (slide: Slide): string => {
+  const visualFamily = slide.visual_json?.seed_family;
+  if (visualFamily) return String(visualFamily);
+  const pageType = String(slide.visual_json?.type || slide.type || "content").toLowerCase();
+  if (pageType === "cover" || pageType === "ending") return "bookend";
+  if (pageType === "hero" || pageType === "quote") return "hero";
+  if (pageType === "toc") return "toc";
+  if (pageType === "section") return "section";
+  if (pageType === "data") return "data";
+  return "content";
+};
+
+const defaultPrototypePageNumsForSlides = (slides: Slide[]): number[] => {
+  const byFamily = new Map<string, Slide>();
+  [...slides]
+    .sort((a, b) => a.page_num - b.page_num)
+    .forEach((slide) => {
+      const family = inferPrototypeFamily(slide);
+      const current = byFamily.get(family);
+      const slideIsSeed = Boolean(slide.visual_json?.is_seed_recommended);
+      const currentIsSeed = Boolean(current?.visual_json?.is_seed_recommended);
+      if (!current || (slideIsSeed && !currentIsSeed)) {
+        byFamily.set(family, slide);
+      }
+    });
+
+  const orderedFamilies = [
+    ...PROTOTYPE_FAMILY_ORDER,
+    ...Array.from(byFamily.keys()).filter((family) => !PROTOTYPE_FAMILY_ORDER.includes(family)).sort(),
+  ];
+  return orderedFamilies
+    .map((family) => byFamily.get(family)?.page_num)
+    .filter((pageNum): pageNum is number => Number.isFinite(pageNum));
+};
 
 interface ChatAttachment {
   id: string;
@@ -204,8 +251,10 @@ type AgentNextActionType =
   | "generate_visual_prompts"
   | "generate_images"
   | "start_prototype"
+  | "confirm_prototype"
   | "start_generation"
-  | "retry_failed";
+  | "retry_failed"
+  | "download";
 
 interface AgentNextAction {
   type: AgentNextActionType;
@@ -217,6 +266,20 @@ interface AgentNextAction {
     page_count?: number;
     page_nums?: number[];
   };
+}
+
+type GateActionPayload = {
+  topic?: string;
+  page_count?: number;
+  page_nums?: number[];
+  style?: StyleProposal | any;
+};
+
+interface GateActionResult {
+  ok: boolean;
+  reason?: "missing_project" | "busy" | "chat_loading" | "stale_gate" | "invalid_input" | "not_ready" | "failed";
+  message?: string;
+  runId?: string;
 }
 
 interface ChatMessage {
@@ -238,6 +301,117 @@ interface ChatMessage {
   attachments?: ChatAttachment[];
 }
 
+interface RunCompletionFollowup {
+  agentRole: "content" | "visual";
+  content: string;
+  nextAction?: AgentNextAction;
+}
+
+function buildRunCompletionFollowup({
+  runKind,
+  projectStatus,
+  completedCount,
+  totalSlides,
+  hasSelectedStyle,
+  hasPrompt,
+  styleProposalCount,
+}: {
+  runKind: string | null;
+  projectStatus: string | null;
+  completedCount: number;
+  totalSlides: number;
+  hasSelectedStyle: boolean;
+  hasPrompt: boolean;
+  styleProposalCount: number;
+}): RunCompletionFollowup {
+  const status = projectStatus || "未知";
+  if (runKind === "content_plan") {
+    return {
+      agentRole: "content",
+      content: "✅ 内容规划已生成。\n\n👉 下一步：请检查页数、标题和顺序；没问题后点击「确认内容，请视觉总监」。",
+      nextAction: { type: "switch_to_visual", label: "确认内容，请视觉总监" },
+    };
+  }
+  if (runKind === "style_proposal") {
+    if (styleProposalCount > 0) {
+      return {
+        agentRole: "visual",
+        content: `✅ 视觉方向已生成，共 ${styleProposalCount} 套。\n\n👉 下一步：在作品画布选择一套方向，点击「确认并生成画面方案」。`,
+      };
+    }
+    return {
+      agentRole: "visual",
+      content: "✅ 已进入视觉方案阶段。\n\n👉 下一步：点击「生成视觉方向」，我会基于当前内容生成可选方案；如果你已有偏好，也可以直接告诉我。",
+      nextAction: { type: "generate_style_proposals", label: "生成视觉方向" },
+    };
+  }
+  if (runKind === "visual_prompts") {
+    return {
+      agentRole: "visual",
+      content: "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先生成打样页预览；满意后再生成全部页面。",
+      nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
+    };
+  }
+  if (runKind === "prototype_generation" || projectStatus === "prototype_ready") {
+    return {
+      agentRole: "visual",
+      content: "✅ 打样图片已生成，页面已刷新。\n\n👉 下一步：检查样张效果；满意后点击「确认打样，生成全部」，不满意可以重新打样或调整风格。",
+      nextAction: { type: "confirm_prototype", label: "确认打样，生成全部", confirm: true },
+    };
+  }
+  if (runKind === "batch_generation" || runKind === "page_generation" || runKind === "retry_failed") {
+    if (projectStatus === "completed") {
+      return {
+        agentRole: "visual",
+        content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。`,
+        nextAction: { type: "download", label: "下载 PPTX" },
+      };
+    }
+    if (projectStatus === "failed") {
+      return {
+        agentRole: "visual",
+        content: `⚠️ 图片生成任务已结束，当前已有 ${completedCount} / ${totalSlides || completedCount} 页完成。\n\n👉 下一步：点击「一键重试失败页」继续补齐。`,
+        nextAction: { type: "retry_failed", label: "一键重试失败页", confirm: true },
+      };
+    }
+    return {
+      agentRole: "visual",
+      content: `✅ 图片生成任务已结束，当前已有 ${completedCount} / ${totalSlides || completedCount} 页完成。\n\n👉 下一步：检查失败页并重试，或继续调整需要修改的页面。`,
+    };
+  }
+  if (projectStatus === "visual_ready" && !hasSelectedStyle) {
+    if (styleProposalCount > 0) {
+      return {
+        agentRole: "visual",
+        content: "✅ 视觉方案阶段已就绪。\n\n👉 下一步：在作品画布选择一套视觉方向，点击「确认并生成画面方案」。",
+      };
+    }
+    return {
+      agentRole: "visual",
+      content: "✅ 视觉方案阶段已就绪。\n\n👉 下一步：点击「生成视觉方向」，先生成可选方案。",
+      nextAction: { type: "generate_style_proposals", label: "生成视觉方向" },
+    };
+  }
+  if (projectStatus === "visual_ready" && hasSelectedStyle && !hasPrompt) {
+    return {
+      agentRole: "visual",
+      content: "✅ 视觉方向已确认。\n\n👉 下一步：生成每页画面方案和生图 Prompt，然后再打样。",
+      nextAction: { type: "generate_visual_prompts", label: "生成画面方案" },
+    };
+  }
+  if (projectStatus === "prompt_ready" || (hasSelectedStyle && hasPrompt)) {
+    return {
+      agentRole: "visual",
+      content: "✅ 页面状态已更新。\n\n👉 下一步：检查每页画面方案，然后点击「打样确认」。",
+      nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
+    };
+  }
+  return {
+    agentRole: "visual",
+    content: `✅ 当前任务已结束，页面状态已更新为「${status}」。\n\n👉 下一步：请查看作品画布里的当前阶段操作按钮，或直接告诉我你想继续怎么改。`,
+  };
+}
+
 interface UiAction {
   key: string;
   label: string;
@@ -245,6 +419,15 @@ interface UiAction {
   href?: string;
   variant?: "primary" | "secondary" | "danger" | "link";
   disabled?: boolean;
+}
+
+interface StageNudge {
+  title: string;
+  body: string;
+  role: "content" | "visual";
+  primary?: UiAction;
+  secondary?: UiAction;
+  tone?: "content" | "visual" | "final" | "warning";
 }
 
 const CONTENT_PLAN_TIMEOUT_MS = 300_000; // 内容规划 LLM 调用预留 5 分钟
@@ -299,6 +482,13 @@ function isTransientRunMessage(message: ChatMessage) {
   );
 }
 
+function isWorkflowTransitionMessage(message: ChatMessage) {
+  const content = (message.content || "").trim();
+  if (message.role === "system" && /^用户回退到/.test(content)) return true;
+  if (message.role !== "agent") return false;
+  return /^(?:⏪\s*)?已(?:回退到|回到)「.+?」/.test(content);
+}
+
 function sanitizeChatHistory(messages: ChatMessage[]) {
   return (messages || []).filter((m) => !isTransientRunMessage(m));
 }
@@ -324,6 +514,34 @@ function clearLegacyChatStorageIfNeeded() {
   localStorage.setItem(CHAT_HISTORY_SCHEMA_KEY, CHAT_HISTORY_SCHEMA_VERSION);
 }
 
+const getBriefDraftStorageKey = (projectId: string) =>
+  `ppt_god_composer_draft_brief_${projectId}`;
+
+const getAgentDraftStorageKey = (projectId: string, role: "content" | "visual" | "finetune", slideId?: string | null) =>
+  role === "finetune"
+    ? `ppt_god_composer_draft_agent_${projectId}_${role}_${slideId || "unselected"}`
+    : `ppt_god_composer_draft_agent_${projectId}_${role}`;
+
+function readComposerDraft(key: string) {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writeComposerDraft(key: string, value: string) {
+  try {
+    if (value) {
+      localStorage.setItem(key, value);
+    } else {
+      localStorage.removeItem(key);
+    }
+  } catch (err) {
+    console.warn("Persist composer draft failed:", err);
+  }
+}
+
 function cleanProgressMessage(message?: string) {
   if (!message) return "";
   return message
@@ -334,6 +552,21 @@ function cleanProgressMessage(message?: string) {
     .replace(/……/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function userFacingGenerationError(message?: string) {
+  const text = String(message || "").trim();
+  const known: Record<string, string> = {
+    style_reference_file_missing: "风格参考原图暂时不可用，已改为使用已提取的风格信息继续生成。请重试一次。",
+  };
+  if (known[text]) return known[text];
+  if (text.includes("图片接口上传超时")) {
+    return "参考图上传超时：已停止自动重试，避免重复消耗额度。可把必须完整保留的图片改为「精确粘贴」，或稍后重试。";
+  }
+  if (/429|rate limit|too many requests/i.test(text)) {
+    return "生图接口当前限流或繁忙。系统会按接口返回的等待时间重试；如果仍失败，请稍后重试失败页。";
+  }
+  return text.replace(/\b[a-z]+(?:_[a-z0-9]+){2,}\b/g, "素材状态异常").trim() || "未知错误";
 }
 
 function runProgressText(run: any) {
@@ -355,6 +588,16 @@ function runProgressText(run: any) {
   return total > 0 ? `${message}：${completed} / ${total} ${unit}完成` : message;
 }
 
+function formatPageNums(pageNums: number[], limit = 4) {
+  const unique = Array.from(new Set((pageNums || []).map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+  if (unique.length <= limit) return unique.join("、");
+  return `${unique.slice(0, limit).join("、")} 等 ${unique.length} 页`;
+}
+
+function isImageRunKind(kind?: string | null) {
+  return ["prototype_generation", "batch_generation", "page_generation", "retry_failed", "finetune"].includes(String(kind || ""));
+}
+
 function workflowProgressText(status: any) {
   const progress = status?.progress;
   if (!progress) return runProgressText(status?.active_run);
@@ -362,6 +605,13 @@ function workflowProgressText(status: any) {
   const current = Math.min(total || Number(progress.current ?? progress.current_page ?? 0), Math.max(0, Number(progress.current ?? progress.current_page ?? 0)));
   const unit = progress.unit || (progress.kind === "style_proposal" ? "套" : "页");
   const message = cleanProgressMessage(progress.message) || progress.label || "任务处理中";
+  const activePages = Array.isArray(progress.active_page_nums) ? progress.active_page_nums.map(Number).filter(Number.isFinite) : [];
+  if (activePages.length > 0 && isImageRunKind(progress.kind || status?.active_run?.kind)) {
+    const activeText = activePages.length === 1
+      ? `正在生成第 ${activePages[0]} 页`
+      : `正在并行生成第 ${formatPageNums(activePages)} 页`;
+    return total > 0 ? `${activeText}：${current} / ${total} ${unit}完成` : activeText;
+  }
   return total > 0 ? `${message}：${current} / ${total} ${unit}完成` : message;
 }
 
@@ -375,7 +625,10 @@ function workflowProgressCounts(status: any) {
   const failed = Math.max(0, Number(progress?.failed ?? status?.target_failed_slides ?? 0));
   const unit = progress?.unit || (progress?.kind === "style_proposal" || status?.active_run?.kind === "style_proposal" ? "套" : "页");
   const percent = total > 0 ? Math.min(100, (current / total) * 100) : 0;
-  return { current, total, failed, unit, percent };
+  const activePageNums = Array.isArray(progress?.active_page_nums)
+    ? progress.active_page_nums.map(Number).filter(Number.isFinite)
+    : [];
+  return { current, total, failed, unit, percent, activePageNums };
 }
 
 function getSlideImageUrl(imagePath: string, status?: string, cacheKey?: string | number) {
@@ -396,7 +649,139 @@ function shouldShowLogoOverlay(slide: any) {
   return true;
 }
 
-function logoOverlayPosition(anchor?: string | null) {
+function isConfirmedLogoRef(ref: any) {
+  if (!ref || ref.role !== "logo") return false;
+  const status = String(ref.review_status || ref.asset_analysis?.review_status || "auto_confirmed").toLowerCase();
+  return status === "auto_confirmed" || status === "user_confirmed";
+}
+
+function referenceDedupeKey(ref: any) {
+  const analysis = ref?.asset_analysis || {};
+  const source = ref?.source_document || analysis.source_document || "";
+  const page = ref?.source_page_num || analysis.pptx_source_page_num || ref?.page_num || "";
+  const digest = analysis.pptx_image_sha1 || analysis.pptx_raw_image_sha1 || ref?.url || ref?.id || "";
+  return `${ref?.role || ""}|${source}|${page}|${digest}`;
+}
+
+function dedupeReferenceImages<T extends any>(items?: T[]) {
+  const seen = new Set<string>();
+  return (items || []).filter((item: any) => {
+    const key = referenceDedupeKey(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }) as T[];
+}
+
+const HEX_COLOR_PATTERN = /#(?:[0-9a-fA-F]{3}){1,2}\b/g;
+
+function stripHexCodes(value: any) {
+  return String(value || "")
+    .replace(HEX_COLOR_PATTERN, "")
+    .replace(/\s+([，。；;,.])/g, "$1")
+    .replace(/（\s*）|\(\s*\)/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function proposalColorValue(color: any) {
+  const raw = typeof color === "string" ? color : color?.hex;
+  const match = String(raw || "").match(/#(?:[0-9a-fA-F]{3}){1,2}\b/);
+  return match?.[0] || "#d1d5db";
+}
+
+function proposalColorLabel(color: any, index: number) {
+  if (typeof color === "string") {
+    const text = stripHexCodes(color);
+    return text && text !== color ? text : `颜色 ${index + 1}`;
+  }
+  const name = stripHexCodes(color?.name);
+  const role = stripHexCodes(color?.role);
+  const parts = [name, role].filter(Boolean);
+  return Array.from(new Set(parts)).join(" · ") || `颜色 ${index + 1}`;
+}
+
+function visualStrategyText(style: any) {
+  const strategy = style?.visual_strategy;
+  if (!strategy || typeof strategy !== "object") return "";
+  return stripHexCodes(strategy.summary || strategy.background_policy || strategy.content_treatment || "");
+}
+
+function proposalDecisionField(style: any, key: "decision_label" | "best_for" | "tradeoff" | "visual_focus") {
+  return stripHexCodes(style?.[key] || "");
+}
+
+function proposalChoiceLabel(style: any, index: number) {
+  const decisionLabel = proposalDecisionField(style, "decision_label");
+  if (decisionLabel) return `${index + 1}. ${decisionLabel}`;
+  return index === 0 ? "推荐" : `方案 ${index + 1}`;
+}
+
+function normalizeStylePalette(palette: any[] | undefined) {
+  return (palette || []).map((c: any) => {
+    if (!c) return { name: "未知", hex: "#CCCCCC", role: "" };
+    if (typeof c === "string") return { name: stripHexCodes(c) || c, hex: proposalColorValue(c), role: "" };
+    return {
+      name: stripHexCodes(c.name) || "颜色",
+      hex: proposalColorValue(c),
+      role: stripHexCodes(c.role) || "",
+    };
+  });
+}
+
+function buildFallbackStyleAdjustment(baseStyle: any, userFeedback: string, agentResponse: string): StyleProposal {
+  const feedback = [userFeedback, agentResponse].filter(Boolean).join(" ");
+  const wantsDarkTech = /(科技|未来|赛博|深色|暗色|黑|酷|炫|低幼|幼|emoji|可爱)/i.test(feedback);
+  const basePalette = normalizeStylePalette(baseStyle?.palette);
+  const palette = wantsDarkTech
+    ? [
+        { name: "深空黑", hex: "#050816", role: "背景色" },
+        { name: "电紫", hex: "#8B5CF6", role: "主视觉光效" },
+        { name: "霓虹蓝", hex: "#38BDF8", role: "数据与线条点缀" },
+        { name: "冷白", hex: "#F8FAFC", role: "文字与 Logo 留白" },
+      ]
+    : basePalette.length >= 4
+    ? basePalette.slice(0, 4)
+    : [
+        ...basePalette,
+        { name: "深灰", hex: "#111827", role: "背景/标题" },
+        { name: "亮蓝", hex: "#3B82F6", role: "点缀" },
+        { name: "浅灰", hex: "#E5E7EB", role: "辅助信息" },
+        { name: "白色", hex: "#FFFFFF", role: "正文" },
+      ].slice(0, 4);
+  const name = wantsDarkTech
+    ? "调整后方案：深色科技感"
+    : `调整后方案：${baseStyle?.name || "自定义风格"}`;
+  const description = stripHexCodes(agentResponse || userFeedback)
+    || "根据你的反馈调整现有风格。确认后会重新生成每页画面描述和生图 Prompt。";
+  return {
+    ...(baseStyle || {}),
+    name,
+    palette,
+    mood: wantsDarkTech ? "科技感, 克制, 深色, 专业" : (baseStyle?.mood || "调整后, 克制, 专业"),
+    font: wantsDarkTech
+      ? "几何无衬线体，标题加粗，正文保持高可读"
+      : (baseStyle?.font || "清晰无衬线体，标题加粗，正文高可读"),
+    description: `${description} 确认后会把这套方向应用到整份 PPT，并重新生成页面画面描述。`,
+    source: "agent_adjustment",
+  };
+}
+
+function logoOverlayPosition(anchor?: string | null, resolvedBox?: any) {
+  if (
+    resolvedBox &&
+    Number.isFinite(Number(resolvedBox.left)) &&
+    Number.isFinite(Number(resolvedBox.top)) &&
+    Number.isFinite(Number(resolvedBox.width))
+  ) {
+    const height = Number.isFinite(Number(resolvedBox.height)) ? Number(resolvedBox.height) : undefined;
+    return {
+      left: `${Number(resolvedBox.left) * 100}%`,
+      top: `${Number(resolvedBox.top) * 100}%`,
+      width: `${Number(resolvedBox.width) * 100}%`,
+      ...(height ? { height: `${height * 100}%` } : {}),
+    } as CSSProperties;
+  }
   const normalized = (anchor || "top-right").replace("_", "-");
   if (normalized === "center") {
     return { top: "50%", left: "50%", transform: "translate(-50%, -50%)" } as CSSProperties;
@@ -454,7 +839,7 @@ function SlideImageWithOverlays({
   onClick?: (e: ReactMouseEvent<HTMLDivElement>) => void;
   onError?: (e: SyntheticEvent<HTMLImageElement>) => void;
 }) {
-  const derivedLogos = (referenceImages || []).filter((ref: any) => ref?.role === "logo");
+  const derivedLogos = (referenceImages || []).filter(isConfirmedLogoRef);
   const logoItems = Array.from(
     new Map(
       [...derivedLogos, ...(logo ? [logo] : [])]
@@ -465,12 +850,17 @@ function SlideImageWithOverlays({
   const showLogo = logoItems.length > 0 && shouldShowLogoOverlay(slide);
   const slideType = String(slide?.visual_json?.type || slide?.type || "content").toLowerCase();
   const policy = slide?.visual_json?.logo_policy || {};
+  const resolvedLogoBox = policy.resolved_overlay_box;
   const largeLogo = policy.scale === "large" || slideType === "cover" || slideType === "ending";
   const logoWidth = largeLogo
     ? logoItems.length > 1 ? "clamp(120px, 26%, 340px)" : "clamp(80px, 18%, 240px)"
     : logoItems.length > 1 ? "clamp(64px, 12%, 160px)" : "clamp(28px, 5.2%, 84px)";
   const overlays = enabledOverlayLayers(slide);
-  const assetById = new Map((referenceImages || []).map((ref: any) => [String(ref.id), ref]));
+  const overlayReferenceImages = [
+    ...(referenceImages || []),
+    ...((slide?.reference_images || []) as any[]),
+  ];
+  const assetById = new Map(overlayReferenceImages.map((ref: any) => [String(ref.id), ref]));
   return (
     <div className={`relative ${className || ""}`} onClick={onClick}>
       <img src={src} alt={alt} className={imgClassName || "w-full h-full object-cover"} onError={onError} />
@@ -496,9 +886,9 @@ function SlideImageWithOverlays({
         <div
           className="absolute z-10 pointer-events-none select-none flex items-center justify-center gap-[7%]"
           style={{
-            ...logoOverlayPosition(policy.placement || logoItems[0]?.logo_anchor),
-            width: logoWidth,
-            maxHeight: largeLogo ? "136px" : "48px",
+            ...logoOverlayPosition(policy.placement || logoItems[0]?.logo_anchor, resolvedLogoBox),
+            ...(!resolvedLogoBox ? { width: logoWidth } : {}),
+            maxHeight: resolvedLogoBox ? undefined : largeLogo ? "136px" : "48px",
           }}
         >
           {logoItems.map((item: any, index: number) => (
@@ -508,7 +898,7 @@ function SlideImageWithOverlays({
                 src={`${API_BASE}${item.overlay_url || item.url}`}
                 alt=""
                 className="min-w-0 flex-1 object-contain"
-                style={{ maxHeight: largeLogo ? "136px" : "48px" }}
+                style={{ maxHeight: resolvedLogoBox ? "100%" : largeLogo ? "136px" : "48px" }}
               />
             </Fragment>
           ))}
@@ -555,7 +945,11 @@ function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const selectedProjectIdRef = useRef<string | null>(null);
+  const clearingActiveNotificationRef = useRef<Set<string>>(new Set());
   const [slides, setSlides] = useState<Slide[]>([]);
+  const [slidesProjectId, setSlidesProjectId] = useState<string | null>(null);
+  const [slidesLoadingProjectId, setSlidesLoadingProjectId] = useState<string | null>(null);
+  const slidesCacheRef = useRef<Record<string, Slide[]>>({});
   const [imageRefreshMap, setImageRefreshMap] = useState<Record<string, number>>({});
   const [slidesHistory, setSlidesHistory] = useState<Slide[][]>([]);
   const [slidesHistoryIndex, setSlidesHistoryIndex] = useState(-1);
@@ -606,6 +1000,7 @@ function App() {
 
   const isBusy = operatingProjectId === selectedProject?.id || hasActiveRun;
   const [selectedPages, setSelectedPages] = useState<Set<number>>(new Set());
+  const [prototypeSelectionTouched, setPrototypeSelectionTouched] = useState(false);
   const [showPrototypePreview, setShowPrototypePreview] = useState(true);
   const [referenceImages, setReferenceImages] = useState<any[]>([]);
   const [templatePages, setTemplatePages] = useState<any[]>([]);
@@ -616,6 +1011,13 @@ function App() {
   const [assetsBarExpanded, setAssetsBarExpanded] = useState(false);
 
   const [chatInput, setChatInput] = useState("");
+  const chatInputValueRef = useRef("");
+  const activeComposerDraftKeyRef = useRef<string | null>(null);
+  const suspendComposerDraftPersistRef = useRef(false);
+  const saveActiveComposerDraft = () => {
+    const key = activeComposerDraftKeyRef.current;
+    if (key) writeComposerDraft(key, chatInputValueRef.current);
+  };
   const [chatLoading, setChatLoading] = useState(false);
   const [thinkingContent, setThinkingContent] = useState("");
   const [thinkingExpanded, setThinkingExpanded] = useState(false);
@@ -640,16 +1042,28 @@ function App() {
     }));
   };
 
-  const clearTransientProjectState = () => {
+  const clearTransientProjectState = (nextProjectId?: string) => {
+    saveActiveComposerDraft();
+    activeComposerDraftKeyRef.current = null;
+    suspendComposerDraftPersistRef.current = chatInputValueRef.current !== "";
+    const cachedSlides = nextProjectId ? slidesCacheRef.current[nextProjectId] : undefined;
     setProjectStatus(null);
     setContentPlanProgress(null);
     setOperatingProjectId(null);
     generationLoadingIdRef.current = null;
     setReferenceImages([]);
     setTemplatePages([]);
-    setSlides([]);
+    if (nextProjectId && cachedSlides) {
+      setSlides(cachedSlides);
+      setSlidesProjectId(nextProjectId);
+    } else {
+      setSlides([]);
+      setSlidesProjectId(null);
+    }
+    setSlidesLoadingProjectId(null);
     setStaleMap({});
     setSelectedPages(new Set());
+    setPrototypeSelectionTouched(false);
     setEditingSlide(null);
     setAgentMode("global");
     setContentPlanSnapshot([]);
@@ -685,10 +1099,10 @@ function App() {
   const [pendingAttachments, setPendingAttachments] = useState<string[]>([]);
   const [pendingFinetuneAttachmentsMap, setPendingFinetuneAttachmentsMap] = useState<Record<string, ChatAttachment[]>>({});
   const [uploadingDoc, setUploadingDoc] = useState(false);
-  const [uploadingStyleRef, setUploadingStyleRef] = useState(false);
-  const [uploadingLogo, setUploadingLogo] = useState(false);
-  const [uploadingVisualAsset, setUploadingVisualAsset] = useState(false);
-  const [uploadingTemplate, setUploadingTemplate] = useState(false);
+  const [, setUploadingStyleRef] = useState(false);
+  const [, setUploadingLogo] = useState(false);
+  const [, setUploadingVisualAsset] = useState(false);
+  const [, setUploadingTemplate] = useState(false);
   const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
   const [editMessageContent, setEditMessageContent] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -711,7 +1125,6 @@ function App() {
   const locallyHandledRunIdsRef = useRef<Set<string>>(new Set());
   const [contentPlanProgress, setContentPlanProgress] = useState<any>(null);
   const currentContentPlanProgress = contentPlanProgress?.project_id === selectedProject?.id ? contentPlanProgress : null;
-  const [styleProposalsLoading] = useState(false);
   const [, setShowStylePanel] = useState(false);
   const [currentAgentRole, setCurrentAgentRole] = useState<"content" | "visual" | "finetune">("content");
   const currentAgentRoleRef = useRef(currentAgentRole);
@@ -828,29 +1241,103 @@ function App() {
     }
     updateStoredChatMessages(projectId, role, updater);
   };
+  const cleanStageContextText = (value: string) =>
+    value
+      .replace(/\[\[PPTGOD_ATTACHMENT:[^\]]+\]\]/g, "")
+      .replace(/📎\s*[^\n]+/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/^(已提交 Brief，开始生成内容规划|确认建议，开始生成内容规划)\s+/, "")
+      .trim();
+  const isVisualRelevantStageContext = (value: string, role?: ChatMessage["role"]) => {
+    const text = cleanStageContextText(value);
+    if (!text) return false;
+    if (/用户(?:在第\s*\d+\s*页[前后]插入了新页面|删除了第\s*\d+\s*页|调整了页面顺序)/.test(text)) return false;
+    if (/用户(?:确认了内容规划|回退到|重试了|确认打样效果|更新了\s*\d+\s*页的画面方案)/.test(text)) return false;
+    if (/^内容规划已生成|^正在|^已启动后台|^风格提案/.test(text)) return false;
+    if (role === "system") {
+      return /(上传了(?:品牌 Logo|风格参考|可复用素材|版式模板)|选择了风格|Logo|素材|风格|版式|参考图|原样出现)/.test(text);
+    }
+    return /(风格|视觉|配色|颜色|字体|排版|品牌|Logo|素材|参考|图片|版式|调性|受众|限制|偏好|克制|科技|商务|深色|浅色|可读|高级|低幼|emoji|动效)/i.test(text);
+  };
+  const getVisualSystemMessageContent = (value: string) => {
+    const text = cleanStageContextText(value);
+    if (!text) return "";
+    if (/^【.+用户补充要求】/.test(text)) {
+      const [header, ...lines] = text.split("\n");
+      const relevantLines = lines.filter((line) =>
+        isVisualRelevantStageContext(line.replace(/^-\s*/, ""), "system")
+      );
+      return relevantLines.length ? [header, ...relevantLines].join("\n") : "";
+    }
+    return isVisualRelevantStageContext(text, "system") ? text : "";
+  };
+  const summarizeStageMessages = (messages: ChatMessage[], stageLabel: string) => {
+    const ignored = /^(已提交 Brief|确认建议，开始生成内容规划|正在启动内容规划生成|用户确认了内容规划|用户回退到)/;
+    const lines = messages
+      .filter((m) => !m.loading && (m.role === "user" || m.role === "system"))
+      .map((m) => ({ text: cleanStageContextText(m.content || ""), role: m.role }))
+      .filter((item) => item.text && !ignored.test(item.text) && isVisualRelevantStageContext(item.text, item.role))
+      .slice(-4)
+      .map(({ text }) => `- ${text.length > 180 ? `${text.slice(0, 180)}...` : text}`);
+    return lines.length ? `【${stageLabel}用户补充要求】\n${lines.join("\n")}` : "";
+  };
+  const buildCrossStageContext = (targetRole: "content" | "visual" | "finetune") => {
+    if (targetRole === "visual") {
+      return summarizeStageMessages(contentChatHistory, "内容阶段");
+    }
+    if (targetRole === "content") {
+      return summarizeStageMessages(visualChatHistory, "视觉阶段");
+    }
+    return "";
+  };
+  const withCrossStageContext = (pageContext: any, targetRole: "content" | "visual" | "finetune") => {
+    const crossStageContext = buildCrossStageContext(targetRole);
+    if (!crossStageContext) return pageContext;
+    return { ...(pageContext || {}), cross_stage_context: crossStageContext };
+  };
   // 如果视觉总监聊天记录为空，自动添加开场引导语
   const ensureVisualGreetingIfNeeded = () => {
     const projectId = selectedProjectIdRef.current;
     if (projectId && chatHistoryProjectIdRef.current === projectId && visualChatHistory.length === 0) {
       const hasAssets = referenceImages.length > 0;
-      const logoAssets = referenceImages.filter((r) => r.role === "logo");
+      const logoAssets = referenceImages.filter(isConfirmedLogoRef);
       const assetDesc = [
         logoAssets.length ? `${logoAssets.length}个品牌 Logo` : "",
-        referenceImages.filter((r) => r.role === "visual_asset").length > 0 ? `${referenceImages.filter((r) => r.role === "visual_asset").length}个核心资产` : "",
+        referenceImages.filter((r) => r.role === "visual_asset").length > 0 ? `${referenceImages.filter((r) => r.role === "visual_asset").length}个可复用素材` : "",
         referenceImages.filter((r) => r.role === "style_ref").length > 0 ? `${referenceImages.filter((r) => r.role === "style_ref").length}张风格参考` : "",
         referenceImages.find((r) => r.role === "template") ? "版式模板" : "",
       ].filter(Boolean).join("、");
+      const handoffNote = buildCrossStageContext("visual")
+        ? "\n\n我也会把内容阶段你提过的补充要求带入后续视觉方案和画面 Prompt。"
+        : "";
       const directorMsg = hasAssets
-        ? `我是视觉总监。已收到你上传的设计素材（${assetDesc}）。\n\n👉 如果你还想补充素材，请继续上传；如果已经齐了，点击下方「开始生成」按钮，我会立即基于这些素材制定风格方案。`
-        : "我是视觉总监。你可以按参考强度从高到低上传素材：品牌 Logo、核心资产、风格参考、版式模板。\n\n👉 Logo 默认作为预览/PPTX 角标叠加；核心资产会按页面内容进入生成；风格参考只学习视觉气质；版式模板只参考页面结构。没有素材也可以直接生成。";
+        ? `我是视觉总监。已收到你上传的设计素材（${assetDesc}）。${handoffNote}\n\n👉 如果你还想补充素材，请继续上传；如果已经齐了，点击「生成视觉方向」，我会基于这些素材制定风格方案。`
+        : `我是视觉总监。你可以按参考强度从高到低上传素材：品牌 Logo、可复用素材、风格参考、版式模板。${handoffNote}\n\n👉 Logo 默认作为预览/PPTX 角标叠加；可复用素材会按页面内容进入生成；风格参考只学习视觉气质；版式模板只参考页面结构。没有素材也可以直接生成视觉方向。`;
       appendProjectChatMessage(projectId, "visual", { role: "agent", content: directorMsg, agentRole: "visual" });
     }
   };
-  // 如果内容总监聊天记录为空，自动添加开场引导语
+  const isLegacyContentGreeting = (message: ChatMessage) => (
+    message.role === "agent" &&
+    message.agentRole === "content" &&
+    (
+      message.content.includes("你好！我是你的内容总监") ||
+      message.content.includes("请告诉我你想做什么主题的 PPT")
+    )
+  );
+
+  const stripLegacyContentGreetings = (messages: ChatMessage[]) =>
+    messages.filter((message) => !isLegacyContentGreeting(message));
+
+  // 如果内容总监聊天记录为空，按当前阶段补充状态，而不是显示 Brief Studio 之前的 onboarding。
   const ensureContentGreetingIfNeeded = () => {
     const projectId = selectedProjectIdRef.current;
-    if (projectId && chatHistoryProjectIdRef.current === projectId && contentChatHistory.length === 0) {
-      appendProjectChatMessage(projectId, "content", { role: "agent", content: "内容总监已介入。你可以继续调整内容规划。", agentRole: "content" });
+    if (!projectId || chatHistoryProjectIdRef.current !== projectId) return;
+    const cleaned = stripLegacyContentGreetings(contentChatHistory);
+    if (cleaned.length !== contentChatHistory.length) {
+      setContentChatHistory(normalizeProjectChatHistory(projectId, cleaned, { allowLegacy: true }));
+    }
+    if (cleaned.length === 0 && slides.length > 0) {
+      appendProjectChatMessage(projectId, "content", { role: "agent", content: "内容规划已生成。你可以直接指出要改的页、顺序或文字。", agentRole: "content" });
     }
   };
   // 为指定 slideId 的微调聊天添加开场引导（仅首次）
@@ -882,15 +1369,35 @@ function App() {
   const visualAssetInputRef = useRef<HTMLInputElement>(null);
   const templateInputRef = useRef<HTMLInputElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const chatAutoScrollRef = useRef(true);
   const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const briefEditorRef = useRef<HTMLDivElement>(null);
   const briefEditorValueRef = useRef("");
   const briefDraggedChipRef = useRef<HTMLElement | null>(null);
 
+  const isChatNearBottom = (element: HTMLDivElement) =>
+    element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+
+  const scrollChatToBottom = () => {
+    const element = chatContainerRef.current;
+    if (!element) return;
+    element.scrollTop = element.scrollHeight;
+  };
+
+  const handleChatScroll = () => {
+    const element = chatContainerRef.current;
+    if (!element) return;
+    chatAutoScrollRef.current = isChatNearBottom(element);
+  };
+
   // Toast 系统
   const showToast = (message: string, type: ToastItem["type"] = "info") => {
     const id = Math.random().toString(36).slice(2);
-    setToasts((prev) => [...prev, { id, message, type }]);
+    const duration = type === "error" ? 5000 : type === "success" ? 2200 : 2600;
+    setToasts((prev) => {
+      const withoutDuplicate = prev.filter((toast) => !(toast.message === message && toast.type === type));
+      return [...withoutDuplicate, { id, message, type, duration }].slice(-3);
+    });
   };
   const removeToast = (id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -906,23 +1413,24 @@ function App() {
     missingProjectHandledRef.current.add(projectId);
     try {
       const freshProjects = await fetchProjects();
-      setProjects(freshProjects);
+      const normalizedProjects = normalizeProjectsForActiveSelection(freshProjects, selectedProjectIdRef.current);
+      setProjects(normalizedProjects);
       if (selectedProjectIdRef.current !== projectId) return;
       clearTransientProjectState();
-      const fallback = freshProjects[0] || null;
+      const fallback = normalizedProjects[0] ? clearProjectNotification(normalizedProjects[0]) : null;
       if (fallback) {
         selectedProjectIdRef.current = fallback.id;
         setSelectedProject(fallback);
         localStorage.setItem("ppt_god_last_project_id", fallback.id);
-        showToast("当前项目不存在或已失效，已切换到最近的可用项目。", "info");
+        showToast("当前项目暂时无法打开，已切换到最近的可用项目。", "info");
       } else {
         selectedProjectIdRef.current = null;
         setSelectedProject(null);
         localStorage.removeItem("ppt_god_last_project_id");
-        showToast("当前项目不存在或已失效，请新建项目。", "info");
+        showToast("当前项目暂时无法打开，请新建项目。", "info");
       }
     } catch (refreshErr: any) {
-      showToast("项目已失效，且刷新项目列表失败：" + (refreshErr.message || "网络错误"), "error");
+      showToast("项目暂时无法打开，刷新项目列表失败：" + (refreshErr.message || "网络错误"), "error");
     }
   };
 
@@ -1052,13 +1560,60 @@ function App() {
     setThinkingExpanded(false);
   };
 
+  const getProjectEntryAgentRole = (project: Project, notificationMessage?: string | null): "content" | "visual" => {
+    const message = notificationMessage || "";
+    if (message.includes("内容规划")) return "content";
+    if (project.status === "draft") return "content";
+    if (project.status === "planning" && !project.content_plan_confirmed && !project.selected_style) return "content";
+    return "visual";
+  };
+
+  const focusProjectLatestUpdate = (project: Project, notificationMessage?: string | null) => {
+    setRightCollapsed(false);
+    setEditingSlide(null);
+    setShowTemplateRecommender(false);
+    setShowPrototypePreview(true);
+    setCurrentAgentRole(getProjectEntryAgentRole(project, notificationMessage));
+    chatAutoScrollRef.current = true;
+    requestAnimationFrame(scrollChatToBottom);
+  };
+
+  const markActiveProjectNotificationRead = (projectId: string) => {
+    if (clearingActiveNotificationRef.current.has(projectId)) return;
+    clearingActiveNotificationRef.current.add(projectId);
+    fetchProject(projectId)
+      .then((fresh) => {
+        const normalizedFresh = clearProjectNotification(fresh);
+        setProjects((prev) =>
+          normalizeProjectsForActiveSelection(
+            prev.map((item) => (item.id === projectId ? normalizedFresh : item)),
+            selectedProjectIdRef.current
+          )
+        );
+        if (selectedProjectIdRef.current === projectId) {
+          setSelectedProject(normalizedFresh);
+        }
+      })
+      .catch((err) => {
+        console.warn("Failed to clear active project notification:", err);
+      })
+      .finally(() => {
+        clearingActiveNotificationRef.current.delete(projectId);
+      });
+  };
+
   const loadProjects = async () => {
     try {
       const data = await fetchProjects();
-      setProjects(data);
       const currentSelectedId = selectedProjectIdRef.current;
+      const activeProjectFromServer = currentSelectedId
+        ? data.find((p: Project) => p.id === currentSelectedId)
+        : null;
+      const activeProjectHadUnread = Boolean(activeProjectFromServer?.has_unread_notification);
+      const normalizedData = normalizeProjectsForActiveSelection(data, currentSelectedId);
+      setProjects(normalizedData);
       if (currentSelectedId) {
-        const updated = data.find((p: Project) => p.id === currentSelectedId);
+        const updated = normalizedData.find((p: Project) => p.id === currentSelectedId);
         if (updated) {
           missingProjectHandledRef.current.delete(currentSelectedId);
           setSelectedProject((prev) => {
@@ -1078,8 +1633,11 @@ function App() {
             return prev;
           });
         }
+        if (activeProjectHadUnread) {
+          markActiveProjectNotificationRead(currentSelectedId);
+        }
       }
-      return data as Project[];
+      return normalizedData as Project[];
     } catch (err: any) {
       showToast("加载项目列表失败：" + (err.message || "网络错误"), "error");
       return [] as Project[];
@@ -1088,16 +1646,22 @@ function App() {
 
   const selectProject = async (project: Project) => {
     if (editingProjectId === project.id) return;
+    if (selectedProjectIdRef.current === project.id) {
+      if (slidesProjectId !== project.id && slidesLoadingProjectId !== project.id) {
+        loadingProjectIdRef.current = project.id;
+        void loadSlides(project.id);
+      }
+      return;
+    }
+    const notificationMessage = project.has_unread_notification ? project.unread_notification_message || "" : null;
     abortActiveChat(true);
     isConfirmingRef.current = false;
     softLockWarnedRef.current = false;
     chatHistoryProjectIdRef.current = null;
     setChatHistoryProjectId(null);
-    clearTransientProjectState();
+    clearTransientProjectState(project.id);
 
-    const optimisticProject = project.has_unread_notification
-      ? { ...project, has_unread_notification: false, unread_notification_message: null }
-      : project;
+    const optimisticProject = clearProjectNotification(project);
     selectedProjectIdRef.current = project.id;
     setProjects((prev) => prev.map((item) => (item.id === project.id ? optimisticProject : item)));
     setSelectedProject(optimisticProject);
@@ -1106,14 +1670,22 @@ function App() {
 
     const isPlanConfirmed = !!optimisticProject.content_plan_confirmed;
     setContentPlanConfirmed(isPlanConfirmed);
-    setCurrentAgentRole(optimisticProject.selected_style || isPlanConfirmed ? "visual" : "content");
+    if (notificationMessage) {
+      focusProjectLatestUpdate(optimisticProject, notificationMessage);
+    } else {
+      setCurrentAgentRole(getProjectEntryAgentRole(optimisticProject));
+    }
 
     try {
       const fresh = await fetchProject(project.id);
+      const normalizedFresh = clearProjectNotification(fresh);
       missingProjectHandledRef.current.delete(project.id);
-      setProjects((prev) => prev.map((item) => (item.id === project.id ? fresh : item)));
+      setProjects((prev) => prev.map((item) => (item.id === project.id ? normalizedFresh : item)));
       if (selectedProjectIdRef.current === project.id) {
-        setSelectedProject(fresh);
+        setSelectedProject(normalizedFresh);
+        if (notificationMessage) {
+          focusProjectLatestUpdate(normalizedFresh, notificationMessage);
+        }
       }
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
@@ -1125,9 +1697,14 @@ function App() {
   };
 
   const loadSlides = async (projectId: string) => {
+    if (selectedProjectIdRef.current === projectId) {
+      setSlidesLoadingProjectId(projectId);
+    }
     try {
       const data = await fetchSlides(projectId);
-      if (loadingProjectIdRef.current !== projectId) return;
+      if (loadingProjectIdRef.current !== projectId) return slidesCacheRef.current[projectId] || [];
+      slidesCacheRef.current[projectId] = data;
+      setSlidesProjectId(projectId);
       setSlides(data);
       // 软锁定检测：如果当前在视觉总监阶段，且内容发生了变化
       if (currentAgentRoleRef.current === "visual" && contentPlanSnapshotRef.current.length > 0 && contentPlanConfirmedRef.current) {
@@ -1162,6 +1739,10 @@ function App() {
       }
       showToast("加载页面列表失败：" + (err.message || "网络错误"), "error");
       return [];
+    } finally {
+      if (selectedProjectIdRef.current === projectId) {
+        setSlidesLoadingProjectId(null);
+      }
     }
   };
 
@@ -1188,7 +1769,10 @@ function App() {
       for (const slide of targetSlides) {
         await updateSlideContent(projectId, slide.page_num, slide.content_json, slide.id);
       }
-      setSlides(JSON.parse(JSON.stringify(targetSlides)));
+      const nextSlides = JSON.parse(JSON.stringify(targetSlides));
+      slidesCacheRef.current[projectId] = nextSlides;
+      setSlidesProjectId(projectId);
+      setSlides(nextSlides);
       showToast("已撤销到之前的状态", "success");
     } catch (err: any) {
       showToast("撤销保存失败：" + (err.message || "未知错误"), "error");
@@ -1294,17 +1878,18 @@ function App() {
     topic: string,
     source: "button" | "agent" = "button",
     pageCount?: number,
-    options?: { onStarted?: () => void; submittedLabel?: string }
-  ) => {
-    if (operatingProjectId === projectId) return;
+    options?: { onStarted?: () => void; submittedLabel?: string; submittedContent?: string }
+  ): Promise<GateActionResult> => {
+    if (operatingProjectId === projectId) {
+      return { ok: false, reason: "busy", message: "内容规划已经在处理中，请稍候。" };
+    }
     abortActiveChat(true);
-    // 记录旧 slides 的 ID，用于区分"旧内容还在"和"新生成完成"
-    const previousSlides = await loadSlides(projectId);
-    const previousSlideIds = previousSlides.map((s: any) => s.id).sort().join(",");
     const loadingId = `cp-${Date.now()}`;
     updateProjectChatMessages(projectId, "content", (prev) => [
-      ...prev,
-      ...(source === "button" ? [{ role: "user" as const, content: options?.submittedLabel || "已提交 Brief，开始生成内容规划" }] : []),
+      ...stripLegacyContentGreetings(prev),
+      ...(source === "button"
+        ? [{ role: "user" as const, content: options?.submittedContent || options?.submittedLabel || "已提交 Brief，开始生成内容规划" }]
+        : []),
       { role: "agent" as const, content: "正在启动内容规划生成...", agentRole: "content", loading: true, id: loadingId },
     ]);
     setOperatingProjectId(projectId);
@@ -1325,6 +1910,11 @@ function App() {
     };
 
     try {
+      updateLoadingMsg("正在读取当前页面，准备生成内容规划...");
+      // 记录旧 slides 的 ID，用于区分"旧内容还在"和"新生成完成"
+      const previousSlides = await loadSlides(projectId);
+      const previousSlideIds = previousSlides.map((s: any) => s.id).sort().join(",");
+      updateLoadingMsg("正在向后台提交内容规划任务...");
       const result = await generateContentPlan(projectId, topic, pageCount);
       options?.onStarted?.();
       if (result?.run?.id) {
@@ -1435,18 +2025,21 @@ function App() {
         }
       }, 2000);
       contentPlanCheckIntervalRef.current = checkInterval;
+      return { ok: true, runId: result?.run?.id };
     } catch (err: any) {
       setOperatingProjectId(null);
       setContentPlanProgress(null);
       removeLoadingMsg();
+      const message = "内容规划生成失败：" + (err.message || "未知错误");
       updateProjectChatMessages(projectId, "content", (prev) => [
         ...prev,
         {
           role: "agent",
-          content: "❌ 内容规划生成失败：" + (err.message || "未知错误") + "\n\n👉 解决方法：\n1. 直接告诉我你的主题，我会重新为你生成\n2. 检查网络后刷新页面重试\n3. 也可以尝试缩减主题范围，或分多次生成",
+          content: "❌ " + message + "\n\n👉 解决方法：\n1. 直接告诉我你的主题，我会重新为你生成\n2. 检查网络后刷新页面重试\n3. 也可以尝试缩减主题范围，或分多次生成",
           agentRole: "content",
         },
       ]);
+      return { ok: false, reason: "failed", message };
     }
   };
 
@@ -1482,7 +2075,14 @@ function App() {
       setContentPlanProgress(null);
       setReferenceImages([]);
       setTemplatePages([]);
-      setSlides([]);
+      const cachedSlides = slidesCacheRef.current[selectedProject.id];
+      if (cachedSlides) {
+        setSlides(cachedSlides);
+        setSlidesProjectId(selectedProject.id);
+      } else {
+        setSlides([]);
+        setSlidesProjectId(null);
+      }
       setStaleMap({});
       setStyleProposalsInChat([]);
       generationLoadingIdRef.current = null;
@@ -1492,6 +2092,7 @@ function App() {
       loadDocuments(selectedProject.id);
       loadTemplatePages(selectedProject.id);
       setSelectedPages(new Set());
+      setPrototypeSelectionTouched(false);
       setThinkingContent("");
       setThinkingExpanded(false);
       setPendingAttachments([]);
@@ -1709,23 +2310,47 @@ function App() {
       }
       const loadingId = generationLoadingIdRef.current;
       generationLoadingIdRef.current = null;
-      const completedCount = slides.filter((s) => s.status === "completed").length;
-      const ok = currentStatus === "completed" || currentStatus === "prototype_ready" || currentStatus === "prompt_ready" || currentStatus === "visual_ready" || currentStatus === "planning";
       if (pid) {
-        updateProjectChatMessages(pid, "visual", (prevMsgs) => [
-          ...prevMsgs.filter((m) => m.id !== loadingId && m.runId !== prevRun.runId),
-          {
-            role: "agent",
-            content: ok
-              ? (prevRun.kind === "visual_prompts"
-                  ? "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先「打样确认」生成 1-3 张预览效果；满意后再「全量生成」所有页面。"
-                  : currentStatus === "completed"
-                    ? `✅ 全量生成已完成，共 ${completedCount} 页。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。`
-                    : "✅ 当前任务已结束，页面状态已更新。\n\n👉 下一步：请根据顶部状态栏继续操作。")
-              : `⚠️ 当前任务已结束（状态：${currentStatus || "未知"}），请检查页面状态。`,
-            agentRole: "visual",
-          },
-        ]);
+        const finishedRunKind = prevRun.kind;
+        const finishedRunId = prevRun.runId;
+        void (async () => {
+          let refreshedProject = selectedProject;
+          let refreshedSlides = slides;
+          try {
+            const [freshProjects, freshSlides] = await Promise.all([
+              loadProjects(),
+              loadSlides(pid),
+              loadStatus(pid),
+            ]).then(([freshProjectsResult, freshSlidesResult]) => [freshProjectsResult, freshSlidesResult] as const);
+            const freshProject = freshProjects.find((p: Project) => p.id === pid);
+            if (freshProject) refreshedProject = freshProject;
+            if (freshSlides.length > 0) refreshedSlides = freshSlides;
+          } catch (err) {
+            console.warn("Failed to refresh project after run completion:", err);
+          }
+          if (selectedProjectIdRef.current !== pid) return;
+          const followup = buildRunCompletionFollowup({
+            runKind: finishedRunKind,
+            projectStatus: refreshedProject?.status || currentStatus,
+            completedCount: refreshedSlides.filter((s) => s.status === "completed").length,
+            totalSlides: refreshedSlides.length,
+            hasSelectedStyle: Boolean(refreshedProject?.selected_style),
+            hasPrompt: refreshedSlides.some((s) => Boolean(s.prompt_text)),
+            styleProposalCount: refreshedProject?.style_proposal?.proposals?.length || 0,
+          });
+          const latestGateContext = gateContextRef.current || gateContext;
+          updateProjectChatMessages(pid, followup.agentRole, (prevMsgs) => [
+            ...prevMsgs.filter((m) => m.id !== loadingId && m.runId !== finishedRunId),
+            {
+              role: "agent",
+              content: followup.content,
+              agentRole: followup.agentRole,
+              nextAction: followup.nextAction,
+              gate: followup.nextAction ? latestGateContext.gate : undefined,
+              gateRevision: followup.nextAction ? latestGateContext.gateRevision : undefined,
+            },
+          ]);
+        })();
       }
     }
     // 兼容旧项目状态：只有同一个项目从 generating 变为 completed 才触发
@@ -1797,12 +2422,16 @@ function App() {
     });
   }, [selectedProject?.id, activeRun?.id, currentProjectStatus?.progress]);
 
-  // 聊天自动滚动
+  // 聊天自动滚动：用户停在底部附近时跟随；用户上滑阅读历史后不抢滚动。
   useEffect(() => {
-    if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
-    }
+    if (!chatAutoScrollRef.current) return;
+    requestAnimationFrame(scrollChatToBottom);
   }, [chatMessages, chatLoading]);
+
+  useEffect(() => {
+    chatAutoScrollRef.current = true;
+    requestAnimationFrame(scrollChatToBottom);
+  }, [selectedProject?.id, currentAgentRole, finetuneTargetSlideId]);
 
   // Rebuild a truthful transient loading message from the backend run after refresh/project switch.
   useEffect(() => {
@@ -1841,7 +2470,9 @@ function App() {
     const projectId = selectedProjectIdRef.current;
     if (!projectId) return;
     appendProjectChatMessage(projectId, "content", { role: "system", content });
-    appendProjectChatMessage(projectId, "visual", { role: "system", content });
+    if (isVisualRelevantStageContext(content, "system")) {
+      appendProjectChatMessage(projectId, "visual", { role: "system", content });
+    }
   };
 
   const handleCreate = async () => {
@@ -1857,13 +2488,14 @@ function App() {
       await loadProjects();
       // 自动选中新创建的项目，并重置为内容规划阶段
       if (data.id) {
-        const fresh = await fetchProjects();
+        const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
         const created = fresh.find((p: Project) => p.id === data.id);
         if (created) {
+          const normalizedCreated = clearProjectNotification(created);
           selectedProjectIdRef.current = created.id;
           loadedChatProjectIdRef.current = created.id;
           chatHistoryProjectIdRef.current = created.id;
-          setSelectedProject(created);
+          setSelectedProject(normalizedCreated);
           setChatHistoryProjectId(created.id);
           setShowPrototypePreview(true);
           setExpandedStyleProposalKey(null);
@@ -1872,11 +2504,6 @@ function App() {
           setVisualChatHistory([]);
           setContentChatHistory(normalizeProjectChatHistory(created.id, [
             { role: "system", content: `用户创建了项目「${title}」` },
-            {
-              role: "agent",
-              content: "👋 你好！我是你的内容总监。请告诉我你想做什么主题的 PPT？\n\n你可以：\n1. 直接输入主题（如「Q3 销售汇报」）\n2. 粘贴文档内容\n3. 拖拽上传 PDF/Word/PPT 文件",
-              agentRole: "content",
-            },
           ], { allowLegacy: true }));
         }
       }
@@ -1891,9 +2518,9 @@ function App() {
     try {
       await updateProjectStyle(projectId, style);
       await loadProjects();
-      const fresh = await fetchProjects();
+      const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
       const updated = fresh.find((p: Project) => p.id === projectId);
-      if (updated && selectedProjectIdRef.current === projectId) setSelectedProject(updated);
+      if (updated && selectedProjectIdRef.current === projectId) setSelectedProject(clearProjectNotification(updated));
       if (selectedProjectIdRef.current === projectId) {
         setShowStylePanel(false);
         setStyleProposalsInChat([]); // 清除Agent面板内的提案
@@ -1946,8 +2573,11 @@ function App() {
       if (selectedProject?.id === projectId) {
         setSelectedProject(null);
         setSlides([]);
+        setSlidesProjectId(null);
+        setSlidesLoadingProjectId(null);
         setProjectStatus(null);
       }
+      delete slidesCacheRef.current[projectId];
       await loadProjects();
     } catch (err: any) {
       showToast("删除失败：" + (err.message || "未知错误"), "error");
@@ -1987,7 +2617,7 @@ function App() {
     try {
       const pageNums = prototype && selectedPages.size > 0 ? Array.from(selectedPages) : undefined;
       // 触发后台任务（不再依赖 SSE 长连接）
-      const startResult = await generateVisualPrompts(projectId, pageNums);
+      const startResult = await generateVisualPrompts(projectId, pageNums, buildCrossStageContext("visual"));
       const targetPageSet = pageNums?.length ? new Set(pageNums) : null;
       const getTargetSlides = (items: Slide[]) => targetPageSet ? items.filter((s) => targetPageSet.has(s.page_num)) : items;
       const hasSavedVisualPromptResult = (items: Slide[]) => {
@@ -2063,7 +2693,11 @@ function App() {
               await loadProjects();
 
               const freshSlides = await fetchSlides(projectId);
-              if (selectedProjectIdRef.current === projectId) setSlides(freshSlides);
+              slidesCacheRef.current[projectId] = freshSlides;
+              if (selectedProjectIdRef.current === projectId) {
+                setSlidesProjectId(projectId);
+                setSlides(freshSlides);
+              }
               if (!hasSavedVisualPromptResult(freshSlides)) {
                 reject(new Error("后台任务已结束，但目标页面缺少画面描述或生图 Prompt。请重试生成生图方案。"));
                 return;
@@ -2080,7 +2714,11 @@ function App() {
                 visualPromptIntervalRef.current = null;
               }
               const freshSlides = await fetchSlides(projectId);
-              if (selectedProjectIdRef.current === projectId) setSlides(freshSlides);
+              slidesCacheRef.current[projectId] = freshSlides;
+              if (selectedProjectIdRef.current === projectId) {
+                setSlidesProjectId(projectId);
+                setSlides(freshSlides);
+              }
               if (hasSavedVisualPromptResult(freshSlides)) {
                 await loadProjects();
                 resolve();
@@ -2117,7 +2755,7 @@ function App() {
         {
           role: "agent",
           content:
-            "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先「打样确认」生成 1-3 张预览效果；满意后再「全量生成」所有页面。也可以直接全量生成。",
+            "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先「打样确认」生成关键种子页预览；满意后再「全量生成」所有页面。也可以直接全量生成。",
           agentRole: "visual",
           nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
         },
@@ -2135,7 +2773,7 @@ function App() {
           role: "agent",
           content: isMissingResult
             ? `❌ 生图方案未完整生成：${message}\n\n👉 解决方法：点击「确认风格，生成生图方案」重新补齐缺失页面；已生成好的页面会继续保留。`
-            : "❌ 生图方案生成失败：" + message + "\n\n👉 解决方法：\n1. 检查网络连接后，点击上方「确认风格，生成生图方案」按钮重试\n2. 如果多次失败，可以尝试回退到「视觉方案」阶段重新选择风格\n3. 也可以直接告诉我具体问题，我来帮你调整",
+            : "❌ 生图方案生成失败：" + message + "\n\n👉 解决方法：\n1. 检查网络连接后，点击上方「确认风格，生成生图方案」按钮重试\n2. 如果多次失败，可以回到「视觉方案」重新选择风格\n3. 也可以直接告诉我具体问题，我来帮你调整",
           agentRole: "visual",
         },
       ]);
@@ -2159,7 +2797,7 @@ function App() {
       : useSelectedPages && selectedPages.size > 0
       ? Array.from(selectedPages)
       : undefined;
-    const pageDesc = pageNums ? `第 ${pageNums.join(", ")} 页` : (prototype ? "前 3 页" : "所有页面");
+    const pageDesc = pageNums ? `第 ${pageNums.join(", ")} 页` : (prototype ? "默认种子页" : "所有页面");
     const loadingId = `gen-${Date.now()}`;
     generationLoadingIdRef.current = loadingId;
     updateProjectChatMessages(projectId, "visual", (prev) => [
@@ -2198,6 +2836,11 @@ function App() {
             ? successMessage
             : `⚠️ 生成结束（状态：${finalStatus || "未知"}），页面已自动刷新，请检查是否有失败页。`,
           agentRole: "visual",
+          nextAction: finalStatus === "completed"
+            ? { type: "download", label: "下载 PPTX" }
+            : finalStatus === "prototype_ready"
+            ? { type: "confirm_prototype", label: "确认打样，生成全部", confirm: true }
+            : undefined,
         },
       ]);
     } catch (err: any) {
@@ -2300,6 +2943,7 @@ function App() {
             ? "✅ 全部页面生成完成。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。"
             : `⚠️ 生成结束（状态：${finalStatus}），部分页面可能未成功，请检查进度。`,
           agentRole: "visual",
+          nextAction: finalStatus === "completed" ? { type: "download", label: "下载 PPTX" } : undefined,
         },
       ]);
     } catch (err: any) {
@@ -2376,13 +3020,13 @@ function App() {
       if (needsFullPlan.length > 0) {
         showToast(`正在更新 ${needsFullPlan.length} 页的画面描述...`, "info");
         const pageNums = needsFullPlan.map((x) => x.slide.page_num);
-        await generateVisualPlan(projectId, pageNums);
+        await generateVisualPlan(projectId, pageNums, buildCrossStageContext("visual"));
         await loadSlides(projectId);
       }
 
       if (pageNumsForPrompt.length > 0) {
         showToast(`正在更新 ${pageNumsForPrompt.length} 页的生图提示词...`, "info");
-        await generatePrompts(projectId, pageNumsForPrompt);
+        await generatePrompts(projectId, pageNumsForPrompt, buildCrossStageContext("visual"));
         await loadSlides(projectId);
         needsPrompt.forEach((x) => {
           clearSlideStale(x.slide.id, "content");
@@ -2414,7 +3058,7 @@ function App() {
           ...prev,
           {
             role: "agent",
-            content: `✅ 已更新 ${updatedCount} 页的画面方案。\n\n这些页面现在进入「需重新生成图片」状态。请检查后再确认生图。`,
+            content: `✅ 已更新 ${updatedCount} 页的画面方案。\n\n这些页面需要重新生成图片。请检查后再确认生图。`,
             agentRole: "visual",
           },
         ]);
@@ -2486,7 +3130,7 @@ function App() {
       completed: "批量生成",
     };
     const ok = await showConfirm(
-      `回退到「${stageNames[targetStage] || targetStage}」？\n这将清除该阶段之后的所有数据，需要重新生成。`
+      `回到「${stageNames[targetStage] || targetStage}」？\n这会清除后面的设计和图片结果，需要重新生成。`
     );
     if (!ok) return;
 
@@ -2530,9 +3174,9 @@ function App() {
     try {
       await rollbackProject(projectId, targetStage);
       await loadProjects();
-      const fresh = await fetchProjects();
+      const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
       const updated = fresh.find((p: Project) => p.id === projectId);
-      if (updated && selectedProjectIdRef.current === projectId) setSelectedProject(updated);
+      if (updated && selectedProjectIdRef.current === projectId) setSelectedProject(clearProjectNotification(updated));
       await loadSlides(projectId);
       const nextGateRevision = (gateRevisionMap[projectId] || 0) + 1;
       const targetGate: WorkflowGate =
@@ -2546,6 +3190,7 @@ function App() {
       if (selectedProjectIdRef.current === projectId) {
         setStaleMap({});
         setSelectedPages(new Set());
+        setPrototypeSelectionTouched(false);
         setEditingSlide(null);
         setGalleryModal(null);
         setShowTemplateRecommender(false);
@@ -2555,15 +3200,15 @@ function App() {
       }
 
       // 根据回退目标生成详细的自动化引导消息
-      let rollbackMsg = `⏪ 已回退到「${stageNames[targetStage] || targetStage}」。后续数据已重置。`;
+      let rollbackMsg = `已回到「${stageNames[targetStage] || targetStage}」。后面的设计和图片结果需要重新生成。`;
       if (targetStage === "visual_ready") {
-        const logoAssets = referenceImages.filter((r: any) => r.role === "logo");
+        const logoAssets = referenceImages.filter(isConfirmedLogoRef);
         const styleRefAssets = referenceImages.filter((r: any) => r.role === "style_ref");
         const templateAsset = referenceImages.find((r: any) => r.role === "template");
         const visualAssetAssets = referenceImages.filter((r: any) => r.role === "visual_asset");
-        rollbackMsg += `\n\n**视觉总监已重新介入。** 为了给你更精准的风格提案和画面生成，请先确认当前的项目素材：\n\n📎 **素材清单（参考强度从高到低）**\n• 品牌 Logo：${logoAssets.length ? `已上传 ${logoAssets.length} 个 ✅` : "未上传"}\n• 核心资产：${visualAssetAssets.length > 0 ? `已上传 ${visualAssetAssets.length} 个 ✅` : "未上传"}\n• 风格参考：${styleRefAssets.length > 0 ? `已上传 ${styleRefAssets.length} 张 ✅` : "未上传"}\n• 版式模板：${templateAsset ? "已上传 ✅" : "未上传"}\n• 风格描述：可在聊天中直接告诉我（如"更商务一点""要温暖生活感"）\n\n你可以：**① 继续上传素材**（品牌 Logo / 核心资产 / 风格参考 / 版式模板）→ **② 告诉我你的风格偏好** → **③ 或直接说"开始提案"**，我会基于现有信息立即生成风格方案。`;
+        rollbackMsg += `\n\n**现在可以重新确认视觉方向。** 为了给你更精准的风格提案和画面生成，请先确认当前的项目素材：\n\n📎 **素材清单（参考强度从高到低）**\n• 品牌 Logo：${logoAssets.length ? `已上传 ${logoAssets.length} 个 ✅` : "未上传"}\n• 可复用素材：${visualAssetAssets.length > 0 ? `已上传 ${visualAssetAssets.length} 个 ✅` : "未上传"}\n• 风格参考：${styleRefAssets.length > 0 ? `已上传 ${styleRefAssets.length} 张 ✅` : "未上传"}\n• 版式模板：${templateAsset ? "已上传 ✅" : "未上传"}\n• 风格描述：可在聊天中直接告诉我（如"更商务一点""要温暖生活感"）\n\n你可以：**① 继续上传素材**（品牌 Logo / 可复用素材 / 风格参考 / 版式模板）→ **② 告诉我你的风格偏好** → **③ 或直接说"开始提案"**，我会基于现有信息立即生成风格方案。`;
       } else if (targetStage === "planning") {
-        rollbackMsg += `\n\n**内容总监已重新介入。** 你可以继续调整内容规划：\n\n• 增减页数、调整章节结构\n• 修改某一页的标题或正文（直接说"修改第X页"）\n• 更换整体内容方向或主题\n\n👉 确认内容规划满意后，我们再一起进入视觉设计阶段。`;
+        rollbackMsg += `\n\n**现在可以继续调整内容规划。**\n\n• 增减页数、调整章节结构\n• 修改某一页的标题或正文（直接说"修改第X页"）\n• 更换整体内容方向或主题\n\n👉 确认内容规划满意后，我们再一起进入视觉设计。`;
       } else if (targetStage === "prompt_ready") {
         rollbackMsg += `\n\n**画面设计已重新打开。** 已保留内容和已确认风格，图片结果已回到待打样状态。\n\n👉 你可以在作品画布检查每页画面方案、选择打样页，或告诉我需要重抽哪一页。`;
       } else if (targetStage === "prototype_ready") {
@@ -2602,7 +3247,7 @@ function App() {
         ...prev,
         {
           role: "agent",
-          content: "❌ 回退失败：" + (err.message || "未知错误") + "\n\n👉 请检查网络后，在顶部流程条中再次点击回退目标。",
+          content: "❌ 没能回到目标位置：" + (err.message || "未知错误") + "\n\n👉 请检查网络后，在顶部流程条重新选择要回到的位置。",
           agentRole: "visual",
         },
       ]);
@@ -2613,7 +3258,7 @@ function App() {
 
   const togglePage = (pageNum: number) => {
     setSelectedPages((prev) => {
-      const next = new Set(prev);
+      const next = new Set(prototypeSelectionTouched ? prev : defaultPrototypePageNums);
       if (next.has(pageNum)) {
         next.delete(pageNum);
       } else {
@@ -2621,14 +3266,17 @@ function App() {
       }
       return next;
     });
+    setPrototypeSelectionTouched(true);
   };
 
   const selectAll = () => {
     setSelectedPages(new Set(slides.map((s) => s.page_num)));
+    setPrototypeSelectionTouched(true);
   };
 
   const clearSelection = () => {
     setSelectedPages(new Set());
+    setPrototypeSelectionTouched(false);
   };
 
   const slideHasPrompt = (slide: Slide) => Boolean(slide.prompt_text && String(slide.prompt_text).trim());
@@ -2638,10 +3286,10 @@ function App() {
       const targetSet = new Set(explicitPageNums);
       return slides.filter((slide) => targetSet.has(slide.page_num));
     }
-    if (selectedPages.size > 0) {
-      return slides.filter((slide) => selectedPages.has(slide.page_num));
-    }
-    return slides.slice(0, Math.min(3, slides.length));
+    const targetPageNums = prototypeSelectionTouched ? Array.from(selectedPages) : defaultPrototypePageNums;
+    if (targetPageNums.length === 0) return [];
+    const targetSet = new Set(targetPageNums);
+    return slides.filter((slide) => targetSet.has(slide.page_num));
   };
 
   const getPrototypeResampleTargetSlides = (explicitPageNums: number[] = []) => {
@@ -2870,10 +3518,10 @@ function App() {
       const fresh = updated.find((s: Slide) => s.id === slideId);
       if (fresh && editingSlide?.id === slideId) setEditingSlide(fresh);
       const exactCount = (layers || []).filter((layer: any) => layer?.enabled !== false).length;
-      showToast(exactCount > 2 ? "Exact 已更新；精确贴图较多，建议留出版面空间" : "Exact Overlay 已更新", "success");
-      if (slide) addSystemLog(`用户更新了第 ${slide.page_num} 页的 Exact Overlay`);
+      showToast(exactCount > 2 ? "原样出现已更新；贴图较多，建议留出版面空间" : "原样出现已更新", "success");
+      if (slide) addSystemLog(`用户更新了第 ${slide.page_num} 页的原样出现素材`);
     } catch (err: any) {
-      showToast("Exact Overlay 更新失败：" + (err.message || "未知错误"), "error");
+      showToast("原样出现更新失败：" + (err.message || "未知错误"), "error");
     }
   };
 
@@ -3035,7 +3683,25 @@ function App() {
     return ref?.asset_name || (basename ? basename.replace(/^content_ref_/, "") : id);
   };
 
-  const getBriefAttachmentIcon = (kind: "doc" | "image") => (kind === "doc" ? "DOC" : "IMG");
+  const getFileTypeBadge = (filename: string, kind?: "doc" | "image") => {
+    if (kind === "image") return "IMG";
+    const clean = filename.split("?")[0].split("#")[0].toLowerCase();
+    const ext = clean.includes(".") ? clean.slice(clean.lastIndexOf(".") + 1) : "";
+    if (["ppt", "pptx"].includes(ext)) return "PPT";
+    if (["pdf"].includes(ext)) return "PDF";
+    if (["doc", "docx"].includes(ext)) return "DOC";
+    if (["md", "markdown"].includes(ext)) return "MD";
+    if (["txt"].includes(ext)) return "TXT";
+    if (["csv", "tsv", "xls", "xlsx"].includes(ext)) return "DATA";
+    if (["png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff", "heic"].includes(ext)) return "IMG";
+    return kind === "doc" ? "FILE" : "FILE";
+  };
+
+  const getBriefAttachmentIcon = (kind: "doc" | "image", id: string) => {
+    if (kind === "image") return "IMG";
+    const doc = documents.find((item: any) => item.filename === id);
+    return getFileTypeBadge(doc?.filename || id, kind);
+  };
 
   const createBriefChipElement = (token: string) => {
     const parsed = parseBriefAttachmentToken(token);
@@ -3046,7 +3712,7 @@ function App() {
     chip.draggable = true;
     chip.dataset.briefToken = token;
     chip.innerHTML =
-      `<span class="pg-brief-inline-icon">${getBriefAttachmentIcon(parsed.kind)}</span>` +
+      `<span class="pg-brief-inline-icon">${getBriefAttachmentIcon(parsed.kind, parsed.id)}</span>` +
       `<span class="pg-brief-inline-name">${escapeHtml(getBriefAttachmentLabel(parsed.kind, parsed.id))}</span>` +
       `<button type="button" class="pg-brief-inline-remove" data-brief-remove="true" title="移除">X</button>`;
     return chip;
@@ -3061,7 +3727,7 @@ function App() {
       if (parsed) {
         html +=
           `<span class="pg-brief-inline-chip" contenteditable="false" draggable="true" data-brief-token="${escapeHtml(match)}">` +
-          `<span class="pg-brief-inline-icon">${getBriefAttachmentIcon(parsed.kind)}</span>` +
+          `<span class="pg-brief-inline-icon">${getBriefAttachmentIcon(parsed.kind, parsed.id)}</span>` +
           `<span class="pg-brief-inline-name">${escapeHtml(getBriefAttachmentLabel(parsed.kind, parsed.id))}</span>` +
           `<button type="button" class="pg-brief-inline-remove" data-brief-remove="true" title="移除">X</button>` +
           `</span>`;
@@ -3331,63 +3997,27 @@ function App() {
     isConfirmingRef.current = true;
     setConfirmingProjectId(projectId);
     abortActiveChat(true); // 停止当前 agent 的流，避免切换到视觉总监后状态错乱
-    setChatLoading(true);
 
     try {
-      // 保存当前内容快照用于软锁定检测
-      const currentSlides = await fetchSlides(projectId);
+      // 保存当前内容快照用于软锁定检测，同时读取视觉阶段需要展示的素材。
+      const [currentSlides, freshReferenceImages] = await Promise.all([
+        fetchSlides(projectId),
+        fetchReferenceImages(projectId),
+      ]);
       if (selectedProjectIdRef.current === projectId) {
         setContentPlanSnapshot(currentSlides);
         softLockWarnedRef.current = false;
-      }
-
-      // 内容总监：获取参考图推荐列表
-      let suggestions: any[] = [];
-      try {
-        const suggestRes = await suggestReferenceImages(projectId);
-        suggestions = suggestRes.suggestions || [];
-      } catch (e) {
-        console.warn("获取参考图推荐失败", e);
-      }
-      if (suggestions.length > 0) {
-        const suggestionText =
-          "📋 内容总监参考图建议\n\n" +
-          suggestions
-            .map(
-              (s: any) =>
-                `**第${s.page_num}页**（${s.type}）：${s.reason}\n建议处理模式：**${
-                  s.recommended_mode === "blend"
-                    ? "融合"
-                    : s.recommended_mode === "crop"
-                    ? "裁切"
-                    : "原图"
-                }**`
-            )
-            .join("\n\n") +
-          "\n\n你可以在单页编辑里点击「+ 本页参考图」上传只影响当前页的图片。";
-        updateProjectChatMessages(projectId, "content", (prev) => [
-          ...prev,
-          {
-            role: "agent",
-            content: suggestionText,
-            agentRole: "content",
-          },
-        ]);
-      }
-
-      // 检查是否已有设计素材：必须从当前项目实时读取，避免切项目后沿用上个项目素材。
-      const freshReferenceImages = await fetchReferenceImages(projectId);
-      if (selectedProjectIdRef.current === projectId) {
         setReferenceImages(freshReferenceImages || []);
       }
+
       const hasAssets = (freshReferenceImages || []).length > 0;
-      const logoAssets = (freshReferenceImages || []).filter((r: any) => r.role === "logo");
+      const logoAssets = (freshReferenceImages || []).filter(isConfirmedLogoRef);
       const styleRefAssets = (freshReferenceImages || []).filter((r: any) => r.role === "style_ref");
       const templateAsset = (freshReferenceImages || []).find((r: any) => r.role === "template");
       const visualAssetAssets = (freshReferenceImages || []).filter((r: any) => r.role === "visual_asset");
       const assetDesc = [
         logoAssets.length ? `${logoAssets.length}个品牌 Logo` : "",
-        visualAssetAssets.length > 0 ? `${visualAssetAssets.length}个核心资产` : "",
+        visualAssetAssets.length > 0 ? `${visualAssetAssets.length}个可复用素材` : "",
         styleRefAssets.length > 0 ? `${styleRefAssets.length}张风格参考` : "",
         templateAsset ? "版式模板" : "",
       ].filter(Boolean).join("、");
@@ -3407,11 +4037,22 @@ function App() {
       }
       appendProjectChatMessage(projectId, "content", { role: "system", content: `用户确认了内容规划，共 ${currentSlides.length} 页` });
       appendProjectChatMessage(projectId, "visual", { role: "system", content: `用户确认了内容规划，共 ${currentSlides.length} 页` });
+      const crossStageContext = buildCrossStageContext("visual");
+      if (crossStageContext) {
+        appendProjectChatMessage(projectId, "visual", {
+          role: "system",
+          content: crossStageContext,
+          agentRole: "visual",
+        });
+      }
 
       // 固定开场白：询问用户是否有素材，等待用户确认后再生成
+      const handoffNote = crossStageContext
+        ? "\n\n我也会把内容阶段你提过的补充要求带入后续视觉方案和画面 Prompt。"
+        : "";
       const directorMsg = hasAssets
-        ? `我是视觉总监。已收到你上传的设计素材（${assetDesc}）。\n\n👉 如果你还想补充素材，请继续上传；如果已经齐了，点击下方「开始生成」按钮，我会立即基于这些素材制定风格方案。`
-        : "我是视觉总监。你可以按参考强度从高到低上传素材：品牌 Logo、核心资产、风格参考、版式模板。\n\n👉 Logo 默认作为预览/PPTX 角标叠加；核心资产会按页面内容进入生成；风格参考只学习视觉气质；版式模板只参考页面结构。没有素材也可以直接生成。";
+        ? `我是视觉总监。已收到你上传的设计素材（${assetDesc}）。${handoffNote}\n\n👉 如果你还想补充素材，请继续上传；如果已经齐了，点击下方「开始生成」按钮，我会立即基于这些素材制定风格方案。`
+        : `我是视觉总监。你可以按参考强度从高到低上传素材：品牌 Logo、可复用素材、风格参考、版式模板。${handoffNote}\n\n👉 Logo 默认作为预览/PPTX 角标叠加；可复用素材会按页面内容进入生成；风格参考只学习视觉气质；版式模板只参考页面结构。没有素材也可以直接生成。`;
       updateProjectChatMessages(projectId, "visual", (prev) => [
         ...prev,
         {
@@ -3420,6 +4061,28 @@ function App() {
           agentRole: "visual",
         },
       ]);
+
+      // 参考图建议需要一次 LLM 判断，但不应该挡在内容到视觉的切换路上。
+      // 后台补充到视觉阶段消息即可，用户可以先继续上传素材或生成视觉方向。
+      void suggestReferenceImages(projectId)
+        .then((suggestRes) => {
+          const suggestions = suggestRes?.suggestions || [];
+          if (!suggestions.length || selectedProjectIdRef.current !== projectId) return;
+          const suggestionText =
+            "页面参考图建议\n\n" +
+            suggestions
+              .map((s: any) => `第 ${s.page_num} 页（${s.type}）：${s.reason}`)
+              .join("\n\n") +
+            "\n\n如果某页需要指定图片，可以在单页编辑里添加本页参考图；如果图片必须完整保留，请在项目素材里打开「原样出现」。";
+          appendProjectChatMessage(projectId, "visual", {
+            role: "agent",
+            content: suggestionText,
+            agentRole: "visual",
+          });
+        })
+        .catch((e) => {
+          console.warn("获取参考图推荐失败", e);
+        });
     } catch (err: any) {
       console.error("[ConfirmContentPlan] error:", err);
       showToast("视觉总监介入失败，请重试", "error");
@@ -3436,9 +4099,6 @@ function App() {
       ]);
     } finally {
       setConfirmingProjectId(null);
-      if (selectedProjectIdRef.current === projectId) {
-        setChatLoading(false);
-      }
       isConfirmingRef.current = false;
     }
   };
@@ -3586,6 +4246,8 @@ function App() {
         const freshSlides = await fetchSlides(selectedProject.id);
         const freshSlide = freshSlides.find((s: Slide) => s.id === targetSlide.id);
         if (freshSlide && selectedProjectIdRef.current === requestProjectId) {
+          slidesCacheRef.current[selectedProject.id] = freshSlides;
+          setSlidesProjectId(selectedProject.id);
           setSlides(freshSlides);
           if (editingSlide?.id === targetSlide.id) setEditingSlide(freshSlide);
         }
@@ -3691,7 +4353,7 @@ function App() {
             content_json: editingSlide.content_json,
             visual_json: editingSlide.visual_json,
             prompt_text: editingSlide.prompt_text,
-            reference_images: editingSlide.reference_images || [],
+            reference_images: dedupeReferenceImages(editingSlide.reference_images || []),
             pending_state: staleMap[editingSlide.id] || null,
           },
           other_pages: otherPages,
@@ -3720,11 +4382,15 @@ function App() {
       if (pendingChatRef.current) {
         pendingChatRef.current.pageContext = pageContext;
       }
+      const effectivePageContext = withCrossStageContext(pageContext, requestAgentRole);
+      if (pendingChatRef.current) {
+        pendingChatRef.current.pageContext = effectivePageContext;
+      }
 
       // 用于标记是否因可重试的流中断而跳出循环
       let streamRetryReason: string | null = null;
 
-      for await (const event of chatWithAgentStream(requestProjectId, userMsg, history, ctrl.signal, pageContext, requestAgentRole)) {
+      for await (const event of chatWithAgentStream(requestProjectId, userMsg, history, ctrl.signal, effectivePageContext, requestAgentRole)) {
         if (event.type === "thinking") {
           if (isRequestVisible()) {
             setThinkingContent((prev) => prev + event.delta);
@@ -3778,7 +4444,7 @@ function App() {
         const retryCtrl = new AbortController();
         abortRef.current = retryCtrl;
         try {
-          for await (const event of chatWithAgentStream(requestProjectId, userMsg, history, retryCtrl.signal, pageContext, requestAgentRole)) {
+          for await (const event of chatWithAgentStream(requestProjectId, userMsg, history, retryCtrl.signal, effectivePageContext, requestAgentRole)) {
             if (event.type === "result") {
               result = event.data;
             } else if (event.type === "content") {
@@ -3885,7 +4551,7 @@ function App() {
 
       // Agent 在聊天中确认风格，自动保存并推进
       if (result.action === "confirm_style" && result.style) {
-        await dispatchGateAction("confirm_style", { style: result.style });
+        await dispatchGateAction("confirm_style", { style: result.style }, { allowWhileChatLoading: true, source: "agent" });
       }
 
       // Agent 要求重新生成指定页
@@ -3933,6 +4599,14 @@ function App() {
           appendRequestMessage({
             role: "agent",
             content: `已为第 ${pageNums.join(", ")} 页再生成一版画面方案。请检查后再决定是否生成图片。`,
+              agentRole: "visual",
+            });
+        } else {
+          appendRequestMessage({
+            role: "agent",
+            content: pageNums.length
+              ? `没有找到第 ${pageNums.join(", ")} 页，未生成新的画面方案。请先确认页码。`
+              : "请先选择要重做画面方案的页面。",
             agentRole: "visual",
           });
         }
@@ -3970,6 +4644,12 @@ function App() {
               agentRole: "visual",
             });
           }
+        } else {
+          appendRequestMessage({
+            role: "agent",
+            content: `没有找到第 ${pageNum || "?"} 页，未应用视觉修改。请先确认页码。`,
+            agentRole: "visual",
+          });
         }
       }
 
@@ -4006,6 +4686,15 @@ function App() {
         if (updatedSlideIds.length > 0) {
           await handleUpdateStaleSlides(updatedSlideIds, { local: true });
           appendRequestMessage({ role: "agent", content: `已更新第 ${updatedPageNums.join(", ")} 页的画面描述。图片不会自动重生成，请检查后再手动确认生成。`, agentRole: "visual" });
+        } else {
+          appendRequestMessage({
+            role: "agent",
+            content: skipped.length > 0
+              ? `没有找到第 ${skipped.join(", ")} 页，未应用视觉修改。请先确认页码。`
+              : "没有可应用的视觉修改，页面未变化。",
+            agentRole: "visual",
+          });
+          return;
         }
         let msg = `✅ 已更新第 ${updatedPageNums.join(", ")} 页的视觉描述。`;
         if (skipped.length > 0) msg += `（跳过不存在的页：${skipped.join(", ")}）`;
@@ -4032,7 +4721,12 @@ function App() {
 
       // 内容总监识别到内容已确认，自动转接视觉总监
       if (result.action === "forward_to_visual" && currentAgentRole === "content") {
-        await dispatchGateAction("switch_to_visual");
+        appendRequestMessage({
+          role: "agent",
+          content: "收到，正在请视觉总监介入。",
+          agentRole: "content",
+        });
+        await dispatchGateAction("switch_to_visual", undefined, { allowWhileChatLoading: true, source: "agent" });
         return;
       }
 
@@ -4057,30 +4751,56 @@ function App() {
             agentRole: "visual",
           });
         } else {
-          await dispatchGateAction("generate_content_plan", { topic: result.topic, page_count: result.page_count });
+          appendRequestMessage({
+            role: "agent",
+            content: result.page_count
+              ? `收到，正在按 ${result.page_count} 页重新生成内容规划。`
+              : "收到，正在把这条反馈落实到内容规划里重新生成。",
+            agentRole: "content",
+          });
+          await dispatchGateAction(
+            "generate_content_plan",
+            { topic: result.topic, page_count: result.page_count },
+            { allowWhileChatLoading: true, source: "agent" }
+          );
         }
       }
 
-	      // 视觉总监确认素材状态，触发风格提案生成
-	      if ((result.action === "propose_styles" || result.action === "adjust_style") && currentAgentRole === "visual" && selectedProject) {
-	        const latestGateContext = gateContextRef.current || gateContext;
-	        if (!latestGateContext.allowedActions.includes("generate_style_proposals")) {
+      // 视觉总监确认素材状态，触发风格提案生成；已进入后续阶段时，风格调整必须仍然落成可确认卡片。
+      if ((result.action === "propose_styles" || result.action === "adjust_style") && currentAgentRole === "visual" && selectedProject) {
+        const latestGateContext = gateContextRef.current || gateContext;
+        const isAdjust = result.action === "adjust_style";
+        const canStartBackendStyleProposal = latestGateContext.allowedActions.includes("generate_style_proposals");
+        const fallbackBaseStyle =
+          selectedProject.selected_style ||
+          selectedProject.style_proposal?.proposals?.[0] ||
+          styleProposalsInChat[0] ||
+          null;
+        const proposalFromAgent = result.style_proposal && typeof result.style_proposal === "object"
+          ? result.style_proposal
+          : null;
+        const fallbackProposal = !proposalFromAgent && fallbackBaseStyle
+          ? buildFallbackStyleAdjustment(fallbackBaseStyle, userMsg, result.response || "")
+          : null;
+        const proposalToShow = proposalFromAgent || fallbackProposal;
+
+        if (!proposalToShow && !canStartBackendStyleProposal) {
           appendRequestMessage({
             role: "agent",
-            content: "这是一条回退前的风格建议，当前步骤已经不适合重新生成风格提案。",
+            content: "我理解你的风格调整方向，但当前步骤没有拿到可选择的新风格卡片。请再发一次具体方向，例如「更强科技感、深色底、去掉低幼感」，我会生成可确认的调整后方案。",
             agentRole: "visual",
           });
           return;
         }
-        const isAdjust = result.action === "adjust_style";
-        // 优先使用 Agent 聊天返回的实时风格提案（与聊天建议保持一致）
-        if (result.style_proposal && typeof result.style_proposal === "object") {
-          const proposal = result.style_proposal;
+
+        // 优先使用 Agent 聊天返回的实时风格提案；若缺少结构化结果，则用当前风格生成一个可确认的调整卡片。
+        if (proposalToShow) {
+          const proposal = proposalToShow;
           // 标准化 palette 格式
           if (proposal.palette && Array.isArray(proposal.palette)) {
             proposal.palette = proposal.palette.map((c: any) => {
               if (!c) return { name: "未知", hex: "#cccccc", role: "" };
-              if (typeof c === "string") return { name: c, hex: c, role: "" };
+              if (typeof c === "string") return { name: stripHexCodes(c) || c, hex: proposalColorValue(c), role: "" };
               return c;
             });
           }
@@ -4092,8 +4812,8 @@ function App() {
             {
               role: "agent",
               content: isAdjust
-                ? "✅ 已根据你的反馈调整了方案，请查看下方新卡片。\n\n👉 满意请点「选择此方案」，不满意继续告诉我哪里要再改。"
-                : "✅ 风格提案已生成，请查看下方卡片。\n\n👉 如果满意请点击「选择此方案」；如果想调整，直接告诉我（如「更商务一点」「配色再暖一些」）。",
+                ? "✅ 已根据你的反馈生成调整后方案，请查看本条消息下方卡片。\n\n👉 满意请点「选择此方案」，我会保存新风格并重新生成画面描述；不满意继续告诉我哪里要再改。"
+                : "✅ 风格提案已生成，请查看本条消息下方卡片。\n\n👉 如果满意请点击「选择此方案」；如果想调整，直接告诉我（如「更商务一点」「配色再暖一些」）。",
               agentRole: "visual",
               hasStyleProposal: true,
               styleProposals: [proposal],
@@ -4110,6 +4830,7 @@ function App() {
             ...prev,
             { role: "agent", content: "⏳ 正在生成风格提案，请稍候...", agentRole: "visual", loading: true, id: styleLoadingId },
           ]);
+          let styleRunId: string | null = null;
           try {
             const freshReferenceImages = await fetchReferenceImages(requestProjectId);
             if (!isRequestCurrentGate()) {
@@ -4117,6 +4838,17 @@ function App() {
               return;
             }
             const styleResult = await generateStyleProposals(requestProjectId, freshReferenceImages.length > 0);
+            styleRunId = styleResult?.run?.id || null;
+            if (styleRunId) {
+              locallyHandledRunIdsRef.current.add(styleRunId);
+              updateProjectChatMessages(requestProjectId, "visual", (prev) =>
+                prev.map((m) =>
+                  m.id === styleLoadingId
+                    ? { ...m, runId: styleRunId || undefined, content: runProgressText(styleResult.run) }
+                    : m
+                )
+              );
+            }
             if (!isRequestCurrentGate()) {
               pendingChatRef.current = null;
               return;
@@ -4132,13 +4864,13 @@ function App() {
               showToast("风格提案已就绪", "success");
             }
             await loadProjects();
-            const fresh = await fetchProjects();
+            const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
             if (!isRequestCurrentGate()) {
               pendingChatRef.current = null;
               return;
             }
             const updated = fresh.find((p: Project) => p.id === requestProjectId);
-            if (updated && selectedProjectIdRef.current === requestProjectId) setSelectedProject(updated);
+            if (updated && selectedProjectIdRef.current === requestProjectId) setSelectedProject(clearProjectNotification(updated));
             // 尝试从项目状态中提取风格提案，确保聊天卡片能正确展示
             const proposals = updated?.style_proposal?.proposals || [];
             if (proposals.length > 0) {
@@ -4171,16 +4903,20 @@ function App() {
               ]);
             }
           } catch (err: any) {
+            if (styleRunId) {
+              locallyHandledRunIdsRef.current.delete(styleRunId);
+            }
             if (!isRequestCurrentGate()) {
               pendingChatRef.current = null;
               return;
             }
-            showToast("风格提案生成失败：" + (err.message || "未知错误"), "error");
+            const errorMessage = userFacingGenerationError(err.message);
+            showToast("风格提案生成失败：" + errorMessage, "error");
             updateProjectChatMessages(requestProjectId, "visual", (prev) => [
               ...prev.filter((m) => m.id !== styleLoadingId),
               {
                 role: "agent",
-                content: "❌ 风格提案生成失败：" + (err.message || "未知错误") + "\n\n👉 请重试生成，或告诉我你想要的风格方向，我可以直接帮你选择。",
+                content: "❌ 风格提案生成失败：" + errorMessage + "\n\n👉 请重试生成，或告诉我你想要的风格方向，我可以直接帮你选择。",
                 agentRole: "visual",
               },
             ]);
@@ -4205,6 +4941,9 @@ function App() {
             pageNum = editingSlide.page_num;
             result.updated_content.page_num = pageNum;
           }
+          if (!slides.some((s) => s.page_num === pageNum)) {
+            throw new Error(`没有找到第 ${pageNum || "?"} 页，未应用内容修改`);
+          }
           await updateSlideContent(selectedProject.id, pageNum, result.updated_content);
           const changedSlide = slides.find((s) => s.page_num === pageNum);
           if (changedSlide) markSlideStale(changedSlide.id, "content");
@@ -4228,7 +4967,7 @@ function App() {
               ...prev,
               {
                 role: "agent",
-                content: `📝 第 ${pageNum} 页内容已更新，视觉方案可能需要调整。请进入「视觉总监」阶段重新设计画面后再生成图片。`,
+                content: `📝 第 ${pageNum} 页内容已更新，视觉方案可能需要调整。请切到「视觉总监」重新设计画面后再生成图片。`,
               },
             ]);
           }
@@ -4276,15 +5015,20 @@ function App() {
             }
           }
           let msg = `✅ 已更新第 ${updatedPageNums.join(", ")} 页内容。`;
+          if (updatedPageNums.length === 0) {
+            msg = "没有找到可更新的页面，内容未变化。";
+          }
           if (skipped.length > 0) {
             msg += `\n⚠️ 跳过不存在的页面：第 ${skipped.join(", ")} 页（项目当前共 ${slides.length} 页）。`;
           }
           setActiveChatMessages((prev) => [...prev, { role: "agent", content: msg }]);
           // 内容更新后，标记相关页面需要重新设计视觉方案，但不自动触发图片生成
-          setActiveChatMessages((prev) => [
-            ...prev,
-            { role: "agent", content: `📝 内容已更新，相关页面的视觉方案可能需要调整。请确认内容后，进入「视觉总监」阶段重新设计画面，再生成图片。` },
-          ]);
+          if (updatedPageNums.length > 0) {
+            setActiveChatMessages((prev) => [
+              ...prev,
+              { role: "agent", content: `📝 内容已更新，相关页面的视觉方案可能需要调整。请确认内容后，切到「视觉总监」重新设计画面，再生成图片。` },
+            ]);
+          }
         } catch (err: any) {
           setActiveChatMessages((prev) => [
             ...prev,
@@ -4409,120 +5153,163 @@ function App() {
 
   const dispatchGateAction = async (
     action: GateActionKey,
-    payload?: { topic?: string; page_count?: number; page_nums?: number[]; style?: StyleProposal | any }
-  ) => {
-    if (!selectedProject || isBusy || chatLoading) return;
+    payload?: GateActionPayload,
+    options: { allowWhileChatLoading?: boolean; source?: "button" | "agent" } = {}
+  ): Promise<GateActionResult> => {
+    const currentProject = selectedProject;
+    const actionRole = currentAgentRoleRef.current === "visual" ? "visual" : "content";
+    const reportBlockedAction = (
+      message: string,
+      reason: GateActionResult["reason"] = "not_ready",
+      toastType: ToastItem["type"] = "info"
+    ): GateActionResult => {
+      if (currentProject && options.source === "agent") {
+        appendProjectChatMessage(currentProject.id, actionRole, {
+          role: "agent",
+          content: message,
+          agentRole: actionRole,
+        });
+      } else {
+        showToast(message, toastType);
+      }
+      return { ok: false, reason, message };
+    };
+
+    if (!currentProject) {
+      return reportBlockedAction("请先选择项目。", "missing_project", "info");
+    }
+    if (isBusy) {
+      return reportBlockedAction("当前已有任务在执行中，请等待状态更新完成后再继续。", "busy", "info");
+    }
+    if (chatLoading && !options.allowWhileChatLoading) {
+      return reportBlockedAction("正在处理上一条消息，请稍候。", "chat_loading", "info");
+    }
     const latestGateContext = gateContextRef.current || gateContext;
     const pageNums = (payload?.page_nums || []).filter((n) => Number.isFinite(Number(n))).map(Number);
     if (!latestGateContext.allowedActions.includes(action)) {
-      showToast("当前步骤不能执行这个动作，可能是回退前的旧建议", "info");
-      return;
+      return reportBlockedAction("这个操作不适用于当前页面状态。请使用页面上可用的按钮继续，或刷新后重试。", "stale_gate", "info");
     }
-    if (action === "start_prototype" || action === "start_generation") {
-      const targetSlides = action === "start_prototype"
-        ? getPrototypeTargetSlides(pageNums)
-        : getFullGenerationTargetSlides(pageNums);
-      if (targetSlides.length === 0) {
-        showToast("请先生成页面内容", "info");
-        return;
+    try {
+      if (action === "start_prototype" || action === "start_generation") {
+        const targetSlides = action === "start_prototype"
+          ? getPrototypeTargetSlides(pageNums)
+          : getFullGenerationTargetSlides(pageNums);
+        if (targetSlides.length === 0) {
+          return reportBlockedAction("请先生成页面内容。", "not_ready", "info");
+        }
+        const missingPromptPages = targetSlides
+          .filter((slide) => !slideHasPrompt(slide))
+          .map((slide) => slide.page_num);
+        if (missingPromptPages.length > 0) {
+          return reportBlockedAction(`第 ${missingPromptPages.join(", ")} 页还没有生图 Prompt，请先生成画面方案。`, "not_ready", "info");
+        }
       }
-      const missingPromptPages = targetSlides
-        .filter((slide) => !slideHasPrompt(slide))
-        .map((slide) => slide.page_num);
-      if (missingPromptPages.length > 0) {
-        showToast(`第 ${missingPromptPages.join(", ")} 页还没有生图 Prompt，请先生成画面方案`, "info");
-        return;
-      }
-    }
 
-    switch (action) {
-      case "send_brief":
-        await handleSendChat();
-        return;
-      case "generate_content_plan": {
-        const userBrief = payload?.topic || serializeBriefInputForPlan(chatInput.trim());
-        const topic = [userBrief, briefAttachmentSummary ? `【用户上传材料】\n${briefAttachmentSummary}` : ""]
-          .filter(Boolean)
-          .join("\n\n");
-        if (!topic) {
-          showToast("请先输入 PPT 主题或 Brief", "info");
-          briefEditorRef.current?.focus();
-          return;
+      switch (action) {
+        case "send_brief":
+          await handleSendChat();
+          return { ok: true };
+        case "generate_content_plan": {
+          const userBrief = payload?.topic || serializeBriefInputForPlan(chatInput.trim());
+          const topic = [userBrief, briefAttachmentSummary ? `【用户上传材料】\n${briefAttachmentSummary}` : ""]
+            .filter(Boolean)
+            .join("\n\n");
+          if (!topic) {
+            briefEditorRef.current?.focus();
+            return reportBlockedAction("请先输入 PPT 主题或 Brief。", "invalid_input", "info");
+          }
+          const submittedLabel = payload?.topic ? "确认建议，开始生成内容规划" : "已提交 Brief，开始生成内容规划";
+          const submittedDetails = [userBrief, briefAttachmentSummary ? `已上传材料：\n${briefAttachmentSummary}` : ""]
+            .filter(Boolean)
+            .join("\n\n");
+          return await startContentPlanPoll(currentProject.id, topic, options.source || "button", payload?.page_count, {
+            onStarted: clearBriefComposerState,
+            submittedLabel,
+            submittedContent: [submittedLabel, submittedDetails].filter(Boolean).join("\n\n"),
+          });
         }
-        await startContentPlanPoll(selectedProject.id, topic, "button", payload?.page_count, {
-          onStarted: clearBriefComposerState,
-          submittedLabel: payload?.topic ? "确认建议，开始生成内容规划" : "已提交 Brief，开始生成内容规划",
-        });
-        return;
-      }
-      case "confirm_content":
-      case "switch_to_visual":
-        if (!contentPlanConfirmed && slides.length > 0) {
-          await handleConfirmContentPlan();
-        } else {
-          setCurrentAgentRole("visual");
-          ensureVisualGreetingIfNeeded();
+        case "confirm_content":
+        case "switch_to_visual":
+          if (!contentPlanConfirmed && slides.length > 0) {
+            await handleConfirmContentPlan();
+          } else {
+            setCurrentAgentRole("visual");
+            ensureVisualGreetingIfNeeded();
+          }
+          return { ok: true };
+        case "switch_to_content":
+          setCurrentAgentRole("content");
+          return { ok: true };
+        case "generate_style_proposals": {
+          if (currentAgentRole !== "visual") {
+            setCurrentAgentRole("visual");
+          }
+          const fakeUserMsg = styleProposalsInChat.length > 0
+            ? "请基于当前最新的素材和我们之前的讨论，重新给我一套风格提案。"
+            : "请基于我已上传的素材帮我生成风格提案。";
+          handleSendChat(fakeUserMsg);
+          return { ok: true };
         }
-        return;
-      case "switch_to_content":
-        setCurrentAgentRole("content");
-        return;
-      case "generate_style_proposals": {
-        if (currentAgentRole !== "visual") {
-          setCurrentAgentRole("visual");
+        case "confirm_style":
+          if (!payload?.style) {
+            return reportBlockedAction("请先选择一套风格方案。", "invalid_input", "info");
+          }
+          await handleSelectStyle(payload.style);
+          return { ok: true };
+        case "generate_visual_prompts":
+          await handleGeneratePrompts(false);
+          return { ok: true };
+        case "start_prototype": {
+          const prototypePageNums = getPrototypeTargetSlides(pageNums).map((slide) => slide.page_num);
+          setSelectedPages(new Set(prototypePageNums));
+          setPrototypeSelectionTouched(true);
+          await handleStartGeneration(true, true, prototypePageNums);
+          return { ok: true };
         }
-        const fakeUserMsg = styleProposalsInChat.length > 0
-          ? "请基于当前最新的素材和我们之前的讨论，重新给我一套风格提案。"
-          : "请基于我已上传的素材帮我生成风格提案。";
-        handleSendChat(fakeUserMsg);
-        return;
-      }
-      case "confirm_style":
-        if (!payload?.style) {
-          showToast("请先选择一套风格方案", "info");
-          return;
+        case "resample_prototype": {
+          const prototypePageNums = getPrototypeResampleTargetSlides(pageNums).map((slide) => slide.page_num);
+          setSelectedPages(new Set(prototypePageNums));
+          setPrototypeSelectionTouched(true);
+          await handleStartGeneration(true, true, prototypePageNums);
+          return { ok: true };
         }
-        await handleSelectStyle(payload.style);
-        return;
-      case "generate_visual_prompts":
-        await handleGeneratePrompts(false);
-        return;
-      case "start_prototype": {
-        const prototypePageNums = getPrototypeTargetSlides(pageNums).map((slide) => slide.page_num);
-        await handleStartGeneration(true, true, prototypePageNums);
-        return;
+        case "confirm_prototype":
+          await handleConfirmPrototype();
+          return { ok: true };
+        case "start_generation":
+          await handleStartGeneration(pageNums.length > 0, false, pageNums.length > 0 ? pageNums : undefined);
+          return { ok: true };
+        case "retry_failed":
+          await handleRetryAllFailed();
+          return { ok: true };
+        case "templates":
+          setShowTemplateRecommender(true);
+          return { ok: true };
+        case "download":
+          window.location.href = getDownloadUrl(currentProject.id);
+          return { ok: true };
+        default: {
+          const exhaustive: never = action;
+          console.warn("Unhandled gate action", exhaustive);
+          return reportBlockedAction("这个动作暂时还不能自动执行。", "not_ready", "info");
+        }
       }
-      case "resample_prototype": {
-        const prototypePageNums = getPrototypeResampleTargetSlides(pageNums).map((slide) => slide.page_num);
-        await handleStartGeneration(true, true, prototypePageNums);
-        return;
-      }
-      case "confirm_prototype":
-        await handleConfirmPrototype();
-        return;
-      case "start_generation":
-        await handleStartGeneration(pageNums.length > 0, false, pageNums.length > 0 ? pageNums : undefined);
-        return;
-      case "retry_failed":
-        await handleRetryAllFailed();
-        return;
-      case "templates":
-        setShowTemplateRecommender(true);
-        return;
-      case "download":
-        window.location.href = getDownloadUrl(selectedProject.id);
-        return;
-      default: {
-        const exhaustive: never = action;
-        console.warn("Unhandled gate action", exhaustive);
-      }
+    } catch (err: any) {
+      return reportBlockedAction("动作执行失败：" + (err.message || "未知错误"), "failed", "error");
     }
   };
 
   const handleAgentNextAction = async (nextAction: AgentNextAction, sourceMessage?: ChatMessage) => {
-    if (!selectedProject || isBusy || chatLoading) return;
+    if (!selectedProject) {
+      showToast("请先选择项目。", "info");
+      return;
+    }
+    if (isBusy || chatLoading) {
+      showToast("当前还有任务或消息在处理中，请等待状态更新完成后再继续。", "info");
+      return;
+    }
     if (sourceMessage && !isMessageFromCurrentGate(sourceMessage)) {
-      showToast("这是回退前的建议，已失效", "info");
+      showToast("这条操作不适用于当前页面状态，请使用页面上可用的按钮继续。", "info");
       return;
     }
     if (nextAction.confirm) {
@@ -4560,11 +5347,17 @@ function App() {
       case "start_prototype":
         await dispatchGateAction("start_prototype", { page_nums: pageNums });
         return;
+      case "confirm_prototype":
+        await dispatchGateAction("confirm_prototype");
+        return;
       case "start_generation":
         await dispatchGateAction("start_generation");
         return;
       case "retry_failed":
         await dispatchGateAction("retry_failed");
+        return;
+      case "download":
+        await dispatchGateAction("download");
         return;
       default: {
         const exhaustive: never = nextAction.type;
@@ -4660,7 +5453,7 @@ function App() {
     ending: "bg-gray-100 text-gray-700",
     section: "bg-pink-100 text-pink-700",
   };
-  const projectLogo = referenceImages.find((r: any) => r.role === "logo");
+  const projectLogo = referenceImages.find(isConfirmedLogoRef);
   const styleDockProposals: StyleProposal[] =
     styleProposalsInChat.length > 0
       ? styleProposalsInChat
@@ -4691,6 +5484,37 @@ function App() {
   };
 
   const currentStatus = selectedProject?.status || "draft";
+  const slidesMissingPromptCount = slides.filter((slide) => !slideHasPrompt(slide)).length;
+  const normalizePageNums = (pageNums?: number[] | null) =>
+    Array.isArray(pageNums)
+      ? Array.from(new Set(pageNums.map(Number).filter((n) => Number.isFinite(n)))).sort((a, b) => a - b)
+      : [];
+  const defaultPrototypePageNums = defaultPrototypePageNumsForSlides(slides);
+  const selectedPrototypePageNums = prototypeSelectionTouched ? normalizePageNums(Array.from(selectedPages)) : defaultPrototypePageNums;
+  const activeRunTargetPageNums = normalizePageNums(
+    activeRun?.target_page_nums ||
+      currentProjectStatus?.target_page_nums ||
+      currentProjectStatus?.progress?.target_page_nums ||
+      null
+  );
+  const isPrototypeRunActive = Boolean(hasActiveRun && activeRun?.kind === "prototype_generation");
+  const visiblePrototypePageNums =
+    isPrototypeRunActive && activeRunTargetPageNums.length > 0
+      ? activeRunTargetPageNums
+      : selectedPrototypePageNums;
+  const visiblePrototypePageSet = new Set(visiblePrototypePageNums);
+  const formatPrototypePages = (pageNums: number[]) =>
+    pageNums.length > 0 ? `第 ${pageNums.join("、")} 页，共 ${pageNums.length} 页` : "未选择打样页";
+  const prototypeSelectionSummary = formatPrototypePages(visiblePrototypePageNums);
+  const canEditPrototypeSelection =
+    (currentStatus === "prompt_ready" || currentStatus === "failed") && !isPrototypeRunActive && !isBusy && !chatLoading;
+  const shouldShowPrototypeSelection =
+    slides.length > 0 && (currentStatus === "prompt_ready" || currentStatus === "failed" || isPrototypeRunActive);
+  const slidesAreLoading = Boolean(
+    selectedProject &&
+    slidesProjectId !== selectedProject.id &&
+    (slidesLoadingProjectId === selectedProject.id || slidesProjectId === null)
+  );
   const workflowState = buildWorkflowState({
     projectStatus: currentStatus,
     slides,
@@ -4698,7 +5522,7 @@ function App() {
     contentPlanConfirmed,
     showPrototypePreview,
     hasSelectedStyle: Boolean(selectedProject?.selected_style),
-    selectedPageCount: selectedPages.size,
+    selectedPageCount: selectedPrototypePageNums.length,
     staleSummary: {
       hasContentOrVisualStale,
       imageStaleCount: imageStaleSlides.length,
@@ -4714,9 +5538,52 @@ function App() {
     ((hasActiveRun && activeRun?.kind === "content_plan") ||
       (operatingProjectId === selectedProject.id && currentStatus === "draft" && currentAgentRole === "content"))
   );
-  const showDraftAgentUpload = currentStatus === "draft" && !isContentPlanRunActive;
+  const showDraftAgentUpload = currentStatus === "draft" && !isContentPlanRunActive && !isBriefStudioActive;
   const showPendingDocumentAttachments = pendingAttachments.length > 0 && showDraftAgentUpload;
   const agentComposerValue = !isBriefStudioActive && chatInput.includes("[[PPTGOD_ATTACHMENT:") ? "" : chatInput;
+  const activeComposerDraftKey = useMemo(() => {
+    if (!selectedProject) return null;
+    if (isBriefStudioActive) return getBriefDraftStorageKey(selectedProject.id);
+    const targetSlideId = currentAgentRole === "finetune"
+      ? finetuneTargetSlideId || editingSlide?.id || null
+      : null;
+    return getAgentDraftStorageKey(selectedProject.id, currentAgentRole, targetSlideId);
+  }, [selectedProject?.id, isBriefStudioActive, currentAgentRole, finetuneTargetSlideId, editingSlide?.id]);
+
+  useEffect(() => {
+    chatInputValueRef.current = chatInput;
+    if (suspendComposerDraftPersistRef.current) {
+      suspendComposerDraftPersistRef.current = false;
+      return;
+    }
+    const key = activeComposerDraftKeyRef.current;
+    if (key) writeComposerDraft(key, chatInput);
+  }, [chatInput]);
+
+  useEffect(() => {
+    const previousKey = activeComposerDraftKeyRef.current;
+    if (previousKey && previousKey !== activeComposerDraftKey) {
+      writeComposerDraft(previousKey, chatInputValueRef.current);
+    }
+    activeComposerDraftKeyRef.current = activeComposerDraftKey;
+    const nextValue = activeComposerDraftKey ? readComposerDraft(activeComposerDraftKey) : "";
+    chatInputValueRef.current = nextValue;
+    setChatInput(nextValue);
+    if (isBriefStudioActive) {
+      requestAnimationFrame(() => syncBriefEditorValue(nextValue));
+    }
+  }, [activeComposerDraftKey, isBriefStudioActive]);
+
+  useEffect(() => {
+    const saveDraftBeforeHide = () => saveActiveComposerDraft();
+    window.addEventListener("pagehide", saveDraftBeforeHide);
+    document.addEventListener("visibilitychange", saveDraftBeforeHide);
+    return () => {
+      window.removeEventListener("pagehide", saveDraftBeforeHide);
+      document.removeEventListener("visibilitychange", saveDraftBeforeHide);
+    };
+  }, []);
+
   useEffect(() => {
     if (!isBriefStudioActive) return;
     if (briefEditorValueRef.current !== chatInput) {
@@ -4777,7 +5644,6 @@ function App() {
   const primaryActionKey = getPrimaryActionKey(workflowState);
   const secondaryActionKeys = getSecondaryActionKeys(workflowState);
   const hasContentConfirmCta = Boolean(selectedProject && slides.length > 0 && currentStatus === "planning" && !contentPlanConfirmed);
-  const hasStyleProposalCta = Boolean(selectedProject && contentPlanConfirmed && currentAgentRole === "visual" && !selectedProject?.selected_style);
   const withGateMeta = (message: ChatMessage): ChatMessage => {
     if (
       !message.nextAction &&
@@ -4805,9 +5671,8 @@ function App() {
   const shouldRenderMessageNextAction = (message: ChatMessage) => {
     const nextAction = message.nextAction;
     if (!nextAction) return false;
+    if (!isMessageFromCurrentGate(message)) return false;
     if (nextAction.type === "generate_content_plan" && message.positioning) return false;
-    if (nextAction.type === "switch_to_visual" && hasContentConfirmCta) return false;
-    if (nextAction.type === "generate_style_proposals" && hasStyleProposalCta) return false;
     if (nextAction.type === "start_prototype" && primaryActionKey === "start-prototype") return false;
     if (nextAction.type === "retry_failed" && secondaryActionKeys.includes("retry-failed")) return false;
     if (nextAction.type === "start_generation" && secondaryActionKeys.includes("generate-all")) return false;
@@ -4818,16 +5683,34 @@ function App() {
     if (!selectedProject) return null;
     if (["deck_visual", "deck_prototype", "deck_final"].includes(gateContext.mainStageMode)) return null;
     const actionKey = primaryActionKey;
+    if (actionKey === "generate-style-proposals") {
+      if (styleDockProposals.length > 0) return null;
+      return {
+        key: "generate-style-proposals",
+        label: isBusy ? "生成中..." : "生成视觉方向",
+        onClick: () => dispatchGateAction("generate_style_proposals"),
+        variant: "primary",
+        disabled: isBusy || chatLoading,
+      };
+    }
+    if (actionKey === "generate-visual-prompts") {
+      return {
+        key: "generate-visual-prompts",
+        label: isBusy ? "生成中..." : "生成画面方案",
+        onClick: () => dispatchGateAction("generate_visual_prompts"),
+        variant: "primary",
+        disabled: isBusy || chatLoading,
+      };
+    }
     if (actionKey === "start-prototype") {
-      const hasSelection = selectedPages.size > 0;
-      const defaultSampleCount = Math.min(3, slides.length || 0);
+      const prototypeActionCount = prototypePromptTargets.length;
       return {
         key: "prototype",
         label: isBusy
-          ? "启动中..."
-          : hasSelection
-          ? `打样已选 ${selectedPages.size} 页`
-          : `打样 ${defaultSampleCount} 页`,
+          ? "打样中..."
+          : prototypeActionCount > 0
+          ? `打样 ${prototypeActionCount} 页`
+          : "选择打样页",
         onClick: () => dispatchGateAction("start_prototype"),
         variant: "primary",
         disabled: isBusy || !canStartPrototypeGeneration,
@@ -4846,6 +5729,7 @@ function App() {
 
   const topSecondaryActions: UiAction[] = (() => {
     if (!selectedProject) return [];
+    const stageDockOwnsActions = ["deck_visual", "deck_prototype"].includes(gateContext.mainStageMode);
     const actionKeys = secondaryActionKeys;
     const actions: UiAction[] = [];
     if (actionKeys.includes("templates")) {
@@ -4856,7 +5740,7 @@ function App() {
         variant: "secondary",
       });
     }
-    if (actionKeys.includes("generate-all")) {
+    if (!stageDockOwnsActions && actionKeys.includes("generate-all")) {
       actions.push({
         key: "generate-all",
         label: "生成全部",
@@ -4865,7 +5749,7 @@ function App() {
         disabled: isBusy || !canStartFullGeneration,
       });
     }
-    if (actionKeys.includes("toggle-prototype-view")) {
+    if (!stageDockOwnsActions && actionKeys.includes("toggle-prototype-view")) {
       actions.push({
         key: "toggle-prototype-view",
         label: showPrototypePreview ? "返回全局预览" : "查看打样结果",
@@ -4874,7 +5758,7 @@ function App() {
         disabled: isBusy,
       });
     }
-    if (actionKeys.includes("resample")) {
+    if (!stageDockOwnsActions && actionKeys.includes("resample")) {
       actions.push({
         key: "resample",
         label: "重新打样",
@@ -4903,6 +5787,14 @@ function App() {
         disabled: isBusy || !canStartFullGeneration,
       });
     }
+    if (slides.length > 0) {
+      actions.push({
+        key: "export-md",
+        label: "导出 MD",
+        href: getContentPlanMarkdownUrl(selectedProject.id),
+        variant: "link",
+      });
+    }
     return actions;
   })();
 
@@ -4910,7 +5802,7 @@ function App() {
     const base = "pg-action text-sm px-3 py-1 rounded disabled:opacity-50 whitespace-nowrap";
     if (variant === "primary") return `${base} pg-action-primary bg-blue-600 text-white hover:bg-blue-700`;
     if (variant === "danger") return `${base} pg-action-danger bg-red-50 text-red-600 hover:bg-red-100 border border-red-100`;
-    if (variant === "link") return `${base} pg-action-link text-gray-500 hover:text-gray-700 underline px-1`;
+    if (variant === "link") return "text-sm px-1 py-1 text-slate-500 hover:text-slate-900 underline underline-offset-2 whitespace-nowrap";
     return `${base} pg-action-secondary bg-gray-100 text-gray-700 hover:bg-gray-200`;
   };
 
@@ -4934,6 +5826,245 @@ function App() {
     );
   };
 
+  const currentStageNudge: StageNudge | null = (() => {
+    if (!selectedProject || currentAgentRole === "finetune" || isBriefStudioActive) return null;
+    const actionDisabled = isBusy || chatLoading;
+    const visualTone: StageNudge["tone"] = "visual";
+    const contentTone: StageNudge["tone"] = "content";
+
+    if (hasActiveRun) {
+      return {
+        title: "当前任务正在处理",
+        body: workflowProgressText(currentProjectStatus || { active_run: activeRun }) || "请等待任务完成，完成后这里会更新下一步。",
+        role: activeRun?.kind === "content_plan" ? "content" : "visual",
+        tone: activeRun?.kind === "content_plan" ? contentTone : visualTone,
+      };
+    }
+
+    if (currentAgentRole === "visual" && hasContentOrVisualStale) {
+      const count = staleSlides.filter((x) => x.stale.content || x.stale.visual).length;
+      return {
+        title: "下一步：更新画面方案",
+        body: `${count} 页内容或画面描述变更，需要先更新画面方案，再重新生成图片。`,
+        role: "visual",
+        tone: "warning",
+        primary: {
+          key: "update-stale",
+          label: "更新画面方案",
+          onClick: () => handleUpdateStaleSlides(),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (currentAgentRole === "visual" && imageStaleSlides.length > 0) {
+      return {
+        title: "下一步：重新生成图片",
+        body: `${imageStaleSlides.length} 页图片已过期。确认画面方案后，重新生成这些页面即可。`,
+        role: "visual",
+        tone: "warning",
+        primary: {
+          key: "generate-stale-images",
+          label: "重新生成图片",
+          onClick: () => handleGenerateStaleImages(),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (!contentPlanConfirmed) {
+      if (slides.length > 0) {
+        return {
+          title: "下一步：确认内容",
+          body: `当前已有 ${slides.length} 页内容规划。检查页数、标题和顺序后，确认进入视觉阶段。`,
+          role: "content",
+          tone: contentTone,
+          primary: {
+            key: "confirm-content",
+            label: confirmingProjectId === selectedProject.id ? "正在介入..." : "确认内容，请视觉总监",
+            onClick: () => dispatchGateAction("confirm_content"),
+            variant: "primary",
+            disabled: actionDisabled || confirmingProjectId === selectedProject.id,
+          },
+        };
+      }
+      return currentAgentRole === "content"
+        ? {
+            title: "下一步：生成内容规划",
+            body: "先在输入框补充主题、材料和目标，再生成整份 PPT 的内容结构。",
+            role: "content",
+            tone: contentTone,
+          }
+        : null;
+    }
+
+    if (currentAgentRole === "content") {
+      return {
+        title: "下一步：进入视觉阶段",
+        body: "内容已确认。接下来由视觉总监生成整体方向、画面方案和打样页。",
+        role: "content",
+        tone: contentTone,
+        primary: {
+          key: "switch-visual",
+          label: "请视觉总监介入",
+          onClick: () => dispatchGateAction("switch_to_visual"),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (!selectedProject.selected_style) {
+      if (styleDockProposals.length > 0) {
+        return {
+          title: "下一步：选择视觉方向",
+          body: `已生成 ${styleDockProposals.length} 套方向。可以选择推荐方案，也可以在作品画布查看详情后选择其它方案。`,
+          role: "visual",
+          tone: visualTone,
+          primary: {
+            key: "choose-recommended-style",
+            label: "选择推荐方案",
+            onClick: () => dispatchGateAction("confirm_style", { style: styleDockProposals[0] }),
+            variant: "primary",
+            disabled: actionDisabled,
+          },
+          secondary: {
+            key: "regenerate-style",
+            label: "重新生成",
+            onClick: () => dispatchGateAction("generate_style_proposals"),
+            variant: "secondary",
+            disabled: actionDisabled,
+          },
+        };
+      }
+      return {
+        title: "下一步：生成视觉方向",
+        body: "基于当前内容生成可选方向；有 Logo、风格图或素材时，也会一起参考。",
+        role: "visual",
+        tone: visualTone,
+        primary: {
+          key: "generate-style",
+          label: "生成视觉方向",
+          onClick: () => dispatchGateAction("generate_style_proposals"),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (slidesMissingPromptCount > 0) {
+      return {
+        title: "下一步：生成画面方案",
+        body: `还有 ${slidesMissingPromptCount} 页缺少画面方案或生图 Prompt。先补齐这些信息，再进入打样。`,
+        role: "visual",
+        tone: visualTone,
+        primary: {
+          key: "generate-prompts",
+          label: "生成画面方案",
+          onClick: () => dispatchGateAction("generate_visual_prompts"),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (currentStatus === "prototype_ready") {
+      return {
+        title: "下一步：确认打样",
+        body: "检查样张的风格、构图和文字可读性。满意后生成全部页面，不满意可重新打样。",
+        role: "visual",
+        tone: visualTone,
+        primary: {
+          key: "confirm-prototype",
+          label: "确认打样，生成全部",
+          onClick: () => dispatchGateAction("confirm_prototype"),
+          variant: "primary",
+          disabled: actionDisabled,
+        },
+        secondary: {
+          key: "resample-prototype",
+          label: "重新打样",
+          onClick: () => dispatchGateAction("resample_prototype"),
+          variant: "secondary",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (currentStatus === "completed") {
+      return {
+        title: "下一步：下载 PPTX",
+        body: `${slides.filter((s) => s.image_path).length} / ${slides.length} 页已有画面。需要修改时，选中页面进入微调。`,
+        role: "visual",
+        tone: "final",
+        primary: {
+          key: "download",
+          label: "下载 PPTX",
+          href: getDownloadUrl(selectedProject.id),
+          variant: "primary",
+          disabled: false,
+        },
+      };
+    }
+
+    if (currentStatus === "failed" && workflowState.hasFailedSlide) {
+      return {
+        title: "下一步：重试失败页",
+        body: "部分页面没有生成成功。先重试失败页，仍失败时再进入单页检查提示词和素材。",
+        role: "visual",
+        tone: "warning",
+        primary: {
+          key: "retry-failed",
+          label: "一键重试失败页",
+          onClick: () => dispatchGateAction("retry_failed"),
+          variant: "danger",
+          disabled: actionDisabled,
+        },
+      };
+    }
+
+    if (workflowState.hasPrompt) {
+      return {
+        title: "下一步：生成打样页",
+        body: `当前打样页：${prototypeSelectionSummary}。先看样张效果，再决定是否生成全部页面。`,
+        role: "visual",
+        tone: visualTone,
+        primary: {
+          key: "start-prototype",
+          label: prototypePromptTargets.length > 0 ? `打样 ${prototypePromptTargets.length} 页` : "选择打样页",
+          onClick: () => dispatchGateAction("start_prototype"),
+          variant: "primary",
+          disabled: actionDisabled || !canStartPrototypeGeneration,
+        },
+      };
+    }
+
+    return null;
+  })();
+
+  const renderNudgeAction = (action: UiAction) => {
+    const className = `${actionClassName(action.variant)} justify-center text-center`;
+    if (action.href) {
+      return (
+        <a key={action.key} href={action.href} className={className}>
+          {action.label}
+        </a>
+      );
+    }
+    return (
+      <button
+        key={action.key}
+        onClick={action.onClick}
+        disabled={action.disabled}
+        className={className}
+      >
+        {action.label}
+      </button>
+    );
+  };
+
   // 卡片间隙插入触发区：竖条（桌面端）/ 横条（移动端），hover 时显示 +
   const InsertGap = ({ onClick, title }: { onClick: () => void; title: string }) => (
     <div
@@ -4949,7 +6080,21 @@ function App() {
   const activeProgress = workflowProgressCounts(currentProjectStatus);
   const activeProgressLabel =
     currentProjectStatus?.progress?.label ||
-    (activeRun?.kind === "style_proposal" ? "风格提案生成进度" : activeRun?.kind === "visual_prompts" ? "画面描述生成进度" : "批量生成进度");
+    (activeRun?.kind === "content_plan"
+      ? "内容规划生成进度"
+      : activeRun?.kind === "style_proposal"
+      ? "风格提案生成进度"
+      : activeRun?.kind === "visual_prompts"
+      ? "画面描述生成进度"
+      : activeRun?.kind === "prototype_generation"
+      ? "打样生成进度"
+      : "批量生成进度");
+  const shouldShowRunProgressEmptyState = Boolean(
+    selectedProject &&
+    slides.length === 0 &&
+    !slidesAreLoading &&
+    (hasActiveRun || currentStatus === "prototype" || currentStatus === "generating")
+  );
 
   return (
     <div className="pg-app flex h-screen w-screen bg-gray-50 text-gray-900 overflow-hidden">
@@ -5026,7 +6171,7 @@ function App() {
                       <div className="min-w-0 flex-1">
                         <div className="pg-project-title font-medium text-sm truncate flex items-center gap-1.5" title={p.title}>
                           <span className="truncate">{p.title}</span>
-                          {p.has_unread_notification && (
+                          {p.has_unread_notification && selectedProject?.id !== p.id && (
                             <span className="inline-block w-2 h-2 rounded-full bg-red-500 flex-shrink-0" title={p.unread_notification_message || "有新动态"} />
                           )}
                         </div>
@@ -5107,13 +6252,20 @@ function App() {
               )}
             </div>
             {/* 选页工具栏：内联到标题栏 */}
-            {selectedProject && slides.length > 0 && (currentStatus === "prompt_ready" || currentStatus === "failed") && (
+            {selectedProject && shouldShowPrototypeSelection && (
               <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-600">
-                <span className="text-slate-500">选页打样：</span>
-                <button onClick={selectAll} className="text-blue-600 hover:underline font-medium">全选</button>
-                <button onClick={clearSelection} className="text-slate-400 hover:underline">清空</button>
-                <span className="text-slate-300">|</span>
-                <span>已选 {selectedPages.size} / {slides.length} 页</span>
+                <span className="text-slate-500">{isPrototypeRunActive ? "正在打样：" : "打样页："}</span>
+                {!isPrototypeRunActive && (
+                  <>
+                    <button onClick={selectAll} disabled={!canEditPrototypeSelection} className="text-blue-600 hover:underline font-medium disabled:text-slate-300 disabled:no-underline">全选</button>
+                    <button onClick={clearSelection} disabled={!canEditPrototypeSelection} className="text-slate-400 hover:underline disabled:text-slate-300 disabled:no-underline">默认种子页</button>
+                    <span className="text-slate-300">|</span>
+                  </>
+                )}
+                <span>{prototypeSelectionSummary}</span>
+                <span className="text-slate-400">
+                  {isPrototypeRunActive ? "生成中已锁定，完成后可重新打样。" : "勾选卡片可调整本次打样范围。"}
+                </span>
               </div>
             )}
             {selectedProject && currentStatus === "prototype_ready" && (
@@ -5194,13 +6346,13 @@ function App() {
               <span className="min-w-0 truncate text-xs text-gray-600">
                 项目素材
                 {referenceImages.length > 0 && (
-                  <> · {referenceImages.filter((r) => r.role === "logo").length > 0 && `${referenceImages.filter((r) => r.role === "logo").length} 个品牌 Logo `}
-                    {referenceImages.filter((r) => r.role === "visual_asset").length > 0 && `${referenceImages.filter((r) => r.role === "visual_asset").length} 个核心资产 `}
+                  <> · {referenceImages.filter(isConfirmedLogoRef).length > 0 && `${referenceImages.filter(isConfirmedLogoRef).length} 个品牌 Logo `}
+                    {referenceImages.filter((r) => r.role === "visual_asset").length > 0 && `${referenceImages.filter((r) => r.role === "visual_asset").length} 个可复用素材 `}
                     {referenceImages.filter((r) => r.role === "style_ref").length > 0 && `${referenceImages.filter((r) => r.role === "style_ref").length} 张风格参考 `}
                     {referenceImages.filter((r) => r.role === "template").length > 0 && "版式模板 "}</>
                 )}
                 {referenceImages.length === 0 && (
-                  <span className="text-gray-400"> · 点击上传</span>
+                  <span className="text-gray-400"> · 尚未添加</span>
                 )}
               </span>
               <span className="ml-auto shrink-0 text-xs text-slate-400">
@@ -5226,12 +6378,12 @@ function App() {
                     try {
                       const targetRef = referenceImages.find((r: any) => r.id === refId);
                       await updateReferenceImage(selectedProject.id, refId, data);
-                      showToast(targetRef?.role === "logo" ? "Logo 设置已更新" : "核心资产已更新");
+                      showToast(targetRef?.role === "logo" ? "Logo 设置已更新" : "可复用素材已更新");
                       await loadReferenceImages(selectedProject.id);
-                      if (targetRef?.role === "visual_asset") {
+                      if (targetRef?.role === "visual_asset" || targetRef?.role === "logo" || data.review_status) {
                         slides.forEach((s) => markSlideStale(s.id, "content"));
                       }
-                      addSystemLog(targetRef?.role === "logo" ? "用户更新了 Logo 角标设置" : "用户更新了核心资产说明");
+                      addSystemLog(targetRef?.role === "logo" ? "用户更新了 Logo 角标设置" : "用户更新了可复用素材说明");
                     } catch (err: any) {
                       showToast("更新失败：" + (err.message || "未知错误"), "error");
                     }
@@ -5257,7 +6409,7 @@ function App() {
                         slides.forEach((s) => markSlideStale(s.id, "content"));
                       }
                       if (deletedRef) {
-                        const roleMap: Record<string, string> = { style_ref: "风格参考", logo: "品牌 Logo", template: "版式模板", visual_asset: "核心资产" };
+                        const roleMap: Record<string, string> = { style_ref: "风格参考", logo: "品牌 Logo", template: "版式模板", visual_asset: "可复用素材" };
                         addSystemLog(`用户删除了项目${roleMap[deletedRef.role] || "素材"}`);
                       }
                       await loadProjects();
@@ -5269,7 +6421,10 @@ function App() {
                   onUnpinAsset={handleUnpinAssetFromSlide}
                   onUpdateOverlayLayers={handleUpdateOverlayLayers}
                   onImageClick={(url) => {
-                    const urls = referenceImages.map((r: any) => `${API_BASE}${r.url}`);
+                    const urls = referenceImages.map((r: any) => {
+                      const assetUrl = r.overlay_url || r.url;
+                      return String(assetUrl || "").startsWith("http") ? assetUrl : `${API_BASE}${assetUrl}`;
+                    });
                     const index = urls.indexOf(url);
                     setGalleryModal({ urls, index: index >= 0 ? index : 0, title: "设计素材" });
                   }}
@@ -5402,12 +6557,48 @@ function App() {
                 </section>
               </div>
             </div>
+          ) : slidesAreLoading ? (
+            <div className="pg-empty-state flex items-center justify-center h-full text-gray-400">
+              <div className="pg-flow-empty text-center max-w-md">
+                <div className="pg-flow-title">正在打开项目内容</div>
+                <div className="pg-flow-copy">页面加载完成后会直接显示；你也可以先在右侧继续查看项目消息。</div>
+              </div>
+            </div>
+          ) : shouldShowRunProgressEmptyState ? (
+            <div className="pg-empty-state flex items-center justify-center h-full text-gray-500">
+              <div className="pg-flow-empty text-center max-w-md">
+                <div className="pg-flow-title">{activeProgressLabel}</div>
+                <div className="mt-4 h-2 w-full max-w-xs mx-auto rounded-full bg-slate-200 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-slate-950 transition-all"
+                    style={{ width: `${activeProgress.percent}%` }}
+                  />
+                </div>
+                <div className="pg-flow-copy mt-3">
+                  {activeProgress.total > 0
+                    ? `${activeProgress.current} / ${activeProgress.total} ${activeProgress.unit}完成`
+                    : "正在同步最新进度，生成结果会直接出现在这里。"}
+                  {activeProgress.failed > 0 ? `，${activeProgress.failed} ${activeProgress.unit}失败` : ""}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRightCollapsed(false);
+                    setCurrentAgentRole(activeRun?.kind === "content_plan" ? "content" : "visual");
+                    chatAutoScrollRef.current = true;
+                    requestAnimationFrame(scrollChatToBottom);
+                  }}
+                  className="pg-action pg-action-secondary mt-4 bg-white text-slate-700 border border-slate-200 px-3 py-1.5 rounded-lg text-sm hover:bg-slate-50"
+                >
+                  查看最新消息
+                </button>
+              </div>
+            </div>
           ) : slides.length === 0 ? (
             <div className="pg-empty-state flex items-center justify-center h-full text-gray-400">
               <div className="pg-flow-empty text-center max-w-md">
-                <div className="pg-flow-command mx-auto mb-8">作品画布</div>
-                <div className="pg-flow-title">正在准备页面</div>
-                <div className="pg-flow-copy">如果长时间没有页面，请回到内容规划重新生成。</div>
+                <div className="pg-flow-title">还没有页面内容</div>
+                <div className="pg-flow-copy">上传材料或填写 Brief 后，先生成内容规划。</div>
               </div>
             </div>
           ) : showTemplateRecommender && templatePages.length > 0 ? (
@@ -5434,9 +6625,9 @@ function App() {
                   try {
                     await updateTemplateRecommendations(selectedProject.id, selected);
                     await loadProjects();
-                    const fresh = await fetchProjects();
+                    const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
                     const updated = fresh.find((p: Project) => p.id === selectedProject.id);
-                    if (updated) setSelectedProject(updated);
+                    if (updated) setSelectedProject(clearProjectNotification(updated));
                     setShowTemplateRecommender(false);
                   } catch (err: any) {
                     showToast("保存模板选择失败：" + (err.message || "未知错误"), "error");
@@ -5484,7 +6675,7 @@ function App() {
               unescapeText={unescapeText}
               onImageClick={(url) => {
                 if (url.includes("/uploads/")) {
-                  const refUrls = editingSlide?.reference_images?.map((r: any) => `${API_BASE}${r.url}`) || [];
+                  const refUrls = dedupeReferenceImages(editingSlide?.reference_images || []).map((r: any) => `${API_BASE}${r.url}`);
                   const index = refUrls.indexOf(url);
                   setGalleryModal({ urls: refUrls, index: index >= 0 ? index : 0, title: "本页参考图" });
                 } else {
@@ -5530,14 +6721,12 @@ function App() {
                   <div className="pg-stage-dock-head">
                     <div>
                       <div className="pg-stage-kicker">视觉方向</div>
-                      <h3>在作品画布上选择视觉方向</h3>
-                      <p>先查看每套方案的配色、字体和页面使用方式。确认后会生成每页画面方案，再用样张验证真实效果。</p>
-                    </div>
-                    <div className="pg-style-dock-actions">
-                      <button onClick={() => logoInputRef.current?.click()} disabled={uploadingLogo || isBusy || chatLoading}>Logo</button>
-                      <button onClick={() => visualAssetInputRef.current?.click()} disabled={uploadingVisualAsset || isBusy || chatLoading}>核心资产</button>
-                      <button onClick={() => styleRefInputRef.current?.click()} disabled={uploadingStyleRef || isBusy || chatLoading}>风格参考</button>
-                      <button onClick={() => templateInputRef.current?.click()} disabled={uploadingTemplate || isBusy || chatLoading}>版式模板</button>
+                      <h3>{styleDockProposals.length > 0 ? "选择视觉方向" : "生成视觉方向"}</h3>
+                      <p>
+                        {styleDockProposals.length > 0
+                          ? "查看每套方案的配色、字体和页面使用方式；素材补充统一在上方「项目素材」处理。"
+                          : "基于当前内容生成三套视觉方向；需要补充素材时，使用上方「项目素材」。"}
+                      </p>
                     </div>
                   </div>
                   {styleDockProposals.length > 0 ? (
@@ -5546,56 +6735,100 @@ function App() {
                         const proposalKey = `${proposal.name}-${index}`;
                         const isExpanded = expandedStyleProposalKey === proposalKey;
                         const palette = Array.isArray(proposal.palette) ? proposal.palette : [];
-                        const mood = proposal.mood || "—";
-                        const font = proposal.font || "—";
-                        const pageTypeAdaptation = (proposal as any).page_type_adaptation || "";
-                        const contentStyleHint = (proposal as any).content_style_hint || "";
+                        const mood = stripHexCodes(proposal.mood) || "—";
+                        const font = stripHexCodes(proposal.font) || "—";
+                        const pageTypeAdaptation = stripHexCodes((proposal as any).page_type_adaptation || "");
+                        const contentStyleHint = stripHexCodes((proposal as any).content_style_hint || "");
+                        const strategySummary = visualStrategyText(proposal);
+                        const bestFor = proposalDecisionField(proposal, "best_for");
+                        const tradeoff = proposalDecisionField(proposal, "tradeoff");
+                        const visualFocus = proposalDecisionField(proposal, "visual_focus");
+                        const summary = stripHexCodes(proposal.description || proposal.mood || "基于当前内容和素材生成的视觉方向。");
                         return (
                           <div key={proposalKey} className={`pg-style-dock-card ${isExpanded ? "is-expanded" : ""}`}>
                             <div className="pg-style-dock-card-top">
-                              <span>{index === 0 ? "推荐" : `方案 ${index + 1}`}</span>
+                              <span>{proposalChoiceLabel(proposal, index)}</span>
                               <div className="pg-style-swatches">
                                 {palette.slice(0, 5).map((c: any, i: number) => (
-                                  <i key={i} style={{ backgroundColor: typeof c === "string" ? c : c?.hex || "#d1d5db" }} />
+                                  <i key={i} style={{ backgroundColor: proposalColorValue(c) }} title={proposalColorLabel(c, i)} />
                                 ))}
                               </div>
                             </div>
                             <h4>{proposal.name}</h4>
-                            <p className="pg-style-dock-card-summary">{proposal.description || proposal.mood || "基于当前内容和素材生成的视觉方向。"}</p>
+                            {(bestFor || tradeoff || visualFocus) && (
+                              <div className="pg-style-dock-decision">
+                                {bestFor && (
+                                  <div className="pg-style-dock-decision-row">
+                                    <b>适合</b>
+                                    <span>{bestFor}</span>
+                                  </div>
+                                )}
+                                {tradeoff && (
+                                  <div className="pg-style-dock-decision-row is-tradeoff">
+                                    <b>取舍</b>
+                                    <span>{tradeoff}</span>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                            <p className="pg-style-dock-card-summary">{summary}</p>
                             {isExpanded && (
                               <div className="pg-style-dock-detail">
-                                <div>
+                                {bestFor && (
+                                  <div className="pg-style-dock-detail-block">
+                                    <b>适合选择</b>
+                                    <p>{bestFor}</p>
+                                  </div>
+                                )}
+                                {tradeoff && (
+                                  <div className="pg-style-dock-detail-block">
+                                    <b>需要接受</b>
+                                    <p>{tradeoff}</p>
+                                  </div>
+                                )}
+                                {visualFocus && (
+                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
+                                    <b>视觉重点</b>
+                                    <p>{visualFocus}</p>
+                                  </div>
+                                )}
+                                {strategySummary && (
+                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
+                                    <b>整体基底</b>
+                                    <p>{strategySummary}</p>
+                                  </div>
+                                )}
+                                <div className="pg-style-dock-detail-block pg-style-dock-palette-block">
                                   <b>配色</b>
                                   <div className="pg-style-dock-color-list">
                                     {palette.slice(0, 5).map((color: any, colorIndex: number) => {
-                                      const hex = typeof color === "string" ? color : color?.hex || "#d1d5db";
-                                      const name = typeof color === "string" ? color : color?.name || hex;
-                                      const role = typeof color === "string" ? "" : color?.role || "";
+                                      const swatch = proposalColorValue(color);
+                                      const label = proposalColorLabel(color, colorIndex);
                                       return (
-                                        <span key={`${hex}-${colorIndex}`}>
-                                          <i style={{ backgroundColor: hex }} />
-                                          {name}{role ? ` · ${role}` : ""}
+                                        <span key={`${swatch}-${colorIndex}`}>
+                                          <i style={{ backgroundColor: swatch }} />
+                                          <em>{label}</em>
                                         </span>
                                       );
                                     })}
                                   </div>
                                 </div>
-                                <div>
+                                <div className="pg-style-dock-detail-block">
                                   <b>氛围</b>
                                   <p>{mood}</p>
                                 </div>
-                                <div>
+                                <div className="pg-style-dock-detail-block">
                                   <b>字体</b>
                                   <p>{font}</p>
                                 </div>
                                 {pageTypeAdaptation && (
-                                  <div>
+                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
                                     <b>页面使用方式</b>
                                     <p>{pageTypeAdaptation}</p>
                                   </div>
                                 )}
                                 {contentStyleHint && (
-                                  <div>
+                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
                                     <b>内容适配</b>
                                     <p>{contentStyleHint}</p>
                                   </div>
@@ -5620,15 +6853,15 @@ function App() {
                   ) : (
                     <div className="pg-style-dock-empty">
                       <div>
-                        <b>还没有风格提案</b>
-                        <p>可以先补充品牌素材，也可以直接根据当前内容生成三套视觉方向。</p>
+                        <b>还没有可选方案</b>
+                        <p>生成后会在这里显示三套方向。</p>
                       </div>
                       <button
                         onClick={() => dispatchGateAction("generate_style_proposals")}
                         disabled={isBusy || chatLoading}
                         className="pg-action pg-action-primary bg-purple-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
                       >
-                        生成风格提案
+                        生成视觉方向
                       </button>
                     </div>
                   )}
@@ -5639,20 +6872,36 @@ function App() {
                 <div className="pg-stage-dock pg-visual-dock">
                   <div>
                     <div className="pg-stage-kicker">画面方案</div>
-                    <h3>检查每页画面方案，然后打样</h3>
-                    <p>点击页面查看和修改画面描述、Prompt；也可以勾选重点页，先生成样张确认效果。</p>
+                    <h3>{slidesMissingPromptCount > 0 ? "先生成每页画面方案" : "检查每页画面方案，然后打样"}</h3>
+                    <p>
+                      {slidesMissingPromptCount > 0
+                        ? `还有 ${slidesMissingPromptCount} 页缺少画面方案或生图 Prompt。先补齐后再进入打样。`
+                        : `当前打样页：${prototypeSelectionSummary}。勾选或取消卡片前的小框，可调整本次需要打样的页面。`}
+                    </p>
                   </div>
                   <div className="pg-visual-dock-actions">
-                    <button onClick={selectAll} disabled={isBusy || chatLoading}>全选打样</button>
-                    <button onClick={clearSelection} disabled={isBusy || chatLoading}>清空</button>
-                    <button
-                      onClick={() => dispatchGateAction("start_prototype")}
-                      disabled={isBusy || chatLoading || !canStartPrototypeGeneration}
-                      className="pg-action pg-action-primary bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                      title={!canStartPrototypeGeneration ? "请先生成打样页的画面方案" : undefined}
-                    >
-                      {selectedPages.size > 0 ? `打样 ${selectedPages.size} 页` : `打样 ${Math.min(3, slides.length)} 页`}
-                    </button>
+                    {slidesMissingPromptCount > 0 ? (
+                      <button
+                        onClick={() => dispatchGateAction("generate_visual_prompts")}
+                        disabled={isBusy || chatLoading}
+                        className="pg-action pg-action-primary bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
+                      >
+                        生成画面方案
+                      </button>
+                    ) : (
+                      <>
+                        <button onClick={selectAll} disabled={isBusy || chatLoading}>全选打样</button>
+                        <button onClick={clearSelection} disabled={isBusy || chatLoading}>默认种子页</button>
+                        <button
+                          onClick={() => dispatchGateAction("start_prototype")}
+                          disabled={isBusy || chatLoading || !canStartPrototypeGeneration}
+                          className="pg-action pg-action-primary bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
+                          title={!canStartPrototypeGeneration ? "请选择至少一页打样页" : undefined}
+                        >
+                          {prototypePromptTargets.length > 0 ? `打样 ${prototypePromptTargets.length} 页` : "选择打样页"}
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               )}
@@ -5661,8 +6910,12 @@ function App() {
                 <div className="pg-stage-dock pg-prototype-dock">
                   <div>
                     <div className="pg-stage-kicker">打样确认</div>
-                    <h3>先确认种子页，再批量生成</h3>
-                    <p>检查样张的风格、构图和文字可读性；满意后生成全部页面，不满意可重新打样。</p>
+                    <h3>{isPrototypeRunActive ? "正在生成打样页" : "先确认种子页，再批量生成"}</h3>
+                    <p>
+                      {isPrototypeRunActive
+                        ? `本次打样范围：${prototypeSelectionSummary}。生成中已锁定选页，完成后可重新打样或进入全量生成。`
+                        : `本次样张：${prototypeSelectionSummary}。检查风格、构图和文字可读性；满意后生成全部页面，不满意可重新打样。`}
+                    </p>
                   </div>
                   <div className="pg-prototype-strip">
                     {slides.filter((s) => s.image_path).slice(0, 3).map((slide) => (
@@ -5771,6 +7024,11 @@ function App() {
                       <div className="pg-style-bar-copy text-[11px] text-indigo-700">
                         氛围：{selectedProject.selected_style.mood || "—"} · 字体：{selectedProject.selected_style.font || "—"}
                       </div>
+                      {visualStrategyText(selectedProject.selected_style) && (
+                        <p className="pg-style-bar-copy text-[11px] text-indigo-700 mt-0.5 leading-relaxed">
+                          整体基底：{visualStrategyText(selectedProject.selected_style)}
+                        </p>
+                      )}
                       {selectedProject.selected_style.description && (
                         <p className="pg-style-bar-copy text-[11px] text-indigo-600 mt-0.5 leading-relaxed">
                           {selectedProject.selected_style.description}
@@ -5798,7 +7056,7 @@ function App() {
                 const visual = slide.visual_json || {};
                 const hasVisualDescription = Boolean(visual.visual_description && String(visual.visual_description).trim());
                 const hasPromptText = Boolean(slide.prompt_text && String(slide.prompt_text).trim());
-                const isSelected = selectedPages.has(slide.page_num);
+                const isPrototypePageChecked = visiblePrototypePageSet.has(slide.page_num);
                 const isLast = index === slides.length - 1;
                 return (
                   <Fragment key={slide.id}>
@@ -5857,23 +7115,26 @@ function App() {
                       }
                     }}
                     className={`pg-slide-card group relative bg-white rounded-lg border border-slate-200 p-3 shadow-sm flex flex-col cursor-pointer hover:shadow-lg hover:border-blue-400 transition-all h-[320px] overflow-hidden w-[calc((100%-4.5rem)/3)] min-w-[260px] flex-shrink-0 max-md:w-full ${
-                      isSelected && (currentStatus === "prompt_ready" || currentStatus === "failed")
+                      isPrototypePageChecked && shouldShowPrototypeSelection
                         ? "ring-2 ring-blue-400"
                         : ""
                     } ${finetuneTargetSlideId === slide.id && currentAgentRole === "finetune" ? "ring-2 ring-amber-400 border-amber-300" : ""} ${dragOverSlideId === slide.id ? "border-dashed border-blue-400 bg-blue-50" : ""} ${dragSlideId === slide.id ? "opacity-50" : ""}`}
                   >
                     <div className="flex items-center justify-between mb-1 shrink-0">
                       <div className="flex items-center gap-1.5">
-                        {(currentStatus === "prompt_ready" || currentStatus === "failed") && (
+                        {shouldShowPrototypeSelection && (
                           <input
                             type="checkbox"
-                            checked={isSelected}
+                            checked={isPrototypePageChecked}
+                            disabled={!canEditPrototypeSelection}
+                            title={canEditPrototypeSelection ? "勾选本页加入打样范围" : "当前任务进行中，打样页已锁定"}
                             onClick={(e) => e.stopPropagation()}
                             onChange={(e) => {
                               e.stopPropagation();
+                              if (!canEditPrototypeSelection) return;
                               togglePage(slide.page_num);
                             }}
-                            className="cursor-pointer"
+                            className={canEditPrototypeSelection ? "cursor-pointer" : "cursor-not-allowed opacity-60"}
                           />
                         )}
                         <span className="text-xs text-slate-400 font-mono">P{slide.page_num}</span>
@@ -5881,17 +7142,6 @@ function App() {
                       </div>
                       <div className="flex items-center gap-1">
                         <SlideReadinessIcons hasVisual={hasVisualDescription} hasPrompt={hasPromptText} />
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteSlide(slide.id);
-                          }}
-                          disabled={isBusy || chatLoading}
-                          className="text-xs text-gray-400 hover:text-red-500 px-1 leading-none disabled:opacity-30"
-                          title="删除"
-                        >
-                          删
-                        </button>
                         <span className={`text-xs px-2 py-0.5 rounded font-medium leading-none ${typeColor[slide.type] || "bg-gray-100"}`}>
                           {typeLabel[slide.type] || slide.type}
                         </span>
@@ -6000,29 +7250,19 @@ function App() {
                     <div className="shrink-0">
                       {/* 页面级参考图（紧凑模式） */}
                       <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleUploadPageRef(slide.id);
-                          }}
-                          disabled={isBusy || chatLoading}
-                          className="text-xs bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded hover:bg-gray-200 disabled:opacity-50 leading-none"
-                        >
-                          + 本页参考图
-                        </button>
-                        {slide.reference_images && slide.reference_images.length > 0 && (
+                        {dedupeReferenceImages(slide.reference_images || []).length > 0 && (
                           <div className="flex gap-0.5 flex-nowrap overflow-x-auto">
-                            {slide.reference_images.map((ref: any) => (
+                            {dedupeReferenceImages(slide.reference_images || []).map((ref: any) => (
                               <div key={ref.id} className="relative group flex-shrink-0">
                                 <img
                                   src={`${API_BASE}${ref.url}`}
                                   alt="ref"
                                   className="w-7 h-7 rounded object-cover border cursor-pointer"
-                                  title={`${ref.process_mode === "blend" ? "融合" : ref.process_mode === "crop" ? "裁剪" : "原图"} — 点击查看大图`}
+                                  title="AI 参考图 — 点击查看大图"
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     const allRefUrls = slides
-                                      .flatMap((s) => s.reference_images?.map((r: any) => `${API_BASE}${r.url}`) || [])
+                                      .flatMap((s) => dedupeReferenceImages(s.reference_images || []).map((r: any) => `${API_BASE}${r.url}`))
                                       .filter((v, i, a) => a.indexOf(v) === i);
                                     const url = `${API_BASE}${ref.url}`;
                                     const index = allRefUrls.indexOf(url);
@@ -6133,22 +7373,22 @@ function App() {
               {currentAgentRole === "finetune" ? "微调工作台" : "智能助手"}
             </span>
             <div className="flex items-center gap-1">
-              <button
-                onClick={() => {
-                  if (chatMessages.length === 0) return;
-                  showConfirm("确定要清空当前 Agent 的聊天记录吗？项目内容不会被删除。").then((confirmed) => {
-                    if (confirmed) {
-                      setActiveChatMessages([]);
-                      showToast("聊天记录已清空", "success");
-                    }
-                  });
-                }}
-                className="text-slate-400 hover:text-red-500 text-sm px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors"
-                title="清空对话"
-                disabled={chatMessages.length === 0}
-              >
-                清空
-              </button>
+              {chatMessages.length > 0 && (
+                <button
+                  onClick={() => {
+                    showConfirm("确定要清空当前 Agent 的聊天记录吗？项目内容不会被删除。").then((confirmed) => {
+                      if (confirmed) {
+                        setActiveChatMessages([]);
+                        showToast("聊天记录已清空", "success");
+                      }
+                    });
+                  }}
+                  className="text-slate-400 hover:text-red-500 text-sm px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors"
+                  title="清空对话"
+                >
+                  清空
+                </button>
+              )}
               <button
                 onClick={() => setRightCollapsed(true)}
                 className="text-slate-400 hover:text-slate-600 text-sm px-1"
@@ -6176,7 +7416,6 @@ function App() {
             >
               <span>内容总监</span>
             </button>
-            <span className="text-slate-300 text-xs">|</span>
             <button
               onClick={() => {
                 if (!contentPlanConfirmed) {
@@ -6200,7 +7439,6 @@ function App() {
             >
               <span>视觉总监</span>
             </button>
-            <span className="text-slate-300 text-xs">|</span>
             <button
               onClick={() => {
                 const hasAnyCompletedSlide = slides.some((s) => s.status === "completed" && s.image_path);
@@ -6242,7 +7480,7 @@ function App() {
           </div>
         </div>
         {/* Agent 模式切换栏：内容规划阶段和视觉总监阶段都显示 */}
-        {selectedProject && slides.length > 0 && (currentStatus === "planning" || currentAgentRole === "visual") && (
+        {selectedProject && slides.length > 0 && editingSlide && (currentStatus === "planning" || currentAgentRole === "visual") && (
           <div className="pg-agent-modebar px-4 py-2 border-b bg-white flex items-center justify-between">
             <div className="flex items-center gap-1 text-xs">
               <span className="text-slate-500">调整范围：</span>
@@ -6299,9 +7537,44 @@ function App() {
             )}
           </div>
         )}
+        {currentStageNudge && currentStageNudge.role === currentAgentRole && (
+          <div className={`pg-current-step px-4 py-3 border-b ${
+            currentStageNudge.tone === "warning"
+              ? "bg-amber-50 border-amber-200"
+              : currentStageNudge.tone === "final"
+              ? "bg-emerald-50 border-emerald-200"
+              : currentStageNudge.tone === "visual"
+              ? "bg-purple-50 border-purple-100"
+              : "bg-blue-50 border-blue-100"
+          }`}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className={`text-sm font-semibold ${
+                  currentStageNudge.tone === "warning"
+                    ? "text-amber-800"
+                    : currentStageNudge.tone === "final"
+                    ? "text-emerald-800"
+                    : currentStageNudge.tone === "visual"
+                    ? "text-purple-800"
+                    : "text-blue-800"
+                }`}>
+                  {currentStageNudge.title}
+                </div>
+                <p className="mt-1 text-xs leading-relaxed text-slate-600">{currentStageNudge.body}</p>
+              </div>
+            </div>
+            {(currentStageNudge.primary || currentStageNudge.secondary) && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {currentStageNudge.primary && renderNudgeAction(currentStageNudge.primary)}
+                {currentStageNudge.secondary && renderNudgeAction(currentStageNudge.secondary)}
+              </div>
+            )}
+          </div>
+        )}
         <div
           ref={chatContainerRef}
           className="pg-chat-stream flex-1 overflow-auto space-y-3 p-3"
+          onScroll={handleChatScroll}
         >
           {!selectedProject && (
             <div className="pg-oracle-card p-3 rounded text-sm">
@@ -6376,11 +7649,22 @@ function App() {
 
           {/* 聊天消息 */}
           {chatMessages.map((msg, i) => {
+            if (currentAgentRole === "content" && isLegacyContentGreeting(msg)) return null;
             if (isTransientRunMessage(msg)) return null;
+            if (isWorkflowTransitionMessage(msg) && (msg.role === "system" || !msg.gate || msg.gateRevision == null || !isMessageFromCurrentGate(msg))) {
+              return null;
+            }
             const previousVisibleMessage = [...chatMessages.slice(0, i)]
               .reverse()
-              .find((item) => !isTransientRunMessage(item));
+              .find((item) => !isTransientRunMessage(item) && !isWorkflowTransitionMessage(item));
             if (msg.role === "system" && previousVisibleMessage?.role === "system" && previousVisibleMessage.content === msg.content) {
+              return null;
+            }
+            const systemContentForVisual =
+              msg.role === "system" && currentAgentRole === "visual"
+                ? getVisualSystemMessageContent(msg.content)
+                : msg.content;
+            if (msg.role === "system" && currentAgentRole === "visual" && !systemContentForVisual) {
               return null;
             }
             const rowAlignClass =
@@ -6394,7 +7678,7 @@ function App() {
             const visibleMessageContent =
               msg.role === "user" && msg.content.trim() === "直接生成"
                 ? "已提交 Brief，开始生成内容规划"
-                : msg.content;
+                : systemContentForVisual;
             return (
             <div key={msg.id || i} className={`pg-message-row flex ${rowAlignClass}`}>
               <div className={`pg-message-stack max-w-[80%] group ${stackRoleClass}`}>
@@ -6499,7 +7783,8 @@ function App() {
                                       key={idx}
                                       className="inline-flex items-center gap-1 text-2xs bg-white/20 text-white px-1.5 py-0.5 rounded"
                                     >
-                                      📎 {att}
+                                      <span className="pg-brief-inline-icon">{getFileTypeBadge(att, "doc")}</span>
+                                      {att}
                                     </span>
                                   ))}
                                 </div>
@@ -6511,9 +7796,9 @@ function App() {
                         <div dangerouslySetInnerHTML={{ __html: renderMarkdown(unescapeText(visibleMessageContent), true) }} />
                       )}
                       {msg.role === "agent" && (msg.action === "propose_plan" || msg.action === "generate_plan") && msg.positioning && (() => {
-                        const actionIsStale =
-                          !isMessageFromCurrentGate(msg) ||
-                          !["draft", "content"].includes(gateContext.gate);
+                        const canUsePositioningAction =
+                          isMessageFromCurrentGate(msg) &&
+                          ["draft", "content"].includes(gateContext.gate);
                         return (
                         <div className="pg-oracle-card mt-3 bg-white border border-blue-200 rounded-lg p-4 shadow-sm">
                           <div className="text-sm font-semibold text-gray-800 mb-2">内容定调</div>
@@ -6533,63 +7818,57 @@ function App() {
                               </div>
                             )}
                           </div>
-                          <button
-                            onClick={async () => {
-                              if (!selectedProject || !msg.topic || actionIsStale) return;
-                              await dispatchGateAction("generate_content_plan", {
-                                topic: msg.topic,
-                                page_count: msg.positioning?.estimated_pages,
-                              });
-                            }}
-                            disabled={isBusy || chatLoading || actionIsStale}
-                            className="pg-action pg-action-primary mt-3 w-full bg-blue-600 text-white text-sm py-2 rounded hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                          >
-                            {actionIsStale ? (
-                              "回退前建议"
-                            ) : isBusy ? (
-                              <span className="flex items-center justify-center gap-2">
-                                <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                                </svg>
-                                生成中...
-                              </span>
-                            ) : (
-                              "开始生成内容规划"
-                            )}
-                          </button>
+                          {canUsePositioningAction && (
+                            <button
+                              onClick={async () => {
+                                if (!selectedProject || !msg.topic) return;
+                                await dispatchGateAction("generate_content_plan", {
+                                  topic: msg.topic,
+                                  page_count: msg.positioning?.estimated_pages,
+                                });
+                              }}
+                              disabled={isBusy || chatLoading}
+                              className="pg-action pg-action-primary mt-3 w-full bg-blue-600 text-white text-sm py-2 rounded hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {isBusy ? (
+                                <span className="flex items-center justify-center gap-2">
+                                  <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                                  </svg>
+                                  生成中...
+                                </span>
+                              ) : (
+                                "开始生成内容规划"
+                              )}
+                            </button>
+                          )}
                         </div>
                         );
                       })()}
                       {msg.role === "agent" && shouldRenderMessageNextAction(msg) && (() => {
-                        const actionIsStale = !isMessageFromCurrentGate(msg);
                         return (
                           <div className="mt-3 border-t border-slate-200 pt-3">
                             {msg.nextAction!.description && (
                               <div className="text-xs text-slate-500 mb-2">{msg.nextAction!.description}</div>
                             )}
-                            {actionIsStale && (
-                              <div className="text-xs text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-2">
-                                这是回退前的建议，已失效。
-                              </div>
-                            )}
                             <button
                               onClick={() => handleAgentNextAction(msg.nextAction!, msg)}
-                              disabled={isBusy || chatLoading || actionIsStale}
+                              disabled={isBusy || chatLoading}
                               className={`pg-action pg-action-primary w-full text-sm py-2 rounded font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
                                 msg.agentRole === "visual"
                                   ? "bg-purple-600 text-white hover:bg-purple-700"
                                   : "bg-blue-600 text-white hover:bg-blue-700"
                               }`}
                             >
-                              {actionIsStale ? "回退前建议" : isBusy ? "处理中..." : msg.nextAction!.label}
+                              {isBusy ? "处理中..." : msg.nextAction!.label}
                             </button>
                           </div>
                         );
                       })()}
                     </div>
                     {/* 视觉总监的风格提案卡片 - 每条消息携带自己的快照，互不干扰 */}
-                    {msg.role === "agent" && msg.agentRole === "visual" && msg.styleProposals && msg.styleProposals.length > 0 && (
+                    {msg.role === "agent" && msg.agentRole === "visual" && msg.styleProposals && msg.styleProposals.length > 0 && isMessageFromCurrentGate(msg) && (
                       <ChatStyleProposal
                         proposals={msg.styleProposals}
                         onSelect={(proposal) => dispatchGateAction("confirm_style", { style: proposal })}
@@ -6601,7 +7880,7 @@ function App() {
                             agentRole: "visual",
                           });
                         }}
-                        disabled={isBusy || chatLoading || !isMessageFromCurrentGate(msg)}
+                        disabled={isBusy || chatLoading}
                       />
                     )}
                     {/* 消息操作按钮 */}
@@ -6620,7 +7899,7 @@ function App() {
                         onClick={() => handleDeleteMessage(i)}
                         disabled={chatLoading || isBusy}
                         className="pg-danger-link text-xs text-slate-400 hover:text-red-600 px-1 disabled:opacity-30 disabled:cursor-not-allowed"
-                        title="删除（回滚到此消息之前）"
+                        title="删除这条及之后的对话"
                       >
                         删除
                       </button>
@@ -6699,6 +7978,13 @@ function App() {
 	                    {activeProgress.current} / {activeProgress.total} {activeProgress.unit}完成
 	                    {activeProgress.failed > 0 && `，${activeProgress.failed} ${activeProgress.unit}失败`}
 	                  </div>
+                    {activeProgress.activePageNums.length > 0 && (
+                      <div className="mt-1 text-2xs text-purple-600">
+                        {activeProgress.activePageNums.length === 1
+                          ? `正在生成第 ${activeProgress.activePageNums[0]} 页`
+                          : `正在并行生成第 ${formatPageNums(activeProgress.activePageNums)} 页`}
+                      </div>
+                    )}
 	                </div>
 	              </div>
 	            </div>
@@ -6848,12 +8134,12 @@ function App() {
                 setUploadingVisualAsset(true);
                 try {
                   await uploadFile(selectedProject.id, file, "visual_asset");
-                  showToast("核心资产已添加");
+                  showToast("可复用素材已添加");
                   await loadReferenceImages(selectedProject.id);
                   slides.forEach((s) => markSlideStale(s.id, "content"));
-                  addSystemLog(`用户上传了核心资产「${file.name}」`);
+                  addSystemLog(`用户上传了可复用素材「${file.name}」`);
                   if (currentAgentRole === "visual") {
-                    appendProjectChatMessage(selectedProject.id, "visual", { role: "user", content: `🖼️ 已上传核心资产：${file.name}`, agentRole: "visual" });
+                    appendProjectChatMessage(selectedProject.id, "visual", { role: "user", content: `🖼️ 已上传可复用素材：${file.name}`, agentRole: "visual" });
                   }
                 } catch (err: any) {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
@@ -6894,79 +8180,6 @@ function App() {
             }}
           />
 
-          {/* 视觉总监阶段：生成/重新生成提案按钮 */}
-          {selectedProject && contentPlanConfirmed && currentAgentRole === "visual" && !selectedProject?.selected_style && (
-              <div className="pg-oracle-card pg-visual-brief-card mb-3 bg-purple-50/80 border border-purple-200 rounded-xl p-4 shadow-sm">
-              <div className="text-sm text-purple-800 mb-2">
-                {styleProposalsInChat.length === 0 ? (
-                  <>
-                    <span className="font-medium">准备好生成方案了吗？</span>
-                    <span className="pg-muted-note ml-1">· 有素材请上传，没有就直接生成</span>
-                  </>
-                ) : (
-                  <>
-                    <span className="font-medium">想要调整方案？</span>
-                    <span className="pg-muted-note ml-1">· 上传新素材或点击重新生成</span>
-                  </>
-                )}
-              </div>
-              {/* 快捷上传入口 */}
-              <div className="flex flex-wrap gap-2 mb-2">
-                <button
-                  onClick={() => logoInputRef.current?.click()}
-                  disabled={uploadingLogo || isBusy || chatLoading}
-                  className="pg-action pg-action-secondary flex-1 min-w-[90px] text-xs bg-white text-purple-700 px-2 py-1.5 rounded-lg border border-purple-200 hover:bg-purple-50 disabled:opacity-50 transition-colors"
-                  title="上传主品牌 Logo；默认作为统一角标叠加，可在素材栏选择四角位置"
-                >
-                  {uploadingLogo ? "上传中..." : "+ 品牌 Logo"}
-                </button>
-                <button
-                  onClick={() => visualAssetInputRef.current?.click()}
-                  disabled={uploadingVisualAsset || isBusy || chatLoading}
-                  className="pg-action pg-action-secondary flex-1 min-w-[90px] text-xs bg-white text-purple-700 px-2 py-1.5 rounded-lg border border-purple-200 hover:bg-purple-50 disabled:opacity-50 transition-colors"
-                  title="上传产品图、主 KV、模特图等必须保真的素材；只在相关页面调用"
-                >
-                  {uploadingVisualAsset ? "上传中..." : "+ 核心资产"}
-                </button>
-                <button
-                  onClick={() => styleRefInputRef.current?.click()}
-                  disabled={uploadingStyleRef || isBusy || chatLoading}
-                  className="pg-action pg-action-secondary flex-1 min-w-[90px] text-xs bg-white text-purple-700 px-2 py-1.5 rounded-lg border border-purple-200 hover:bg-purple-50 disabled:opacity-50 transition-colors"
-                  title="上传风格参考；只提取配色、材质、构图气质，不要求图片本身出现"
-                >
-                  {uploadingStyleRef ? "上传中..." : "+ 风格参考"}
-                </button>
-                <button
-                  onClick={() => templateInputRef.current?.click()}
-                  disabled={uploadingTemplate || isBusy || chatLoading}
-                  className="pg-action pg-action-secondary flex-1 min-w-[90px] text-xs bg-white text-purple-700 px-2 py-1.5 rounded-lg border border-purple-200 hover:bg-purple-50 disabled:opacity-50 transition-colors"
-                  title="上传 PPT/PDF 版式模板；用于提取封面、目录、内容页等版式秩序"
-                >
-                  {uploadingTemplate ? "上传中..." : "+ 版式模板"}
-                </button>
-              </div>
-              <button
-                onClick={async () => {
-                  if (!selectedProject) return;
-                  const hasExistingProposal = styleProposalsInChat.length > 0;
-                  // 路由到聊天接口：让视觉总监带着完整聊天历史 + 当前提案锚点重新决策
-                  // 这样调整意见不会被丢弃，按钮和聊天走同一条管道
-                  const fakeUserMsg = hasExistingProposal
-                    ? "请基于当前最新的素材和我们之前的讨论，重新给我一套风格提案。"
-                    : "请基于我已上传的素材帮我生成风格提案。";
-                  handleSendChat(fakeUserMsg);
-                }}
-                disabled={styleProposalsLoading || isBusy || chatLoading}
-                className="pg-action pg-action-primary w-full bg-purple-600 text-white text-sm py-2.5 rounded-lg font-medium hover:bg-purple-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {styleProposalsLoading || isBusy || chatLoading
-                  ? "正在生成..."
-                  : styleProposalsInChat.length === 0
-                    ? (referenceImages.length > 0 ? "素材已齐，开始生成" : "直接生成风格提案")
-                    : "基于当前素材重新生成提案"}
-              </button>
-            </div>
-          )}
           {/* draft 阶段文档上传区域 */}
           {showDraftAgentUpload && (
             <div className="mb-4">
@@ -6983,7 +8196,7 @@ function App() {
                   disabled={uploadingDoc || isBusy || chatLoading}
                   className="pg-action pg-action-secondary pg-upload-button text-sm bg-gray-100 text-gray-700 px-3 py-1.5 rounded hover:bg-gray-200 disabled:opacity-50 transition-colors"
                 >
-                  {uploadingDoc ? "解析中..." : "上传文档"}
+                  {uploadingDoc ? "上传中..." : "上传文档"}
                 </button>
                 <span className="pg-upload-hint text-xs text-gray-400">支持 PDF、Word、PPT、Markdown、TXT 等</span>
               </div>
@@ -6997,6 +8210,7 @@ function App() {
                   key={filename}
                   className="pg-attachment-chip inline-flex items-center gap-1 text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded border border-blue-200"
                 >
+                  <span className="pg-brief-inline-icon">{getFileTypeBadge(filename, "doc")}</span>
                   <span>{filename}</span>
                   <button
                     onClick={() => setPendingAttachments((prev) => prev.filter((f) => f !== filename))}
@@ -7589,6 +8803,7 @@ function SingleSlideEditor({
   const [isGenerating, setIsGenerating] = useState(false);
   const [pageActionLoading, setPageActionLoading] = useState<"plan" | "image" | null>(null);
   const [rerollingPlan, setRerollingPlan] = useState(false);
+  const [assetRouteLoading, setAssetRouteLoading] = useState<string | null>(null);
 
   // 保存当前编辑内容（不退出）
   const handleSave = async (): Promise<boolean> => {
@@ -7788,6 +9003,180 @@ function SingleSlideEditor({
     if (!el) return;
     el.focus();
     document.execCommand(cmd, false, value);
+  };
+
+  const projectAssetById = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const ref of referenceImages || []) {
+      if (ref?.id) map.set(String(ref.id), ref);
+    }
+    return map;
+  }, [referenceImages]);
+  const enabledOverlayLayers = Array.isArray(slide.visual_json?.overlay_layers)
+    ? slide.visual_json.overlay_layers.filter((layer: any) => layer?.enabled !== false && layer?.asset_id)
+    : [];
+  const overlayAssetIds = new Set(enabledOverlayLayers.map((layer: any) => String(layer.asset_id)));
+  const visualAssetIds = Array.isArray(slide.visual_json?.visual_asset_ids)
+    ? slide.visual_json.visual_asset_ids.map(String).filter(Boolean)
+    : [];
+  const manualVisualAssetIds = Array.isArray(slide.visual_json?.manual_visual_asset_ids)
+    ? slide.visual_json.manual_visual_asset_ids.map(String).filter(Boolean)
+    : [];
+  const manualVisualAssetSet = new Set(manualVisualAssetIds);
+  const visualAssetUsage = {
+    ...(slide.visual_json?.visual_asset_usage || {}),
+    ...(slide.visual_json?.manual_visual_asset_usage || {}),
+  };
+  const assetRouteModes = slide.visual_json?.asset_route_modes && typeof slide.visual_json.asset_route_modes === "object"
+    ? slide.visual_json.asset_route_modes
+    : {};
+  type AssetRoute = "blend" | "double_blend" | "overlay";
+  const pageReferenceItems = dedupeReferenceImages(slide.reference_images || []);
+  const blendProjectAssetIds = visualAssetIds.filter((id: string, index: number, arr: string[]) =>
+    !overlayAssetIds.has(id) && arr.indexOf(id) === index
+  );
+  const blendProjectAssets = blendProjectAssetIds.map((id: string) => ({
+    id,
+    asset: projectAssetById.get(id),
+    usage: visualAssetUsage[id],
+    manual: manualVisualAssetSet.has(id),
+    route: assetRouteModes[id] || (
+      ["product", "material"].includes(String(projectAssetById.get(id)?.asset_kind || "").toLowerCase())
+        ? "double_blend"
+        : "blend"
+    ),
+  }));
+  const overlayProjectAssets = enabledOverlayLayers
+    .map((layer: any) => ({
+      layer,
+      id: String(layer.asset_id),
+      asset: projectAssetById.get(String(layer.asset_id)),
+    }))
+    .filter(({ asset }: any) => Boolean(asset));
+  const routeAssetName = (asset: any, fallback: string) =>
+    asset?.asset_name || asset?.asset_analysis?.subject || fallback;
+  const routeAssetUrl = (asset: any) =>
+    asset?.overlay_url || asset?.url ? `${API_BASE}${asset.overlay_url || asset.url}` : "";
+
+  const routeLabel = (route: string) => {
+    if (route === "overlay") return "精确粘贴";
+    if (route === "double_blend") return "精修融合";
+    return "智能融合";
+  };
+  const routeProcessMode = (route: AssetRoute) => {
+    if (route === "overlay") return "original";
+    if (route === "double_blend") return "crop";
+    return "blend";
+  };
+  const pageReferenceRoute = (ref: any): AssetRoute => {
+    const id = String(ref?.id || "");
+    if (id && overlayAssetIds.has(id)) return "overlay";
+    const mode = String(ref?.process_mode || "").toLowerCase();
+    if (mode === "crop") return "double_blend";
+    const analysisRoute = String(ref?.asset_analysis?.asset_route_mode || ref?.asset_analysis?.route_mode || "").toLowerCase();
+    if (analysisRoute === "double_blend" || analysisRoute === "overlay" || analysisRoute === "blend") {
+      return analysisRoute as AssetRoute;
+    }
+    return "blend";
+  };
+  const imageReferenceInputCount =
+    pageReferenceItems.filter((ref: any) => pageReferenceRoute(ref) !== "overlay").length +
+    blendProjectAssets.filter(({ route }: any) => route !== "overlay").length;
+  const imageReferenceBadgeText = imageReferenceInputCount > 14
+    ? `参考图 ${imageReferenceInputCount} 张 · 前 14 张进入生图`
+    : `参考图 ${imageReferenceInputCount}/14 · 会稍慢`;
+  const pageReferenceLabel = (ref: any) => {
+    const analysis = ref?.asset_analysis || {};
+    const page = ref?.source_page_num || analysis.pptx_source_page_num;
+    const groupIndex = analysis.asset_group_index;
+    const groupSize = analysis.asset_group_size;
+    if (analysis.asset_group_role === "parallel_page_reference_set" && page && groupIndex && groupSize) {
+      return `原 PPT 第 ${page} 页图片组 ${groupIndex}/${groupSize}`;
+    }
+    if (page) return `原 PPT 第 ${page} 页参考图`;
+    return "本页上传素材";
+  };
+
+  const setPageReferenceRoute = async (ref: any, route: AssetRoute) => {
+    const refId = String(ref?.id || "");
+    if (!refId) return;
+    setAssetRouteLoading(refId);
+    try {
+      const currentLayers = enabledOverlayLayers.filter((layer: any) => String(layer.asset_id) !== refId);
+      if (route === "overlay") {
+        await updateSlideOverlayLayers(projectId, slide.id, [
+          ...currentLayers,
+          {
+            id: `ov_${refId}`,
+            asset_id: refId,
+            enabled: true,
+            preset: "right-card",
+            fit: "contain",
+            mode: "exact_card",
+            usage_note: `${pageReferenceLabel(ref)}：原图保留`,
+          },
+        ]);
+      } else {
+        if (overlayAssetIds.has(refId)) {
+          await updateSlideOverlayLayers(projectId, slide.id, currentLayers);
+        }
+        await updateReferenceImage(projectId, refId, { process_mode: routeProcessMode(route) });
+      }
+      markSlideStale?.(slide.id, "visual");
+      await onSaved?.();
+      onToast?.(`已切换为${routeLabel(route)}`, "success");
+      onSystemLog?.(`用户将第 ${slide.page_num} 页本页参考图切换为${routeLabel(route)}`);
+    } catch (err: any) {
+      try {
+        await onSaved?.();
+      } catch {}
+      onToast?.("切换失败，已刷新当前状态：" + (err.message || "未知错误"), "error");
+    } finally {
+      setAssetRouteLoading(null);
+    }
+  };
+
+  const setPageAssetRoute = async (assetId: string, route: AssetRoute) => {
+    setAssetRouteLoading(assetId);
+    try {
+      const nextRouteModes = { ...assetRouteModes, [assetId]: route };
+      const nextManualIds = manualVisualAssetIds.includes(assetId) ? manualVisualAssetIds : [...manualVisualAssetIds, assetId];
+      if (!manualVisualAssetIds.includes(assetId)) {
+        await updateSlideAssetPins(projectId, slide.id, nextManualIds, {
+          ...(slide.visual_json?.manual_visual_asset_usage || {}),
+          [assetId]: visualAssetUsage[assetId] || `用户切换为${routeLabel(route)}`,
+        });
+      }
+      const currentLayers = enabledOverlayLayers.filter((layer: any) => String(layer.asset_id) !== assetId);
+      if (route === "overlay") {
+        await updateSlideOverlayLayers(projectId, slide.id, [
+          ...currentLayers,
+          {
+            id: `ov_${assetId}`,
+            asset_id: assetId,
+            enabled: true,
+            preset: "right-card",
+            fit: "contain",
+            mode: "exact_card",
+            usage_note: visualAssetUsage[assetId] || "用户切换为精确粘贴",
+          },
+        ]);
+      } else if (overlayAssetIds.has(assetId)) {
+        await updateSlideOverlayLayers(projectId, slide.id, currentLayers);
+      }
+      await updateVisualPlan(projectId, slide.page_num, { asset_route_modes: nextRouteModes }, slide.id);
+      markSlideStale?.(slide.id, "visual");
+      await onSaved?.();
+      onToast?.(`已切换为${routeLabel(route)}`, "success");
+      onSystemLog?.(`用户将第 ${slide.page_num} 页素材切换为${routeLabel(route)}`);
+    } catch (err: any) {
+      try {
+        await onSaved?.();
+      } catch {}
+      onToast?.("切换失败，已刷新当前状态：" + (err.message || "未知错误"), "error");
+    } finally {
+      setAssetRouteLoading(null);
+    }
   };
 
   // 内容规划阶段不显示 "需更新画面方案" 的 content stale 提示
@@ -8093,80 +9482,187 @@ function SingleSlideEditor({
         />
       </div>
 
-      {/* 本页参考图 */}
+      {/* 本页图片确认 */}
       <div className="mb-6">
         <div className="flex items-center gap-1.5 mb-2">
-          <label className="text-xs text-gray-500 font-medium">本页参考图</label>
+          <label className="text-xs text-gray-500 font-medium">本页图片确认</label>
+          {imageReferenceInputCount >= 8 && (
+            <span className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
+              {imageReferenceBadgeText}
+            </span>
+          )}
           <div className="relative group">
             <span className="text-xs text-gray-400 cursor-help">ⓘ</span>
             <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-1 hidden group-hover:block w-64 bg-gray-800 text-white text-[11px] rounded-lg px-3 py-2 shadow-lg z-50">
-              <p className="mb-1">只影响当前这一页，优先级高于项目级核心资产。</p>
-              <p className="font-semibold mb-1">三种处理模式：</p>
-              <p><span className="text-blue-300">融合</span>：提取图片主体，智能融入画面</p>
-              <p><span className="text-orange-300">裁剪</span>：保留图片内容，允许裁剪适配</p>
-              <p><span className="text-green-300">原图</span>：原样插入，不改变比例</p>
+              <p className="mb-1">这里列出本页会出现的图片素材。</p>
+              <p>你可以保留系统推荐，也可以改成更保真或原样保留。</p>
               <div className="absolute left-1/2 -translate-x-1/2 top-full w-2 h-2 bg-gray-800 rotate-45" />
             </div>
           </div>
         </div>
-        <div className="flex flex-wrap gap-3 mb-2">
-          {slide.reference_images?.map((ref: any) => (
-            <div key={ref.id} className="flex flex-col items-center gap-1">
-              <div className="relative group">
-                <img
-                  src={`${API_BASE}${ref.url}`}
-                  alt="ref"
-                  className="w-16 h-16 rounded object-cover border cursor-pointer"
-                  onClick={() => onImageClick?.(`${API_BASE}${ref.url}`)}
-                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                />
-                {/* 删除按钮 */}
-                <button
-                  onClick={async () => {
-                    try {
-                      await deleteReferenceImage(projectId, ref.id);
-                      markSlideStale?.(slide.id, "visual");
-                      onSaved?.();
-                      onToast?.("已删除", "success");
-                      onSystemLog?.(`用户删除了第 ${slide.page_num} 页的本页参考图`);
-                    } catch (err: any) {
-                      onToast?.("删除失败：" + (err.message || "未知错误"), "error");
-                    }
-                  }}
-                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white text-2xs rounded-full items-center justify-center hidden group-hover:flex shadow-sm z-10"
-                  title="删除"
-                >
-                  X
-                </button>
-              </div>
-              {/* 模式切换按钮 */}
-              <div className="flex gap-0.5">
-                {[
-                  { key: "blend", label: "融合", color: "bg-blue-500" },
-                  { key: "crop", label: "裁剪", color: "bg-orange-500" },
-                  { key: "original", label: "原图", color: "bg-green-600" },
-                ].map((m) => (
-                  <button
-                    key={m.key}
-                    onClick={async () => {
-                      try {
-                        await updateReferenceImageMode(projectId, ref.id, m.key);
-                        markSlideStale?.(slide.id, "visual");
-                        onSaved?.();
-                        onToast?.(`已切换为${m.label}模式`, "success");
-                        onSystemLog?.(`用户将第 ${slide.page_num} 页本页参考图切换为${m.label}模式`);
-                      } catch (err: any) {
-                        onToast?.("更新失败：" + (err.message || "未知错误"), "error");
-                      }
-                    }}
-                    className={`text-2xs px-1.5 py-0.5 rounded leading-none ${ref.process_mode === m.key ? `${m.color} text-white` : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
-                  >
-                    {m.label}
-                  </button>
-                ))}
-              </div>
+        <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 mb-2">
+          <div className="grid grid-cols-3 gap-2 text-[11px] mb-3">
+            <div className="rounded bg-white border border-slate-200 p-2">
+              <div className="font-semibold text-slate-700">智能融合</div>
+              <div className="text-slate-500 mt-0.5">自然融入画面</div>
             </div>
-          ))}
+            <div className="rounded bg-white border border-blue-200 p-2">
+              <div className="font-semibold text-blue-700">精修融合</div>
+              <div className="text-slate-500 mt-0.5">融合后校准细节</div>
+            </div>
+            <div className="rounded bg-white border border-amber-200 p-2">
+              <div className="font-semibold text-amber-700">精确粘贴</div>
+              <div className="text-slate-500 mt-0.5">原样保留，位置可控</div>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            {pageReferenceItems.map((ref: any) => {
+              const route = pageReferenceRoute(ref);
+              const refId = String(ref.id);
+              return (
+                <div key={ref.id} className="flex items-center gap-3 rounded-md bg-white border border-slate-200 p-2">
+                  <div className="relative group flex-shrink-0">
+                    <img
+                      src={`${API_BASE}${ref.url}`}
+                      alt="ref"
+                      className="w-14 h-14 rounded object-cover border cursor-pointer"
+                      onClick={() => onImageClick?.(`${API_BASE}${ref.url}`)}
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                    />
+                    <button
+                      onClick={async () => {
+                        try {
+                          await deleteReferenceImage(projectId, ref.id);
+                          markSlideStale?.(slide.id, "visual");
+                          onSaved?.();
+                          onToast?.("已删除", "success");
+                          onSystemLog?.(`用户删除了第 ${slide.page_num} 页的本页参考图`);
+                        } catch (err: any) {
+                          onToast?.("删除失败：" + (err.message || "未知错误"), "error");
+                        }
+                      }}
+                      className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-red-500 text-white text-2xs rounded-full items-center justify-center hidden group-hover:flex shadow-sm z-10"
+                      title="删除"
+                    >
+                      X
+                    </button>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-slate-700 truncate">{ref.asset_name || ref.asset_analysis?.subject || "本页参考图"}</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">{pageReferenceLabel(ref)} · {routeLabel(route)}</div>
+                  </div>
+                  <div className="flex gap-1">
+                    {(["blend", "double_blend", "overlay"] as const).map((target) => (
+                      <button
+                        key={target}
+                        type="button"
+                        disabled={assetRouteLoading === refId || route === target}
+                        onClick={() => setPageReferenceRoute(ref, target)}
+                        className={`text-[11px] px-2 py-1 rounded border ${
+                          route === target
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                        } disabled:opacity-60`}
+                      >
+                        {assetRouteLoading === refId && route !== target ? "切换中" : routeLabel(target)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            {blendProjectAssets.map(({ id, asset, usage, manual, route }: any) => {
+              const url = routeAssetUrl(asset);
+              return (
+                <div key={id} className="flex items-center gap-3 rounded-md bg-white border border-slate-200 p-2">
+                  {url ? (
+                    <img
+                      src={url}
+                      alt={routeAssetName(asset, "项目素材")}
+                      className="w-14 h-14 rounded object-contain border bg-white cursor-pointer"
+                      onClick={() => onImageClick?.(url)}
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                    />
+                  ) : (
+                    <div className="w-14 h-14 rounded border bg-slate-100 flex items-center justify-center text-[10px] text-slate-400">缺失</div>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-slate-700 truncate">{routeAssetName(asset, "项目素材")}</div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      项目素材 · {manual ? "手动指定" : "系统分配"} · {routeLabel(route)}
+                    </div>
+                    {usage && <div className="text-[11px] text-slate-400 mt-0.5 truncate">{usage}</div>}
+                  </div>
+                  <div className="flex gap-1">
+                    {(["blend", "double_blend", "overlay"] as const).map((target) => (
+                      <button
+                        key={target}
+                        type="button"
+                        disabled={assetRouteLoading === id || route === target}
+                        onClick={() => setPageAssetRoute(id, target)}
+                        className={`text-[11px] px-2 py-1 rounded border ${
+                          route === target
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                        } disabled:opacity-60`}
+                      >
+                        {assetRouteLoading === id && route !== target ? "切换中" : routeLabel(target)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            {overlayProjectAssets.map(({ id, asset, layer }: any) => {
+              const url = routeAssetUrl(asset);
+              return (
+                <div key={`overlay-${id}`} className="flex items-center gap-3 rounded-md bg-amber-50 border border-amber-200 p-2">
+                  {url ? (
+                    <img
+                      src={url}
+                      alt={routeAssetName(asset, "精确粘贴素材")}
+                      className="w-14 h-14 rounded object-contain border bg-white cursor-pointer"
+                      onClick={() => onImageClick?.(url)}
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                    />
+                  ) : (
+                    <div className="w-14 h-14 rounded border bg-amber-100 flex items-center justify-center text-[10px] text-amber-500">缺失</div>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-slate-700 truncate">{routeAssetName(asset, "精确粘贴素材")}</div>
+                    <div className="text-[11px] text-amber-700 mt-0.5">项目素材 · 精确粘贴 · {layer.preset || "默认位置"}</div>
+                    {layer.usage_note && <div className="text-[11px] text-slate-400 mt-0.5 truncate">{layer.usage_note}</div>}
+                  </div>
+                  <div className="flex gap-1">
+                    {(["blend", "double_blend", "overlay"] as const).map((target) => (
+                      <button
+                        key={target}
+                        type="button"
+                        disabled={assetRouteLoading === id || target === "overlay"}
+                        onClick={() => setPageAssetRoute(id, target)}
+                        className={`text-[11px] px-2 py-1 rounded border ${
+                          target === "overlay"
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
+                        } disabled:opacity-60`}
+                      >
+                        {assetRouteLoading === id && target !== "overlay" ? "切换中" : routeLabel(target)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+
+            {pageReferenceItems.length + blendProjectAssets.length + overlayProjectAssets.length === 0 && (
+              <div className="text-xs text-slate-500 rounded-md bg-white border border-dashed border-slate-200 p-3">
+                当前页没有显式图片素材；最终画面会根据文字和画面描述生成。
+              </div>
+            )}
+          </div>
         </div>
         <button
           onClick={() => {

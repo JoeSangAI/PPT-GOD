@@ -9,7 +9,13 @@ from sqlalchemy import inspect, text
 
 from app.core.config import settings
 from app.core.provider_credentials import ProviderCredentials, reset_provider_credentials, set_provider_credentials
-from app.core.tester_auth import TESTER_ID_HEADER, reset_current_tester_id, set_current_tester_id
+from app.core.tester_auth import (
+    TESTER_ID_HEADER,
+    reset_current_request_is_local,
+    reset_current_tester_id,
+    set_current_request_is_local,
+    set_current_tester_id,
+)
 from app.api import auth, projects, slides, chat, documents
 from app.models.base import SessionLocal, engine
 from app.models import models
@@ -74,6 +80,10 @@ async def mvp_context_and_project_guard(request: Request, call_next):
     provider_token = set_provider_credentials(ProviderCredentials.from_headers(request.headers))
     tester_id = (request.headers.get(TESTER_ID_HEADER) or request.query_params.get("tester_id") or "").strip() or None
     tester_token = set_current_tester_id(tester_id)
+    client_host = (request.client.host if request.client else "") or ""
+    host_header = (request.headers.get("host") or "").split(":", 1)[0]
+    is_local_request = client_host in {"127.0.0.1", "::1", "localhost"} and host_header in {"127.0.0.1", "::1", "localhost"}
+    local_token = set_current_request_is_local(is_local_request)
     try:
         match = None if request.method == "OPTIONS" else _project_path_re.match(request.url.path)
         if match:
@@ -91,6 +101,7 @@ async def mvp_context_and_project_guard(request: Request, call_next):
         return await call_next(request)
     finally:
         reset_current_tester_id(tester_token)
+        reset_current_request_is_local(local_token)
         reset_provider_credentials(provider_token)
 
 app.include_router(auth.router)

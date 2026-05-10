@@ -1,21 +1,21 @@
+from datetime import datetime, timezone
 import logging
 import os
 
 import redis
 
 from app.celery_app import celery_app
-from sqlalchemy.orm import Session
-
 from app.core.config import settings
 from app.core.provider_credentials import load_task_provider_credentials, provider_credentials_context
 from app.models.base import SessionLocal
 from app.models.models import Project, Slide
+from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.generation_pipeline import run_generation_pipeline
+from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from app.services.logo_assets import prepare_logo_lockup_image
+from app.services.logo_policy import is_logo_confirmed
 from app.services.run_state import finish_run, is_run_active, mark_run_running, update_run_progress
 from app.services.style_proposal import generate_style_proposals
-from app.services.image_analyzer import analyze_logo, analyze_reference_image
-from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -24,30 +24,34 @@ redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
 
 def compute_style_asset_signature(project: Project | None) -> str:
     """Fingerprint global style assets so cached proposals are invalidated after uploads/deletes."""
-    if not project:
-        return ""
-    parts = []
-    for ref in sorted(project.reference_images or [], key=lambda r: (r.role or "", r.id or "")):
-        if ref.slide_id or ref.role not in {"logo", "style_ref", "template"}:
-            continue
-        try:
-            mtime = os.path.getmtime(ref.file_path) if os.path.exists(ref.file_path) else 0
-        except OSError:
-            mtime = 0
-        parts.append({
-            "id": ref.id,
-            "role": ref.role,
-            "path": os.path.basename(ref.file_path or ""),
-            "mtime": round(mtime, 3),
-        })
-    if project.selected_template_recommendations:
-        parts.append({"template_recommendations": project.selected_template_recommendations})
-    return json_dumps_compact(parts) if parts else ""
+    return style_asset_signature(project)
 
 
-def json_dumps_compact(value) -> str:
-    import json
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _cached_reference_analysis(ref) -> dict | None:
+    analysis = ref.asset_analysis if isinstance(getattr(ref, "asset_analysis", None), dict) else {}
+    if not analysis:
+        return None
+    if analysis.get("analysis_status") == "completed":
+        return analysis
+    if any(analysis.get(key) for key in ("description", "style_name", "dominant_palette", "colors", "composition_style", "mood")):
+        return analysis
+    return None
+
+
+def _file_exists(path: str | None) -> bool:
+    return bool(path and os.path.exists(path))
+
+
+def _first_cached_reference_analysis(refs) -> dict | None:
+    for ref in refs or []:
+        cached = _cached_reference_analysis(ref)
+        if cached:
+            return cached
+    return None
+
+
+def _first_existing_ref(refs):
+    return next((ref for ref in refs or [] if _file_exists(getattr(ref, "file_path", None))), None)
 
 
 def _resolve_target_pages(project_id: str, page_nums: list = None) -> list:
@@ -207,7 +211,7 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
             db.commit()
             return {"project_id": project_id, "status": "no_slides"}
 
-        mark_run_running(db, run_id, stage="style_proposal", message="正在生成风格提案...")
+        mark_run_running(db, run_id, stage="style_proposal", message="正在准备风格提案上下文...")
         db.commit()
 
         content_plan = [s.content_json for s in slides]
@@ -215,7 +219,9 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
         # 自动分析项目素材（失败不阻断主流程）
         assets = {}
         if project.reference_images:
-            logo_refs = [r for r in project.reference_images if r.role == "logo"]
+            update_run_progress(db, run_id, stage="asset_analysis", message="正在读取项目素材...")
+            db.commit()
+            logo_refs = [r for r in project.reference_images if r.role == "logo" and is_logo_confirmed(r)]
             style_refs = [r for r in project.reference_images if r.role == "style_ref"]
             template_refs = [r for r in project.reference_images if r.role == "template"]
 
@@ -230,22 +236,29 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                     logger.warning(f"[StyleProposals Celery] Logo analysis failed: {e}")
 
             if style_refs:
-                existing_style_refs = [r for r in style_refs if os.path.exists(r.file_path)]
-                if not existing_style_refs:
-                    msg = "已上传风格参考图，但原文件不存在。请重新上传参考图后再生成风格提案。"
-                    finish_run(db, run_id, status="failed", message=msg, error_msg="style_reference_file_missing")
-                    project.style_proposal = None
-                    db.commit()
-                    return {"project_id": project_id, "status": "failed", "error": "style_reference_file_missing"}
-                try:
-                    logger.info(f"[StyleProposals Celery] Analyzing reference image for project={project_id}")
-                    assets["reference_analysis"] = analyze_reference_image(existing_style_refs[0].file_path)
-                except Exception as e:
-                    logger.warning(f"[StyleProposals Celery] Reference analysis failed: {e}")
+                cached = _first_cached_reference_analysis(style_refs)
+                if cached:
+                    logger.info(f"[StyleProposals Celery] Reusing cached reference analysis for project={project_id}")
+                    assets["reference_analysis"] = cached
+                else:
+                    style_ref = _first_existing_ref(style_refs)
+                    if not style_ref:
+                        logger.warning(
+                            "[StyleProposals Celery] Skipping %s missing style reference file(s) for project=%s; generating from remaining context",
+                            len(style_refs),
+                            project_id,
+                        )
+                    else:
+                        try:
+                            logger.info(f"[StyleProposals Celery] Analyzing reference image for project={project_id}")
+                            assets["reference_analysis"] = analyze_reference_image(style_ref.file_path)
+                        except Exception as e:
+                            logger.warning(f"[StyleProposals Celery] Reference analysis failed: {e}")
 
             if template_refs or project.selected_template_recommendations:
                 assets["template_analysis"] = {"has_template": True}
                 template_sample = None
+                template_ref = None
                 recommendations = project.selected_template_recommendations or {}
                 if isinstance(recommendations, dict):
                     for key in ("cover", "content", "toc", "ending"):
@@ -253,14 +266,29 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                         if isinstance(rec, dict) and rec.get("file_path"):
                             template_sample = rec["file_path"]
                             break
-                if not template_sample and template_refs:
-                    template_sample = template_refs[0].file_path
-                if template_sample:
+                if template_refs:
+                    template_ref = next((r for r in template_refs if r.file_path == template_sample), None) if template_sample else None
+                    template_ref = template_ref or _first_existing_ref(template_refs) or template_refs[0]
+                if not template_sample and template_ref and _file_exists(template_ref.file_path):
+                    template_sample = template_ref.file_path
+                cached = _cached_reference_analysis(template_ref) if template_ref else None
+                if cached:
+                    logger.info(f"[StyleProposals Celery] Reusing cached template analysis for project={project_id}")
+                    assets["template_analysis"]["reference_analysis"] = cached
+                elif template_sample and _file_exists(template_sample):
                     try:
                         logger.info(f"[StyleProposals Celery] Analyzing template reference for project={project_id}")
                         assets["template_analysis"]["reference_analysis"] = analyze_reference_image(template_sample)
                     except Exception as e:
                         logger.warning(f"[StyleProposals Celery] Template analysis failed: {e}")
+                elif template_refs:
+                    logger.warning(
+                        "[StyleProposals Celery] Skipping missing template reference file(s) for project=%s; generating from remaining context",
+                        project_id,
+                    )
+
+        update_run_progress(db, run_id, stage="style_proposal", message="正在生成风格提案...")
+        db.commit()
 
         proposals = generate_style_proposals(content_plan, assets=assets if assets else None)
         db.expire_all()
@@ -283,6 +311,7 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "asset_based": asset_based,
             "asset_signature": compute_style_asset_signature(project),
+            "content_signature": content_signature(project.slides or []),
         }
         # 风格提案生成后，项目进入视觉方案待确认阶段
         if project.status in ("planning", "draft"):

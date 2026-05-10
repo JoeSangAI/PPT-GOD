@@ -4,6 +4,7 @@ export interface ToastItem {
   id: string;
   message: string;
   type: "success" | "error" | "info";
+  duration?: number;
 }
 
 export default function ToastContainer({
@@ -30,9 +31,9 @@ function ToastItemComponent({
   onRemove: (id: string) => void;
 }) {
   useEffect(() => {
-    const timer = setTimeout(() => onRemove(toast.id), 3000);
+    const timer = setTimeout(() => onRemove(toast.id), toast.duration ?? 2600);
     return () => clearTimeout(timer);
-  }, [toast.id, onRemove]);
+  }, [toast.id, toast.duration, onRemove]);
 
   const colors = {
     success: "bg-green-600",

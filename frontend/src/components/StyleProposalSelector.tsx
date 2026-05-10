@@ -10,6 +10,18 @@ export interface StyleProposal {
   mood: string;
   font: string;
   description: string;
+  decision_label?: string;
+  best_for?: string;
+  tradeoff?: string;
+  visual_focus?: string;
+  visual_strategy?: {
+    summary?: string;
+    background_policy?: string;
+    content_treatment?: string;
+    exception_policy?: string;
+    logo_contrast?: string;
+    base_tone?: string;
+  };
   source?: string;
 }
 
@@ -72,13 +84,13 @@ export default function StyleProposalSelector({
               <div className="border-2 border-dashed border-gray-200 rounded-lg p-8 text-center">
                 <div className="text-4xl mb-3">—</div>
                 <h3 className="text-base font-semibold text-gray-800 mb-1">暂无风格提案</h3>
-                <p className="text-sm text-gray-500 mb-4">你可以先上传素材（Logo / 参考图 / 模板），或直接生成风格提案</p>
+                <p className="text-sm text-gray-500 mb-4">可以直接生成视觉方向；需要补充素材时，使用项目素材库。</p>
                 <button
                   onClick={onRegenerate}
                   disabled={disabled}
                   className="bg-blue-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  生成风格提案
+                  生成视觉方向
                 </button>
               </div>
             ) : (

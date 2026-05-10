@@ -7,6 +7,8 @@ import { chromium } from "playwright";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_URL = process.env.APP_URL || "http://127.0.0.1:5173";
 const API_BASE = process.env.VITE_API_BASE_URL || "http://localhost:8000";
+const APP_ORIGIN = new URL(APP_URL).origin;
+const API_ORIGIN = new URL(API_BASE, APP_URL).origin;
 const project = {
   id: "low-cost-project",
   title: "Low Cost E2E",
@@ -84,15 +86,51 @@ let retryFailedCalls = 0;
 let rollbackCalls = 0;
 let chatCalls = 0;
 
+function workflowStatus() {
+  const activeRun = project.status === "generating"
+    ? {
+        id: "mock-task",
+        kind: "prototype_generation",
+        status: "running",
+        stage: "image_generation",
+        message: "Mock generation running",
+      }
+    : null;
+  return {
+    project_id: project.id,
+    project_phase: project.status,
+    project_status: project.status,
+    total_slides: slides.length,
+    completed_slides: slides.filter((s) => s.status === "completed").length,
+    target_count: slides.length,
+    target_page_nums: null,
+    active_run: activeRun,
+    last_run: activeRun,
+    progress: activeRun
+      ? { run_id: activeRun.id, kind: activeRun.kind, status: activeRun.status, current: 0, total: slides.length }
+      : null,
+    has_pptx: false,
+    slides: slides.map((s) => ({ id: s.id, page_num: s.page_num, status: s.status, error_msg: null })),
+  };
+}
+
 await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
+  window.localStorage.setItem(
+    "pptgod.mvpAuth",
+    JSON.stringify({ testerId: "low-cost-tester", displayName: "Low Cost Tester" }),
+  );
 }, project.id);
 
-await page.route(`${API_BASE}/**`, async (route) => {
+await page.route("**/*", async (route) => {
   const request = route.request();
   const url = new URL(request.url());
   const path = url.pathname;
   const method = request.method();
+  const mockableApiOrigin = url.origin === APP_ORIGIN || url.origin === API_ORIGIN;
+  if (!mockableApiOrigin) {
+    return route.continue();
+  }
 
   if (method === "GET" && path === "/projects") {
     return route.fulfill({ json: [project] });
@@ -114,6 +152,9 @@ await page.route(`${API_BASE}/**`, async (route) => {
   }
   if (method === "GET" && path === `/projects/${project.id}/generation-progress`) {
     return route.fulfill({ json: { project_id: project.id, project_status: project.status } });
+  }
+  if (method === "GET" && path === `/projects/${project.id}/workflow-status`) {
+    return route.fulfill({ json: workflowStatus() });
   }
   if (method === "GET" && path === `/projects/${project.id}/generation-status`) {
     return route.fulfill({
@@ -154,6 +195,7 @@ await page.route(`${API_BASE}/**`, async (route) => {
         prototype: true,
         page_nums: [1],
         task_id: "mock-task",
+        run: workflowStatus().active_run,
       },
     });
   }
@@ -188,13 +230,16 @@ await page.route(`${API_BASE}/**`, async (route) => {
     });
   }
 
-  return route.fulfill({ status: 404, json: { detail: `Unhandled mock route: ${method} ${path}` } });
+  if (path.startsWith("/projects") || path.startsWith("/auth")) {
+    return route.fulfill({ status: 404, json: { detail: `Unhandled mock route: ${method} ${path}` } });
+  }
+  return route.continue();
 });
 
 try {
   await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
   await page.getByText("Low Cost E2E").first().waitFor({ timeout: 10_000 });
-  await page.getByRole("button", { name: "先打样种子页" }).click();
+  await page.getByRole("button", { name: /^打样\s+\d+\s+页$|^打样确认$/ }).first().click();
   await page.getByText("停止生成").waitFor({ timeout: 10_000 });
   await page.getByText("停止生成").click();
   await page.getByText("已停止生成", { exact: true }).waitFor({ timeout: 10_000 });
@@ -208,7 +253,7 @@ try {
   project.status = "prompt_ready";
   slides[0].status = "prompt_ready";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByTitle("回退到「视觉方案」：会清除后续阶段数据").click();
+  await page.getByRole("button", { name: /视觉方案/ }).click();
   await page.getByRole("button", { name: "确认" }).click();
   await page.getByText("回退成功", { exact: true }).waitFor({ timeout: 10_000 });
 
@@ -218,10 +263,8 @@ try {
   slides[0].image_path = "./outputs/low-cost-project/slide_01.png";
   slides[0].prompt_text = "Mock prompt";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByText("效果预览确认").waitFor({ timeout: 10_000 });
-  await page.getByRole("button", { name: "返回全局预览", exact: true }).click();
-  await page.getByText("效果预览确认").waitFor({ state: "hidden", timeout: 10_000 });
-  await page.getByRole("button", { name: "查看打样结果" }).waitFor({ timeout: 10_000 });
+  await page.getByText("先确认种子页，再批量生成").waitFor({ timeout: 10_000 });
+  await page.getByRole("button", { name: "重新打样" }).first().waitFor({ timeout: 10_000 });
 
   await page.getByPlaceholder("输入指令...").fill("测试聊天错误处理");
   await page.getByRole("button", { name: "发送" }).click();

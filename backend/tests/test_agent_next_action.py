@@ -2,7 +2,10 @@ from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VI
 from app.api.chat import (
     _content_result_needs_contract_review,
     _enforce_content_action_contract,
+    _infer_requested_page_count,
 )
+from app.api.slides import PageNumsRequest
+from app.services.visual_plan import _build_batch_prompt
 
 
 def test_content_proposal_gets_generate_plan_next_action():
@@ -28,6 +31,32 @@ def test_agent_action_contract_includes_handoffs_and_content_regeneration():
     assert "regenerate_plan" in CONTENT_ACTIONS
     assert "forward_to_content" in VISUAL_ACTIONS
     assert "refine_slide" in FINETUNE_ACTIONS
+
+
+def test_visual_generation_request_accepts_cross_stage_context():
+    request = PageNumsRequest(stage_context="内容阶段要求突出 OpenDay 39 场和累计参会约 2 万人")
+
+    assert "OpenDay 39 场" in request.stage_context
+
+
+def test_visual_plan_prompt_inherits_cross_stage_requirements():
+    prompt = _build_batch_prompt(
+        pages_summary=[
+            {
+                "page_num": 6,
+                "type": "data",
+                "headline": "活动增长",
+                "subhead": "",
+                "body_preview": "OpenDay：39 场；累计参会人数：约 2 万人",
+                "existing_visual_suggestion": "",
+                "global_user_requirements": "内容阶段要求突出 OpenDay 39 场和累计参会约 2 万人",
+            }
+        ],
+        style={"meta": {"palette": ["#111111"], "theme": "商务"}, "body": ""},
+    )
+
+    assert "跨阶段用户补充要求" in prompt
+    assert "OpenDay 39 场" in prompt
 
 
 def test_visual_answer_before_style_can_offer_style_proposal():
@@ -239,3 +268,51 @@ def test_failed_contract_compiler_does_not_silently_keep_promise_answer():
     assert compiled["action"] == "answer"
     assert compiled["no_change_reason"] == "content_instruction_compiler_failed"
     assert "没有修改 PPT" in compiled["response"]
+
+
+def test_page_count_change_is_forced_to_regenerate_plan_even_if_compiler_answers():
+    result = {"action": "answer", "response": "已根据你的要求重新规划为 12 页内容。"}
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="把它变成 12 页 PPT。",
+        project_context={"title": "非凡产研", "total_slides": 10},
+        compiler=lambda **_: {
+            "action": "answer",
+            "response": "已根据你的要求重新规划为 12 页内容。",
+            "no_change_reason": "incorrectly_treated_as_answer",
+        },
+    )
+
+    assert compiled["action"] == "regenerate_plan"
+    assert compiled["page_count"] == 12
+    assert "必须 12 页" in compiled["topic"]
+
+
+def test_confirmation_after_unapplied_plan_offer_generates_before_visual_handoff():
+    result = {"action": "forward_to_visual", "response": "内容已就绪，已切换至视觉总监阶段。"}
+    history = [
+        {
+            "role": "assistant",
+            "content": "已根据你的要求重新规划内容：\n\n>12页内容规划：\n• >P1 封面\n• >P2 使命愿景\n• >P12 结尾",
+        }
+    ]
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="ok",
+        project_context={"title": "非凡产研", "total_slides": 10, "content_plan_confirmed": False},
+        history=history,
+        compiler=lambda **_: {
+            "action": "forward_to_visual",
+            "response": "内容已确认，现在进入视觉总监。",
+        },
+    )
+
+    assert compiled["action"] == "regenerate_plan"
+    assert compiled["page_count"] == 12
+    assert "真正生成" in compiled["response"]
+
+
+def test_page_reference_is_not_misread_as_deck_page_count():
+    assert _infer_requested_page_count("第12页现在是什么作用？") is None

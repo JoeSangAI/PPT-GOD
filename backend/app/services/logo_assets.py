@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-from functools import lru_cache
 
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 
@@ -184,8 +183,3 @@ def prepare_logo_lockup_image(source_paths: list[str] | tuple[str, ...] | None) 
         return output_path
     except Exception:
         return prepare_logo_overlay_image(valid_paths[0])
-
-
-@lru_cache(maxsize=256)
-def prepared_logo_overlay_image_cached(source_path: str, mtime: float | None = None) -> str:
-    return prepare_logo_overlay_image(source_path)

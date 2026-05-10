@@ -13,6 +13,12 @@ export const API_BASE =
     ? "http://localhost:8000"
     : "";
 
+function makeApiUrl(path: string): URL {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const rawUrl = `${API_BASE}${normalizedPath}`;
+  return new URL(rawUrl, window.location.origin);
+}
+
 const AUTH_STORAGE_KEY = "pptgod.mvpAuth";
 const PROVIDER_STORAGE_KEY = "pptgod.providerSettings";
 
@@ -98,11 +104,11 @@ function providerHeaders(): Record<string, string> {
   const deerApiBase = headerSafe(provider.deerApiBase);
   const deerImageModel = headerSafe(provider.deerImageModel);
   if (minimaxApiKey) headers["x-pptgod-minimax-api-key"] = minimaxApiKey;
-  if (minimaxApiBase) headers["x-pptgod-minimax-api-base"] = minimaxApiBase;
-  if (minimaxLlmModel) headers["x-pptgod-minimax-llm-model"] = minimaxLlmModel;
+  if (minimaxApiKey && minimaxApiBase) headers["x-pptgod-minimax-api-base"] = minimaxApiBase;
+  if (minimaxApiKey && minimaxLlmModel) headers["x-pptgod-minimax-llm-model"] = minimaxLlmModel;
   if (deerApiKey) headers["x-pptgod-deer-api-key"] = deerApiKey;
-  if (deerApiBase) headers["x-pptgod-deer-api-base"] = deerApiBase;
-  if (deerImageModel) headers["x-pptgod-deer-image-model"] = deerImageModel;
+  if (deerApiKey && deerApiBase) headers["x-pptgod-deer-api-base"] = deerApiBase;
+  if (deerApiKey && deerImageModel) headers["x-pptgod-deer-image-model"] = deerImageModel;
   return headers;
 }
 
@@ -199,42 +205,41 @@ export async function fetchSlides(projectId: string) {
   return (await checkRes(res)).json();
 }
 
-export async function generateVisualPlan(projectId: string, pageNums?: number[]) {
+export async function generateVisualPlan(projectId: string, pageNums?: number[], stageContext?: string) {
+  const body: any = {};
+  if (pageNums) body.page_nums = pageNums;
+  if (stageContext) body.stage_context = stageContext;
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/visual-plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(pageNums ? { page_nums: pageNums } : {}),
+    body: JSON.stringify(body),
   });
   return (await checkRes(res)).json();
 }
 
-export async function generatePrompts(projectId: string, pageNums?: number[]) {
+export async function generatePrompts(projectId: string, pageNums?: number[], stageContext?: string) {
+  const body: any = {};
+  if (pageNums) body.page_nums = pageNums;
+  if (stageContext) body.stage_context = stageContext;
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/prompts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(pageNums ? { page_nums: pageNums } : {}),
+    body: JSON.stringify(body),
   });
   return (await checkRes(res)).json();
 }
 
-export async function generateVisualPrompts(projectId: string, pageNums?: number[]) {
+export async function generateVisualPrompts(projectId: string, pageNums?: number[], stageContext?: string) {
+  const body: any = {};
+  if (pageNums) body.page_nums = pageNums;
+  if (stageContext) body.stage_context = stageContext;
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/visual-prompts`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(pageNums ? { page_nums: pageNums } : {}),
+    body: JSON.stringify(body),
   });
   return (await checkRes(res)).json();
 }
-
-/**
-
- * @returns {{ generation_status: "running" | "idle", project_status: string, active_run: object | null }}
- */
-export async function fetchGenerationStatus(projectId: string) {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/generation-status`);
-  return (await checkRes(res)).json();
-}
-
 
 export async function startGeneration(projectId: string, pageNums?: number[], prototype?: boolean) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/generate`, {
@@ -259,24 +264,21 @@ export async function confirmPrototype(projectId: string) {
   return (await checkRes(res)).json();
 }
 
-export async function fetchProjectStatus(projectId: string) {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/status`);
-  return (await checkRes(res)).json();
-}
-
 export async function fetchWorkflowStatus(projectId: string) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/workflow-status`);
   return (await checkRes(res)).json();
 }
 
-export async function fetchGenerationProgress(projectId: string) {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/generation-progress`);
-  return (await checkRes(res)).json();
+export function getDownloadUrl(projectId: string, prototype?: boolean) {
+  const url = makeApiUrl(`/projects/${projectId}/download`);
+  if (prototype) url.searchParams.set("prototype", "1");
+  const testerId = getStoredAuth()?.testerId;
+  if (testerId) url.searchParams.set("tester_id", testerId);
+  return url.toString();
 }
 
-export function getDownloadUrl(projectId: string, prototype?: boolean) {
-  const url = new URL(`${API_BASE}/projects/${projectId}/download`);
-  if (prototype) url.searchParams.set("prototype", "1");
+export function getContentPlanMarkdownUrl(projectId: string) {
+  const url = makeApiUrl(`/projects/${projectId}/slides/export-markdown`);
   const testerId = getStoredAuth()?.testerId;
   if (testerId) url.searchParams.set("tester_id", testerId);
   return url.toString();
@@ -325,18 +327,6 @@ export async function fetchReferenceImages(projectId: string, slideId?: string) 
   return Array.isArray(data) ? data : (data.items || []);
 }
 
-export async function fetchAssetLibrary(projectId: string, params: Record<string, any> = {}) {
-  const url = new URL(`${API_BASE}/projects/${projectId}/reference-images`);
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  });
-  const res = await apiFetch(url.toString());
-  const data = await (await checkRes(res)).json();
-  return Array.isArray(data) ? { items: data, total: data.length, facets: {} } : data;
-}
-
 export async function updateSlideAssetPins(
   projectId: string,
   slideId: string,
@@ -371,21 +361,14 @@ export async function deleteReferenceImage(projectId: string, refId: string) {
   return (await checkRes(res)).json();
 }
 
-export async function updateReferenceImageMode(projectId: string, refId: string, processMode: string) {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/reference-images/${refId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ process_mode: processMode }),
-  });
-  return (await checkRes(res)).json();
-}
-
 export async function updateReferenceImage(projectId: string, refId: string, data: {
   process_mode?: string;
   asset_name?: string;
   asset_kind?: string;
   usage_note?: string;
   logo_anchor?: string;
+  review_status?: string;
+  review_reason?: string;
   reanalyze?: boolean;
 }) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/reference-images/${refId}`, {
@@ -625,7 +608,7 @@ export async function updateProjectStyle(projectId: string, selectedStyle: any) 
 }
 
 export async function generateStyleProposals(projectId: string, force: boolean = false): Promise<any> {
-  const url = new URL(`${API_BASE}/projects/${projectId}/style-proposals`);
+  const url = makeApiUrl(`/projects/${projectId}/style-proposals`);
   if (force) url.searchParams.set("force", "true");
   const res = await apiFetch(url.toString(), {
     method: "POST",
@@ -643,6 +626,11 @@ export async function pollForStyleProposals(
     const project = await fetchProject(projectId);
     if (project?.style_proposal?.proposals) {
       return project.style_proposal.proposals;
+    }
+    const workflow = await fetchWorkflowStatus(projectId);
+    const run = workflow?.active_run || workflow?.last_run;
+    if (run?.kind === "style_proposal" && ["failed", "stale", "cancelled"].includes(run.status)) {
+      throw new Error(run.message || run.error_msg || "风格提案生成没有完成，请重试");
     }
   }
   throw new Error("风格提案生成超时，请刷新页面后重试");

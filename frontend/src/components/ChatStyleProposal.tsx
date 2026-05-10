@@ -12,6 +12,18 @@ export interface StyleProposal {
   mood: string;
   font: string;
   description: string;
+  decision_label?: string;
+  best_for?: string;
+  tradeoff?: string;
+  visual_focus?: string;
+  visual_strategy?: {
+    summary?: string;
+    background_policy?: string;
+    content_treatment?: string;
+    exception_policy?: string;
+    logo_contrast?: string;
+    base_tone?: string;
+  };
   source?: string;
 }
 
@@ -43,6 +55,8 @@ function ProposalCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const palette = normalizePalette(proposal.palette);
+  const strategyText = proposal.visual_strategy?.summary || proposal.visual_strategy?.background_policy || "";
+  const decisionLabel = proposal.decision_label?.trim();
 
   return (
     <div className="border border-purple-200 rounded-lg overflow-hidden bg-white">
@@ -61,13 +75,18 @@ function ProposalCard({
       <div className="p-3">
         {/* 名称与标签 */}
         <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
             <span className="text-xs font-bold text-gray-800">
               {index + 1}.
             </span>
             <span className="text-sm font-bold text-gray-900">
               {proposal.name}
             </span>
+            {decisionLabel && (
+              <span className="text-2xs bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded">
+                {decisionLabel}
+              </span>
+            )}
           </div>
           {proposal.source === "original" ? (
             <span className="text-2xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded">
@@ -119,7 +138,19 @@ function ProposalCard({
           </div>
         )}
 
+        {(proposal.best_for || proposal.tradeoff) && (
+          <div className="text-xs bg-gray-50 border border-gray-100 rounded px-2 py-1.5 mb-2 leading-relaxed">
+            {proposal.best_for && <div className="text-gray-700">适合：{proposal.best_for}</div>}
+            {proposal.tradeoff && <div className="text-gray-500 mt-0.5">取舍：{proposal.tradeoff}</div>}
+          </div>
+        )}
+
         {/* 描述 - 可展开 */}
+        {strategyText && (
+          <div className="text-xs text-purple-700 bg-purple-50 border border-purple-100 rounded px-2 py-1.5 mb-2 leading-relaxed">
+            {strategyText}
+          </div>
+        )}
         {proposal.description && (
           <div className="mb-2">
             <div

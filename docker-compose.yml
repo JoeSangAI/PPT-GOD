@@ -1,26 +1,25 @@
-version: "3.8"
-
 services:
   db:
     image: postgres:15-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: pptgod
       POSTGRES_PASSWORD: pptgod
       POSTGRES_DB: pptgod
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
 
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${PPTGOD_HOST_PORT:-8000}:8000"
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
@@ -34,7 +33,10 @@ services:
       - ./backend/outputs:/app/outputs
 
   celery_worker:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
     command: celery -A app.celery_app worker -l info
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod

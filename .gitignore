@@ -22,6 +22,7 @@ backend/uploads/
 backend/outputs/
 outputs/
 output/
+exports/
 frontend/test-output/
 
 # Local browser/debug artifacts

@@ -72,6 +72,7 @@ def main() -> None:
         reference_image_ids=["logo-1", "asset-product-1"],
         style_override=style_override,
         global_visual_assets=global_visual_assets,
+        has_project_logo=True,
         progress_callback=lambda progress: print(f"VISUAL_PROGRESS {progress}", flush=True),
     )
     intent = visual_plan[0]

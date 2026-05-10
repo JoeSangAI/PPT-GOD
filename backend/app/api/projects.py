@@ -1,4 +1,5 @@
 import logging
+import time
 from fastapi import APIRouter, Depends, HTTPException
 
 logger = logging.getLogger(__name__)
@@ -8,10 +9,12 @@ from sqlalchemy.orm import Session
 from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
-from app.core.tester_auth import require_tester_id, tester_id_from_header, verify_project_access
+from app.core.tester_auth import is_local_admin_request, require_tester_id, tester_id_from_header, verify_project_access
 from app.core.provider_credentials import store_current_provider_credentials
+from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
-from app.services.run_state import cancel_active_run, create_project_run, get_active_run, normalize_confirmed_project_stage, serialize_run
+from app.services.celery_runtime import ensure_celery_worker
+from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -37,17 +40,15 @@ def create_project(
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(tester_id: str = Depends(require_tester_id), db: Session = Depends(get_db)):
-    projects = (
-        db.query(Project)
-        .filter(Project.tester_id == tester_id)
-        .order_by(Project.created_at.desc())
-        .all()
-    )
+    query = db.query(Project)
+    if not is_local_admin_request(tester_id):
+        query = query.filter(Project.tester_id == tester_id)
+    projects = query.order_by(Project.created_at.desc()).all()
     changed = False
     for project in projects:
         before = project.status
-        normalize_confirmed_project_stage(project, list(project.slides or []), get_active_run(db, project.id))
-        changed = changed or project.status != before
+        reconcile_project_state(project, list(project.slides or []), get_active_run(db, project.id))
+        changed = changed or project.status != before or bool(db.dirty)
     if changed:
         db.commit()
     return projects
@@ -58,12 +59,12 @@ def get_project(project_id: str, tester_id: str = Depends(tester_id_from_header)
     project = db.query(Project).filter(Project.id == project_id).first()
     verify_project_access(project, tester_id)
     before = project.status
-    normalize_confirmed_project_stage(project, list(project.slides or []), get_active_run(db, project_id))
+    reconcile_project_state(project, list(project.slides or []), get_active_run(db, project_id))
     # 用户已进入项目详情，清除未读通知
     if project.has_unread_notification:
         project.has_unread_notification = False
         project.unread_notification_message = None
-    if project.status != before or not project.has_unread_notification:
+    if project.status != before or not project.has_unread_notification or db.dirty:
         db.commit()
         db.refresh(project)
     return project
@@ -117,10 +118,17 @@ def update_project_style(
     project = db.query(Project).filter(Project.id == project_id).first()
     verify_project_access(project, tester_id)
     if payload.selected_style is not None:
-        project.selected_style = payload.selected_style
+        slides = list(project.slides or [])
+        style_dependencies = dependency_signature(project, slides)
+        style_dependencies["selected_style"] = selected_style_signature(payload.selected_style)
+        project.selected_style = with_artifact_meta(
+            payload.selected_style,
+            kind="selected_style",
+            dependencies=style_dependencies,
+        )
         project.content_plan_confirmed = True
         project.status = "visual_ready"
-        for slide in project.slides or []:
+        for slide in slides:
             slide.visual_json = {}
             slide.prompt_text = None
             slide.image_path = None
@@ -158,6 +166,7 @@ def create_style_proposals(
         raise HTTPException(status_code=400, detail="No content plan found. Generate content plan first.")
 
     current_asset_signature = compute_style_asset_signature(project)
+    current_content_signature = content_signature(slides)
     has_global_style_ref = any(
         ref.role == "style_ref" and not ref.slide_id
         for ref in (project.reference_images or [])
@@ -167,14 +176,16 @@ def create_style_proposals(
     # 这样用户上传/删除参考图后，不会继续看到旧的“无素材推荐”或过期提案。
     if not force and project.style_proposal and project.style_proposal.get("proposals"):
         cached_asset_signature = project.style_proposal.get("asset_signature")
+        cached_content_signature = project.style_proposal.get("content_signature")
         cached_proposals = project.style_proposal.get("proposals") or []
         cached_is_style_dna = any(
             isinstance(p, dict)
             and (p.get("source") == "asset_clone" or p.get("clone_mode") in {"style_dna", "strict_reference"})
             for p in cached_proposals
         )
-        cache_signature_matches = cached_asset_signature == current_asset_signature or (
-            not cached_asset_signature and not current_asset_signature
+        cache_signature_matches = (
+            (cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature))
+            and (cached_content_signature == current_content_signature or not cached_content_signature)
         )
         if cache_signature_matches and (not has_global_style_ref or cached_is_style_dna):
             return {
@@ -211,6 +222,9 @@ def create_style_proposals(
     )
     total_count = 1 if has_assets else 3
 
+    if not ensure_celery_worker():
+        raise HTTPException(status_code=503, detail="后台生成服务未启动，任务没有开始。请启动 worker 后重试。")
+
     # 改用 Celery 队列执行，比 FastAPI BackgroundTasks 更可靠
     try:
         run = create_project_run(
@@ -227,8 +241,10 @@ def create_style_proposals(
 
     credential_id = store_current_provider_credentials(redis_client)
     task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id)
-    run.task_id = task.id
+    set_run_task(db, run.id, task.id)
     db.commit()
+    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
     return {"status": "generating", "proposals": None, "run": serialize_run(run)}
 
 
@@ -291,51 +307,7 @@ def rollback_project(
     except Exception as e:
         logger.warning(f"Rollback: failed to cancel asyncio visual task for project {project_id}: {e}")
 
-    if target == "planning":
-        project.status = "planning"
-        project.content_plan_confirmed = False
-        project.selected_style = None
-        project.style_proposal = None
-        for slide in project.slides:
-            slide.visual_json = {}
-            slide.prompt_text = None
-            slide.image_path = None
-            slide.status = "pending"
-            slide.error_msg = None
-    elif target == "visual_ready":
-        project.status = "visual_ready"
-        project.content_plan_confirmed = True
-        project.selected_style = None
-        project.style_proposal = None
-        for slide in project.slides:
-            slide.visual_json = {}
-            slide.prompt_text = None
-            slide.image_path = None
-            slide.status = "pending"
-            slide.error_msg = None
-    elif target == "prompt_ready":
-        project.status = "prompt_ready"
-        project.content_plan_confirmed = True
-        for slide in project.slides:
-            slide.image_path = None
-            if slide.prompt_text:
-                slide.status = "prompt_ready"
-            else:
-                slide.status = "visual_ready" if slide.visual_json else "pending"
-            slide.error_msg = None
-    elif target == "prototype_ready":
-        project.status = "prototype_ready"
-        project.content_plan_confirmed = True
-        # 回到效果预览表示查看已有打样结果，不再清空 image_path。
-        # 如果用户要重新打样，应回到 prompt_ready 或直接触发新的 prototype run。
-        for slide in project.slides:
-            if slide.image_path:
-                slide.status = "completed"
-            elif slide.prompt_text:
-                slide.status = "prompt_ready"
-            else:
-                slide.status = "visual_ready" if slide.visual_json else "pending"
-            slide.error_msg = None
+    apply_project_rollback(project, list(project.slides or []), target)
 
     db.commit()
 

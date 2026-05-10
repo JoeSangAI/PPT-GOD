@@ -1,16 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchWorkflowStatus } from "../api/client";
-
-export interface WorkflowRun {
-  id?: string;
-  kind?: string;
-  status?: string;
-  stage?: string;
-  message?: string | null;
-  total_count?: number;
-  completed_count?: number;
-  failed_count?: number;
-}
+import { isActiveRun } from "../workflow";
+import type { WorkflowRun } from "../workflow";
 
 export interface WorkflowProgress {
   run_id?: string;
@@ -28,6 +19,8 @@ export interface WorkflowProgress {
   can_cancel?: boolean;
   current_page?: number;
   total_pages?: number;
+  active_page_nums?: number[];
+  running_count?: number;
 }
 
 export interface WorkflowStatus {
@@ -47,10 +40,6 @@ export interface WorkflowStatus {
   has_pptx?: boolean;
   pptx_path?: string | null;
   slides?: Array<{ id?: string; page_num: number; status: string; error_msg?: string | null }>;
-}
-
-export function isWorkflowRunActive(run?: WorkflowRun | null) {
-  return Boolean(run && (run.status === "queued" || run.status === "running"));
 }
 
 export function useProjectWorkflow(projectId?: string | null) {
@@ -91,7 +80,7 @@ export function useProjectWorkflow(projectId?: string | null) {
   }, [projectId]);
 
   const activeRun = workflowStatus?.active_run || null;
-  const hasActiveRun = isWorkflowRunActive(activeRun);
+  const hasActiveRun = isActiveRun(activeRun);
 
   useEffect(() => {
     if (!projectId || !hasActiveRun) return;

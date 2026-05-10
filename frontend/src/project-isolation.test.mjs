@@ -5,6 +5,7 @@ import { join } from "node:path";
 const sourcePath = join(import.meta.dirname, "App.tsx");
 const source = readFileSync(sourcePath, "utf8");
 const css = readFileSync(join(import.meta.dirname, "index.css"), "utf8");
+const workflow = readFileSync(join(import.meta.dirname, "workflow.ts"), "utf8");
 const lines = source.split(/\r?\n/);
 
 assert.match(source, /projectId\?: string;/, "ChatMessage must carry projectId ownership");
@@ -60,8 +61,123 @@ assert.match(
 );
 assert.match(
   source,
-  /const getPrototypeTargetSlides = \(explicitPageNums: number\[] = \[]\)[\s\S]*return slides\.slice\(0, Math\.min\(3, slides\.length\)\);/,
-  "default prototype generation must target the first 3 pages, not the full deck"
+  /allowWhileChatLoading\?: boolean/,
+  "chat-triggered gate actions must be able to run while the chat request is still resolving"
+);
+assert.match(
+  source,
+  /result\.action === "regenerate_plan"[\s\S]*appendRequestMessage[\s\S]*dispatchGateAction\([\s\S]*"generate_content_plan"[\s\S]*allowWhileChatLoading: true[\s\S]*source: "agent"/,
+  "content-stage regenerate_plan must acknowledge the user and execute instead of being silently blocked by chatLoading"
+);
+assert.match(
+  workflow,
+  /if \(gate === "content"\) \{[\s\S]*actions\.push\("generate_content_plan"\)/,
+  "content-stage gate must allow content-plan regeneration before content is confirmed"
+);
+assert.match(
+  workflow,
+  /if \(state\.projectStatus !== "draft" && !state\.contentPlanConfirmed\) actions\.push\("confirm_content", "switch_to_visual"\)/,
+  "content-stage gate must allow Agent handoff to visual to execute the same confirmation path as the button"
+);
+assert.doesNotMatch(
+  source,
+  /nextAction\.type === "switch_to_visual" && hasContentConfirmCta/,
+  "chat handoff suggestions to visual must not be hidden when the main confirmation CTA exists"
+);
+assert.match(
+  source,
+  /const shouldRenderMessageNextAction = \(message: ChatMessage\) => \{[\s\S]*if \(!isMessageFromCurrentGate\(message\)\) return false;/,
+  "stale gate-bound chat actions must be removed from the active task flow"
+);
+assert.doesNotMatch(
+  source,
+  /回退前|已失效|当前步骤不能执行|回滚到此消息/,
+  "current user-facing UI must not expose stale rollback/internal-state wording"
+);
+assert.match(
+  source,
+  /isWorkflowTransitionMessage\(msg\)[\s\S]*msg\.role === "system"[\s\S]*!msg\.gate[\s\S]*!isMessageFromCurrentGate\(msg\)/,
+  "workflow transition notes must not reappear as current guidance after reload"
+);
+assert.match(
+  source,
+  /interface GateActionResult[\s\S]*ok: boolean[\s\S]*reason\?:/,
+  "gate actions must return an execution result instead of failing silently"
+);
+assert.match(
+  source,
+  /const reportBlockedAction = \([\s\S]*options\.source === "agent"[\s\S]*appendProjectChatMessage[\s\S]*return \{ ok: false, reason, message \};/,
+  "blocked agent actions must produce visible chat feedback"
+);
+assert.match(
+  source,
+  /const startContentPlanPoll = async \([\s\S]*Promise<GateActionResult>[\s\S]*正在读取当前页面，准备生成内容规划[\s\S]*return \{ ok: true, runId: result\?\.run\?\.id \};/,
+  "content-plan generation must show immediate status and report startup success"
+);
+assert.match(
+  source,
+  /if \(isBusy \|\| chatLoading\) \{[\s\S]*当前还有任务或消息在处理中[\s\S]*return;/,
+  "manual next actions must show why they cannot run instead of returning silently"
+);
+assert.match(
+  source,
+  /result\.action === "forward_to_visual"[\s\S]*收到，正在请视觉总监介入[\s\S]*dispatchGateAction\("switch_to_visual"[\s\S]*allowWhileChatLoading: true[\s\S]*source: "agent"/,
+  "Agent visual handoff must execute the handoff action and avoid claiming it already switched before the action runs"
+);
+assert.match(
+  source,
+  /没有找到第 \$\{pageNums\.join\(", "\)\} 页，未生成新的画面方案/,
+  "page-targeted visual rerolls must report when no target page was changed"
+);
+assert.match(
+  source,
+  /const buildCrossStageContext = \(targetRole: "content" \| "visual" \| "finetune"\)[\s\S]*summarizeStageMessages\(contentChatHistory, "内容阶段"\)/,
+  "visual-stage requests must inherit user requirements from content-stage chat"
+);
+assert.match(
+  source,
+  /withCrossStageContext\(pageContext, requestAgentRole\)[\s\S]*chatWithAgentStream\(requestProjectId, userMsg, history, ctrl\.signal, effectivePageContext, requestAgentRole\)/,
+  "Agent chat requests must include cross-stage context in page_context"
+);
+assert.match(
+  source,
+  /const isVisualRelevantStageContext = \([\s\S]*用户\(\?:在第\\s\*\\d\+\\s\*页\[前后\]插入了新页面\|删除了第\\s\*\\d\+\\s\*页\|调整了页面顺序\)/,
+  "visual handoff context must filter structural content-operation logs"
+);
+assert.match(
+  source,
+  /const addSystemLog = \(content: string\) => \{[\s\S]*appendProjectChatMessage\(projectId, "content"[\s\S]*if \(isVisualRelevantStageContext\(content, "system"\)\) \{[\s\S]*appendProjectChatMessage\(projectId, "visual"/,
+  "system logs must only enter the visual Agent when they affect visual decisions"
+);
+assert.match(
+  source,
+  /msg\.role === "system" && currentAgentRole === "visual"[\s\S]*getVisualSystemMessageContent\(msg\.content\)[\s\S]*!systemContentForVisual[\s\S]*return null;/,
+  "visual Agent rendering must hide irrelevant historical system logs"
+);
+assert.match(
+  source,
+  /const defaultPrototypePageNumsForSlides = \(slides: Slide\[]\): number\[] => \{[\s\S]*PROTOTYPE_FAMILY_ORDER[\s\S]*const getPrototypeTargetSlides = \(explicitPageNums: number\[] = \[]\)[\s\S]*prototypeSelectionTouched \? Array\.from\(selectedPages\) : defaultPrototypePageNums[\s\S]*const defaultPrototypePageNums = defaultPrototypePageNumsForSlides\(slides\);/,
+  "default prototype generation must target representative seed pages, not the full deck"
+);
+assert.match(
+  source,
+  /function normalizeProjectsForActiveSelection\(projects: Project\[], activeProjectId: string \| null\)[\s\S]*clearProjectNotification\(project\)/,
+  "project lists must normalize unread notifications for the active project"
+);
+assert.match(
+  source,
+  /const loadProjects = async \(\) => \{[\s\S]*activeProjectHadUnread[\s\S]*normalizeProjectsForActiveSelection\(data, currentSelectedId\)[\s\S]*markActiveProjectNotificationRead\(currentSelectedId\)/,
+  "project polling must treat notifications for the open project as already seen and sync read state"
+);
+assert.match(
+  source,
+  /p\.has_unread_notification && selectedProject\?\.id !== p\.id/,
+  "the sidebar unread dot must only render for projects outside the current page"
+);
+assert.match(
+  source,
+  /const isPrototypeRunActive = Boolean\(hasActiveRun && activeRun\?\.kind === "prototype_generation"\);[\s\S]*disabled=\{!canEditPrototypeSelection\}/,
+  "prototype selection checkboxes must be locked while a prototype run is active"
 );
 assert.match(
   source,
@@ -88,6 +204,26 @@ assert.doesNotMatch(
   /visualInspector|pg-visual-inspector|pg-slide-grid-style-preview|selectedPromptTargets/,
   "visual design must use the slide detail editor and must not restyle cards as a fake style preview"
 );
+assert.match(
+  source,
+  /function visualStrategyText[\s\S]*visual_strategy/,
+  "style proposals must surface the deck-level visual background strategy"
+);
+assert.match(
+  source,
+  /proposalDecisionField[\s\S]*best_for[\s\S]*tradeoff[\s\S]*visual_focus/,
+  "style proposal cards must surface decision criteria before shared visual strategy"
+);
+assert.match(
+  css,
+  /pg-style-dock-decision/,
+  "style proposal cards need a dedicated decision summary treatment"
+);
+assert.match(
+  source,
+  /整体基底/,
+  "selected style summary must show the visual background strategy so users can revise it"
+);
 assert.doesNotMatch(
   css,
   /pg-visual-inspector|pg-slide-grid-style-preview/,
@@ -98,6 +234,7 @@ const allowedDirectSetContexts = [
   "const setActiveChatMessages",
   "const appendProjectChatMessage",
   "const updateProjectChatMessages",
+  "const ensureContentGreetingIfNeeded",
   "loadedChatProjectIdRef.current !== selectedProject.id",
   "const handleCreate",
   "chatHistoryProjectIdRef.current = created.id",

@@ -8,8 +8,8 @@ from typing import Dict
 from PIL import Image as PILImage
 import requests
 
-from app.core.config import settings
 from app.core.provider_credentials import get_provider_credentials
+from app.services.visual_strategy import detect_logo_tone_from_image
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,10 @@ def analyze_logo(image_path: str) -> Dict:
 3. 如果无法判断某项，留空字符串或空数组"""
 
     raw = _call_vision_model(image_path, prompt)
-    return _parse_analysis_result(raw, "logo")
+    result = _parse_analysis_result(raw, "logo")
+    if isinstance(result, dict):
+        result.update(detect_logo_tone_from_image(image_path))
+    return result
 
 
 def analyze_reference_image(image_path: str) -> Dict:
@@ -273,6 +276,7 @@ def _default_logo_analysis() -> Dict:
         "font_style": "",
         "industry_vibe": "",
         "description": "",
+        "logo_tone": "unknown",
     }
 
 

@@ -6,6 +6,8 @@ LOGO_WIDTH_RATIOS = {"small": 0.052, "large": 0.18}
 LOGO_HEIGHT_RATIOS = {"small": 0.068, "large": 0.18}
 LOGO_ANCHORS = {"top-left", "top-right", "bottom-left", "bottom-right"}
 LOGO_PLACEMENTS = LOGO_ANCHORS | {"center", "lower-center", "title-block-center"}
+LOGO_REVIEW_CONFIRMED_STATUSES = {"auto_confirmed", "user_confirmed"}
+LOGO_REVIEW_NON_CONFIRMED_STATUSES = {"needs_review", "dismissed", "not_logo"}
 ANCHOR_LABELS = {
     "top-left": "top-left safe corner",
     "top-right": "top-right safe corner",
@@ -73,19 +75,51 @@ def logo_anchor_from_ref(ref: Any | None) -> str:
     return normalize_logo_anchor(getattr(ref, "logo_anchor", None))
 
 
+def _asset_analysis_for_ref(ref: Any | None) -> Mapping:
+    if ref is None:
+        return {}
+    if isinstance(ref, Mapping):
+        analysis = ref.get("asset_analysis")
+    else:
+        analysis = getattr(ref, "asset_analysis", None)
+    return analysis if isinstance(analysis, Mapping) else {}
+
+
+def logo_review_status(ref: Any | None) -> str:
+    """Return the review state for a logo, with safe legacy defaults."""
+    analysis = _asset_analysis_for_ref(ref)
+    status = str(analysis.get("review_status") or "").strip().lower()
+    if status in LOGO_REVIEW_CONFIRMED_STATUSES or status in LOGO_REVIEW_NON_CONFIRMED_STATUSES:
+        return status
+
+    # Existing manual uploads often have no analysis at all; keep them usable.
+    if not analysis:
+        return "auto_confirmed"
+
+    # Cover-only PPT detections are guesses. Keep them visible for user review,
+    # but do not let them into the protected brand lockup until confirmed.
+    if str(analysis.get("classification") or "").strip().lower() == "logo_candidate":
+        return "needs_review"
+    return "auto_confirmed"
+
+
+def is_logo_confirmed(ref: Any | None) -> bool:
+    return logo_review_status(ref) in LOGO_REVIEW_CONFIRMED_STATUSES
+
+
 def logo_policy_for_page(page: Any) -> dict:
     data = _as_dict(page)
     show_logo = should_show_logo(data)
     explicit = data.get("logo_policy")
     page_type = str(data.get("type") or "").lower()
-    default_placement = "title-block-center" if page_type == "cover" else "lower-center" if page_type == "ending" else DEFAULT_LOGO_ANCHOR
+    default_placement = "center" if page_type == "cover" else DEFAULT_LOGO_ANCHOR
     anchor = (
         normalize_logo_placement(explicit.get("placement"), default_placement)
         if isinstance(explicit, Mapping) and explicit.get("placement")
         else default_placement
     )
     scale = str(explicit.get("scale")) if isinstance(explicit, Mapping) and explicit.get("scale") else (
-        "large" if page_type in {"cover", "ending"} else "small"
+        "large" if page_type == "cover" else "small"
     )
     return {
         "show_logo": show_logo,
@@ -96,6 +130,10 @@ def logo_policy_for_page(page: Any) -> dict:
 
 
 def logo_prompt_instruction(page: Any) -> str:
+    data = _as_dict(page)
+    explicit = data.get("logo_policy")
+    if not (isinstance(explicit, Mapping) and explicit.get("show_logo") is True):
+        return ""
     policy = logo_policy_for_page(page)
     if not policy["show_logo"]:
         return ""
@@ -109,6 +147,10 @@ def logo_prompt_instruction(page: Any) -> str:
 
 
 def logo_reservation_instruction(page: Any, anchor: str | None = None) -> str:
+    data = _as_dict(page)
+    explicit = data.get("logo_policy")
+    if not (isinstance(explicit, Mapping) and explicit.get("show_logo") is True):
+        return ""
     policy = logo_policy_for_page(page)
     if not policy["show_logo"]:
         return ""

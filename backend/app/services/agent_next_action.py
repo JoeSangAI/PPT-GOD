@@ -137,10 +137,10 @@ def _visual_next_action(action: str | None, result: dict[str, Any], project_cont
         }
 
     if action in {"collect_assets", "answer"} and content_confirmed and not has_selected_style:
-        return {"type": "generate_style_proposals", "label": "生成风格提案"}
+        return {"type": "generate_style_proposals", "label": "生成视觉方向"}
 
     if action == "answer" and has_selected_style and not has_prompts:
-        return {"type": "generate_visual_prompts", "label": "生成画面描述和 Prompt"}
+        return {"type": "generate_visual_prompts", "label": "生成画面方案"}
 
     if action == "answer" and has_prompts and not has_images:
         return {"type": "start_prototype", "label": "打样确认", "confirm": True}

@@ -19,6 +19,8 @@ from app.services.generation_pipeline import (
 )
 from app.services.image_generation import _cache_key
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
+from app.services.logo_overlay_layout import resolve_logo_overlay_box
+from app.services.logo_policy import logo_policy_for_page
 from app.services.pptx_assembler import assemble_pptx
 from app.services import prompt_engine
 from app.utils.text_cleaning import normalize_markdown_emphasis
@@ -30,13 +32,14 @@ from app.services.visual_plan import (
     _recall_visual_assets_for_page,
     _safe_parse_json,
 )
-from app.services.content_plan import _normalize_content_markdown
+from app.services.content_plan import _annotate_ppt_source_refs, _normalize_content_markdown
 from app.services.style_proposal import _build_content_style_direction
 from app.utils.project_docs import load_project_documents
 from types import SimpleNamespace
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.util import Inches
 
 
@@ -121,6 +124,52 @@ def pptx_upload_with_content_graphic(name="graphic-source.pptx"):
     return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
+def pptx_upload_with_identity_code(name="identity-code-source.pptx"):
+    image_buf = io.BytesIO()
+    img = Image.new("RGB", (180, 180), "white")
+    for x in range(24, 156):
+        for y in range(24, 156):
+            if (x // 12 + y // 12) % 2 == 0 or (x % 29 < 8 and y % 31 < 8):
+                img.putpixel((x, y), (20, 20, 20))
+    img.save(image_buf, "PNG")
+    image_buf.seek(0)
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.6), Inches(0.5), Inches(7.0), Inches(0.6)).text = "菜鸟驿站身份码与扫码出库流程"
+    slide.shapes.add_picture(image_buf, Inches(1.0), Inches(2.5), width=Inches(1.6))
+
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
+def pptx_upload_with_phone_frame_chrome(name="phone-frame-source.pptx"):
+    image_buf = io.BytesIO()
+    img = Image.new("RGBA", (220, 460), (255, 255, 255, 0))
+    for x in range(16, 204):
+        for y in range(12, 448):
+            on_outer = x < 26 or x > 194 or y < 24 or y > 438
+            on_inner = 40 < x < 180 and 80 < y < 390 and (x + y) % 17 < 2
+            if on_outer:
+                img.putpixel((x, y), (30, 30, 30, 255))
+            elif on_inner:
+                img.putpixel((x, y), (210, 215, 225, 255))
+    img.save(image_buf, "PNG")
+    image_buf.seek(0)
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.6), Inches(0.5), Inches(7.0), Inches(0.6)).text = "手机边框承载小程序界面与身份码展示"
+    slide.shapes.add_picture(image_buf, Inches(1.0), Inches(1.0), height=Inches(4.6))
+
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
 def _patterned_png(color):
     buf = io.BytesIO()
     img = Image.new("RGB", (180, 120), "white")
@@ -169,6 +218,64 @@ def pptx_upload_with_two_cover_logos(name="two-logos.pptx"):
     slide.shapes.add_textbox(Inches(0.7), Inches(1.4), Inches(9.0), Inches(0.8)).text = "开学季绿色营销推广方案"
     slide.shapes.add_picture(logo_blob((35, 80, 170), (20, 20, 20)), Inches(0.65), Inches(0.35), width=Inches(1.45))
     slide.shapes.add_picture(logo_blob((30, 160, 90), (245, 165, 35)), Inches(2.35), Inches(0.35), width=Inches(1.45))
+
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
+def pptx_upload_with_cropped_cover_logo(name="cropped-logo.pptx"):
+    logo_buf = io.BytesIO()
+    img = Image.new("RGB", (440, 72), "white")
+    for x in range(16, 204):
+        for y in range(18, 54):
+            img.putpixel((x, y), (180, 122, 0))
+    for x in range(252, 408):
+        for y in range(16, 56):
+            img.putpixel((x, y), (210, 20, 28))
+    img.save(logo_buf, "PNG")
+    logo_buf.seek(0)
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.7), Inches(1.4), Inches(9.0), Inches(0.8)).text = "校园联播网媒体介绍"
+    logo = slide.shapes.add_picture(logo_buf, Inches(0.65), Inches(6.8), width=Inches(2.8))
+    logo.crop_right = 0.5
+
+    out = io.BytesIO()
+    prs.save(out)
+    out.seek(0)
+    return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
+def pptx_upload_with_cropped_multicolor_cover_logo(name="cropped-multicolor-logo.pptx"):
+    logo_buf = io.BytesIO()
+    img = Image.new("RGB", (860, 260), "white")
+    for x in range(35, 455):
+        for y in range(52, 212):
+            if x < 90 or y < 74 or y > 190 or (x // 11 + y // 9) % 3 == 0:
+                img.putpixel((x, y), (184, 126, 8))
+            elif (x + y) % 17 < 4:
+                img.putpixel((x, y), (80, 40, 12))
+    for x in range(500, 810):
+        for y in range(50, 210):
+            if (x - 500) ** 2 + (y - 130) ** 2 < 75 ** 2:
+                img.putpixel((x, y), (30, 95, 210))
+            elif x % 19 < 7:
+                img.putpixel((x, y), (220, 30, 45))
+    logo_buf.seek(0)
+    img.save(logo_buf, "PNG")
+    logo_buf.seek(0)
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_textbox(Inches(0.7), Inches(1.4), Inches(9.0), Inches(0.8)).text = "Focus Media & Cainiao Station 2026 SPRING"
+    logo = slide.shapes.add_picture(logo_buf, Inches(0.65), Inches(6.75), width=Inches(1.28))
+    logo.crop_left = 0.08
+    logo.crop_top = 0.24
+    logo.crop_right = 0.45
+    logo.crop_bottom = 0.22
 
     out = io.BytesIO()
     prs.save(out)
@@ -290,6 +397,24 @@ def test_punchline_page_content_is_normalized_to_one_line():
     assert "整套 PPT" in page["visual_suggestion"]
 
 
+def test_single_ppt_outline_gets_source_refs_when_polishing():
+    outline = [
+        {"page_num": 1, "type": "cover", "text_content": {"headline": "封面", "body": ""}},
+        {"page_num": 2, "type": "content", "text_content": {"headline": "策略", "body": "原内容"}},
+    ]
+    documents = '--- PPT_SOURCE filename="source.pptx" pages=2 ---\n\n--- 第1页 ---\n封面\n\n--- 第2页 ---\n策略'
+
+    annotated = _annotate_ppt_source_refs(outline, documents, "请美化这个 PPT")
+
+    assert annotated[0]["source_refs"] == [{
+        "source_document": "source.pptx",
+        "source_page_num": 1,
+        "source_type": "pptx_slide",
+        "reason": "single_ppt_page_polish",
+    }]
+    assert annotated[1]["source_refs"][0]["source_page_num"] == 2
+
+
 def test_fallback_visual_plan_treats_hero_as_punchline_slide():
     plan = _fallback_visual_plan(
         [
@@ -322,9 +447,7 @@ def test_visual_plan_json_repair_handles_multiline_llm_strings():
     assert parsed["6"]["visual_description"] == "第一行\n第二行"
 
 
-def test_prompt_keeps_exact_text_contract_and_visual_evidence(monkeypatch):
-    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda _: "A concise slide image prompt.")
-
+def test_prompt_keeps_exact_text_contract_and_visual_evidence():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 1,
@@ -373,6 +496,30 @@ def test_prompt_includes_exact_overlay_reservation():
     assert "Do not place required text" in prompt
 
 
+def test_prompt_skips_exact_overlay_reservation_when_asset_unavailable():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 1,
+            "type": "content",
+            "layout": "content_split",
+            "visual_evidence": "产品截图旁边解释三点价值",
+            "visual_description": "右侧放文字。",
+            "available_overlay_asset_ids": [],
+            "overlay_layers": [{
+                "id": "ov",
+                "asset_id": "missing-asset",
+                "enabled": True,
+                "preset": "right-card",
+            }],
+        },
+        content_text={"headline": "Exact Overlay", "body": "截图不存在时不能预留空槽"},
+        style_text_override="Style: clean\nPalette: #FFFFFF, #111111",
+    )
+
+    assert "Exact Overlay Reservation" not in prompt
+    assert "right-side card media slot" not in prompt
+
+
 def test_pptx_assembler_adds_exact_overlay_layer(tmp_path):
     bg_path = tmp_path / "slide.png"
     asset_path = tmp_path / "asset.png"
@@ -403,9 +550,125 @@ def test_pptx_assembler_adds_exact_overlay_layer(tmp_path):
     assert len(prs.slides[0].shapes) >= 3
 
 
-def test_prompt_for_punchline_page_uses_punchline_treatment(monkeypatch):
-    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda _: "unused")
+def test_logo_overlay_layout_avoids_dense_ending_content(tmp_path):
+    bg_path = tmp_path / "ending.png"
+    logo_path = tmp_path / "logo.png"
 
+    bg = Image.new("RGB", (1792, 1024), (4, 6, 18))
+    draw = ImageDraw.Draw(bg)
+    # Simulate a centered ending page: title, contact line, and two CTA bands.
+    draw.rectangle((470, 250, 1320, 360), fill=(235, 70, 160))
+    draw.rectangle((650, 450, 1140, 500), fill=(230, 230, 235))
+    draw.rectangle((610, 640, 1180, 710), outline=(205, 80, 255), width=8)
+    draw.rectangle((610, 750, 1180, 820), outline=(255, 80, 170), width=8)
+    bg.save(bg_path)
+
+    Image.new("RGBA", (520, 330), (255, 255, 255, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "ending", "lower-center", "large")
+
+    assert resolved is not None
+    assert resolved["strategy"].startswith("smart:")
+    # The old lower-center rule put the logo into the centered CTA stack.
+    assert not (
+        0.32 < resolved["left"] < 0.68
+        and 0.55 < resolved["top"] < 0.82
+    )
+
+
+def test_cover_center_logo_placement_is_physical_center(tmp_path):
+    bg_path = tmp_path / "cover.png"
+    logo_path = tmp_path / "logo.png"
+    bg = Image.new("RGB", (1792, 1024), (10, 20, 45))
+    draw = ImageDraw.Draw(bg)
+    draw.rectangle((80, 260, 780, 430), fill=(245, 245, 255))
+    bg.save(bg_path)
+    Image.new("RGBA", (300, 120), (255, 255, 255, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "cover", "center", "large")
+
+    assert resolved is not None
+    assert resolved["strategy"] == "static:center"
+    assert abs((resolved["left"] + resolved["width"] / 2) - 0.5) < 0.01
+    assert abs((resolved["top"] + resolved["height"] / 2) - 0.5) < 0.01
+
+
+def test_pptx_assembler_uses_resolved_logo_overlay_box(tmp_path):
+    bg_path = tmp_path / "slide.png"
+    logo_path = tmp_path / "logo.png"
+    output_path = tmp_path / "out.pptx"
+    Image.new("RGB", (1792, 1024), "black").save(bg_path)
+    Image.new("RGBA", (300, 120), (255, 255, 255, 255)).save(logo_path)
+
+    assemble_pptx(
+        slide_images=[{
+            "page_num": 1,
+            "type": "cover",
+            "image_path": str(bg_path),
+            "visual_json": {
+                "logo_policy": {
+                    "show_logo": True,
+                    "placement": "lower-center",
+                    "scale": "large",
+                    "resolved_overlay_box": {
+                        "left": 0.12,
+                        "top": 0.08,
+                        "width": 0.18,
+                        "height": 0.06,
+                        "strategy": "smart:test",
+                    },
+                }
+            },
+        }],
+        output_path=str(output_path),
+        logo_config={"file_path": str(logo_path), "anchor": "top-right"},
+    )
+
+    prs = Presentation(str(output_path))
+    logo_shape = prs.slides[0].shapes[1]
+    assert logo_shape.left == int(prs.slide_width * 0.12)
+    assert logo_shape.top == int(prs.slide_height * 0.08)
+    assert logo_shape.width == int(prs.slide_width * 0.18)
+
+
+def test_pptx_assembler_adds_dark_backplate_for_light_logo_on_light_slide(tmp_path):
+    bg_path = tmp_path / "slide.png"
+    logo_path = tmp_path / "logo.png"
+    output_path = tmp_path / "out.pptx"
+    Image.new("RGB", (1792, 1024), "white").save(bg_path)
+    logo = Image.new("RGBA", (300, 120), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(logo)
+    draw.rectangle((20, 35, 280, 85), fill=(248, 248, 248, 255))
+    logo.save(logo_path)
+
+    assemble_pptx(
+        slide_images=[{
+            "page_num": 1,
+            "type": "cover",
+            "image_path": str(bg_path),
+            "visual_json": {},
+        }],
+        output_path=str(output_path),
+        logo_config={"file_path": str(logo_path), "anchor": "top-right"},
+    )
+
+    prs = Presentation(str(output_path))
+    shapes = prs.slides[0].shapes
+    assert len(shapes) == 3
+    assert shapes[1].fill.fore_color.rgb == RGBColor(17, 24, 39)
+    logo_shape = shapes[2]
+    assert abs((logo_shape.left + logo_shape.width / 2) - prs.slide_width / 2) < Inches(0.05)
+
+
+def test_ending_logo_policy_defaults_to_small_corner_signature():
+    policy = logo_policy_for_page({"type": "ending"})
+
+    assert policy["show_logo"] is True
+    assert policy["placement"] == "top-right"
+    assert policy["scale"] == "small"
+
+
+def test_prompt_for_punchline_page_uses_punchline_treatment():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 4,
@@ -430,9 +693,7 @@ def test_prompt_for_punchline_page_uses_punchline_treatment(monkeypatch):
     assert "dense panels" in prompt
 
 
-def test_prompt_includes_selected_global_visual_asset(monkeypatch):
-    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda brief: brief)
-
+def test_prompt_includes_selected_global_visual_asset():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 2,
@@ -464,9 +725,7 @@ def test_prompt_includes_selected_global_visual_asset(monkeypatch):
     assert "黄色标签" not in prompt
 
 
-def test_prompt_strips_product_details_from_layout_usage_and_style_negatives(monkeypatch):
-    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda brief: brief)
-
+def test_prompt_strips_product_details_from_layout_usage_and_style_negatives():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 1,
@@ -547,6 +806,31 @@ def test_visual_plan_source_prompt_avoids_asset_detail_production():
     assert "保真要求" not in prompt
 
 
+def test_visual_asset_recall_uses_structured_source_refs():
+    recalled = _recall_visual_assets_for_page(
+        {
+            "page_num": 3,
+            "text_content": {"headline": "全新叙事页", "body": "这里没有直接提产品名"},
+            "source_refs": [{"source_document": "source.pptx", "source_page_num": 2}],
+        },
+        [
+            {
+                "id": "asset-1",
+                "name": "不在文案里的产品图",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "source_document": "source.pptx",
+                "source_page_num": 2,
+                "analysis_summary": "name=不在文案里的产品图",
+            }
+        ],
+    )
+
+    assert recalled[0]["id"] == "asset-1"
+    assert "源 PPT 页" in recalled[0]["reason"]
+
+
 def test_visual_plan_prompt_treats_toc_as_simple_navigation():
     prompt = _build_batch_prompt(
         pages_summary=[
@@ -582,6 +866,30 @@ def test_visual_plan_prompt_guards_cover_data_and_ending_roles():
     assert "不要引入新的证明素材" in prompt
 
 
+def test_visual_plan_prompt_disables_logo_policy_without_project_logo():
+    prompt = _build_batch_prompt(
+        pages_summary=[{"page_num": 1, "type": "cover", "headline": "年度策略"}],
+        style={"meta": {"theme": "商务", "mood": "清晰", "palette": ["#111111", "#FFFFFF"]}, "body": ""},
+        has_project_logo=False,
+    )
+
+    assert "当前项目没有已确认的用户 Logo" in prompt
+    assert '"show_logo": false' in prompt
+    assert "不要为 Logo、品牌角标、标识、徽标或占位框预留空间" in prompt
+    assert "title-block-center" not in prompt
+
+
+def test_visual_plan_prompt_allows_logo_policy_with_project_logo():
+    prompt = _build_batch_prompt(
+        pages_summary=[{"page_num": 1, "type": "cover", "headline": "年度策略"}],
+        style={"meta": {"theme": "商务", "mood": "清晰", "palette": ["#111111", "#FFFFFF"]}, "body": ""},
+        has_project_logo=True,
+    )
+
+    assert "title-block-center" in prompt
+    assert '"show_logo": true' in prompt
+
+
 def test_default_visual_asset_usage_does_not_describe_product_appearance():
     usage = _default_visual_asset_usage(
         {"name": "胡姬花花生油瓶", "kind": "product"},
@@ -594,9 +902,7 @@ def test_default_visual_asset_usage_does_not_describe_product_appearance():
         assert unwanted not in usage
 
 
-def test_prompt_reserves_logo_overlay_corner_without_logo_ban(monkeypatch):
-    monkeypatch.setattr(prompt_engine, "_call_llm_for_final_prompt", lambda brief: brief)
-
+def test_prompt_does_not_reserve_logo_area_without_uploaded_logo_policy():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 1,
@@ -610,9 +916,79 @@ def test_prompt_reserves_logo_overlay_corner_without_logo_ban(monkeypatch):
         style_text_override="Style: 品牌提案\nPalette: #FFFFFF, #B01622",
     )
 
+    assert "Logo Overlay Reservation" not in prompt
+    assert "exact overlay" not in prompt
+    assert "do not draw or invent logos" in prompt
+
+
+def test_prompt_reserves_logo_overlay_area_when_policy_is_enabled():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 1,
+            "type": "cover",
+            "layout": "cover",
+            "visual_evidence": "品牌主张与主视觉背景",
+            "visual_description": "封面突出主标题，品牌 Logo 与标题形成稳定关系。",
+            "logo_policy": {"show_logo": True, "placement": "center", "scale": "large"},
+        },
+        content_text={"headline": "胡姬花年度整合营销提案"},
+        reference_images=[],
+        style_text_override="Style: 品牌提案\nPalette: #FFFFFF, #B01622",
+    )
+
     assert "Logo Overlay Reservation" in prompt
-    assert "title/text block brand lockup area" in prompt
-    assert "No logo, brand mark" not in prompt
+    assert "center brand lockup area" in prompt
+    assert "do not draw, invent, or stylize any logo" in prompt
+    assert "exact overlay" in prompt
+
+
+def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
+    project = SimpleNamespace(reference_images=[])
+
+    intent = slides_api._with_project_logo_policy(
+        {
+            "type": "cover",
+            "logo_policy": {
+                "show_logo": True,
+                "placement": "title-block-center",
+                "scale": "large",
+                "resolved_overlay_box": {"left": 0.1},
+            },
+        },
+        project,
+    )
+
+    assert intent["logo_policy"]["show_logo"] is False
+    assert intent["logo_policy"]["use_as_scene_asset"] is False
+    assert "resolved_overlay_box" not in intent["logo_policy"]
+
+
+def test_prompt_asset_policy_filters_stale_overlay_layers(tmp_path):
+    asset_path = tmp_path / "asset.png"
+    Image.new("RGB", (8, 8), "white").save(asset_path)
+    project_asset = SimpleNamespace(
+        id="asset-ok",
+        role="visual_asset",
+        slide_id=None,
+        file_path=str(asset_path),
+    )
+    project = SimpleNamespace(reference_images=[project_asset])
+    slide = SimpleNamespace(id="slide-1", reference_images=[])
+
+    intent = slides_api._with_prompt_asset_policies(
+        {
+            "type": "content",
+            "overlay_layers": [
+                {"id": "ok", "asset_id": "asset-ok", "preset": "right-card"},
+                {"id": "missing", "asset_id": "asset-missing", "preset": "left-card"},
+            ],
+        },
+        project,
+        slide,
+    )
+
+    assert [layer["asset_id"] for layer in intent["overlay_layers"]] == ["asset-ok"]
+    assert intent["available_overlay_asset_ids"] == ["asset-ok"]
 
 
 def test_generation_loads_selected_visual_assets_without_signature_logo(tmp_path):
@@ -882,7 +1258,10 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
     assert "FIRST PASS" in calls[0]["prompt"]
     assert "second hidden refinement pass" in calls[0]["prompt"]
     assert calls[0]["reference_count"] == 1
-    assert calls[1]["prompt"] == "用第2张及后续参考图替换第一张PPT图中的产品。参考素材路径：/tmp/uploads/huji-product.png"
+    assert calls[1]["prompt"] == (
+        "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
+        "只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：/tmp/uploads/huji-product.png"
+    )
     assert calls[1]["reference_count"] == 2
 
     final_img = Image.open(result["image_path"])
@@ -923,8 +1302,41 @@ def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeyp
 
     assert result["error"] is None
     assert len(calls) == 2
-    assert calls[1]["prompt"] == "用第2张及后续参考图替换第一张PPT图中的产品。参考素材路径：/tmp/uploads/product-a.png; /tmp/uploads/product-b.png"
+    assert calls[1]["prompt"] == (
+        "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
+        "只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：/tmp/uploads/product-a.png; /tmp/uploads/product-b.png"
+    )
     assert calls[1]["reference_count"] == 3
+
+
+def test_double_blend_pass_accepts_page_reference_refs(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+        calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
+        return Image.new("RGB", (16, 9), "green" if len(calls) == 2 else "blue")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    slide = Slide(page_num=8, prompt_text="draft prompt", visual_json={})
+    ref_data = [
+        {
+            "id": "page-ref-1",
+            "role": "content_ref",
+            "asset_name": "原 PPT 活动海报",
+            "file_path": "/tmp/uploads/page-poster.png",
+            "asset_route_mode": "double_blend",
+            "image": Image.new("RGB", (8, 8), "white"),
+        },
+    ]
+
+    result = _generate_one_slide(slide, "project-3", str(tmp_path), ref_data)
+
+    assert result["error"] is None
+    assert len(calls) == 2
+    assert "原 PPT 活动海报" in calls[0]["prompt"]
+    assert calls[1]["prompt"].startswith("用第2张及后续参考图校准第一张PPT图中的对应素材。")
+    assert calls[1]["reference_count"] == 2
 
 
 def test_image_cache_key_includes_reference_image_content():
@@ -961,13 +1373,18 @@ def test_product_visual_asset_recall_uses_generic_product_page_when_single_asset
     assert recalled[0]["id"] == "asset-1"
 
 
-def test_project_visual_assets_for_planning_filters_legacy_ppt_scenes():
+def test_project_visual_assets_for_planning_filters_legacy_ppt_scenes(tmp_path):
+    scene_path = tmp_path / "scene.png"
+    product_path = tmp_path / "product.png"
+    map_path = tmp_path / "map.png"
+    for path in (scene_path, product_path, map_path):
+        Image.new("RGB", (8, 8), "white").save(path)
     project = SimpleNamespace(reference_images=[
         SimpleNamespace(
             id="legacy-scene",
             role="visual_asset",
             slide_id=None,
-            file_path="/tmp/scene.png",
+            file_path=str(scene_path),
             asset_name="legacy scene",
             asset_kind="scene",
             process_mode="blend",
@@ -982,7 +1399,7 @@ def test_project_visual_assets_for_planning_filters_legacy_ppt_scenes():
             id="core-product",
             role="visual_asset",
             slide_id=None,
-            file_path="/tmp/product.png",
+            file_path=str(product_path),
             asset_name="core product",
             asset_kind="product",
             process_mode="crop",
@@ -997,7 +1414,7 @@ def test_project_visual_assets_for_planning_filters_legacy_ppt_scenes():
             id="legacy-map",
             role="visual_asset",
             slide_id=None,
-            file_path="/tmp/map.png",
+            file_path=str(map_path),
             asset_name="legacy map",
             asset_kind="other",
             process_mode="blend",
@@ -1013,6 +1430,58 @@ def test_project_visual_assets_for_planning_filters_legacy_ppt_scenes():
     assets = slides_api._project_visual_assets_for_planning(project)
 
     assert [asset["id"] for asset in assets] == ["core-product"]
+
+
+def test_missing_project_assets_do_not_create_prompt_references(tmp_path):
+    existing_path = tmp_path / "asset.png"
+    Image.new("RGB", (8, 8), "white").save(existing_path)
+    missing_path = tmp_path / "missing.png"
+    existing = SimpleNamespace(
+        id="asset-ok",
+        role="visual_asset",
+        slide_id=None,
+        file_path=str(existing_path),
+        asset_name="existing product",
+        asset_kind="product",
+        process_mode="crop",
+        usage_note="",
+        asset_analysis={"selection_tier": "manual"},
+    )
+    missing = SimpleNamespace(
+        id="asset-missing",
+        role="visual_asset",
+        slide_id=None,
+        file_path=str(missing_path),
+        asset_name="missing product",
+        asset_kind="product",
+        process_mode="crop",
+        usage_note="",
+        asset_analysis={"selection_tier": "manual"},
+    )
+    project = SimpleNamespace(reference_images=[existing, missing])
+
+    planning_assets = slides_api._project_visual_assets_for_planning(project)
+    prompt_refs = slides_api._project_refs_for_prompt(
+        project,
+        ["asset-ok", "asset-missing"],
+        {"visual_asset_ids": ["asset-ok", "asset-missing"]},
+    )
+
+    assert [asset["id"] for asset in planning_assets] == ["asset-ok"]
+    assert [ref["id"] for ref in prompt_refs] == ["asset-ok"]
+
+
+def test_missing_template_does_not_create_prompt_reference(tmp_path):
+    existing_path = tmp_path / "template.png"
+    Image.new("RGB", (8, 8), "white").save(existing_path)
+    project = SimpleNamespace(reference_images=[
+        SimpleNamespace(id="template-ok", role="template", file_path=str(existing_path), process_mode="blend"),
+        SimpleNamespace(id="template-missing", role="template", file_path=str(tmp_path / "missing-template.png"), process_mode="blend"),
+    ])
+
+    refs = slides_api._project_template_refs_for_prompt(project)
+
+    assert [ref["id"] for ref in refs] == ["template-ok"]
 
 
 def test_visual_plan_auto_adds_recalled_product_asset_when_llm_misses(monkeypatch):
@@ -1070,6 +1539,53 @@ def test_visual_plan_auto_adds_recalled_product_asset_when_llm_misses(monkeypatc
     assert plan[0]["visual_asset_ids"] == ["asset-1"]
     assert "uploaded product image" in plan[0]["visual_asset_usage"]["asset-1"]
     assert "胡姬花花生油瓶" not in plan[0]["visual_asset_usage"]["asset-1"]
+
+
+def test_visual_plan_forces_logo_policy_off_when_project_has_no_logo(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"1": {'
+                                        '"visual_evidence": "竞技场封面主视觉", '
+                                        '"visual_summary": "暗红竞技场封面", '
+                                        '"visual_description": "主标题左侧，右侧预留品牌标识区域。", '
+                                        '"visual_asset_ids": [], '
+                                        '"visual_asset_usage": {}, '
+                                        '"logo_policy": {"show_logo": true, "placement": "title-block-center", "scale": "large", "use_as_scene_asset": false}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 1,
+                "type": "cover",
+                "text_content": {"headline": "古罗马角斗士", "body": ""},
+            }
+        ],
+        has_project_logo=False,
+    )
+
+    assert plan[0]["logo_policy"]["show_logo"] is False
+    assert plan[0]["logo_policy"]["placement"] == "top-right"
+    assert plan[0]["logo_policy"]["use_as_scene_asset"] is False
+    assert "品牌标识" not in plan[0]["visual_description"]
 
 
 def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypatch):
@@ -1406,6 +1922,40 @@ def test_visual_asset_upload_defaults_crop_but_honors_explicit_blend(tmp_path, m
     assert refreshed_slide.prompt_text is None
 
 
+def test_visual_asset_upload_returns_before_vlm_analysis_when_background_available(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Asset upload", status="planning")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(slides_api.settings, "UPLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        slides_api,
+        "analyze_visual_asset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not analyze synchronously")),
+    )
+    scheduled = []
+    monkeypatch.setattr(slides_api, "_submit_asset_analysis_task", lambda *args: scheduled.append(args))
+
+    result = slides_api.upload_file(
+        project.id,
+        png_upload("product.png"),
+        role="visual_asset",
+        slide_id=None,
+        process_mode=None,
+        asset_name="产品图",
+        asset_kind="product",
+        usage_note="用于产品展示页",
+        background_tasks=BackgroundTasks(),
+        db=db,
+    )
+
+    assert result["asset_analysis"]["analysis_status"] == "queued"
+    assert result["asset_analysis"]["subject"] == "产品图"
+    assert result["process_mode"] == "crop"
+    assert scheduled and scheduled[0][0] == "visual_asset"
+
+
 def test_visual_asset_upload_rejects_slide_level_asset(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="Asset upload", status="planning")
@@ -1523,6 +2073,37 @@ def test_pptx_document_upload_extracts_generic_picture_as_page_ref_only(tmp_path
     assert docs[0]["asset_extraction_status"] == "completed"
 
 
+def test_pptx_asset_extraction_is_idempotent_for_page_refs(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_picture("source.pptx"),
+        db=db,
+    )
+    source_path = str(tmp_path / project.id / "docs" / "source.pptx")
+    first = documents_api._extract_pptx_assets_for_document(project.id, source_path, "source.pptx", db=db)
+    second = documents_api._extract_pptx_assets_for_document(project.id, source_path, "source.pptx", db=db)
+
+    page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+
+    assert first["page_refs"] == 1
+    assert second["page_refs"] == 0
+    assert len(page_refs) == 1
+    assert page_refs[0].slide_id == slide.id
+
+
 def test_pptx_document_upload_queues_asset_extraction_with_background_tasks(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="PPT upload", status="planning")
@@ -1590,7 +2171,7 @@ def test_uploaded_document_text_is_parsed_on_generate_when_background_not_done(t
     assert docs_after[0]["char_count"] > 0
 
 
-def test_pptx_upload_keeps_generic_picture_grid_out_of_global_library(tmp_path, monkeypatch):
+def test_pptx_upload_keeps_parallel_picture_group_complete_and_out_of_global_library(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="PPT upload", status="planning")
     db.add(project)
@@ -1624,9 +2205,11 @@ def test_pptx_upload_keeps_generic_picture_grid_out_of_global_library(tmp_path, 
     ).all()
 
     assert result["extracted_assets"]["total"] == 0
-    assert stats["total"] == 3
-    assert len(page_refs) == 3
+    assert stats["total"] == 5
+    assert len(page_refs) == 5
     assert len(library_assets) == 0
+    assert {ref.asset_analysis["asset_group_size"] for ref in page_refs} == {5}
+    assert sorted(ref.asset_analysis["asset_group_index"] for ref in page_refs) == [1, 2, 3, 4, 5]
 
 
 def test_pptx_document_upload_promotes_primary_core_asset(tmp_path, monkeypatch):
@@ -1699,6 +2282,69 @@ def test_pptx_document_upload_keeps_content_graphic_page_level(tmp_path, monkeyp
     assert page_ref.asset_analysis["selection_reason"] == "content graphic kept as page-level evidence"
 
 
+def test_pptx_document_upload_keeps_identity_code_out_of_global_library(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = documents_api.upload_document(
+        project.id,
+        pptx_upload_with_identity_code("identity-code-source.pptx"),
+        db=db,
+    )
+    stats = documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "identity-code-source.pptx"),
+        "identity-code-source.pptx",
+        db=db,
+    )
+
+    assert result["asset_extraction_status"] == "queued"
+    assert stats["page_refs"] == 1
+    assert stats["visual_assets"] == 0
+    page_ref = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    assert page_ref.asset_analysis["selection_tier"] == "page_ref"
+    assert page_ref.asset_analysis["selection_reason"] == "QR/identity code kept as page-specific evidence"
+
+
+def test_pptx_document_upload_ignores_phone_frame_layout_chrome(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = documents_api.upload_document(
+        project.id,
+        pptx_upload_with_phone_frame_chrome("phone-frame-source.pptx"),
+        db=db,
+    )
+    stats = documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "phone-frame-source.pptx"),
+        "phone-frame-source.pptx",
+        db=db,
+    )
+
+    assert result["asset_extraction_status"] == "queued"
+    assert stats["page_refs"] == 0
+    assert stats["visual_assets"] == 0
+    assert db.query(ReferenceImage).filter(ReferenceImage.project_id == project.id).count() == 0
+
+
 def test_pptx_document_upload_promotes_multiple_cover_logos(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="PPT upload", status="draft")
@@ -1732,6 +2378,169 @@ def test_pptx_document_upload_promotes_multiple_cover_logos(tmp_path, monkeypatc
     assert all(logo.asset_analysis["classification"] == "logo_candidate" for logo in logos)
 
 
+def test_pptx_document_upload_respects_picture_crop_for_logo(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_cropped_cover_logo("cropped-logo.pptx"),
+        db=db,
+    )
+    stats = documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "cropped-logo.pptx"),
+        "cropped-logo.pptx",
+        db=db,
+    )
+
+    logo = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "logo",
+        ReferenceImage.slide_id.is_(None),
+    ).one()
+    extracted = Image.open(logo.file_path).convert("RGB")
+    right_half_pixels = [
+        extracted.getpixel((x, y))
+        for x in range(extracted.width // 2, extracted.width)
+        for y in range(extracted.height)
+    ]
+
+    assert stats["logos"] == 1
+    assert extracted.width <= 225
+    assert logo.asset_analysis["pptx_crop"] == [0.0, 0.0, 0.5, 0.0]
+    assert not any(r > 180 and g < 60 and b < 70 for r, g, b in right_half_pixels)
+
+
+def test_pptx_document_upload_promotes_cropped_multicolor_cover_logo(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_cropped_multicolor_cover_logo("cropped-multicolor-logo.pptx"),
+        db=db,
+    )
+    stats = documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "cropped-multicolor-logo.pptx"),
+        "cropped-multicolor-logo.pptx",
+        db=db,
+    )
+
+    logos = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "logo",
+        ReferenceImage.slide_id.is_(None),
+    ).all()
+    page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+
+    assert stats["logos"] == 1
+    assert stats["page_refs"] == 0
+    assert len(logos) == 1
+    assert page_refs == []
+    assert logos[0].asset_analysis["classification"] == "logo_candidate"
+    assert logos[0].asset_analysis["review_status"] == "needs_review"
+    assert max(logos[0].asset_analysis["pptx_crop"]) > 0
+
+
+def test_unconfirmed_logos_do_not_enter_project_logo_refs(tmp_path):
+    db = make_session()
+    project = Project(title="Logo review", status="planning")
+    db.add(project)
+    db.flush()
+    needs_review_path = tmp_path / "maybe_logo.png"
+    confirmed_path = tmp_path / "confirmed_logo.png"
+    Image.new("RGB", (80, 40), "white").save(needs_review_path)
+    Image.new("RGB", (80, 40), "white").save(confirmed_path)
+    needs_review = ReferenceImage(
+        project_id=project.id,
+        file_path=str(needs_review_path),
+        role="logo",
+        process_mode="original",
+        asset_analysis={"classification": "logo_candidate", "review_status": "needs_review"},
+    )
+    confirmed = ReferenceImage(
+        project_id=project.id,
+        file_path=str(confirmed_path),
+        role="logo",
+        process_mode="original",
+        asset_analysis={"review_status": "user_confirmed"},
+    )
+    db.add_all([needs_review, confirmed])
+    db.commit()
+    db.refresh(project)
+
+    refs = slides_api._project_logo_refs(project)
+
+    assert [ref.id for ref in refs] == [confirmed.id]
+
+
+def test_missing_confirmed_logo_does_not_enable_logo_policy(tmp_path):
+    db = make_session()
+    project = Project(title="Missing logo", status="planning")
+    db.add(project)
+    db.flush()
+    ref = ReferenceImage(
+        project_id=project.id,
+        file_path=str(tmp_path / "missing-logo.png"),
+        role="logo",
+        process_mode="original",
+        asset_analysis={"review_status": "user_confirmed"},
+    )
+    db.add(ref)
+    db.commit()
+    db.refresh(project)
+
+    intent = slides_api._with_project_logo_policy(
+        {"type": "cover", "logo_policy": {"show_logo": True, "placement": "center", "scale": "large"}},
+        project,
+    )
+
+    assert slides_api._project_logo_refs(project) == []
+    assert intent["logo_policy"]["show_logo"] is False
+
+
+def test_logo_review_status_can_promote_candidate_back_to_logo(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Logo review", status="planning")
+    db.add(project)
+    db.flush()
+    logo_path = tmp_path / "maybe_logo.png"
+    Image.new("RGB", (80, 40), "white").save(logo_path)
+    ref = ReferenceImage(
+        project_id=project.id,
+        file_path=str(logo_path),
+        role="logo",
+        process_mode="original",
+        asset_analysis={"classification": "logo_candidate", "review_status": "needs_review"},
+    )
+    db.add(ref)
+    db.commit()
+
+    result = slides_api.update_reference_image(
+        project.id,
+        ref.id,
+        {"review_status": "user_confirmed"},
+        db=db,
+    )
+    db.refresh(project)
+
+    assert result["review_status"] == "user_confirmed"
+    assert [logo.id for logo in slides_api._project_logo_refs(project)] == [ref.id]
+
+
 def test_pending_pptx_page_refs_link_after_content_plan_exists(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="PPT upload", status="draft")
@@ -1758,6 +2567,51 @@ def test_pending_pptx_page_refs_link_after_content_plan_exists(tmp_path, monkeyp
     assert pending.slide_id is None
 
     slide = Slide(project_id=project.id, page_num=1, status="pending")
+    db.add(slide)
+    db.commit()
+
+    linked = slides_api._link_pending_pptx_page_refs(project.id, db)
+    db.commit()
+
+    assert linked == 1
+    db.refresh(pending)
+    assert pending.slide_id == slide.id
+
+
+def test_pending_pptx_page_refs_link_by_source_refs_when_pages_are_reordered(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_picture("source.pptx"),
+        db=db,
+    )
+    documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "source.pptx"),
+        "source.pptx",
+        db=db,
+    )
+    pending = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    assert pending.slide_id is None
+
+    slide = Slide(
+        project_id=project.id,
+        page_num=3,
+        status="pending",
+        content_json={
+            "page_num": 3,
+            "source_refs": [{"source_document": "source.pptx", "source_page_num": 1}],
+        },
+    )
     db.add(slide)
     db.commit()
 
@@ -1891,9 +2745,10 @@ def test_overlay_layers_endpoint_and_visual_merge(tmp_path):
         project_id=project.id,
         role="visual_asset",
         file_path=str(path),
-        process_mode="original",
+        process_mode="blend",
         asset_name="后台截图",
         asset_kind="material",
+        asset_analysis={"subject": "后台截图"},
     )
     db.add(asset)
     db.commit()
@@ -1918,9 +2773,56 @@ def test_overlay_layers_endpoint_and_visual_merge(tmp_path):
     assert slide.visual_json["overlay_layers"][0]["preset"] == "right-card"
     assert slide.prompt_text is None
     assert slide.status == "visual_ready"
+    db.refresh(asset)
+    assert asset.process_mode == "original"
+    assert asset.asset_analysis["exact_overlay"] is True
 
     merged = slides_api._merge_manual_pins_into_visual_json({"visual_asset_ids": []}, slide.visual_json)
     assert merged["overlay_layers"][0]["asset_id"] == asset.id
+
+
+def test_overlay_layers_accept_page_reference_assets(tmp_path):
+    db = make_session()
+    project = Project(title="Page reference overlay", status="completed")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=2, status="completed", prompt_text="old", visual_json={})
+    db.add(slide)
+    db.flush()
+    path = tmp_path / "page-ref.png"
+    Image.new("RGB", (120, 70), "white").save(path)
+    page_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(path),
+        process_mode="blend",
+        asset_name="原 PPT 第 2 页参考图",
+        asset_analysis={"subject": "页面图片"},
+    )
+    db.add(page_ref)
+    db.commit()
+
+    result = slides_api.update_slide_overlay_layers(
+        project.id,
+        slide.id,
+        slides_api.OverlayLayersRequest(layers=[
+            slides_api.OverlayLayerRequest(
+                asset_id=page_ref.id,
+                preset="center-card",
+                mode="exact_card",
+                usage_note="原样保留",
+            )
+        ]),
+        db=db,
+    )
+    db.refresh(slide)
+    db.refresh(page_ref)
+
+    assert result["overlay_layers"][0]["asset_id"] == page_ref.id
+    assert slide.visual_json["overlay_layers"][0]["preset"] == "center-card"
+    assert page_ref.process_mode == "original"
+    assert page_ref.asset_analysis["exact_overlay"] is True
 
 
 def test_asset_pins_unpin_removes_overlay_layer(tmp_path):
@@ -2058,6 +2960,144 @@ def test_pipeline_skips_exact_overlay_assets_as_image_inputs(tmp_path):
     assert auto_asset.id in [ref.get("id") for ref in refs]
 
 
+def test_project_asset_route_overrides_stale_process_mode(tmp_path):
+    db = make_session()
+    project = Project(title="Route override", status="prompt_ready")
+    db.add(project)
+    db.flush()
+    path = tmp_path / "asset.png"
+    Image.new("RGB", (20, 20), "red").save(path)
+    asset = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(path),
+        process_mode="original",
+        asset_name="已从精确粘贴切回的素材",
+        asset_kind="material",
+    )
+    db.add(asset)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        prompt_text="prompt",
+        visual_json={
+            "visual_asset_ids": [asset.id],
+            "asset_route_modes": {asset.id: "blend"},
+        },
+    )
+    db.add(slide)
+    db.commit()
+
+    refs = _load_reference_images(db.query(Slide).filter(Slide.id == slide.id).one())
+    prompt_refs = slides_api._project_refs_for_prompt(
+        db.query(Project).filter(Project.id == project.id).one(),
+        [asset.id],
+        slide.visual_json,
+    )
+
+    assert refs[0]["id"] == asset.id
+    assert refs[0]["asset_route_mode"] == "blend"
+    assert refs[0]["process_mode"] == "blend"
+    assert prompt_refs[0]["asset_route_mode"] == "blend"
+    assert prompt_refs[0]["process_mode"] == "blend"
+
+
+def test_pipeline_skips_page_reference_overlay_as_image_input(tmp_path):
+    db = make_session()
+    project = Project(title="Pipeline page reference overlay", status="prompt_ready")
+    db.add(project)
+    db.flush()
+    overlay_path = tmp_path / "page-overlay.png"
+    blend_path = tmp_path / "page-blend.png"
+    Image.new("RGB", (20, 20), "red").save(overlay_path)
+    Image.new("RGB", (20, 20), "blue").save(blend_path)
+    slide = Slide(
+        project_id=project.id,
+        page_num=3,
+        status="prompt_ready",
+        prompt_text="prompt",
+        visual_json={
+            "overlay_layers": [{
+                "id": "ov_page_ref",
+                "asset_id": "pending",
+                "enabled": True,
+                "preset": "right-card",
+            }],
+        },
+    )
+    db.add(slide)
+    db.flush()
+    overlay_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(overlay_path),
+        process_mode="original",
+        asset_name="原样保留素材",
+    )
+    blend_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(blend_path),
+        process_mode="blend",
+        asset_name="融合素材",
+    )
+    db.add_all([overlay_ref, blend_ref])
+    db.flush()
+    slide.visual_json = {
+        "overlay_layers": [{
+            "id": "ov_page_ref",
+            "asset_id": overlay_ref.id,
+            "enabled": True,
+            "preset": "right-card",
+        }],
+    }
+    db.commit()
+
+    refs = _load_reference_images(db.query(Slide).filter(Slide.id == slide.id).one())
+
+    assert overlay_ref.id not in [ref.get("id") for ref in refs]
+    assert blend_ref.id in [ref.get("id") for ref in refs]
+
+
+def test_pipeline_skips_chart_reference_overlay_as_image_input(tmp_path):
+    db = make_session()
+    project = Project(title="Pipeline chart reference overlay", status="prompt_ready")
+    db.add(project)
+    db.flush()
+    chart_path = tmp_path / "chart-overlay.png"
+    Image.new("RGB", (20, 20), "green").save(chart_path)
+    slide = Slide(project_id=project.id, page_num=4, status="prompt_ready", prompt_text="prompt", visual_json={})
+    db.add(slide)
+    db.flush()
+    chart_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="chart_ref",
+        file_path=str(chart_path),
+        process_mode="original",
+        asset_name="原样保留图表",
+    )
+    db.add(chart_ref)
+    db.flush()
+    slide.visual_json = {
+        "overlay_layers": [{
+            "id": "ov_chart_ref",
+            "asset_id": chart_ref.id,
+            "enabled": True,
+            "preset": "center-card",
+        }],
+    }
+    db.commit()
+
+    refs = _load_reference_images(db.query(Slide).filter(Slide.id == slide.id).one())
+
+    assert chart_ref.id not in [ref.get("id") for ref in refs]
+
+
 def test_reference_image_library_filters_and_facets(tmp_path):
     db = make_session()
     project = Project(title="Library", status="visual_ready")
@@ -2106,8 +3146,10 @@ def test_default_reference_image_list_hides_legacy_low_value_visual_assets(tmp_p
     db.flush()
     scene_path = tmp_path / "scene.png"
     core_path = tmp_path / "core.png"
+    phone_path = tmp_path / "phone.png"
     Image.new("RGB", (10, 10), "white").save(scene_path)
     Image.new("RGB", (10, 10), "white").save(core_path)
+    Image.new("RGB", (10, 10), "white").save(phone_path)
     db.add_all([
         ReferenceImage(
             project_id=project.id,
@@ -2133,6 +3175,20 @@ def test_default_reference_image_list_hides_legacy_low_value_visual_assets(tmp_p
                 "source_document": "source.pptx",
                 "selection_tier": "core_global",
                 "importance_score": 35,
+            },
+        ),
+        ReferenceImage(
+            project_id=project.id,
+            role="visual_asset",
+            file_path=str(phone_path),
+            process_mode="crop",
+            asset_name="手机边框",
+            asset_kind="product",
+            asset_analysis={
+                "source_document": "source.pptx",
+                "selection_tier": "core_global",
+                "importance_score": 35,
+                "source_slide_text": "手机边框承载小程序界面与身份码展示",
             },
         ),
     ])

@@ -25,16 +25,26 @@ OVERLAY_PRESET_LABELS = {
 }
 
 OVERLAY_MODES = {"exact_card", "exact_cutout"}
+OVERLAY_VALIGNS = {"center", "bottom"}
 DEFAULT_OVERLAY_PRESET = "right-card"
 DEFAULT_OVERLAY_MODE = "exact_card"
+DEFAULT_OVERLAY_VALIGN = "bottom"
 
 
-def enabled_overlay_layers(visual_json: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+def enabled_overlay_layers(
+    visual_json: Mapping[str, Any] | None,
+    *,
+    valid_asset_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     visual = visual_json if isinstance(visual_json, Mapping) else {}
     layers = visual.get("overlay_layers") or []
     if not isinstance(layers, list):
         return []
-    normalized = normalize_overlay_layers(layers, valid_asset_ids=None, strict_assets=False)
+    normalized = normalize_overlay_layers(
+        layers,
+        valid_asset_ids=valid_asset_ids,
+        strict_assets=valid_asset_ids is not None,
+    )
     return [layer for layer in normalized if layer.get("enabled", True)]
 
 
@@ -70,6 +80,9 @@ def normalize_overlay_layers(
         mode = str(raw.get("mode") or DEFAULT_OVERLAY_MODE).strip()
         if mode not in OVERLAY_MODES:
             mode = DEFAULT_OVERLAY_MODE
+        valign = str(raw.get("valign") or DEFAULT_OVERLAY_VALIGN).strip()
+        if valign not in OVERLAY_VALIGNS:
+            valign = DEFAULT_OVERLAY_VALIGN
         normalized.append({
             "id": layer_id,
             "asset_id": asset_id,
@@ -77,6 +90,7 @@ def normalize_overlay_layers(
             "preset": preset,
             "fit": "contain",
             "mode": mode,
+            "valign": valign,
             "usage_note": str(raw.get("usage_note") or "").strip(),
             "z_index": index,
         })
@@ -103,8 +117,12 @@ def remove_asset_from_overlay_layers(visual_json: dict | None, asset_id: str) ->
     return visual
 
 
-def overlay_reservation_instruction(visual_json: Mapping[str, Any] | None) -> str:
-    layers = enabled_overlay_layers(visual_json)
+def overlay_reservation_instruction(
+    visual_json: Mapping[str, Any] | None,
+    *,
+    valid_asset_ids: set[str] | None = None,
+) -> str:
+    layers = enabled_overlay_layers(visual_json, valid_asset_ids=valid_asset_ids)
     if not layers:
         return ""
     parts = []
@@ -128,7 +146,15 @@ def overlay_box(prs: Any, preset: str) -> tuple[int, int, int, int]:
     return left, top, width, height
 
 
-def contained_picture_box(image_path: str, left: int, top: int, width: int, height: int) -> tuple[int, int, int, int]:
+def contained_picture_box(
+    image_path: str,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    *,
+    valign: str = DEFAULT_OVERLAY_VALIGN,
+) -> tuple[int, int, int, int]:
     if not image_path or not os.path.exists(image_path):
         return left, top, width, height
     try:
@@ -142,5 +168,8 @@ def contained_picture_box(image_path: str, left: int, top: int, width: int, heig
     pic_w = int(img_w * scale)
     pic_h = int(img_h * scale)
     pic_left = left + int((width - pic_w) / 2)
-    pic_top = top + int((height - pic_h) / 2)
+    if valign == "bottom":
+        pic_top = top + max(0, height - pic_h)
+    else:
+        pic_top = top + int((height - pic_h) / 2)
     return pic_left, pic_top, pic_w, pic_h

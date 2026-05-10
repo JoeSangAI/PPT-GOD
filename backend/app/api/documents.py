@@ -99,8 +99,19 @@ def _slide_by_page(project_id: str, db: Session) -> dict[int, Slide]:
 def _asset_analysis(asset: PptxImageAsset) -> dict:
     tags = asset.metadata.get("asset_tags") if isinstance(asset.metadata, dict) else []
     tags = [str(tag) for tag in tags] if isinstance(tags, list) else []
+    logo_review = {}
+    if asset.role == "logo":
+        is_candidate = asset.classification == "logo_candidate"
+        logo_review = {
+            "review_status": "needs_review" if is_candidate else "auto_confirmed",
+            "needs_user_review": is_candidate,
+            "confidence_score": 0.58 if is_candidate else 0.92,
+            "review_reason": "从 PPT 封面/封底位置识别出的疑似 Logo，请确认是否为品牌标识。" if is_candidate else "跨页重复的小型标识，已自动确认为 Logo。",
+            "detected_names": [],
+        }
     return {
         **asset.metadata,
+        **logo_review,
         "detected_kind": asset.asset_kind or "other",
         "subject": asset.asset_name,
         "description": asset.usage_note,
@@ -112,6 +123,17 @@ def _asset_analysis(asset: PptxImageAsset) -> dict:
             *tags,
         ]))[:32],
     }
+
+
+def _pptx_page_ref_key_from_analysis(analysis: dict, file_path: str | None = None) -> tuple[str, int | None, str]:
+    source_document = str(analysis.get("source_document") or "")
+    source_page_num = analysis.get("pptx_source_page_num")
+    try:
+        source_page_num = int(source_page_num) if source_page_num is not None else None
+    except (TypeError, ValueError):
+        source_page_num = None
+    digest = str(analysis.get("pptx_image_sha1") or file_path or "")
+    return source_document, source_page_num, digest
 
 
 def _attach_extracted_pptx_assets(
@@ -142,6 +164,15 @@ def _attach_extracted_pptx_assets(
         str(ref.asset_analysis.get("pptx_image_sha1"))
         for ref in existing_logo_refs
         if isinstance(ref.asset_analysis, dict) and ref.asset_analysis.get("pptx_image_sha1")
+    }
+    existing_page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+    existing_page_ref_keys = {
+        _pptx_page_ref_key_from_analysis(ref.asset_analysis, ref.file_path)
+        for ref in existing_page_refs
+        if isinstance(ref.asset_analysis, dict)
     }
 
     stats = {"logos": 0, "page_refs": 0, "visual_assets": 0}
@@ -188,6 +219,10 @@ def _attach_extracted_pptx_assets(
             continue
 
         slide = slides_by_page.get(asset.source_page_num)
+        page_ref_key = _pptx_page_ref_key_from_analysis(analysis, asset.file_path)
+        if page_ref_key in existing_page_ref_keys:
+            continue
+        existing_page_ref_keys.add(page_ref_key)
         if slide:
             affected_slides.add(slide.id)
         db.add(ReferenceImage(

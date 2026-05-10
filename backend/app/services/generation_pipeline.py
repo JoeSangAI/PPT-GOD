@@ -12,7 +12,8 @@ from app.core.config import settings
 from app.models.models import Project, Slide
 from app.services.image_generation import generate_slide_image, save_slide_image
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
-from app.services.logo_policy import should_use_logo_as_scene_asset
+from app.services.logo_overlay_layout import resolve_logo_overlay_box
+from app.services.logo_policy import is_logo_confirmed, should_show_logo, should_use_logo_as_scene_asset
 from app.services.overlay_layers import exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import cleanup_generation_progress, finish_run, is_run_active, mark_run_running, update_run_progress
@@ -21,7 +22,19 @@ from app.utils.reference_image import default_visual_asset_process_mode
 logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
-MAX_REFERENCE_INPUTS = 14
+MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
+
+
+def _existing_path(path: str | None, output_dir: str | None = None) -> str | None:
+    if not path:
+        return None
+    if os.path.exists(path):
+        return path
+    if path.startswith("./outputs") and output_dir:
+        candidate = os.path.join(os.path.dirname(os.path.abspath(output_dir)), path[2:])
+        if os.path.exists(candidate):
+            return candidate
+    return path
 
 
 def _reference_input_priority(ref: Dict) -> int:
@@ -66,11 +79,17 @@ def _load_reference_images(
     返回 List[Dict]，每个 Dict 包含 image (PIL.Image) 和 process_mode (str)。
     """
     refs = []
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    overlay_asset_ids = exact_overlay_asset_ids(visual)
+    asset_route_modes = {}
+    raw_route_modes = visual.get("asset_route_modes") or {}
+    if isinstance(raw_route_modes, dict):
+        asset_route_modes = {str(k): str(v).lower() for k, v in raw_route_modes.items() if k and v}
 
     # 0. 单页微调时，当前页历史图片必须排第一，图像编辑模型以它为底图。
     finetune_base_path = None
-    if slide.visual_json and isinstance(slide.visual_json, dict):
-        finetune_base_path = slide.visual_json.get("finetune_base_image_path")
+    if visual:
+        finetune_base_path = visual.get("finetune_base_image_path")
     if finetune_base_path:
         if os.path.exists(finetune_base_path):
             try:
@@ -98,9 +117,12 @@ def _load_reference_images(
     already_loaded_paths = set()
     if slide.reference_images:
         finetune_attachment_ids = set()
-        if slide.visual_json and isinstance(slide.visual_json, dict):
-            finetune_attachment_ids = set(slide.visual_json.get("finetune_attachment_ids") or [])
+        if visual:
+            finetune_attachment_ids = set(visual.get("finetune_attachment_ids") or [])
         for idx, ref in enumerate(slide.reference_images, start=1):
+            if str(getattr(ref, "id", "") or "") in overlay_asset_ids:
+                logger.info(f"Slide {slide.page_num}: 页面参考图 {ref.id} 走精确粘贴，跳过生图参考输入")
+                continue
             if finetune_base_path:
                 # In direct edit mode, keep the image context tight: current slide
                 # plus only the images uploaded for this chat turn. Long-lived page
@@ -125,6 +147,7 @@ def _load_reference_images(
                         "asset_name": getattr(ref, "asset_name", None),
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
+                        "asset_route_mode": "double_blend" if (ref.process_mode or "blend") == "crop" else "blend",
                     })
                     already_loaded_paths.add(ref.file_path)
                 except Exception as e:
@@ -175,6 +198,7 @@ def _load_reference_images(
             ref for ref in slide.project.reference_images
             if (
                 ref.role == "logo"
+                and is_logo_confirmed(ref)
                 and not ref.slide_id
                 and os.path.exists(ref.file_path)
             )
@@ -200,16 +224,15 @@ def _load_reference_images(
     # 3. 全局视觉资产：只加载 visual plan 为当前页选中的资产。
     selected_asset_ids = []
     manual_asset_ids = set()
-    overlay_asset_ids = exact_overlay_asset_ids(slide.visual_json if isinstance(slide.visual_json, dict) else {})
-    if slide.visual_json and isinstance(slide.visual_json, dict):
-        raw_ids = slide.visual_json.get("visual_asset_ids") or []
+    if visual:
+        raw_ids = visual.get("visual_asset_ids") or []
         if isinstance(raw_ids, list):
             selected_asset_ids = []
             for x in raw_ids:
                 value = str(x)
                 if value and value not in overlay_asset_ids and value not in selected_asset_ids:
                     selected_asset_ids.append(value)
-        manual_raw = slide.visual_json.get("manual_visual_asset_ids") or []
+        manual_raw = visual.get("manual_visual_asset_ids") or []
         if isinstance(manual_raw, list):
             manual_asset_ids = {str(x) for x in manual_raw if x}
 
@@ -228,9 +251,18 @@ def _load_reference_images(
                 continue
             if os.path.exists(ref.file_path):
                 try:
+                    route_mode = asset_route_modes.get(ref.id) or (
+                        "double_blend"
+                        if str(getattr(ref, "asset_kind", "") or "").lower() in {"product", "material"}
+                        else "blend"
+                    )
+                    effective_process_mode = "crop" if route_mode == "double_blend" else (
+                        "original" if route_mode == "overlay" else "blend"
+                    )
                     refs.append({
                         "image": Image.open(ref.file_path),
-                        "process_mode": ref.process_mode or default_visual_asset_process_mode(getattr(ref, "asset_kind", None)),
+                        "process_mode": effective_process_mode,
+                        "asset_route_mode": route_mode,
                         "role": ref.role,
                         "label": f"Global Visual Asset {idx}",
                         "file_path": ref.file_path,
@@ -305,9 +337,11 @@ def _load_reference_images(
 
 def _map_slide_type_to_template_key(slide_type: str) -> str:
     """将 slide 类型映射到模板类别。"""
+    slide_type = str(slide_type or "content").lower()
     mapping = {
         "cover": "cover",
         "toc": "toc",
+        "section": "toc",
         "hero": "content",
         "data": "content",
         "ending": "ending",
@@ -328,8 +362,28 @@ def _slide_family(slide: Slide) -> Optional[str]:
     if slide_type in {"hero", "quote"}:
         return "hero"
     if slide_type == "toc":
+        return "toc"
+    if slide_type == "section":
         return "section"
+    if slide_type == "data":
+        return "data"
     return "content"
+
+
+def _slide_language_group(slide: Slide) -> str:
+    if slide.visual_json and isinstance(slide.visual_json, dict):
+        group = slide.visual_json.get("visual_language_group")
+        if group:
+            return str(group)
+    family = _slide_family(slide) or "content"
+    return f"legacy_{family}"
+
+
+def _slide_seed_key(slide: Slide) -> tuple[str, str] | None:
+    family = _slide_family(slide)
+    if not family:
+        return None
+    return (family, _slide_language_group(slide))
 
 
 def _is_finetune_slide(slide: Slide) -> bool:
@@ -339,13 +393,13 @@ def _is_finetune_slide(slide: Slide) -> bool:
     return bool(slide.visual_json.get("finetune_base_image_path"))
 
 
-def _collect_existing_seeds(slides: List[Slide]) -> Dict[str, List[str]]:
+def _collect_existing_seeds(slides: List[Slide]) -> Dict[tuple[str, str], List[str]]:
     """
     扫描所有 slide，把已经成功生成的页按 seed_family 聚合，
-    返回 {family: [image_path, ...]}，按推荐种子优先 + 页码升序排序。
+    返回 {(family, visual_language_group): [image_path, ...]}，按推荐种子优先 + 页码升序排序。
     每家族最多保留 2 张，避免 Stage 2 注入过多版式样本干扰主体。
     """
-    pool: Dict[str, List[Dict]] = {}
+    pool: Dict[tuple[str, str], List[Dict]] = {}
     for s in slides:
         if s.status != "completed":
             continue
@@ -354,22 +408,22 @@ def _collect_existing_seeds(slides: List[Slide]) -> Dict[str, List[str]]:
         if _is_finetune_slide(s):
             # finetune 模式产生的图片继承自旧底图，不作为家族种子
             continue
-        family = _slide_family(s)
-        if not family:
+        seed_key = _slide_seed_key(s)
+        if not seed_key:
             continue
         is_recommended = False
         if isinstance(s.visual_json, dict):
             is_recommended = bool(s.visual_json.get("is_seed_recommended"))
-        pool.setdefault(family, []).append({
+        pool.setdefault(seed_key, []).append({
             "image_path": s.image_path,
             "page_num": s.page_num,
             "is_recommended": is_recommended,
         })
 
-    seeds_by_family: Dict[str, List[str]] = {}
-    for family, items in pool.items():
+    seeds_by_family: Dict[tuple[str, str], List[str]] = {}
+    for seed_key, items in pool.items():
         items.sort(key=lambda x: (not x["is_recommended"], x["page_num"]))
-        seeds_by_family[family] = [item["image_path"] for item in items[:2]]
+        seeds_by_family[seed_key] = [item["image_path"] for item in items[:2]]
     return seeds_by_family
 
 
@@ -385,21 +439,31 @@ def _uses_direct_finetune_ref(ref_data: List[Dict]) -> bool:
 
 
 def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
-    return [ref for ref in ref_data if _is_product_or_material_ref(ref)]
+    refs = []
+    for ref in ref_data:
+        route_mode = str(ref.get("asset_route_mode") or "").lower()
+        if route_mode == "blend":
+            continue
+        if route_mode == "double_blend":
+            refs.append(ref)
+            continue
+        if _is_product_or_material_ref(ref):
+            refs.append(ref)
+    return refs
 
 
 def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
-    product_names = [
+    ref_names = [
         str(ref.get("asset_name") or "").strip()
         for ref in product_refs
         if str(ref.get("asset_name") or "").strip()
     ]
-    product_label = " / ".join(product_names[:3]) if product_names else "the uploaded product"
+    ref_label = " / ".join(ref_names[:3]) if ref_names else "the uploaded reference material"
     return (
         prompt
         + "\n\nFIRST PASS: generate the complete slide using the supplied reference material, including "
-        f"{product_label}. Product fidelity can be approximate in this first pass; a second hidden refinement "
-        "pass will strengthen the product details using the same uploaded reference image."
+        f"{ref_label}. Exact fidelity can be approximate in this first pass; a second hidden refinement "
+        "pass will strengthen the reference-material details using the same uploaded reference image."
     )
 
 
@@ -410,8 +474,11 @@ def _product_refinement_prompt(slide: Slide, product_refs: List[Dict]) -> str:
         if str(ref.get("file_path") or "").strip()
     ]
     if paths:
-        return f"用第2张及后续参考图替换第一张PPT图中的产品。参考素材路径：{'; '.join(paths)}"
-    return "用第2张及后续参考图替换第一张PPT图中的产品。"
+        return (
+            "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
+            f"只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：{'; '.join(paths)}"
+        )
+    return "用第2张及后续参考图校准第一张PPT图中的对应素材。保留整体版式和文字结构，只增强参考素材细节。"
 
 
 def _generate_one_slide(
@@ -626,8 +693,8 @@ def run_generation_pipeline(
         # 条件：1) 是 is_seed_recommended 推荐种子页 OR 同家族目前还没有任何已完成页；
         #      2) 该页是 target_slides 的一部分；
         #      3) 不是 finetune 模式（finetune 优先底图，不参与种子家族）。
-        target_families = {
-            _slide_family(s) for s in slides_with_prompt if _slide_family(s)
+        target_seed_keys = {
+            _slide_seed_key(s) for s in slides_with_prompt if _slide_seed_key(s)
         }
 
         seed_pages: List[Slide] = []
@@ -637,10 +704,11 @@ def run_generation_pipeline(
                 non_seed_pages.append(slide)
                 continue
             family = _slide_family(slide)
-            if not family:
+            seed_key = _slide_seed_key(slide)
+            if not family or not seed_key:
                 non_seed_pages.append(slide)
                 continue
-            if family in seeds_by_family:
+            if seed_key in seeds_by_family:
                 non_seed_pages.append(slide)
                 continue
             # 此家族还没有任何已完成图片：让推荐种子优先生成；
@@ -653,20 +721,20 @@ def run_generation_pipeline(
 
         # 兜底：家族在 target 中但还没种子也没有推荐种子 (例如批次只生成 page 5、不含 page 3)，
         # 取该家族在 slides_with_prompt 中最早的页作种子，提升 Stage 1。
-        seed_target_families = {_slide_family(s) for s in seed_pages if _slide_family(s)}
-        for family in target_families:
-            if family in seeds_by_family or family in seed_target_families:
+        seed_target_keys = {_slide_seed_key(s) for s in seed_pages if _slide_seed_key(s)}
+        for seed_key in target_seed_keys:
+            if not seed_key or seed_key in seeds_by_family or seed_key in seed_target_keys:
                 continue
-            family_pages = [s for s in non_seed_pages if _slide_family(s) == family]
+            family_pages = [s for s in non_seed_pages if _slide_seed_key(s) == seed_key]
             if not family_pages:
                 continue
             family_pages.sort(key=lambda s: s.page_num)
             promoted = family_pages[0]
             non_seed_pages = [s for s in non_seed_pages if s.id != promoted.id]
             seed_pages.append(promoted)
-            seed_target_families.add(family)
+            seed_target_keys.add(seed_key)
             logger.info(
-                f"Pipeline: 家族 {family} 没有推荐种子或现有种子，临时提升 page {promoted.page_num} 作种子"
+                f"Pipeline: 种子组 {seed_key} 没有推荐种子或现有种子，临时提升 page {promoted.page_num} 作种子"
             )
 
         if seed_pages:
@@ -695,16 +763,16 @@ def run_generation_pipeline(
                     # 把成功生成的种子页加入 seeds_by_family，供 Stage 2 使用
                     if not result.get("error"):
                         slide = result["slide"]
-                        family = _slide_family(slide)
-                        if family and result.get("image_path"):
-                            seeds_by_family.setdefault(family, []).append(result["image_path"])
+                        seed_key = _slide_seed_key(slide)
+                        if seed_key and result.get("image_path"):
+                            seeds_by_family.setdefault(seed_key, []).append(result["image_path"])
 
         # Stage 2：生成非种子页，按家族注入种子参考图
         if non_seed_pages:
             ref_data_by_slide = {}
             for s in non_seed_pages:
-                family = _slide_family(s)
-                seed_paths = seeds_by_family.get(family, []) if family else []
+                seed_key = _slide_seed_key(s)
+                seed_paths = seeds_by_family.get(seed_key, []) if seed_key else []
                 # finetune 页面不使用种子参考（底图优先）
                 if _is_finetune_slide(s):
                     seed_paths = []
@@ -751,7 +819,7 @@ def run_generation_pipeline(
 
                 logo_refs = [
                     ref for ref in project.reference_images or []
-                    if ref.role == "logo" and not ref.slide_id and os.path.exists(ref.file_path)
+                    if ref.role == "logo" and is_logo_confirmed(ref) and not ref.slide_id and os.path.exists(ref.file_path)
                 ]
                 logo_config = (
                     {
@@ -760,6 +828,31 @@ def run_generation_pipeline(
                     }
                     if logo_refs else None
                 )
+                logo_path_for_overlay = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) if logo_refs else None
+                if logo_path_for_overlay and logo_config:
+                    slides_by_page = {s.page_num: s for s in slides}
+                    for slide_data in all_completed_images:
+                        if not should_show_logo(slide_data):
+                            continue
+                        visual = dict(slide_data.get("visual_json") or {})
+                        policy = dict(visual.get("logo_policy") or {})
+                        resolved_box = resolve_logo_overlay_box(
+                            _existing_path(slide_data.get("image_path"), output_dir),
+                            logo_path_for_overlay,
+                            str(slide_data.get("type") or "content").lower(),
+                            policy.get("placement") or logo_config.get("anchor") or "top-right",
+                            policy.get("scale") or "small",
+                        )
+                        if not resolved_box:
+                            continue
+                        policy["resolved_overlay_box"] = resolved_box
+                        visual["logo_policy"] = policy
+                        slide_data["visual_json"] = visual
+                        slide_model = slides_by_page.get(slide_data.get("page_num"))
+                        if slide_model:
+                            slide_model.visual_json = visual
+                            flag_modified(slide_model, "visual_json")
+                    db.commit()
                 overlay_assets = {
                     ref.id: {
                         "file_path": ref.file_path,
@@ -767,7 +860,15 @@ def run_generation_pipeline(
                         "asset_kind": ref.asset_kind,
                     }
                     for ref in project.reference_images or []
-                    if ref.role == "visual_asset" and not ref.slide_id and os.path.exists(ref.file_path)
+                    if (
+                        (
+                            ref.role == "visual_asset" and not ref.slide_id
+                        )
+                        or (
+                            ref.role in {"content_ref", "chart_ref"} and ref.slide_id
+                        )
+                    )
+                    and os.path.exists(ref.file_path)
                 }
                 assemble_pptx(
                     slide_images=all_completed_images,

@@ -13,8 +13,10 @@ from app.models.models import Project, TesterUser, utc_now
 
 
 TESTER_ID_HEADER = "x-pptgod-tester-id"
+LOCAL_ADMIN_TESTER_ID = "local-admin"
 
 _current_tester_id: ContextVar[str | None] = ContextVar("pptgod_tester_id", default=None)
+_current_request_is_local: ContextVar[bool] = ContextVar("pptgod_request_is_local", default=False)
 
 
 def set_current_tester_id(tester_id: str | None):
@@ -29,6 +31,19 @@ def get_current_tester_id() -> str | None:
     return _current_tester_id.get()
 
 
+def set_current_request_is_local(is_local: bool):
+    return _current_request_is_local.set(bool(is_local))
+
+
+def reset_current_request_is_local(token) -> None:
+    _current_request_is_local.reset(token)
+
+
+def is_local_admin_request(tester_id: str | None = None) -> bool:
+    current_id = tester_id if tester_id is not None else get_current_tester_id()
+    return current_id == LOCAL_ADMIN_TESTER_ID and _current_request_is_local.get()
+
+
 def normalize_login_key(display_name: str) -> str:
     key = re.sub(r"\s+", " ", (display_name or "").strip().lower())
     if not key:
@@ -40,13 +55,6 @@ def normalize_login_key(display_name: str) -> str:
 
 def hash_passcode(passcode: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{passcode}".encode("utf-8")).hexdigest()
-
-
-def split_passcode_hash(value: str) -> tuple[str, str]:
-    if ":" not in value:
-        return "", value
-    salt, digest = value.split(":", 1)
-    return salt, digest
 
 
 def get_or_create_tester(db: Session, display_name: str, passcode: str = "") -> TesterUser:
@@ -80,12 +88,16 @@ def require_tester_id(x_pptgod_tester_id: Optional[str] = Header(default=None)) 
     tester_id = tester_id_from_header(x_pptgod_tester_id)
     if not tester_id:
         raise HTTPException(status_code=401, detail="请先登录测试账号")
+    if tester_id == LOCAL_ADMIN_TESTER_ID and not is_local_admin_request(tester_id):
+        raise HTTPException(status_code=403, detail="本地管理员账号只能在本机地址使用")
     return tester_id
 
 
 def verify_project_access(project: Project | None, tester_id: str | None) -> Project:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if is_local_admin_request(tester_id):
+        return project
     if project.tester_id and project.tester_id != tester_id:
         raise HTTPException(status_code=403, detail="这个项目属于其他测试账号，请切换账号后再试")
     return project

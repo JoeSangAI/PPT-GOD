@@ -1,4 +1,5 @@
 import base64
+from dataclasses import dataclass
 import hashlib
 import io
 import logging
@@ -30,6 +31,18 @@ _image_api_semaphore = threading.BoundedSemaphore(
     max(1, int(settings.IMAGE_API_MAX_CONCURRENCY or 1))
 )
 _real_image_calls_this_run = 0
+
+
+class ReferenceUploadTimeoutError(RuntimeError):
+    """Raised when reference images fail before the image API starts generation."""
+
+
+@dataclass(frozen=True)
+class _ReferenceUploadProfile:
+    max_side: int | None
+    jpeg_quality: int
+    png_threshold_bytes: int
+    label: str
 
 
 def _get_image_client() -> OpenAI:
@@ -111,30 +124,55 @@ def _is_api_retryable(exc: Exception) -> bool:
     只在同一接口、同一 Idempotency-Key 下重试瞬时失败。
     不切换模型，不改成无参考图生成，也不返回占位图。
     """
+    if isinstance(exc, ReferenceUploadTimeoutError):
+        return False
     if isinstance(exc, (APIConnectionError, APITimeoutError)):
         return True
     if isinstance(exc, APIStatusError):
         status = exc.status_code
-        if status == 429 or 500 <= status < 600:
+        if status in {408, 409, 425, 429} or 500 <= status < 600:
             return True
     if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
         return True
     if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
         status = exc.response.status_code
-        if status == 429 or 500 <= status < 600:
+        if status in {408, 409, 425, 429} or 500 <= status < 600:
             return True
     text = str(exc).lower()
     retryable_markers = (
+        "rate limit",
+        "too many requests",
         "connection error",
         "connection aborted",
+        "connection reset",
         "timed out",
         "timeout",
+        "read operation timed out",
+        "remote end closed",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
         "temporarily unavailable",
-        "图片接口上传超时",
     )
     if any(marker in text for marker in retryable_markers):
         return True
     return False
+
+
+def _retry_after_seconds(exc: Exception, fallback: int) -> int:
+    headers = None
+    response = getattr(exc, "response", None)
+    if response is not None:
+        headers = getattr(response, "headers", None)
+    retry_after = None
+    if headers:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(0, min(90, int(float(retry_after))))
+        except (TypeError, ValueError):
+            pass
+    return fallback
 
 
 def _download_image_bytes(url: str, max_attempts: int = 3) -> bytes:
@@ -154,12 +192,51 @@ def _download_image_bytes(url: str, max_attempts: int = 3) -> bytes:
     raise Exception("Image download failed after all retries")
 
 
-def _prepare_reference_image_for_upload(ref: Image.Image) -> Image.Image:
+def _base_reference_upload_profile() -> _ReferenceUploadProfile:
+    configured_max_side = int(settings.IMAGE_REFERENCE_MAX_SIDE or 0)
+    jpeg_quality = max(60, min(95, int(settings.IMAGE_REFERENCE_JPEG_QUALITY or 85)))
+    return _ReferenceUploadProfile(
+        max_side=configured_max_side if configured_max_side > 0 else None,
+        jpeg_quality=jpeg_quality,
+        png_threshold_bytes=512 * 1024,
+        label="source" if configured_max_side <= 0 else f"max{configured_max_side}",
+    )
+
+
+def _reference_upload_profiles() -> List[_ReferenceUploadProfile]:
+    base = _base_reference_upload_profile()
+    profiles = [base]
+    seen = {base.max_side}
+    fallback_specs = [
+        (2200, max(82, min(base.jpeg_quality, 88)), 512 * 1024, "fallback2200"),
+        (1800, max(80, min(base.jpeg_quality, 86)), 384 * 1024, "fallback1800"),
+        (1440, max(78, min(base.jpeg_quality, 84)), 256 * 1024, "fallback1440"),
+        (1280, max(76, min(base.jpeg_quality, 82)), 192 * 1024, "fallback1280"),
+    ]
+    for max_side, quality, png_threshold, label in fallback_specs:
+        if base.max_side is not None and max_side >= base.max_side:
+            continue
+        if max_side in seen:
+            continue
+        profiles.append(_ReferenceUploadProfile(max_side, quality, png_threshold, label))
+        seen.add(max_side)
+    return profiles
+
+
+def _reference_upload_budget_bytes() -> tuple[int, int]:
+    target_mb = max(1.0, float(settings.IMAGE_REFERENCE_UPLOAD_TARGET_MB or 20.0))
+    max_file_mb = max(1.0, float(settings.IMAGE_REFERENCE_MAX_FILE_MB or 8.0))
+    return int(target_mb * 1024 * 1024), int(max_file_mb * 1024 * 1024)
+
+
+def _prepare_reference_image_for_upload(
+    ref: Image.Image,
+    max_side: int | None = None,
+) -> Image.Image:
     """Normalize user/template references before sending them to the image API."""
-    max_side = max(256, int(settings.IMAGE_REFERENCE_MAX_SIDE or 1400))
     img = ImageOps.exif_transpose(ref)
     img = img.copy()
-    if max(img.size) > max_side:
+    if max_side and max_side > 0 and max(img.size) > max_side:
         img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     if img.mode in ("RGBA", "LA"):
         background = Image.new("RGB", img.size, (255, 255, 255))
@@ -171,8 +248,13 @@ def _prepare_reference_image_for_upload(ref: Image.Image) -> Image.Image:
     return img
 
 
-def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesIO, str, int]:
-    img = _prepare_reference_image_for_upload(ref)
+def _reference_upload_file(
+    ref: Image.Image,
+    index: int,
+    profile: _ReferenceUploadProfile | None = None,
+) -> tuple[str, io.BytesIO, str, int]:
+    upload_profile = profile or _base_reference_upload_profile()
+    img = _prepare_reference_image_for_upload(ref, max_side=upload_profile.max_side)
     buf = io.BytesIO()
     png_buf = io.BytesIO()
     img.save(png_buf, format="PNG", optimize=True)
@@ -183,8 +265,7 @@ def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesI
     # fail before generation starts. Prefer a high-quality JPEG for normal RGB
     # references, while keeping tiny PNGs lossless for marks/screenshots where PNG is
     # already compact.
-    jpeg_quality = max(60, min(95, int(settings.IMAGE_REFERENCE_JPEG_QUALITY or 85)))
-    if png_size <= 512 * 1024:
+    if png_size <= upload_profile.png_threshold_bytes:
         png_buf.seek(0)
         buf = png_buf
         size_bytes = png_size
@@ -193,13 +274,46 @@ def _reference_upload_file(ref: Image.Image, index: int) -> tuple[str, io.BytesI
     img.save(
         buf,
         format="JPEG",
-        quality=jpeg_quality,
+        quality=upload_profile.jpeg_quality,
         optimize=True,
         progressive=True,
     )
     size_bytes = buf.tell()
     buf.seek(0)
     return f"ref_{index}.jpg", buf, "image/jpeg", size_bytes
+
+
+def _build_reference_upload_files(
+    reference_images: List[Image.Image],
+) -> tuple[list[tuple[str, tuple[str, io.BytesIO, str]]], int, _ReferenceUploadProfile]:
+    target_bytes, max_file_bytes = _reference_upload_budget_bytes()
+    last_files: list[tuple[str, tuple[str, io.BytesIO, str]]] = []
+    last_upload_bytes = 0
+    last_profile = _base_reference_upload_profile()
+
+    for profile in _reference_upload_profiles():
+        files: list[tuple[str, tuple[str, io.BytesIO, str]]] = []
+        upload_bytes = 0
+        largest_file = 0
+        for i, ref in enumerate(reference_images):
+            filename, buf, mime_type, size_bytes = _reference_upload_file(ref, i, profile)
+            upload_bytes += size_bytes
+            largest_file = max(largest_file, size_bytes)
+            field_name = "image" if i == 0 else "additional_images[]"
+            files.append((field_name, (filename, buf, mime_type)))
+
+        last_files = files
+        last_upload_bytes = upload_bytes
+        last_profile = profile
+        if upload_bytes <= target_bytes and largest_file <= max_file_bytes:
+            return files, upload_bytes, profile
+
+    logger.warning(
+        "ImageGen: reference upload still exceeds budget after fallback: upload=%.2fMB profile=%s",
+        last_upload_bytes / (1024 * 1024),
+        last_profile.label,
+    )
+    return last_files, last_upload_bytes, last_profile
 
 
 def _is_connection_timeout(exc: Exception) -> bool:
@@ -241,15 +355,7 @@ def _call_gpt_image_2_edit(
     """使用 requests 直接调用 DeerAPI images/edit，支持 additional_images[] 多图垫图。"""
     if not reference_images:
         raise ValueError("reference_images required for edit")
-    files = []
-    upload_bytes = 0
-    filename, buf, mime_type, size_bytes = _reference_upload_file(reference_images[0], 0)
-    upload_bytes += size_bytes
-    files.append(("image", (filename, buf, mime_type)))
-    for i, ref in enumerate(reference_images[1:], 1):
-        filename, buf, mime_type, size_bytes = _reference_upload_file(ref, i)
-        upload_bytes += size_bytes
-        files.append(("additional_images[]", (filename, buf, mime_type)))
+    files, upload_bytes, upload_profile = _build_reference_upload_files(reference_images)
     data = {
         "model": get_deer_image_model(),
         "prompt": prompt,
@@ -261,9 +367,10 @@ def _call_gpt_image_2_edit(
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     logger.info(
-        "ImageGen: calling edit API with %s reference images, upload=%.2fMB",
+        "ImageGen: calling edit API with %s reference images, upload=%.2fMB, profile=%s",
         len(reference_images),
         upload_bytes / (1024 * 1024),
+        upload_profile.label,
     )
     try:
         resp = requests.post(
@@ -278,8 +385,8 @@ def _call_gpt_image_2_edit(
         )
     except requests.exceptions.RequestException as e:
         if _is_connection_timeout(e):
-            raise RuntimeError(
-                "图片接口上传超时：参考图已压缩后仍未能稳定写入 API，请稍后重试失败页"
+            raise ReferenceUploadTimeoutError(
+                "图片接口上传超时：参考图上传在进入生成前中断，已停止自动重试，避免重复消耗生图额度"
             ) from e
         raise
     resp.raise_for_status()
@@ -302,9 +409,21 @@ def _call_gemini_chat_generate(
 ) -> Image.Image:
     client = _get_image_client()
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    upload_profile = _base_reference_upload_profile()
+    if len(reference_images or []) >= 8 and upload_profile.max_side is None:
+        upload_profile = _ReferenceUploadProfile(
+            max_side=2200,
+            jpeg_quality=upload_profile.jpeg_quality,
+            png_threshold_bytes=upload_profile.png_threshold_bytes,
+            label="gemini-bulk2200",
+        )
     for ref_img in (reference_images or [])[:14]:
         buffered = io.BytesIO()
-        _prepare_reference_image_for_upload(ref_img).save(buffered, format="PNG", optimize=True)
+        _prepare_reference_image_for_upload(ref_img, max_side=upload_profile.max_side).save(
+            buffered,
+            format="PNG",
+            optimize=True,
+        )
         img_b64 = base64.b64encode(buffered.getvalue()).decode()
         messages[0]["content"].append({
             "type": "image_url",
@@ -381,6 +500,7 @@ def _generate_real_slide_image(
             if not _is_api_retryable(e):
                 logger.error(f"ImageGen: non-retryable error, aborting: {err_detail}")
                 raise
+            api_backoff[attempt + 1] = _retry_after_seconds(e, api_backoff[attempt + 1])
     raise Exception("Image generation failed after all retries")
 
 

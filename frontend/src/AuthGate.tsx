@@ -13,6 +13,24 @@ import {
   type ProviderSettings,
 } from "./api/client";
 
+const LOCAL_ADMIN_AUTH: MvpAuth = { testerId: "local-admin", displayName: "本地管理员" };
+const SERVER_MANAGED_PROVIDERS = import.meta.env.PROD;
+
+function isLocalAdminUrl() {
+  const host = window.location.hostname;
+  if (!["127.0.0.1", "localhost", "::1"].includes(host)) return false;
+  const params = new URLSearchParams(window.location.search);
+  return params.get("local_admin") === "1" || params.get("admin") === "1";
+}
+
+function getInitialAuth(): MvpAuth | null {
+  if (isLocalAdminUrl()) {
+    saveStoredAuth(LOCAL_ADMIN_AUTH);
+    return LOCAL_ADMIN_AUTH;
+  }
+  return getStoredAuth();
+}
+
 function providerName(baseUrl: string, fallback: string) {
   try {
     const host = new URL(baseUrl).hostname.toLowerCase();
@@ -235,7 +253,7 @@ function RestoreDefaultsButton({
 }
 
 export default function AuthGate() {
-  const [auth, setAuth] = useState<MvpAuth | null>(() => getStoredAuth());
+  const [auth, setAuth] = useState<MvpAuth | null>(() => getInitialAuth());
   const [displayName, setDisplayName] = useState("");
   const [provider, setProvider] = useState<ProviderSettings>(() => getProviderSettings());
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -245,6 +263,7 @@ export default function AuthGate() {
   const [copied, setCopied] = useState(false);
 
   const canEnter = useMemo(() => {
+    if (SERVER_MANAGED_PROVIDERS) return Boolean(displayName.trim());
     return Boolean(
       displayName.trim() &&
       provider.minimaxApiBase.trim() &&
@@ -306,9 +325,15 @@ export default function AuthGate() {
                 </button>
               </div>
               <div className="space-y-1 rounded-md bg-slate-50 p-2 text-[11px] leading-5 text-slate-500">
-                <div className="truncate">文本模型 {providerModelLabel(provider.minimaxApiBase, provider.minimaxLlmModel, "文本接口")}</div>
-                <div className="truncate">图片模型 {providerModelLabel(provider.deerApiBase, provider.deerImageModel, "图片接口")}</div>
-                <div className="text-slate-400">Key 只在设置里维护</div>
+                {SERVER_MANAGED_PROVIDERS ? (
+                  <div className="text-slate-500">使用服务器端模型额度</div>
+                ) : (
+                  <>
+                    <div className="truncate">文本模型 {providerModelLabel(provider.minimaxApiBase, provider.minimaxLlmModel, "文本接口")}</div>
+                    <div className="truncate">图片模型 {providerModelLabel(provider.deerApiBase, provider.deerImageModel, "图片接口")}</div>
+                    <div className="text-slate-400">Key 只在设置里维护</div>
+                  </>
+                )}
               </div>
               <div className="mt-3 grid grid-cols-3 gap-2">
                 <button className="pg-action pg-action-secondary rounded bg-slate-100 px-2 py-1.5 hover:bg-slate-200" onClick={() => setSettingsOpen(true)}>
@@ -338,15 +363,25 @@ export default function AuthGate() {
               <div className="mb-4 flex items-start justify-between gap-4">
                 <div>
                   <h2 className="text-lg font-semibold text-slate-900">测试设置</h2>
-                  <p className="mt-1 text-sm text-slate-500">这些 Key 只保存在当前浏览器，并随请求发给后端用于本次生成。</p>
+                  <p className="mt-1 text-sm text-slate-500">
+                    {SERVER_MANAGED_PROVIDERS
+                      ? "当前使用服务器端模型配置。"
+                      : "这些 Key 只保存在当前浏览器，并随请求发给后端用于本次生成。"}
+                  </p>
                 </div>
                 <button className="pg-action pg-action-secondary rounded-md px-2 py-1 text-slate-500 hover:bg-slate-100" onClick={() => setSettingsOpen(false)}>
                   关闭
                 </button>
               </div>
-              <ProviderSetup value={provider} onChange={setProvider} defaultAdvancedOpen />
+              {SERVER_MANAGED_PROVIDERS ? (
+                <div className="rounded-md bg-slate-50 p-4 text-sm text-slate-600">
+                  这次线上测试先不要求朋友填写 API Key。后续接 credits 时，会在这里显示余额和用量。
+                </div>
+              ) : (
+                <ProviderSetup value={provider} onChange={setProvider} defaultAdvancedOpen />
+              )}
               <div className="mt-5 flex justify-end gap-2">
-                <RestoreDefaultsButton provider={provider} onRestore={setProvider} />
+                {!SERVER_MANAGED_PROVIDERS && <RestoreDefaultsButton provider={provider} onRestore={setProvider} />}
                 <button
                   type="button"
                   className="pg-action pg-action-primary rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
@@ -385,10 +420,14 @@ export default function AuthGate() {
         <section className="pg-auth-card pg-auth-card-v2" aria-label="登录到 PPT God">
           <div className="pg-auth-card-head">
             <h2>进入 PPT God</h2>
-            <p>
-              目前还是过渡测试阶段，所以需要你填写一个固定用户名和两枚 API Key。用户名用来识别你的测试空间；
-              API Key 用来调用内容和图片模型。
-            </p>
+            {SERVER_MANAGED_PROVIDERS ? (
+              <p>目前还是过渡测试阶段，只需要填写一个固定用户名。用户名用来识别你的测试空间。</p>
+            ) : (
+              <p>
+                目前还是过渡测试阶段，所以需要你填写一个固定用户名和两枚 API Key。用户名用来识别你的测试空间；
+                API Key 用来调用内容和图片模型。
+              </p>
+            )}
           </div>
 
           <form className="pg-login-form" onSubmit={handleLoginSubmit}>
@@ -404,14 +443,16 @@ export default function AuthGate() {
               />
             </label>
 
-            <ProviderSetup value={provider} onChange={setProvider} />
+            {!SERVER_MANAGED_PROVIDERS && <ProviderSetup value={provider} onChange={setProvider} />}
 
             {error && <div className="pg-auth-error">{error}</div>}
             <button disabled={!canEnter || busy} className="pg-primary-button pg-login-submit">
               {busy ? "正在进入..." : "进入 PPT God"}
             </button>
             <div className="pg-auth-assurance">
-              你的 Key 只保存在当前浏览器，并通过 HTTPS 用于本次生成。公共电脑上请不要保存 Key。
+              {SERVER_MANAGED_PROVIDERS
+                ? "模型调用使用服务器端测试额度。"
+                : "你的 Key 只保存在当前浏览器，并随请求用于本次生成。公共电脑上请不要保存 Key。"}
             </div>
           </form>
         </section>

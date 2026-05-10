@@ -1,44 +1,13 @@
-import json
 import logging
-import os
 import re
 from typing import Dict, List, Optional
 
-from app.core.config import settings
-from app.core.llm_client import get_llm_client
-from app.core.provider_credentials import get_minimax_llm_model
 from app.services.logo_policy import logo_prompt_instruction, logo_reservation_instruction
 from app.services.overlay_layers import overlay_reservation_instruction
 from app.services.style_pack import derive_style_pack_from_content
-from app.utils.text_cleaning import clean_llm_output, normalize_markdown_emphasis
+from app.utils.text_cleaning import normalize_markdown_emphasis
 
 logger = logging.getLogger(__name__)
-
-
-
-
-def _load_template(path: str) -> str:
-    """加载模板文件，如果不存在返回空字符串。"""
-    if not os.path.exists(path):
-        logger.warning(f"模板不存在: {path}")
-        return ""
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def _extract_model_facing_text(markdown: str) -> str:
-    """
-    从双语 Markdown 中提取发给模型的部分。
-    规则：只保留英文行，过滤掉 <!-- 中文注释 --> 行。
-    """
-    lines = markdown.splitlines()
-    filtered = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("<!--") and stripped.endswith("-->"):
-            continue
-        filtered.append(line)
-    return "\n".join(filtered)
 
 
 def _strip_markdown(text: str) -> str:
@@ -86,23 +55,27 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _compact_style_pack(style_text: str, max_lines: int = 4, max_chars: int = 600) -> str:
+def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 1100) -> str:
     """Keep the global style useful but short so page evidence stays dominant."""
     if not style_text:
         return derive_style_pack_from_content([])
     lines = [line.strip() for line in style_text.splitlines() if line.strip()]
-    priority: list[str] = []
-    # Keep only high-level style language. Palette, typography, and reference
-    # metadata are intentionally not expanded into hard locks here; the first
-    # image pass should stay short and let uploaded references carry identity.
+    priority_by_key: dict[str, str] = {}
+    # Keep the semantic contract before cosmetic details. Visual rhythm is where
+    # topic-specific subject anchors usually live, so it must survive compaction.
     keywords = (
-        "Style:", "Mood:", "Visual rhythm:",
+        "Style:", "Palette:", "Mood:", "Visual strategy:",
+        "Page type adaptation:", "Visual rhythm:",
+        "Texture/material:", "Typography:", "Reference usage:",
     )
     for line in lines:
-        if line.startswith(keywords):
-            cleaned = _remove_negative_clauses(line)
-            if cleaned:
-                priority.append(cleaned)
+        for keyword in keywords:
+            if line.startswith(keyword):
+                cleaned = _remove_negative_clauses(line)
+                if cleaned and keyword not in priority_by_key:
+                    priority_by_key[keyword] = cleaned
+                break
+    priority = [priority_by_key[keyword] for keyword in keywords if keyword in priority_by_key]
     compact_lines = (priority or lines)[:max_lines]
     compact = "\n".join(compact_lines)
     if len(compact) > max_chars:
@@ -303,12 +276,34 @@ def _protected_assets_block(reference_images: Optional[List[Dict]]) -> str:
             )
         elif _is_product_ref(ref):
             label = ref.get("asset_name") or "Product"
-            rule = (
-                "use the uploaded product image as the product source; a hidden refinement pass strengthens fidelity."
-            )
+            if str(ref.get("asset_route_mode") or "").lower() == "blend":
+                rule = "use the uploaded product image as a natural scene reference."
+            else:
+                rule = "use the uploaded product image as the product source; a hidden refinement pass strengthens fidelity."
         lines.append(f"{idx}. {label} — {rule}")
 
     return "Assets:\n" + "\n".join(lines)
+
+
+def _valid_overlay_asset_ids(page_intent: Dict) -> set[str] | None:
+    if not isinstance(page_intent, dict):
+        return None
+    raw = page_intent.get("available_overlay_asset_ids")
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple, set)):
+        return {str(item) for item in raw if item}
+    return set()
+
+
+def _brand_mark_safety_instruction(page_intent: Dict) -> str:
+    logo_reservation = logo_reservation_instruction(page_intent)
+    if logo_reservation:
+        return (
+            "Brand marks: do not draw, invent, or stylize any logo, wordmark, brand icon, "
+            "or placeholder mark; keep the reserved logo area clean for exact overlay."
+        )
+    return "Brand marks: do not draw or invent logos, wordmarks, brand icons, or placeholder marks."
 
 
 def _reference_descriptions_for_prompt(
@@ -339,8 +334,10 @@ def _reference_descriptions_for_prompt(
                     f"Logo / lockup: exact uploaded mark. {logo_instruction}"
                 )
             elif role == "content_ref":
+                detail = _compact_reference_text(desc, 180) if desc else ""
                 reference_descriptions.append(
                     "Page reference: use this uploaded image as the page visual source."
+                    + (f" Context: {detail}" if detail else "")
                 )
             elif role == "chart_ref":
                 reference_descriptions.append(
@@ -349,13 +346,18 @@ def _reference_descriptions_for_prompt(
             elif role == "visual_asset":
                 asset_name = img.get("asset_name") or "visual asset"
                 asset_kind = img.get("asset_kind") or "other"
+                route_mode = str(img.get("asset_route_mode") or "").lower()
                 usage_map = page_intent.get("visual_asset_usage") if isinstance(page_intent, dict) else {}
                 page_usage = ""
                 if isinstance(usage_map, dict) and img.get("id") in usage_map:
                     page_usage = str(usage_map.get(img.get("id")) or "")
-                if str(asset_kind).lower() in {"product", "material"}:
+                if route_mode == "double_blend":
                     rule = (
                         f"Product slot: {asset_name}. Use the uploaded product image as the product source; product fidelity is reinforced in a hidden refinement pass."
+                    )
+                elif str(asset_kind).lower() in {"product", "material"}:
+                    rule = (
+                        f"Product slot: {asset_name}. Blend the uploaded product image naturally into the scene while preserving its core identity."
                     )
                 else:
                     rule = (
@@ -373,102 +375,6 @@ def _reference_descriptions_for_prompt(
                     "Do not copy seed text, body imagery, product shots, or logo unless this page has its own uploaded logo."
                 )
     return [line.strip() for line in reference_descriptions if line and line.strip()]
-
-
-def _build_rich_brief(
-    page_intent: Dict,
-    style_text: str,
-    layout_text: str,
-    content_text: Dict,
-    reference_descriptions: List[str],
-) -> str:
-    """
-    组装 Rich Brief（给 LLM 的详细指令）。
-    不是最终 Prompt，而是让 LLM 翻译的源材料。
-    """
-    # References 区块：有参考图时列出并说明，无参考图时只写 None，不附加任何鼓励性文字
-    if reference_descriptions:
-        refs_block = "\n".join([f"- {desc}" for desc in reference_descriptions])
-        refs_section = f"""【References — user-uploaded images for this page】
-{refs_block}
-- Honor user intent and approximate placement; let the renderer handle fine details."""
-    else:
-        refs_section = """【References】
-None"""
-
-    def _format_body(val):
-        if isinstance(val, str):
-            return _strip_markdown(val)
-        elif isinstance(val, list):
-            return json.dumps(val, ensure_ascii=False)
-        return ""
-
-    visual_evidence = page_intent.get("visual_evidence", "") or "Use the strongest concrete visual evidence implied by this slide's content."
-    style_pack = _compact_style_pack(style_text)
-    logo_reservation = logo_reservation_instruction(page_intent)
-    logo_section = f"\n【Logo Overlay Reservation】\n{logo_reservation}\n" if logo_reservation else ""
-    overlay_reservation = overlay_reservation_instruction(page_intent)
-    overlay_section = f"\n【Exact Overlay Reservation】\n{overlay_reservation}\n" if overlay_reservation else ""
-
-    brief = f"""【Content — 本页核心主题，决定视觉主体画什么】
-Headline: {_strip_markdown(content_text.get("headline", ""))}
-Subhead: {_strip_markdown(content_text.get("subhead", ""))}
-Body: {_format_body(content_text.get("body"))}
-
-【Project Style Pack — 全局一致性约束，保持简短执行】
-{style_pack}
-
-【Visual Evidence — 本页必须画出的配图对象/商业证据】
-{visual_evidence}
-
-【Layout Intent】
-{layout_text}
-
-【Visual Description from Director — 围绕画面证据组织画面】
-{page_intent.get("visual_description", "")}
-
-【Design Notes】
-{page_intent.get("design_notes", "")}
-
-{refs_section}
-{logo_section}
-{overlay_section}
-
-【Requirements】
-- 16:9 aspect ratio (1792x1024), landscape orientation
-- Single presentation slide background image
-- No watermark, UI elements, frames, or page numbers
-- Do not invent or redraw brand marks. If a protected user-uploaded Logo / lockup is listed in References, integrate that exact mark with high fidelity.
-- The visual must make the Visual Evidence visible. Do not replace it with generic decoration.
-- Use style as a wrapper, not the subject. Page content decides the scene/object/chart.
-- Magazine-quality, award-winning design
-"""
-    return brief
-
-
-def _call_llm_for_final_prompt(rich_brief: str) -> str:
-    """调用 LLM 将 Rich Brief 翻译为自然流畅的 Final Prompt。"""
-    client = get_llm_client()
-    response = client.chat.completions.create(
-        model=get_minimax_llm_model(),
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Write one concise image-generation prompt for a 16:9 presentation slide. "
-                    "Use the slide text and Visual Evidence as the subject; use style only as visual direction. "
-                    "Mention only necessary layout, references, and constraints. Output only the prompt."
-                ),
-            },
-            {"role": "user", "content": rich_brief},
-        ],
-        temperature=0.3,
-    )
-    final = response.choices[0].message.content or ""
-    final = final.strip()
-    # 去掉可能的代码块包裹和 thinking 标签
-    final = clean_llm_output(final)
-    return final
 
 
 def generate_prompt_for_page(
@@ -538,6 +444,7 @@ def generate_prompt_for_page(
 
     protected_block = _protected_assets_block(reference_images)
     protected_section = f"{protected_block}\n\n" if protected_block else ""
+    brand_mark_safety = _brand_mark_safety_instruction(page_intent)
 
     if text_directives:
         # Keep the first-pass prompt compact: text contract, optional logo rule,
@@ -551,7 +458,10 @@ def generate_prompt_for_page(
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
         logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
-        overlay_reservation = overlay_reservation_instruction(page_intent)
+        overlay_reservation = overlay_reservation_instruction(
+            page_intent,
+            valid_asset_ids=_valid_overlay_asset_ids(page_intent),
+        )
         overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
         final_prompt = (
             "Text:\n"
@@ -559,6 +469,9 @@ def generate_prompt_for_page(
             + "\n\n"
             + protected_section
             + (refs_section.strip() + "\n\n" if refs_section else "")
+            + "Rules:\n"
+            + brand_mark_safety
+            + "\n\n"
             + "Style:\n"
             + style_block
             + "\n\n"
@@ -581,11 +494,17 @@ def generate_prompt_for_page(
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
         logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
-        overlay_reservation = overlay_reservation_instruction(page_intent)
+        overlay_reservation = overlay_reservation_instruction(
+            page_intent,
+            valid_asset_ids=_valid_overlay_asset_ids(page_intent),
+        )
         overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
         final_prompt = (
             protected_section
             + (refs_section.strip() + "\n\n" if refs_section else "")
+            + "Rules:\n"
+            + brand_mark_safety
+            + "\n\n"
             + "Style:\n"
             + style_block
             + "\n\nVisual:\n"
@@ -634,6 +553,8 @@ def generate_prompts_for_all_pages(
             content_text = {**content_text, "reference_context": content_item["reference_context"]}
         if content_item.get("reference_user_hint"):
             content_text = {**content_text, "reference_user_hint": content_item["reference_user_hint"]}
+        if content_item.get("global_user_requirements"):
+            content_text = {**content_text, "global_user_requirements": content_item["global_user_requirements"]}
         prompt = generate_prompt_for_page(
             page_intent=intent,
             content_text=content_text,

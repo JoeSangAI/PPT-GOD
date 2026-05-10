@@ -2,17 +2,18 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import json_repair
 
-from app.core.config import settings
 from app.core.llm_client import get_llm_client
-from app.core.provider_credentials import get_minimax_llm_model
+from app.core.provider_credentials import get_minimax_llm_model, get_raw_provider_credentials, provider_credentials_context
 from app.services.logo_policy import logo_policy_for_page
 from app.services.overlay_layers import normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
 from app.services.style_pack import derive_style_pack_from_content
+from app.services.visual_strategy import visual_language_group
 from app.utils.text_cleaning import clean_llm_output
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,11 @@ LOW_CONFIDENCE_ASSET_TERMS = {
     "用于",
     "进行展示",
 }
+LOGO_PLACEHOLDER_TERMS = ("logo", "标识", "徽标", "角标", "wordmark", "lockup", "占位框", "空框")
+LOGO_RESERVATION_TERMS = (
+    "预留", "留出", "保留", "放置", "位置", "区域", "右上角",
+    "左上角", "右下角", "左下角", "叠加", "overlay", "title-block",
+)
 
 
 def _is_punchline_page_type(page_type: str) -> bool:
@@ -61,12 +67,17 @@ def _infer_seed_family(page_type: str) -> str:
     每个家族里第一张已生成的页会自动成为该家族的"种子页"，
     后续兄弟页生成时拿种子图作为视觉参考，保证商业提案级一致性。
     """
+    page_type = str(page_type or "content").strip().lower()
     if page_type in ("cover", "ending"):
         return "bookend"
     if _is_punchline_page_type(page_type):
         return "hero"
-    if page_type in ("toc",):
+    if page_type == "toc":
+        return "toc"
+    if page_type == "section":
         return "section"
+    if page_type == "data":
+        return "data"
     return "content"
 
 
@@ -114,11 +125,43 @@ def _load_style(style_id: str) -> Dict:
     return {"meta": {}, "body": content}
 
 
+def _visual_strategy_from_style_text(style_text: str | None) -> dict:
+    text = str(style_text or "")
+    match = re.search(r"base_tone\s*=\s*(dark|light|mixed)", text, flags=re.IGNORECASE)
+    base_tone = match.group(1).lower() if match else "mixed"
+    summary = ""
+    for line in text.splitlines():
+        if line.strip().lower().startswith("visual strategy:"):
+            summary = line.split(":", 1)[1].strip()
+            break
+    return {
+        "base_tone": base_tone,
+        "summary": summary or "按页面功能成组控制明暗，同类正文页使用同一种信息页处理。",
+    }
+
+
+def _remove_logo_placeholder_language(text: str) -> str:
+    cleaned: list[str] = []
+    for clause in re.split(r"[。；;\n]+", str(text or "")):
+        value = clause.strip()
+        if not value:
+            continue
+        lower = value.lower()
+        has_logo_term = any(term.lower() in lower for term in LOGO_PLACEHOLDER_TERMS)
+        has_reservation_term = any(term.lower() in lower for term in LOGO_RESERVATION_TERMS)
+        if has_logo_term and has_reservation_term:
+            continue
+        cleaned.append(value)
+    return "；".join(cleaned).strip()
+
+
 def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subhead: str = "") -> str:
     """根据页面类型和内容特征分配合适的 layout。"""
+    page_type = str(page_type or "content").strip().lower()
     mapping = {
         "cover": "cover",
         "toc": "toc",
+        "section": "section",
         "hero": "hero",
         "quote": "hero",
         "data": "data",
@@ -143,6 +186,7 @@ def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subh
 
 def _fallback_visual_evidence(page: Dict) -> str:
     """Build a concrete, content-led visual object when the LLM misses a page."""
+    page_type = str(page.get("type") or "").strip().lower()
     text = page.get("text_content", {}) or {}
     headline = text.get("headline", "") or page.get("section_title", "")
     body = text.get("body", "")
@@ -163,19 +207,28 @@ def _fallback_visual_evidence(page: Dict) -> str:
         return "区域市场地图、机会箭头和竞争态势标记"
     if any(k in source for k in ("资本", "利润", "定价权", "增长", "估值", "8个亿")):
         return "增长曲线、利润阶梯和品牌资产护城河示意"
-    if _is_punchline_page_type(page.get("type", "")):
+    if _is_punchline_page_type(page_type):
         return f"围绕「{headline}」的金句排版、可选署名/上下文与象征性背景"
-    if page.get("type") in ("cover", "ending"):
+    if page_type == "section":
+        return f"围绕「{headline}」的章节标题、序号和转场氛围"
+    if page_type in ("cover", "ending"):
         return f"围绕「{headline}」的品牌主视觉和核心记忆符号"
     return f"支撑「{headline}」这一页观点的核心场景、物件或结构图"
 
 
 def _fallback_visual_description(page: Dict, visual_evidence: str) -> str:
-    if _is_punchline_page_type(page.get("type", "")):
+    page_type = str(page.get("type") or "").strip().lower()
+    if _is_punchline_page_type(page_type):
         return (
             f"以「{visual_evidence}」作为金句页主视觉，只保留核心短句和必要的轻量辅助信息；"
             "版面使用大量留白和低干扰背景，可用纹理、光效、象征物、人物或场景承托，"
             "并严格沿用全局风格的配色、字体气质和材质语言。"
+        )
+    if page_type == "section":
+        return (
+            f"以「{visual_evidence}」作为章节分隔页主视觉，突出章节名、编号或一句转场判断；"
+            "正文信息极少，版面可以更强烈使用主色、留白、材质或象征物来建立段落节奏，"
+            "但必须沿用整套 deck 的字体气质和视觉语言。"
         )
     return (
         f"以「{visual_evidence}」作为本页画面证据，"
@@ -197,6 +250,22 @@ def _page_search_text(page: Dict) -> str:
     else:
         chunks.append(str(body or ""))
     return "\n".join(chunks).lower()
+
+
+def _page_source_ref_keys(page: Dict) -> set[tuple[str, int]]:
+    refs = page.get("source_refs") if isinstance(page.get("source_refs"), list) else []
+    keys: set[tuple[str, int]] = set()
+    for item in refs:
+        if not isinstance(item, dict):
+            continue
+        source_doc = str(item.get("source_document") or "").strip()
+        try:
+            source_page = int(item.get("source_page_num") or 0)
+        except (TypeError, ValueError):
+            source_page = 0
+        if source_doc and source_page > 0:
+            keys.add((source_doc, source_page))
+    return keys
 
 
 def _asset_search_terms(asset: Dict) -> set[str]:
@@ -262,30 +331,6 @@ def _asset_kind_triggers(kind: str) -> tuple[str, ...]:
     return ()
 
 
-def _page_has_kind_intent(page: Dict, kind: str, *extra_texts: str) -> bool:
-    page_text = _page_search_text(page)
-    if extra_texts:
-        page_text = "\n".join([page_text, *(str(text or "").lower() for text in extra_texts)])
-    return any(term.lower() in page_text for term in _asset_kind_triggers(kind))
-
-
-def _should_keep_selected_asset(
-    page: Dict,
-    asset: Dict,
-    usage: str,
-    visual_evidence: str,
-    visual_desc: str,
-) -> bool:
-    kind = str(asset.get("kind") or "other").lower()
-    if kind not in {"product", "material"}:
-        return True
-    if usage and "uploaded product image" in usage.lower():
-        return True
-    if _page_has_kind_intent(page, kind, visual_evidence, visual_desc, usage):
-        return True
-    return False
-
-
 def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[List[Dict]]) -> list[Dict]:
     """
     Lightweight deterministic recall for must-consider assets.
@@ -296,6 +341,7 @@ def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[Li
         return []
 
     page_text = _page_search_text(page)
+    page_source_refs = _page_source_ref_keys(page)
     recalled = []
     for asset in global_visual_assets:
         asset_id = asset.get("id")
@@ -307,7 +353,13 @@ def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[Li
         terms = _asset_search_terms(asset)
         direct_hits = [term for term in terms if len(term) >= 2 and term in page_text]
         kind_hits = [term for term in _asset_kind_triggers(kind) if term.lower() in page_text]
-        should_recall = bool(direct_hits)
+        try:
+            asset_source_page = int(asset.get("source_page_num") or 0)
+        except (TypeError, ValueError):
+            asset_source_page = 0
+        asset_source_key = (str(asset.get("source_document") or "").strip(), asset_source_page)
+        source_hit = bool(asset_source_key[0] and asset_source_key[1] and asset_source_key in page_source_refs)
+        should_recall = source_hit or bool(direct_hits)
         # Product/material assets are the critical case: if the page asks for a product
         # or packaging scene and there is only one such global asset, make it a candidate.
         if not should_recall and kind in {"product", "material"} and kind_hits:
@@ -317,12 +369,15 @@ def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[Li
             ]
             should_recall = len(product_assets) == 1
         if should_recall:
+            reason = "页面继承了该素材的源 PPT 页" if source_hit else (
+                "页面内容命中资产名称/关键词" if direct_hits else "页面内容需要产品/包装类画面且项目只有一个核心产品资产"
+            )
             recalled.append({
                 "id": str(asset_id),
                 "name": asset.get("name") or "",
                 "kind": kind,
                 "matched_terms": (direct_hits or kind_hits)[:8],
-                "reason": "页面内容命中资产名称/关键词" if direct_hits else "页面内容需要产品/包装类画面且项目只有一个核心产品资产",
+                "reason": reason,
             })
     return recalled[:3]
 
@@ -438,15 +493,45 @@ def _build_batch_prompt(
     batch_num: int = 1,
     total_batches: int = 1,
     global_visual_assets: Optional[List[Dict]] = None,
+    has_project_logo: bool = False,
 ) -> str:
     """构建批量生成 visual_description 的 LLM prompt。"""
     palette = style["meta"].get("palette", ["#1E3A5F", "#F5F5F0"])
     theme = style["meta"].get("theme") or style["meta"].get("style_name") or "Content-derived presentation style"
     mood = style["meta"].get("mood", "Professional, clean, confident")
     description = style.get("body", "")
+    visual_strategy = _visual_strategy_from_style_text(description)
+    visual_strategy_text = visual_strategy.get("summary") or "按页面功能成组控制明暗，同类正文页使用同一种信息页处理。"
 
     batch_hint = f"这是第 {batch_num}/{total_batches} 批。" if total_batches > 1 else ""
-    visual_assets = (global_visual_assets or [])[:20]
+    requirement_lines = []
+    for page in pages_summary:
+        value = str(page.get("global_user_requirements") or "").strip()
+        if value and value not in requirement_lines:
+            requirement_lines.append(value)
+    requirements_instruction = ""
+    if requirement_lines:
+        requirements_instruction = f"""
+【跨阶段用户补充要求 — 必须继承】
+以下要求来自用户在前序阶段提出的补充说明。它们不一定只属于视觉阶段；如果与本批页面相关，必须影响 visual_evidence、数据强调、时间轴/对比/结构图选择和 visual_description。
+{chr(10).join(requirement_lines)}
+"""
+    all_visual_assets = list(global_visual_assets or [])
+    recalled_ids = {
+        str(item.get("id"))
+        for page in pages_summary
+        for item in (page.get("must_consider_visual_assets") or [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    recalled_assets = [asset for asset in all_visual_assets if str(asset.get("id")) in recalled_ids]
+    fallback_assets = [
+        asset for asset in all_visual_assets
+        if str(asset.get("id")) not in recalled_ids
+    ]
+    fallback_assets.sort(key=lambda asset: -float(asset.get("importance_score") or 0))
+    # Keep the prompt lean: always include deterministic recalls for this batch,
+    # plus a small high-value fallback pool for manual product/person/material assets.
+    visual_assets = [*recalled_assets, *fallback_assets[: max(0, 8 - len(recalled_assets))]][:12]
     visual_asset_instruction = ""
     if visual_assets:
         visual_asset_instruction = f"""
@@ -500,13 +585,34 @@ def _build_batch_prompt(
 - cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
 - cover / 封面：只负责定调和命名，不承载正文论证；标题、副标题和主视觉必须形成单一焦点，避免信息堆叠。
 - toc / 目录页：只有导航功能，不承担内容论证。画面必须像清爽的路线图：3-6 个短章节名、明确编号、足够留白、少装饰；不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
+- section / 章节页：只负责章节切换、段落节奏和仪式感。画面应突出章节名、序号或一句转场判断；不要塞正文论证、三点列表、数据图或复杂商业证据。
 - data / 数据页：只有当页面正文给出真实数字、标签或表格时才画图；必须围绕这些数据做大数字、简单图表或高可读表格，不要编造数值、趋势或坐标轴。
 - ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
 - hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
-- content / data / table / 对比分析页：优先保证阅读效率。信息越密集，背景越应降饱和、提亮度、减少装饰；品牌主色只用于标题、页眉、编号、强调块和少量装饰。
+- content / data / table / 对比分析页：优先保证阅读效率，但必须在整套明暗/基底策略内处理。信息越密集，越应通过卡片、内容区、网格、字号层级和留白降噪；不要机械切换到另一套浅底风格。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
 - 如果参考图本身是强视觉封面、海报、广告KV或单页主视觉，必须先抽象为色彩/材质/装饰/构图原则，再按页面类型调节强度，不能把单页主视觉机械扩散到全 deck。
 """
+
+    logo_pipeline_rule = (
+        "Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠加；封面是品牌主标识，可以按封面构图选择 "
+        "title-block-center / center / lower-center / top-right 等页面级位置，其中 title-block-center 表示相对标题/副标题/年份这一组内容居中，而不是页面物理居中；"
+        "封底/结束页如果已经有 CTA、联系方式或多行收束信息，默认用 top-right+small 角标，只有页面非常空旷、以品牌收束为主体时才用 center/lower-center+large；"
+        "沉浸式 hero / 金句页默认不出现，除非本页明确需要角标或品牌招牌场景。你不要把 Logo 写进 visual_asset_ids。"
+        if has_project_logo
+        else "当前项目没有已确认的用户 Logo。所有页面的 logo_policy 必须返回 show_logo=false；不要为 Logo、品牌角标、标识、徽标或占位框预留空间，也不要把空框画进封面。"
+    )
+    logo_policy_rule = (
+        '5. logo_policy：对象，格式 {"show_logo": true/false, "placement": "top-right|top-left|bottom-right|bottom-left|center|lower-center|title-block-center", "scale": "small|large", "use_as_scene_asset": false}。'
+        "内容页通常 top-right+small；封面优先考虑 title-block-center+large，只有主视觉需要才用 center/lower-center；封底/结束页有 CTA 或联系方式时通常 top-right+small，只有空旷品牌收束页才考虑 center/lower-center+large；金句页默认 show_logo=false。"
+        if has_project_logo
+        else '5. logo_policy：对象，格式 {"show_logo": false, "placement": "top-right", "scale": "small", "use_as_scene_asset": false}。因为当前项目没有已确认 Logo，所有页面都必须 show_logo=false。'
+    )
+    logo_policy_example = (
+        '{"show_logo": true, "placement": "title-block-center", "scale": "large", "use_as_scene_asset": false}'
+        if has_project_logo
+        else '{"show_logo": false, "placement": "top-right", "scale": "small", "use_as_scene_asset": false}'
+    )
 
     prompt = f"""你是一位顶级 PPT 视觉总监。为以下每一页 PPT 生成视觉意图（visual intent）。
 
@@ -517,13 +623,18 @@ def _build_batch_prompt(
 配色：{', '.join(str(c) for c in palette[:5])}
 {f"描述：{description}" if description else ""}
 
+【整套明暗/基底策略 — 必须先遵守，再设计单页】
+{visual_strategy_text}
+除非这套策略明确允许浅底例外，否则内容页不得因为信息量较大就自动切换成米白、浅灰等另一套视觉语言；应优先在当前基底内用卡片、局部内容区、字号层级和留白解决可读性。
+
 【大纲（{len(sanitized_pages)} 页）】
 {json.dumps(sanitized_pages, ensure_ascii=False, indent=2)}
+{requirements_instruction}
 {ref_instruction}
 {visual_asset_instruction}
 {page_type_style_rules}
 【Logo 管道规则】
-Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠加；封面/封底是品牌主标识，可以按封面构图选择 title-block-center / center / lower-center / top-right 等页面级位置，其中 title-block-center 表示相对标题/副标题/年份这一组内容居中，而不是页面物理居中；沉浸式 hero / 金句页默认不出现，除非本页明确需要角标或品牌招牌场景。你不要把 Logo 写进 visual_asset_ids。
+{logo_pipeline_rule}
 
 【任务】
 为每一页生成五个字段：
@@ -532,13 +643,14 @@ Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠
 2. visual_description：围绕 visual_evidence 写画面方案——**给用户阅读**，也会进入下游 pipeline。**不含**任何必须在页面上逐字渲染的正文（正文由单独约束）。
 3. visual_asset_ids：本页需要使用的全局视觉资产 id 数组；无关页面输出 []，最多 3 个
 4. visual_asset_usage：对象，key 为 asset_id，value 为一句中文说明，只说明该资产在本页的用途、位置和叙事作用；无资产输出 {{}}
-5. logo_policy：对象，格式 {{"show_logo": true/false, "placement": "top-right|top-left|bottom-right|bottom-left|center|lower-center|title-block-center", "scale": "small|large", "use_as_scene_asset": false}}。内容页通常 top-right+small；封面/封底优先考虑 title-block-center+large，只有主视觉需要才用 center/lower-center；金句页默认 show_logo=false。
+{logo_policy_rule}
    - 无参考图：约 80–120 字，说明画面证据、布局主次、文字区与配图区如何分工、整体色调强度。
    - 含参考图：见上文规则。
 
 【质量标准】
 1. visual_evidence 必须具体。优先选择白皮书、直播间、达人矩阵、终端货架、企业楼宇、地图、增长曲线、VS 对比、产品/工艺场景等能证明观点的对象。
    - toc / 目录页例外：visual_evidence 应写成「章节路线图 / 导航结构」，不要编造商业证据或场景图。
+   - section / 章节页例外：visual_evidence 应写成「章节标题 / 编号 / 转场氛围」，不要写正文证据或信息图。
    - data / 数据页例外：visual_evidence 应写成「正文给出的具体数字/图表对象」，不要写没有数据支撑的抽象增长曲线。
    - ending / 封底例外：visual_evidence 应写成「收束画面 / CTA / 联系方式区域」，不要引入新的证明素材。
    - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠。
@@ -554,20 +666,70 @@ Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠
 
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
-{{"1": {{"visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {{"show_logo": true, "placement": "title-block-center", "scale": "large", "use_as_scene_asset": false}}}}, "2": {{...}}, ...}}
+{{"1": {{"visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {logo_policy_example}}}, "2": {{...}}, ...}}
 
 为当前批次的每一页都生成，不要遗漏。"""
     return prompt
+
+
+def _visual_plan_batch_worker_count(total_batches: int) -> int:
+    try:
+        configured = int(os.getenv("PPTGOD_VISUAL_PLAN_BATCH_WORKERS", "3"))
+    except ValueError:
+        configured = 3
+    return max(1, min(total_batches, configured, 3))
+
+
+def _generate_visual_plan_batch(
+    batch: List[Dict],
+    style: Dict,
+    batch_num: int,
+    total_batches: int,
+    global_visual_assets: Optional[List[Dict]],
+    provider_credentials,
+    has_project_logo: bool,
+) -> Dict:
+    with provider_credentials_context(provider_credentials):
+        prompt = _build_batch_prompt(
+            batch,
+            style,
+            batch_num=batch_num,
+            total_batches=total_batches,
+            global_visual_assets=global_visual_assets,
+            has_project_logo=has_project_logo,
+        )
+        client = get_llm_client()
+        response = client.chat.completions.create(
+            model=get_minimax_llm_model(),
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是世界一流的 PPT 视觉总监。必须且只能输出合法的 JSON 对象，严禁添加任何额外说明文本。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+        )
+        raw = response.choices[0].message.content or ""
+        raw = clean_llm_output(raw.strip())
+        logger.info(f"VisualPlan: batch {batch_num}/{total_batches} raw length={len(raw)}")
+        if not raw:
+            logger.warning(f"VisualPlan: batch {batch_num} 返回空内容")
+            return {}
+        parsed = _safe_parse_json(raw, batch_num)
+        return parsed if isinstance(parsed, dict) else {}
 
 
 def _fallback_visual_plan(
     content_plan: List[Dict],
     reference_image_ids: List[str],
     style_pack_snapshot: str | None = None,
+    has_project_logo: bool = False,
 ) -> List[Dict]:
     """返回安全的 fallback visual plan，保证 pipeline 不中断。"""
     visual_plan = []
     style_pack_snapshot = style_pack_snapshot or derive_style_pack_from_content(content_plan)
+    visual_strategy = _visual_strategy_from_style_text(style_pack_snapshot)
     for page in content_plan:
         page_type = page.get("type", "content")
         body = page.get("text_content", {}).get("body", "")
@@ -591,8 +753,21 @@ def _fallback_visual_plan(
             "visual_asset_ids": [],
             "visual_asset_usage": {},
             "style_pack_snapshot": style_pack_snapshot,
+            "visual_language_group": visual_language_group(
+                page_type,
+                _assign_layout(page_type, body_count, headline, text_content.get("subhead", "")),
+                visual_strategy,
+            ),
         })
         visual_plan[-1]["logo_policy"] = logo_policy_for_page(visual_plan[-1])
+        if not has_project_logo:
+            visual_plan[-1]["logo_policy"] = {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "visibility": "omit",
+                "use_as_scene_asset": False,
+            }
     _annotate_seed_family(visual_plan)
     return visual_plan
 
@@ -604,6 +779,7 @@ def _do_generate_visual_plan(
     style_override: Optional[Dict] = None,
     global_visual_assets: Optional[List[Dict]] = None,
     progress_callback: Optional[callable] = None,
+    has_project_logo: bool | None = None,
 ) -> List[Dict]:
     """generate_visual_plan 的实际实现（不含异常捕获）。"""
     style_pack_snapshot = ""
@@ -623,6 +799,8 @@ def _do_generate_visual_plan(
             },
             "body": style_pack_snapshot,
         }
+    visual_strategy = _visual_strategy_from_style_text(style_pack_snapshot or style.get("body", ""))
+    effective_has_project_logo = bool(reference_image_ids) if has_project_logo is None else bool(has_project_logo)
 
     # 1. 准备 batch prompt 的页面摘要
     pages_summary = []
@@ -641,6 +819,7 @@ def _do_generate_visual_plan(
             "existing_visual_suggestion": page.get("visual_suggestion", ""),
             "reference_context": page.get("reference_context", ""),
             "reference_user_hint": page.get("reference_user_hint", ""),
+            "global_user_requirements": page.get("global_user_requirements", ""),
         }
         if recalled_assets:
             summary["must_consider_visual_assets"] = recalled_assets
@@ -650,66 +829,88 @@ def _do_generate_visual_plan(
     BATCH_SIZE = 5
     total_pages = len(pages_summary)
     descriptions: Dict[str, Dict] = {}
-    client = get_llm_client()
-    import re
-
+    total_batches = (total_pages + BATCH_SIZE - 1) // BATCH_SIZE
+    batches: list[tuple[int, int, list[Dict]]] = []
     for batch_idx in range(0, total_pages, BATCH_SIZE):
         batch = pages_summary[batch_idx : batch_idx + BATCH_SIZE]
         batch_num = batch_idx // BATCH_SIZE + 1
-        total_batches = (total_pages + BATCH_SIZE - 1) // BATCH_SIZE
+        batches.append((batch_idx, batch_num, batch))
         ref_pages_in_batch = [p["page_num"] for p in batch if (p.get("reference_context") or "").strip()]
         logger.info(f"VisualPlan: batch {batch_num}/{total_batches}, pages={[p['page_num'] for p in batch]}, ref_pages={ref_pages_in_batch}")
-        if progress_callback:
-            progress_callback({
-                "stage": "visual_planning",
-                "message": "正在生成视觉方案",
-                "current_page": batch_idx,
-                "total_pages": total_pages,
-            })
 
-        prompt = _build_batch_prompt(
-            batch,
-            style,
-            batch_num=batch_num,
-            total_batches=total_batches,
-            global_visual_assets=global_visual_assets,
-        )
+    if progress_callback:
+        progress_callback({
+            "stage": "visual_planning",
+            "message": "正在生成视觉方案",
+            "current_page": 0,
+            "total_pages": total_pages,
+        })
 
+    completed_pages = 0
+    provider_credentials = get_raw_provider_credentials()
+    worker_count = _visual_plan_batch_worker_count(total_batches)
+    if worker_count <= 1:
+        batch_results = []
+        for _batch_idx, batch_num, batch in batches:
+            try:
+                batch_results.append((batch_num, _generate_visual_plan_batch(
+                    batch,
+                    style,
+                    batch_num,
+                    total_batches,
+                    global_visual_assets,
+                    provider_credentials,
+                    effective_has_project_logo,
+                )))
+            except Exception as e:
+                logger.error(f"VisualPlan: batch {batch_num}/{total_batches} 调用失败: {e}")
+            finally:
+                completed_pages += len(batch)
+                if progress_callback:
+                    progress_callback({
+                        "stage": "visual_planning",
+                        "message": "正在生成视觉方案",
+                        "current_page": min(completed_pages, total_pages),
+                        "total_pages": total_pages,
+                    })
+    else:
+        batch_results = []
         try:
-            response = client.chat.completions.create(
-                model=get_minimax_llm_model(),
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "你是世界一流的 PPT 视觉总监。必须且只能输出合法的 JSON 对象，严禁添加任何额外说明文本。",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.5,
-            )
-            raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            logger.info(f"VisualPlan: batch {batch_num}/{total_batches} raw length={len(raw)}")
-
-            raw = clean_llm_output(raw)
-
-            if raw:
-                batch_descriptions = _safe_parse_json(raw, batch_num)
-                if batch_descriptions and isinstance(batch_descriptions, dict):
-                    descriptions.update(batch_descriptions)
-            else:
-                logger.warning(f"VisualPlan: batch {batch_num} 返回空内容")
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="visual-plan") as executor:
+                future_map = {
+                    executor.submit(
+                        _generate_visual_plan_batch,
+                        batch,
+                        style,
+                        batch_num,
+                        total_batches,
+                        global_visual_assets,
+                        provider_credentials,
+                        effective_has_project_logo,
+                    ): (batch_num, len(batch))
+                    for _batch_idx, batch_num, batch in batches
+                }
+                for future in as_completed(future_map):
+                    batch_num, batch_len = future_map[future]
+                    try:
+                        batch_results.append((batch_num, future.result()))
+                    except Exception as e:
+                        logger.error(f"VisualPlan: batch {batch_num}/{total_batches} 调用失败: {e}")
+                    finally:
+                        completed_pages += batch_len
+                        if progress_callback:
+                            progress_callback({
+                                "stage": "visual_planning",
+                                "message": "正在生成视觉方案",
+                                "current_page": min(completed_pages, total_pages),
+                                "total_pages": total_pages,
+                            })
         except Exception as e:
-            logger.error(f"VisualPlan: batch {batch_num}/{total_batches} 调用失败: {e}")
-            # 单批次失败不影响其他批次，继续执行
-        finally:
-            if progress_callback:
-                progress_callback({
-                    "stage": "visual_planning",
-                    "message": "正在生成视觉方案",
-                    "current_page": min(batch_idx + len(batch), total_pages),
-                    "total_pages": total_pages,
-                })
+            logger.error(f"VisualPlan: 并发批处理失败，已保留可用批次结果: {e}")
+
+    for _batch_num, batch_descriptions in sorted(batch_results, key=lambda item: item[0]):
+        if isinstance(batch_descriptions, dict):
+            descriptions.update(batch_descriptions)
 
     # 3. 组装 Visual Plan Intent
     visual_plan = []
@@ -832,6 +1033,11 @@ def _do_generate_visual_plan(
         if not visual_summary:
             visual_summary = visual_desc[:40] + "..." if len(visual_desc) > 40 else visual_desc
 
+        if not effective_has_project_logo:
+            visual_evidence = _remove_logo_placeholder_language(visual_evidence) or _fallback_visual_evidence(page)
+            visual_summary = _remove_logo_placeholder_language(visual_summary) or visual_evidence
+            visual_desc = _remove_logo_placeholder_language(visual_desc) or _fallback_visual_description(page, visual_evidence)
+
         text_content = page.get("text_content", {})
         intent = {
             "page_num": page.get("page_num", 0),
@@ -853,6 +1059,16 @@ def _do_generate_visual_plan(
             "visual_asset_ids": visual_asset_ids,
             "visual_asset_usage": visual_asset_usage,
             "style_pack_snapshot": style_pack_snapshot,
+            "visual_language_group": visual_language_group(
+                page_type,
+                _assign_layout(
+                    page_type,
+                    body_count,
+                    text_content.get("headline", ""),
+                    text_content.get("subhead", ""),
+                ),
+                visual_strategy,
+            ),
         }
         if llm_logo_policy:
             intent["logo_policy"] = logo_policy_for_page({**intent, "logo_policy": llm_logo_policy})
@@ -860,6 +1076,14 @@ def _do_generate_visual_plan(
                 intent["logo_policy"]["use_as_scene_asset"] = bool(llm_logo_policy.get("use_as_scene_asset"))
         else:
             intent["logo_policy"] = logo_policy_for_page(intent)
+        if not effective_has_project_logo:
+            intent["logo_policy"] = {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "visibility": "omit",
+                "use_as_scene_asset": False,
+            }
         visual_plan.append(intent)
 
     _annotate_seed_family(visual_plan)
@@ -881,6 +1105,7 @@ def generate_visual_plan(
     style_override: Optional[Dict] = None,
     global_visual_assets: Optional[List[Dict]] = None,
     progress_callback: Optional[callable] = None,
+    has_project_logo: bool | None = None,
 ) -> List[Dict]:
     """
     根据 Content Plan 生成 Visual Plan Intent。
@@ -890,9 +1115,16 @@ def generate_visual_plan(
 
     try:
         return _do_generate_visual_plan(
-            content_plan, style_id, reference_image_ids, style_override, global_visual_assets, progress_callback
+            content_plan,
+            style_id,
+            reference_image_ids,
+            style_override,
+            global_visual_assets,
+            progress_callback,
+            has_project_logo,
         )
     except Exception as e:
         logger.exception(f"VisualPlan: 生成视觉方案时发生未预期错误: {e}，返回默认 fallback")
         # 返回安全 fallback，保证 pipeline 不中断
-        return _fallback_visual_plan(content_plan, reference_image_ids or [])
+        effective_has_project_logo = bool(reference_image_ids) if has_project_logo is None else bool(has_project_logo)
+        return _fallback_visual_plan(content_plan, reference_image_ids or [], has_project_logo=effective_has_project_logo)

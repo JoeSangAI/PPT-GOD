@@ -20,11 +20,18 @@ class Settings(BaseSettings):
     IMAGE_GEN_CACHE_DIR: str = "./outputs/image-cache"
     MAX_REAL_IMAGES_PER_RUN: int = 0  # 0 means unlimited
     IMAGE_API_MAX_CONCURRENCY: int = 2
-    IMAGE_REFERENCE_MAX_SIDE: int = 1280
+    # 0 means keep source dimensions unless upload-size fallback is required.
+    IMAGE_REFERENCE_MAX_SIDE: int = 0
     IMAGE_REFERENCE_JPEG_QUALITY: int = 85
+    IMAGE_REFERENCE_UPLOAD_TARGET_MB: float = 20.0
+    IMAGE_REFERENCE_MAX_FILE_MB: float = 8.0
+    IMAGE_MAX_REFERENCE_INPUTS: int = 14
     IMAGE_EDIT_CONNECT_TIMEOUT_SECONDS: int = 120
     IMAGE_EDIT_READ_TIMEOUT_SECONDS: int = 900
     GENERATION_PENDING_TIMEOUT_SECONDS: int = 120
+    AUTO_START_CELERY_WORKER: bool = True
+    CELERY_WORKER_STARTUP_TIMEOUT_SECONDS: int = 8
+    RUN_HEARTBEAT_TIMEOUT_SECONDS: int = 300
     CELERY_TASK_SOFT_TIME_LIMIT: int = 1800
     CELERY_TASK_TIME_LIMIT: int = 2100
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175"

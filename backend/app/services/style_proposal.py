@@ -8,9 +8,9 @@ from typing import List, Dict, Optional
 
 import yaml
 
-from app.core.config import settings
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
+from app.services.visual_strategy import build_visual_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,68 @@ TRADITIONAL_CULTURE_TERMS = [
 ]
 FOOD_AGRI_TERMS = ["食品", "餐饮", "农业", "花生油", "粮油", "调味品", "食用油", "风味", "香"]
 TECH_TERMS = ["科技", "AI", "人工智能", "数据", "算法", "数字化", "芯片", "云计算"]
+ANCIENT_ROME_TERMS = [
+    "古罗马", "罗马", "角斗士", "角斗", "斗兽场", "竞技场", "Colosseum", "gladiator",
+    "gladius", "凯撒", "帝国", "元老院", "军团", "罗马帝国", "血腥舞台",
+]
+HISTORICAL_EPIC_TERMS = [
+    "古代", "史诗", "战争", "文明", "帝国", "遗迹", "神话", "历史", "博物馆",
+    "文物", "考古", "雕塑", "石柱", "石刻", "青铜", "羊皮纸",
+]
+TOPIC_STYLE_RULES = [
+    {
+        "id": "ancient_rome_gladiator",
+        "label": "古罗马角斗士/竞技场文化",
+        "terms": ANCIENT_ROME_TERMS,
+        "match_terms": [
+            "古罗马", "罗马", "角斗士", "角斗", "竞技场", "斗兽场", "帝国", "军团",
+            "短剑", "盾牌", "盔甲", "雕塑", "石柱", "观众席", "青铜", "石材",
+        ],
+        "style_name": "古罗马竞技史诗风",
+        "palette": [
+            {"name": "火山岩黑", "hex": "#171310", "role": "强视觉页背景/竞技场暗部"},
+            {"name": "血酒红", "hex": "#7A1F1D", "role": "标题强调/冲突线索"},
+            {"name": "石灰白", "hex": "#E8DDC8", "role": "正文页基底/石材留白"},
+            {"name": "旧青铜", "hex": "#A8743A", "role": "徽章、编号和重点信息"},
+        ],
+        "mood": "史诗、粗粝、古典、戏剧化",
+        "font": "标题用古典衬线或罗马碑刻感字体，正文用高可读黑体/无衬线，字形保持锐利和碑刻感。",
+        "visual_language": "历史史诗、古典雕塑、石材建筑、青铜器、羊皮纸和暗红冲突感",
+        "page_type_adaptation": (
+            "封面/章节/金句页可强化题材场景和材质情绪；目录/正文/表格页使用低干扰信息基底，"
+            "保留同一套题材色、编号和装饰语言来保证阅读效率。"
+        ),
+        "recommended_library_ids": [
+            "classic_pop_sculpture_vaporwave",
+            "magazine_editorial",
+            "sports_energy",
+        ],
+        "score_threshold": 2,
+    },
+    {
+        "id": "historical_culture",
+        "label": "历史文化/文明叙事",
+        "terms": HISTORICAL_EPIC_TERMS,
+        "match_terms": ["历史", "文明", "文物", "雕塑", "博物馆", "史诗", "地图", "年表", "档案"],
+        "style_name": "博物馆档案叙事风",
+        "palette": [
+            {"name": "档案黑", "hex": "#1D1A16", "role": "标题和章节基底"},
+            {"name": "羊皮纸", "hex": "#E9DDC3", "role": "正文页基底"},
+            {"name": "文物金", "hex": "#A37A3B", "role": "编号和重点证据"},
+            {"name": "石灰灰", "hex": "#B8B0A2", "role": "辅助层次"},
+        ],
+        "mood": "历史、克制、展陈、可信",
+        "font": "标题用稳重衬线，正文用清晰黑体，数据页保持高可读。",
+        "visual_language": "博物馆展陈、历史杂志、古典材质、文物证据和克制档案感",
+        "page_type_adaptation": "强视觉页建立时代氛围，正文页用档案、年表、地图、图注和留白组织知识点。",
+        "recommended_library_ids": [
+            "magazine_editorial",
+            "classic_pop_sculpture_vaporwave",
+            "modern_newspaper",
+        ],
+        "score_threshold": 3,
+    },
+]
 TECH_NEGATION_PATTERNS = [
     "拒绝科技", "不是科技", "非科技", "去科技", "反科技", "科技与狠活", "科技狠活",
     "拒绝工业化", "反工业化",
@@ -38,6 +100,26 @@ def _contains_unnegated_tech(text: str) -> bool:
 
 def _score_terms(text: str, terms: List[str]) -> int:
     return sum(text.count(term) for term in terms)
+
+
+def _infer_topic_style_profile(text: str) -> Optional[Dict]:
+    for rule in TOPIC_STYLE_RULES:
+        score = _score_terms(text, rule["terms"])
+        if rule["id"] == "ancient_rome_gladiator" and ("罗马" in text and "角斗" in text):
+            score = max(score, rule["score_threshold"])
+        if score >= rule["score_threshold"]:
+            match_terms = [term for term in rule["match_terms"] if term.lower() in text.lower()]
+            if not match_terms:
+                match_terms = list(rule["match_terms"][:5])
+            return {
+                **rule,
+                "keywords": match_terms[:8],
+                "direction": (
+                    f"内容核心是{rule['label']}，风格必须先服务题材锚点："
+                    f"{'、'.join(match_terms[:8])}。表现手法可多样，但视觉语言应围绕{rule['visual_language']}展开。"
+                ),
+            }
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -98,12 +180,16 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
     full_text_fragments = []
     # 用于内容主旨推断（供无素材时 LLM 理解主题）
     topic_hints = []
+    dense_pages = 0
+    table_pages = 0
+    measured_pages = 0
 
     for page in content_plan[:15]:
         text = page.get("text_content", {}) or {}
         h = text.get("headline", "")
         sub = text.get("subhead", "")
         body = text.get("body", "")
+        measured_pages += 1
 
         if h:
             headlines.append(h)
@@ -117,10 +203,20 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
             if isinstance(body, str):
                 full_text_fragments.append(body)
                 first_line = body.strip().split("\n")[0][:100]
+                lines = [line for line in body.splitlines() if line.strip()]
+                if len(lines) >= 10 or len(body) >= 520:
+                    dense_pages += 1
+                if "|" in body:
+                    table_pages += 1
                 if first_line:
                     topic_hints.append(first_line)
             elif isinstance(body, list) and len(body) > 0:
                 full_text_fragments.append(" ".join(str(x) for x in body[:8]))
+                joined_body = "\n".join(str(x) for x in body)
+                if len(body) >= 10 or len(joined_body) >= 520:
+                    dense_pages += 1
+                if "|" in joined_body:
+                    table_pages += 1
                 first_item = body[0] if isinstance(body[0], str) else (body[0].get("content", "") if isinstance(body[0], dict) else "")
                 if first_item:
                     topic_hints.append(str(first_item)[:100])
@@ -133,7 +229,7 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
         keyword_pool = [
             "金融", "医疗", "教育", "消费", "品牌", "学术", "艺术", "设计", "汽车",
             "地产", "零售", "投资", "产品", "战略", *TECH_TERMS,
-            *FOOD_AGRI_TERMS, *TRADITIONAL_CULTURE_TERMS,
+            *FOOD_AGRI_TERMS, *TRADITIONAL_CULTURE_TERMS, *ANCIENT_ROME_TERMS, *HISTORICAL_EPIC_TERMS,
         ]
         for kw in keyword_pool:
             if kw in TECH_TERMS and not _contains_unnegated_tech(text_to_search):
@@ -146,6 +242,7 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
     food_score = _score_terms(full_text, FOOD_AGRI_TERMS)
     tech_score = _score_terms(full_text, TECH_TERMS) if _contains_unnegated_tech(full_text) else 0
     brand_score = _score_terms(full_text, ["消费", "品牌", "零售", "产品", "战略"])
+    topic_style_profile = _infer_topic_style_profile(full_text)
 
     # 推断行业/场景。先处理强语义，避免“拒绝科技与狠活”一类反向表达误判为科技。
     if "金融" in keywords or "投资" in keywords:
@@ -162,8 +259,21 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
         industries.append("学术/研究")
     if "艺术" in keywords or "设计" in keywords:
         industries.append("艺术/设计")
+    if topic_style_profile:
+        if topic_style_profile.get("id") in {"ancient_rome_gladiator", "historical_culture"}:
+            industries = [industry for industry in industries if industry != "古法非遗/传统文化"]
+        industries.append(topic_style_profile["label"])
     if not industries:
         industries.append("通用商务")
+
+    style_direction_hint = _build_content_style_direction(
+        traditional_score=traditional_score,
+        food_score=food_score,
+        tech_score=tech_score,
+        brand_score=brand_score,
+    )
+    if topic_style_profile:
+        style_direction_hint = topic_style_profile["direction"]
 
     return {
         "headlines": headlines[:8],
@@ -172,12 +282,10 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
         "keywords": list(set(keywords)),
         "total_pages": len(content_plan),
         "topic_hints": topic_hints[:6],  # 用于帮助 LLM 理解内容主旨
-        "style_direction_hint": _build_content_style_direction(
-            traditional_score=traditional_score,
-            food_score=food_score,
-            tech_score=tech_score,
-            brand_score=brand_score,
-        ),
+        "style_direction_hint": style_direction_hint,
+        "topic_style_profile": topic_style_profile,
+        "dense_page_ratio": round(dense_pages / max(measured_pages, 1), 3),
+        "table_page_ratio": round(table_pages / max(measured_pages, 1), 3),
     }
 
 
@@ -193,6 +301,418 @@ def _build_content_style_direction(traditional_score: int, food_score: int, tech
     if brand_score:
         return "内容核心偏消费品牌/商业提案，应优先考虑品牌识别、货架记忆和说服效率。"
     return "根据内容标题和正文真实判断风格，选择最贴合主题和受众的视觉方向。"
+
+
+def _topic_profile(summary: Dict) -> Dict:
+    profile = summary.get("topic_style_profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def _proposal_text(proposal: Dict) -> str:
+    return " ".join(
+        str(proposal.get(key) or "")
+        for key in ("name", "mood", "font", "description", "source", "texture", "ornaments", "clone_rules")
+    )
+
+
+def _proposal_matches_topic(proposal: Dict, summary: Dict) -> bool:
+    profile = _topic_profile(summary)
+    if not profile:
+        return True
+
+    text = _proposal_text(proposal)
+    topic_terms = list(dict.fromkeys([
+        *(profile.get("keywords") or []),
+        *(profile.get("match_terms") or []),
+        profile.get("label", ""),
+    ]))
+    return any(term and term in text for term in topic_terms)
+
+
+def _filter_topic_mismatched_proposals(proposals: List[Dict], summary: Dict) -> List[Dict]:
+    if not _topic_profile(summary):
+        return proposals
+    return [p for p in proposals if isinstance(p, dict) and _proposal_matches_topic(p, summary)]
+
+
+def _topic_original_proposal(summary: Dict) -> Optional[Dict]:
+    profile = _topic_profile(summary)
+    if not profile:
+        return None
+    anchors = "、".join((profile.get("keywords") or profile.get("match_terms") or [])[:8])
+    return {
+        "name": profile["style_name"],
+        "palette": profile["palette"],
+        "mood": profile["mood"],
+        "font": profile["font"],
+        "description": (
+            f"这份 PPT 讲的是{profile['label']}，视觉应先抓住{anchors}这些题材锚点，"
+            f"再用{profile['visual_language']}形成统一风格。强视觉页负责定调，信息页降低装饰强度，"
+            "用同一套颜色、材质和编号系统保证阅读效率。"
+        ),
+        "page_type_adaptation": profile["page_type_adaptation"],
+        "content_style_hint": (
+            f"每页画面证据必须来自{profile['label']}的题材锚点："
+            f"{anchors or '核心人物、场景、物件、结构或证据'}；"
+            f"整体保持{profile['visual_language']}，风格库只作为表现手法。"
+        ),
+        "source": "original",
+    }
+
+
+def _topic_decision_variants(summary: Dict) -> List[Dict]:
+    """Build strong-topic proposals as distinct choices, not cosmetic variants."""
+    profile = _topic_profile(summary)
+    if not profile:
+        return []
+
+    anchors = "、".join((profile.get("keywords") or profile.get("match_terms") or [])[:8])
+    label = profile.get("label", "当前主题")
+    visual_language = profile.get("visual_language", "主题化视觉语言")
+    font = profile.get("font", "标题强化主题气质，正文保持高可读。")
+
+    if profile.get("id") == "ancient_rome_gladiator":
+        return [
+            {
+                "name": "斗兽场暗幕",
+                "decision_label": "沉浸史诗",
+                "best_for": "想让观众第一眼记住斗兽场、盔甲和短剑带来的历史戏剧感。",
+                "tradeoff": "正文页需要控制暗色面积，用浅色内容区保证长段落可读。",
+                "visual_focus": "强视觉页使用斗兽场暗部、火山岩黑、血酒红和旧青铜材质；信息页保留同一套编号和纹理。",
+                "palette": [
+                    {"name": "火山岩黑", "hex": "#171310", "role": "封面/章节/金句页背景"},
+                    {"name": "血酒红", "hex": "#7A1F1D", "role": "冲突线索和标题强调"},
+                    {"name": "石灰白", "hex": "#E8DDC8", "role": "正文内容区和留白"},
+                    {"name": "旧青铜", "hex": "#A8743A", "role": "编号、徽章和重点信息"},
+                ],
+                "mood": "史诗、沉浸、古典、戏剧化",
+                "font": font,
+                "description": (
+                    "选它如果你更看重开场冲击和历史氛围。画面会把斗兽场暗部、盔甲、短剑和青铜装饰作为主记忆点，"
+                    "封面和转场更像一场古罗马竞技入场；正文页则用石材浅色内容区承载信息。"
+                ),
+                "page_type_adaptation": (
+                    "封面、章节页、金句页可深色沉浸；目录、规则解释、训练体系和表格页必须用浅色石材内容区提高阅读效率，"
+                    "只保留暗红强调、青铜编号和石纹边界。"
+                ),
+                "content_style_hint": (
+                    f"每页画面证据必须来自{label}：{anchors or '斗兽场、短剑、盾牌、盔甲、雕塑、石柱、观众席'}；"
+                    "优先塑造沉浸式历史场景。"
+                ),
+                "source": "original_immersive_epic",
+            },
+            {
+                "name": "石刻档案",
+                "decision_label": "展陈可读",
+                "best_for": "内容解释、规则、年表和知识点较多，希望观众读得清楚、觉得可信。",
+                "tradeoff": "视觉冲击弱于深色沉浸方案，但更稳，更像博物馆展陈或历史读物。",
+                "visual_focus": "浅石材底、文物图注、地图/制度图解、旧青铜编号和克制暗红强调。",
+                "palette": [
+                    {"name": "羊皮纸", "hex": "#EFE3CA", "role": "正文页和目录页基底"},
+                    {"name": "碑刻黑", "hex": "#26211A", "role": "标题和正文文字"},
+                    {"name": "文物金", "hex": "#A67C3D", "role": "编号、图注和重点证据"},
+                    {"name": "暗酒红", "hex": "#7A1F1D", "role": "少量冲突强调"},
+                ],
+                "mood": "克制、可信、展陈、历史感",
+                "font": font,
+                "description": (
+                    "选它如果你更看重清晰讲解和可信感。它把古罗马题材做成展览导览式系统：浅石材底负责阅读，"
+                    "文物图注、地图、编号和暗红重点帮助观众理解角斗士制度、训练和竞技规则。"
+                ),
+                "page_type_adaptation": (
+                    "正文、目录、时间线和制度解释页统一浅底；封面和章节页可以短暂加深背景，但仍保持展陈秩序、图注和编号系统。"
+                ),
+                "content_style_hint": (
+                    f"每页画面证据必须来自{label}：{anchors or '斗兽场、短剑、盾牌、盔甲、雕塑、石柱、观众席'}；"
+                    "优先服务知识解释、图注和结构化阅读。"
+                ),
+                "source": "original_exhibition_readable",
+            },
+            {
+                "name": "竞技场硝烟",
+                "decision_label": "力量冲突",
+                "best_for": "想突出训练、对抗、生死规则和竞技场里的原始张力。",
+                "tradeoff": "情绪更锋利，历史展陈感会少一些，需要避免每页都变成过度戏剧化海报。",
+                "visual_focus": "盾牌、短剑、砂土、红色斜切动线和高对比标题块，强化动作感与生死规则。",
+                "palette": [
+                    {"name": "炭铁黑", "hex": "#202126", "role": "高对比背景和标题块"},
+                    {"name": "战痕红", "hex": "#9A2B22", "role": "冲突线、章节标记和重点词"},
+                    {"name": "沙尘土黄", "hex": "#C6A36A", "role": "竞技场地面和材质过渡"},
+                    {"name": "骨白", "hex": "#EADDC4", "role": "正文区和图注文字"},
+                ],
+                "mood": "强烈、粗粝、紧张、运动感",
+                "font": font,
+                "description": (
+                    "选它如果你希望这份 PPT 更有力量和现场感。它会把盾牌、短剑、砂土和红色动线作为视觉重点，"
+                    "让训练、对抗和生死规则更有冲击；信息页用高对比标题块和骨白内容区控制阅读。"
+                ),
+                "page_type_adaptation": (
+                    "封面、训练、对抗和规则转折页可使用斜切动线和强对比；知识解释页减少动效感，用稳定内容区承载文字。"
+                ),
+                "content_style_hint": (
+                    f"每页画面证据必须来自{label}：{anchors or '斗兽场、短剑、盾牌、盔甲、雕塑、石柱、观众席'}；"
+                    "优先强化训练、对抗和竞技场规则的动作张力。"
+                ),
+                "source": "original_arena_conflict",
+            },
+        ]
+
+    if profile.get("id") == "historical_culture":
+        return [
+            {
+                "name": "文明暗厅",
+                "decision_label": "沉浸展厅",
+                "best_for": "希望先建立历史厚重感，让封面和章节页像走进一间暗色展厅。",
+                "tradeoff": "需要在正文页主动增加浅色内容区，否则长文阅读压力会变大。",
+                "visual_focus": f"{visual_language}，用深色展厅、局部打光、文物金和题材场景定调。",
+                "palette": profile["palette"],
+                "mood": profile["mood"],
+                "font": font,
+                "description": "选它如果你更看重历史氛围和第一眼记忆。强视觉页像暗色展厅，正文页用浅色内容区承接信息，避免气氛压过知识点。",
+                "page_type_adaptation": profile["page_type_adaptation"],
+                "content_style_hint": profile.get("direction", ""),
+                "source": "original_history_immersive",
+            },
+            {
+                "name": "档案图注",
+                "decision_label": "资料清晰",
+                "best_for": "页面里有较多解释、年表、引用或事实证据，需要像历史读物一样好读。",
+                "tradeoff": "气氛更克制，封面冲击力弱于沉浸展厅方案。",
+                "visual_focus": "羊皮纸浅底、图注、地图、年表、编号和少量文物金重点。",
+                "palette": [
+                    {"name": "羊皮纸", "hex": "#E9DDC3", "role": "正文页基底"},
+                    {"name": "档案黑", "hex": "#1D1A16", "role": "标题和正文文字"},
+                    {"name": "文物金", "hex": "#A37A3B", "role": "编号和证据重点"},
+                    {"name": "石灰灰", "hex": "#B8B0A2", "role": "辅助层次和边界"},
+                ],
+                "mood": "可信、克制、展陈、清晰",
+                "font": font,
+                "description": "选它如果你更看重读得清楚。它把历史内容转成档案、图注、地图和年表系统，适合解释复杂知识点和证据链。",
+                "page_type_adaptation": "正文和数据页统一浅底；封面/章节页只做适度加深，保持图注和编号系统不断裂。",
+                "content_style_hint": profile.get("direction", ""),
+                "source": "original_history_archive",
+            },
+            {
+                "name": "史诗剧照",
+                "decision_label": "叙事冲击",
+                "best_for": "希望每个章节像一段历史故事，有更强的戏剧性和传播感。",
+                "tradeoff": "需要控制素材密度，避免叙事画面抢走事实和结构。",
+                "visual_focus": "大幅场景、雕塑/遗迹剪影、强标题和少量高对比色块。",
+                "palette": [
+                    {"name": "夜幕黑", "hex": "#181614", "role": "强视觉页背景"},
+                    {"name": "赤陶红", "hex": "#8E3B2E", "role": "章节冲突和标题强调"},
+                    {"name": "砂岩米", "hex": "#D9C5A3", "role": "内容区和材质过渡"},
+                    {"name": "古铜金", "hex": "#B18445", "role": "重点信息和装饰"},
+                ],
+                "mood": "史诗、叙事、戏剧、厚重",
+                "font": font,
+                "description": "选它如果你希望 PPT 更像历史纪录片分镜。章节和金句页更有剧照感，内容页保留清晰网格和图注来承载事实。",
+                "page_type_adaptation": "章节/金句页强化大幅场景；正文页退回清晰网格、浅内容区和图注结构。",
+                "content_style_hint": profile.get("direction", ""),
+                "source": "original_history_cinematic",
+            },
+        ]
+
+    return []
+
+
+def _decision_archetypes(summary: Dict) -> List[Dict]:
+    topic_variants = _topic_decision_variants(summary)
+    if topic_variants:
+        return [
+            {
+                key: variant[key]
+                for key in ("decision_label", "best_for", "tradeoff", "visual_focus")
+                if key in variant
+            }
+            for variant in topic_variants
+        ]
+
+    industries = summary.get("industries") or []
+    topic = industries[0] if industries else "这份内容"
+    dense = (summary.get("dense_page_ratio") or 0) >= 0.28 or (summary.get("table_page_ratio") or 0) >= 0.18
+    information_label = "信息清晰" if dense else "稳妥专业"
+    return [
+        {
+            "decision_label": "主题记忆",
+            "best_for": f"想让观众第一眼记住{topic}的气质、场景和品牌/主题识别。",
+            "tradeoff": "强视觉页更有存在感，正文页需要控制装饰密度。",
+            "visual_focus": "用更明确的主色、场景化画面和统一装饰语言建立整套 PPT 的第一印象。",
+        },
+        {
+            "decision_label": information_label,
+            "best_for": "页数、文字或数据较多，希望阅读效率、可信感和汇报稳定性优先。",
+            "tradeoff": "画面冲击力更克制，但更适合长时间讲解和逐页阅读。",
+            "visual_focus": "浅底、清晰层级、图表/卡片秩序和少量强调色，降低理解成本。",
+        },
+        {
+            "decision_label": "表达冲击",
+            "best_for": "希望提案更有态度，适合路演、发布、竞标或需要快速抓住注意力的场景。",
+            "tradeoff": "视觉个性更强，需要接受更高对比和更鲜明的版式节奏。",
+            "visual_focus": "高对比色块、大标题、强节奏分区和更鲜明的视觉符号。",
+        },
+    ]
+
+
+def _ensure_decision_metadata(proposals: List[Dict], summary: Dict) -> List[Dict]:
+    archetypes = _decision_archetypes(summary)
+    if not archetypes:
+        return proposals
+    normalized: List[Dict] = []
+    for index, proposal in enumerate(proposals[:3]):
+        if not isinstance(proposal, dict):
+            continue
+        archetype = archetypes[index % len(archetypes)]
+        for key in ("decision_label", "best_for", "tradeoff", "visual_focus"):
+            if not proposal.get(key):
+                proposal[key] = archetype.get(key, "")
+
+        description = str(proposal.get("description") or "").strip()
+        best_for = str(proposal.get("best_for") or "").strip()
+        tradeoff = str(proposal.get("tradeoff") or "").strip()
+        visual_focus = str(proposal.get("visual_focus") or "").strip()
+        if best_for and "选它如果" not in description and best_for not in description:
+            decision_sentence = f"选它如果你更看重：{best_for}"
+            if visual_focus:
+                decision_sentence += f" 视觉重点是{visual_focus}"
+            if tradeoff:
+                decision_sentence += f" 需要接受的取舍是{tradeoff}"
+            description = f"{decision_sentence} {description}".strip()
+            proposal["description"] = description[:520]
+        normalized.append(proposal)
+    return normalized
+
+
+def _finalize_style_proposals(proposals: List[Dict], summary: Dict) -> List[Dict]:
+    proposals = _ensure_decision_metadata(proposals, summary)
+
+    for p in proposals:
+        p.setdefault("name", "未命名风格")
+        if not p.get("palette"):
+            p["palette"] = [
+                {"name": "深墨蓝", "hex": "#333333", "role": "主色"},
+                {"name": "纯白", "hex": "#FFFFFF", "role": "辅色"},
+                {"name": "中灰", "hex": "#999999", "role": "点缀色"},
+                {"name": "浅灰", "hex": "#CCCCCC", "role": "背景色"},
+            ]
+        p.setdefault("mood", "专业商务")
+        p.setdefault("font", "无衬线")
+        p.setdefault("description", "")
+        p.setdefault("source", "original")
+
+        # 兼容旧格式：如果 palette 是字符串数组，转换为对象数组
+        if p["palette"] and isinstance(p["palette"][0], str):
+            default_roles = ["主色", "辅色", "点缀色", "背景色"]
+            default_names = ["主色", "辅色", "点缀色", "背景色"]
+            p["palette"] = [
+                {
+                    "name": default_names[i] if i < len(default_names) else f"颜色{i+1}",
+                    "hex": color,
+                    "role": default_roles[i] if i < len(default_roles) else f"配色{i+1}",
+                }
+                for i, color in enumerate(p["palette"])
+            ]
+
+        # 如果 description 太短，补一段默认话术
+        if len(p["description"]) < 60:
+            first_name = p["palette"][0].get("name", "主色") if p["palette"] and isinstance(p["palette"][0], dict) else "主色"
+            p["description"] = f"「{p['name']}」是一套{p['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页在同一视觉语言内保证可读性与留白。"
+
+        p.setdefault(
+            "visual_strategy",
+            build_visual_strategy(
+                summary=summary,
+                palette=p.get("palette") if isinstance(p.get("palette"), list) else None,
+            ),
+        )
+        p.setdefault("page_type_adaptation", _page_type_adaptation_rules(p.get("palette") or [], p.get("visual_strategy")))
+
+    return proposals[:3]
+
+
+def _topic_library_description(style: Dict, summary: Dict) -> str:
+    profile = _topic_profile(summary)
+    style_name = style["aliases"][0] if style.get("aliases") else style.get("name", "风格库方案")
+    if profile:
+        anchors = "、".join((profile.get("keywords") or profile.get("match_terms") or [])[:6])
+        return (
+            f"我从风格库中选择了『{style_name}』作为表现手法，但题材仍然必须围绕{profile['label']}。"
+            f"它应服务{anchors}等画面锚点，用{profile['visual_language']}统一封面、目录和正文页；"
+            "风格库提供版式节奏和情绪强度，不能替代内容主题。"
+        )
+    return style.get("description", "")
+
+
+def _proposal_from_style_library(style: Dict, summary: Dict) -> Dict:
+    return {
+        "name": style["aliases"][0] if style.get("aliases") else style.get("name", "风格库方案"),
+        "palette": style["palette"][:4] if len(style.get("palette", [])) >= 4 else style.get("palette", []) + ["#FFFFFF"],
+        "mood": style.get("category", "专业商务"),
+        "font": ", ".join(style.get("fonts", [])[:2]) if style.get("fonts") else "无衬线",
+        "description": _topic_library_description(style, summary),
+        "source": style.get("id", "style_library"),
+    }
+
+
+def _fallback_style_ids_for_summary(summary: Dict) -> List[str]:
+    profile = _topic_profile(summary)
+    if profile.get("recommended_library_ids"):
+        return list(profile["recommended_library_ids"])
+    industries = " ".join(summary.get("industries") or [])
+    keywords = " ".join(summary.get("keywords") or [])
+    text = f"{industries} {keywords} {summary.get('style_direction_hint', '')}"
+    if any(term in text for term in TRADITIONAL_CULTURE_TERMS):
+        return ["traditional_chinese", "magazine_editorial", "modern_newspaper"]
+    if any(term in text for term in FOOD_AGRI_TERMS):
+        return ["magazine_editorial", "paper_craft", "sharp_minimalism"]
+    if _contains_unnegated_tech(text):
+        return ["minimal_data", "blueprint", "executive_dashboard"]
+    if "品牌" in text or "消费" in text:
+        return ["magazine_editorial", "strategic_infographic", "sharp_minimalism"]
+    return ["magazine_editorial", "strategic_infographic", "sharp_minimalism"]
+
+
+def _append_content_aware_fallbacks(proposals: List[Dict], summary: Dict, style_library: List[Dict]) -> List[Dict]:
+    topic_original = _topic_original_proposal(summary)
+    if topic_original and not any(_proposal_matches_topic(p, summary) for p in proposals):
+        proposals.append(topic_original)
+
+    fallback_map = {s["id"]: s for s in style_library}
+    used_sources = {str(p.get("source") or "") for p in proposals if isinstance(p, dict)}
+    for fid in _fallback_style_ids_for_summary(summary):
+        if len(proposals) >= 3:
+            break
+        if fid in fallback_map and fid not in used_sources:
+            proposals.append(_proposal_from_style_library(fallback_map[fid], summary))
+            used_sources.add(fid)
+
+    if topic_original and len(proposals) < 3:
+        variants = [
+            {
+                **topic_original,
+                "name": f"{_topic_profile(summary).get('label', '主题')}展陈信息风",
+                "description": (
+                    f"这份 PPT 讲的是{_topic_profile(summary).get('label', '当前主题')}，可以用展陈信息逻辑处理大量知识点。"
+                    "正文页用清晰图注、编号、地图或结构图承载信息，强视觉页保留题材场景与材质气质，"
+                    "保证既有主题记忆，也能读清目录、规则和解释性内容。"
+                ),
+                "source": "original_museum_variant",
+            },
+            {
+                **topic_original,
+                "name": f"{_topic_profile(summary).get('label', '主题')}沉浸叙事风",
+                "description": (
+                    f"这份 PPT 的主角是{_topic_profile(summary).get('label', '当前主题')}，适合把封面和转场做成沉浸式叙事场景。"
+                    "内容页降低情绪强度，用同一套题材色、材质和编号系统承载长文，"
+                    "让观众持续感到这是同一个主题世界，而不是通用商务模板。"
+                ),
+                "source": "original_arena_variant",
+            },
+        ]
+        for variant in variants:
+            if len(proposals) < 3:
+                proposals.append(variant)
+    return proposals
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int] | None:
@@ -331,18 +851,6 @@ def _get_color_name(hex_color: str) -> str:
     return "参考色"
 
 
-def _color_label(hex_color: str) -> str:
-    if _is_warm_accent(hex_color):
-        return "暖性强调色"
-    if _is_chromatic_brand_color(hex_color):
-        return "品牌主色"
-    if _is_neutral_dark(hex_color):
-        return "深色层次"
-    if _is_dark(hex_color):
-        return "深色系"
-    return "参考色"
-
-
 def _extract_hex(value) -> str | None:
     if not isinstance(value, str):
         return None
@@ -449,30 +957,45 @@ def _has_clone_reference(ref: Dict, template: Dict) -> bool:
     return bool(template_ref and (template_ref.get("description") or template_ref.get("dominant_palette")))
 
 
-def _page_type_adaptation_rules(palette: List[Dict]) -> str:
+def _reference_explicitly_traditional(ref: Dict) -> bool:
+    text = " ".join(
+        str(ref.get(key) or "")
+        for key in ("style_name", "description", "mood", "ornaments", "texture", "clone_rules", "composition_style")
+    )
+    return bool(text and any(term in text for term in TRADITIONAL_CULTURE_TERMS))
+
+
+def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | None = None) -> str:
     primary = palette[0]["hex"] if palette else "#2F2A24"
     accent = palette[1]["hex"] if len(palette) > 1 else "#B8945C"
-    light = "#F7F3EA"
-    for color in palette:
-        rgb = _hex_to_rgb(color.get("hex", ""))
-        if rgb and sum(rgb) / 3 > 145 and _saturation(color["hex"]) < 0.45:
-            light = color["hex"]
-            break
+    strategy = visual_strategy or {}
+    base_tone = str(strategy.get("base_tone") or "").lower()
 
+    if base_tone == "dark":
+        return (
+            "页面类型适配规则：先保持整套深色视觉基底，再按页面功能调节强弱。"
+            f"封面、章节页、转场页、金句页可放大使用品牌主色 {primary} 和强调色 {accent}，承担品牌定调和情绪冲击；"
+            "内容页、数据页、表格页仍使用同一深色系语言，通过高对比暗色卡片、局部浅色内容区、清晰字号层级和留白保证阅读效率。"
+            "除非用户明确要求或出现极端表格/长文页，不要把正文页自动切成米白、浅灰等另一套视觉语言。"
+        )
+    if base_tone == "light":
+        return (
+            "页面类型适配规则：正文页以浅底和留白保证阅读效率，强视觉页可使用更深的主色或装饰区形成节奏。"
+            f"用 {primary} 做标题、页眉、编号、强调块，用 {accent} 做少量装饰线和重点信息；"
+            "深色页只用于封面、章节、金句或明确需要情绪冲击的页面，不能在正文页随机混用。"
+        )
     if palette and _needs_page_type_modulation(primary):
         return (
             "页面类型适配规则：参考图只用于定调，不要求所有页面按同一强度复刻。"
             f"封面、章节页、转场页、金句页可放大使用品牌主色 {primary} 和强调色 {accent}，承担品牌定调和情绪冲击；"
-            f"内容页、数据页、表格页、长文分析页应优先使用 {light} 或其他低饱和浅底，"
-            f"用 {primary} 做标题、页眉、编号、强调块，用 {accent} 做少量装饰线和重点信息；"
-            "正文使用高可读的深色文字。信息越密集，背景越要降饱和、提亮度、减少装饰。"
-            "地图页、图表页、配图页和业务场景页的具体画面必须由该页文案决定，不能机械复刻参考图构图。"
+            "内容页、数据页、表格页、长文分析页必须先沿用同一套色彩和材质语言，再用卡片、留白、局部内容区和字号层级解决阅读效率。"
+            "如果需要浅底，必须按同类信息页成组出现，并保留相同品牌色、装饰语言和 Logo 对比处理。"
         )
 
     return (
         "页面类型适配规则：参考图提供风格基因，不是每页画面模板。"
         "封面/章节页可以更强烈地使用主色，内容/数据/表格页必须优先保证阅读效率，"
-        "根据页面信息密度选择浅底或留白，并由文案决定具体配图内容。"
+        "但同类正文页应使用同一种信息页处理，不要逐页随机切换明暗语言。"
     )
 
 
@@ -486,15 +1009,20 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
 
     palette = _collect_clone_palette(ref, logo)
     palette_hex = [c["hex"] for c in palette]
+    explicit_traditional_ref = _reference_explicitly_traditional(ref)
     style_name = (ref.get("style_name") or "").strip()
     if not style_name:
         desc_for_name = " ".join(str(x) for x in [ref.get("description"), ref.get("mood"), ref.get("ornaments"), ref.get("texture")] if x)
-        if any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
+        if explicit_traditional_ref and any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
             style_name = "品牌主色典雅"
-        elif any(_is_dark(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
+        elif explicit_traditional_ref and any(_is_dark(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
             style_name = "深色典雅"
         elif "国潮" in desc_for_name or "中式" in desc_for_name:
             style_name = "中式典雅"
+        elif any(_is_chromatic_brand_color(c) for c in palette_hex):
+            style_name = "品牌主色复刻"
+        elif any(_is_dark(c) for c in palette_hex):
+            style_name = "深色参考质感"
         else:
             style_name = "参考图复刻"
 
@@ -502,22 +1030,44 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
     style_name = re.sub(r"(科技|战略|未来|数据|智能|AI)", "", style_name, flags=re.IGNORECASE).strip(" -_·")
     if not style_name:
         style_name = "参考图复刻"
-    if any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex) and style_name == "参考图复刻":
+    if explicit_traditional_ref and any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex) and style_name == "参考图复刻":
         style_name = "品牌主色典雅"
 
-    mood = ref.get("mood") or "古朴、典雅、厚重"
-    font = ref.get("font_suggestion") or logo.get("font_style") or "标题使用文化感较强的宋体/书法体，正文使用清晰黑体"
+    mood = ref.get("mood") or ("古朴、典雅、厚重" if explicit_traditional_ref else "现代、清晰、克制")
+    font = ref.get("font_suggestion") or logo.get("font_style") or (
+        "标题使用文化感较强的宋体/书法体，正文使用清晰黑体"
+        if explicit_traditional_ref
+        else "标题使用现代黑体/几何无衬线，正文使用清晰黑体，整套保持同一字体系"
+    )
     composition = ref.get("composition_style") or "沿用参考图的版式节奏"
-    ornaments = ref.get("ornaments") or "沿用参考图中的装饰纹样与边框语言"
-    texture = ref.get("texture") or "沿用参考图的背景肌理与光影层次"
-    clone_rules = ref.get("clone_rules") or "提取参考图的主色关系、装饰气质和整体氛围，并按页面类型调节使用强度。"
-    adaptation_rules = _page_type_adaptation_rules(palette)
+    ornaments = ref.get("ornaments") or (
+        "沿用参考图中的装饰纹样与边框语言"
+        if explicit_traditional_ref
+        else "只沿用参考图中明确出现的装饰语言；没有明确装饰时使用简洁几何线条"
+    )
+    texture = ref.get("texture") or (
+        "沿用参考图的背景肌理与光影层次"
+        if explicit_traditional_ref
+        else "沿用参考图的背景质感；没有明确肌理时保持干净现代"
+    )
+    clone_rules = ref.get("clone_rules") or (
+        "提取参考图的主色关系、装饰气质和整体氛围，并按页面类型调节使用强度。"
+        if explicit_traditional_ref
+        else "提取参考图的主色关系、版式节奏和整体氛围，按页面类型调节强度；不要引入参考图中没有的文化符号。"
+    )
+    visual_strategy = build_visual_strategy(
+        summary=summary,
+        palette=palette,
+        reference_analysis=ref,
+        logo_analysis=logo,
+    )
+    adaptation_rules = _page_type_adaptation_rules(palette, visual_strategy)
 
     primary_name = _get_color_name(palette[0]['hex']) if palette else '品牌主色'
     accent_name = _get_color_name(palette[1]['hex']) if len(palette) > 1 else '强调色'
     description = (
         f"整体「{mood}」气质。{primary_name}定调品牌识别，{accent_name}做重点强调；"
-        f"封面/章节页可放大装饰，内容/数据页优先留白与可读性。{clone_rules}"
+        f"封面/章节页可放大装饰，内容/数据页在同一视觉语言内提高留白与可读性。{clone_rules}"
     )
 
     return {
@@ -526,10 +1076,14 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
         "mood": mood,
         "font": font,
         "description": description[:420],
+        "texture": texture,
+        "ornaments": ornaments,
+        "clone_rules": clone_rules,
         "source": "asset_clone",
         "clone_mode": "style_dna",
         "reference_usage": "style_text_only",
         "page_type_adaptation": adaptation_rules,
+        "visual_strategy": visual_strategy,
         "content_style_hint": summary.get("style_direction_hint", ""),
     }
 
@@ -562,6 +1116,11 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     if has_assets:
         return _generate_asset_based_proposal(content_plan, summary, assets, style_library)
 
+    topic_variants = _topic_decision_variants(summary)
+    if topic_variants:
+        logger.info("StyleProposal: using deterministic topic decision variants for profile=%s", _topic_profile(summary).get("id"))
+        return _finalize_style_proposals(topic_variants, summary)
+
     client = get_llm_client()
 
     # 构建 style 库摘要，供 LLM 挑选
@@ -593,6 +1152,20 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 【内容风格判断提示】（必须优先于通用商务/科技模板）
 {summary.get("style_direction_hint", "")}
 
+【强题材一致性要求】
+- 如果内容主题已经指向明确时代、地域、人物、场景或文化类型，三套方案都必须围绕这个题材建立视觉语言。
+- 风格库只能作为表现手法，不能替代题材本身；例如古罗马角斗士不能被改写成瑞士设计、苹果发布会或泛奢侈品风。
+- 任何方案名称和说明都必须让客户一眼看出它服务于当前 PPT 主题，而不是通用模板。
+
+【三套方案必须是三种明确选择】
+- 不是给 3 个相似名字，而是给 3 种不同取舍：第一眼记忆、信息可读、表达冲击。
+- 三套方案的 decision_label、best_for、tradeoff、visual_focus 必须互不重复。
+- palette 的主导色和页面使用方式必须有实质差异，不能只是同一套深色/浅色换顺序。
+- 卡片首屏会展示 best_for 和 tradeoff，所以这两项必须像给用户做选择题一样清楚。
+
+【本次建议的决策框架】（可改写，但不能合并成同一种方案）
+{json.dumps(_decision_archetypes(summary), ensure_ascii=False, indent=2)}
+
 【可用风格库（第 2、3 套必须从中选择）】
 {json.dumps(style_catalog, ensure_ascii=False, indent=2)}
 
@@ -601,14 +1174,18 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 {{
   "name": "风格名称（简洁直观的设计语言命名，如'流体玻璃极简'、'折叠纸艺温暖'，禁止用'原生之境'这类虚词）",
   "palette": [
-    {{"name": "直观颜色名（如'酒红'、'琥珀金'、'米白'，不要用'品牌主色'这类技术词）", "hex": "#0A1628", "role": "主背景色"}},
+    {{"name": "直观颜色名（如'酒红'、'琥珀金'、'米白'，不要用'品牌主色'这类技术词）", "hex": "#0A1628", "role": "主背景色/整体基底"}},
     {{"name": "直观颜色名", "hex": "#E8D5A3", "role": "标题色"}},
-    {{"name": "直观颜色名", "hex": "#F5F5F0", "role": "正文色"}},
+    {{"name": "直观颜色名", "hex": "#F5F5F0", "role": "正文页基底/内容区"}},
     {{"name": "直观颜色名", "hex": "#1E3A5F", "role": "点缀色"}}
   ],
   "mood": "氛围标签（3-5个具体形容词，如'冷静、专业、克制'）",
   "font": "字体建议（如'无衬线黑体，标题加粗'）",
   "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清为什么适合这份PPT即可）",
+  "decision_label": "用户一眼能看懂的选择标签，如'主题记忆'、'信息清晰'、'表达冲击'",
+  "best_for": "选它如果用户更看重什么结果，必须具体到这份 PPT",
+  "tradeoff": "选择它需要接受什么取舍，必须能帮助用户排除不适合的方案",
+  "visual_focus": "这套方案最主要的画面差异和页面处理方式",
   "source": "original（第1套）或 风格库id（第2、3套）"
 }}
 
@@ -680,57 +1257,21 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     else:
         logger.warning("StyleProposal: LLM 返回空内容，使用默认方案")
 
+    filtered_proposals = _filter_topic_mismatched_proposals(proposals, summary)
+    if len(filtered_proposals) != len(proposals):
+        logger.warning(
+            "StyleProposal: filtered %s topic-mismatched proposals for profile=%s",
+            len(proposals) - len(filtered_proposals),
+            _topic_profile(summary).get("id"),
+        )
+    proposals = filtered_proposals
+
     # 如果解析失败或数量不足，用 style 库兜底
     if len(proposals) < 3:
-        logger.info("StyleProposal: 使用 style 库兜底")
-        fallback_ids = ["swiss_design", "dark_luxury", "apple_keynote"]
-        fallback_map = {s["id"]: s for s in style_library}
-        for fid in fallback_ids:
-            if fid in fallback_map and len(proposals) < 3:
-                s = fallback_map[fid]
-                proposals.append({
-                    "name": s["aliases"][0] if s["aliases"] else s["name"],
-                    "palette": s["palette"][:4] if len(s["palette"]) >= 4 else s["palette"] + ["#FFFFFF"],
-                    "mood": s["category"],
-                    "font": ", ".join(s["fonts"][:2]) if s["fonts"] else "无衬线",
-                    "description": s["description"],
-                    "source": s["id"],
-                })
+        logger.info("StyleProposal: 使用内容感知兜底")
+        proposals = _append_content_aware_fallbacks(proposals, summary, style_library)
 
-    # 确保每个提案都有所需字段，并把 source 放入 description 的末尾提示（仅库匹配项）
-    for p in proposals:
-        p.setdefault("name", "未命名风格")
-        if not p.get("palette"):
-            p["palette"] = [
-                {"name": "深墨蓝", "hex": "#333333", "role": "主色"},
-                {"name": "纯白", "hex": "#FFFFFF", "role": "辅色"},
-                {"name": "中灰", "hex": "#999999", "role": "点缀色"},
-                {"name": "浅灰", "hex": "#CCCCCC", "role": "背景色"},
-            ]
-        p.setdefault("mood", "专业商务")
-        p.setdefault("font", "无衬线")
-        p.setdefault("description", "")
-        p.setdefault("source", "original")
-
-        # 兼容旧格式：如果 palette 是字符串数组，转换为对象数组
-        if p["palette"] and isinstance(p["palette"][0], str):
-            default_roles = ["主色", "辅色", "点缀色", "背景色"]
-            default_names = ["主色", "辅色", "点缀色", "背景色"]
-            p["palette"] = [
-                {
-                    "name": default_names[i] if i < len(default_names) else f"颜色{i+1}",
-                    "hex": color,
-                    "role": default_roles[i] if i < len(default_roles) else f"配色{i+1}",
-                }
-                for i, color in enumerate(p["palette"])
-            ]
-
-        # 如果 description 太短，补一段默认话术
-        if len(p["description"]) < 60:
-            first_name = p["palette"][0].get("name", "主色") if p["palette"] and isinstance(p["palette"][0], dict) else "主色"
-            p["description"] = f"「{p['name']}」是一套{p['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页优先保证可读性与留白。"
-
-    return proposals[:3]
+    return _finalize_style_proposals(proposals, summary)
 
 
 def _generate_asset_based_proposal(
@@ -786,7 +1327,7 @@ def _generate_asset_based_proposal(
   "palette": [
     {{"name": "直观颜色名（如'酒红'、'琥珀金'，不要用'品牌主色'这类技术词）", "hex": "参考图中的实际色值", "role": "品牌主色/强视觉页主色"}},
     {{"name": "直观颜色名", "hex": "参考图中的实际色值", "role": "强调色/标题色/装饰色"}},
-    {{"name": "直观颜色名", "hex": "适合信息页阅读的浅底色", "role": "内容页背景/留白"}},
+    {{"name": "直观颜色名", "hex": "参考图中可承载正文的底色或内容区颜色", "role": "正文页基底/内容区"}},
     {{"name": "直观颜色名", "hex": "高可读文字色", "role": "正文/数据文字"}}
   ],
   "mood": "氛围标签（忠实来自参考图，不发明新风格）",
@@ -797,7 +1338,7 @@ def _generate_asset_based_proposal(
 【核心原则】
 1. **忠实定调**：风格名、主色关系、材质、装饰语言必须来自参考图，不得根据文案另造风格
 2. **不是逐页照搬**：参考图只提供风格基因，不是每一页的画面模板
-3. **按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，降低背景强度、减少装饰、增加留白
+3. **先定整套基底，再按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，但要在同一视觉语言内通过卡片、内容区、字号层级和留白解决，不要机械切成另一套浅底风格
 4. **内容决定配图**：地图、图表、业务场景、产品场景和人物/物件选择由该页文案决定，不机械复制参考图里的画面对象
 5. **命名不跑偏**：风格名只取调性，不混入行业词，也不混入版式词（参考输出格式 name 字段的示范）"""
 
@@ -831,21 +1372,9 @@ def _generate_asset_based_proposal(
             logger.warning(f"StyleProposal(AssetBased): JSON 解析失败: {e}")
 
     if not proposal:
-        # 回退：从风格库中找最接近的一套
-        logger.info("StyleProposal(AssetBased): 使用风格库兜底")
-        fallback_ids = ["swiss_design", "dark_luxury", "apple_keynote"]
-        fallback_map = {s["id"]: s for s in style_library}
-        for fid in fallback_ids:
-            if fid in fallback_map:
-                s = fallback_map[fid]
-                proposal = {
-                    "name": s["aliases"][0] if s["aliases"] else s["name"],
-                    "palette": s["palette"][:4] if len(s["palette"]) >= 4 else s["palette"] + ["#FFFFFF"],
-                    "mood": s["category"],
-                    "font": ", ".join(s["fonts"][:2]) if s["fonts"] else "无衬线",
-                    "description": s["description"],
-                }
-                break
+        logger.info("StyleProposal(AssetBased): 使用内容感知兜底")
+        fallbacks = _append_content_aware_fallbacks([], summary, style_library)
+        proposal = fallbacks[0] if fallbacks else {}
 
     # 标准化
     proposal.setdefault("name", "基于素材的定制风格")
@@ -876,6 +1405,17 @@ def _generate_asset_based_proposal(
 
     if len(proposal.get("description", "")) < 60:
         first_name = proposal["palette"][0].get("name", "主色") if proposal["palette"] and isinstance(proposal["palette"][0], dict) else "主色"
-        proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页优先保证可读性与留白。"
+        proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页在同一视觉语言内保证可读性与留白。"
+
+    proposal["visual_strategy"] = build_visual_strategy(
+        summary=summary,
+        palette=proposal.get("palette") if isinstance(proposal.get("palette"), list) else None,
+        reference_analysis=ref,
+        logo_analysis=logo,
+    )
+    proposal["page_type_adaptation"] = _page_type_adaptation_rules(
+        proposal.get("palette") or [],
+        proposal.get("visual_strategy"),
+    )
 
     return [proposal]

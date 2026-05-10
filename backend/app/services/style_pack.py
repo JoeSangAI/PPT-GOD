@@ -1,12 +1,41 @@
 import re
 from typing import Dict, List, Optional
 
+from app.services.visual_strategy import build_visual_strategy, visual_strategy_text
+
 
 TRADITIONAL_TERMS = ("古法", "非遗", "传承", "匠心", "老字号", "中式", "东方", "国潮", "传统", "文化")
 FOOD_TERMS = ("食品", "花生油", "食用油", "粮油", "农业", "风味", "香", "餐饮", "调味")
 BRAND_TERMS = ("品牌", "消费", "零售", "产品", "渠道", "营销", "心智", "提案", "战略")
 TECH_TERMS = ("科技", "AI", "人工智能", "数据", "算法", "数字化", "芯片", "云计算")
 TECH_NEGATIONS = ("拒绝科技", "科技与狠活", "科技狠活", "反科技", "非科技", "去科技", "拒绝工业化")
+ANCIENT_ROME_TERMS = (
+    "古罗马", "罗马", "角斗士", "角斗", "斗兽场", "竞技场", "Colosseum", "gladiator",
+    "gladius", "凯撒", "帝国", "元老院", "军团", "罗马帝国", "血腥舞台",
+)
+TOPIC_STYLE_PRESETS = [
+    {
+        "id": "ancient_rome_gladiator",
+        "terms": ANCIENT_ROME_TERMS,
+        "matches": lambda text: _score(text, ANCIENT_ROME_TERMS) >= 2 or ("罗马" in text and "角斗" in text),
+        "style": "古罗马竞技史诗风",
+        "palette": ["#171310", "#7A1F1D", "#E8DDC8", "#A8743A"],
+        "mood": "史诗、粗粝、古典、戏剧化",
+        "typography": (
+            "Headline uses classical serif or Roman inscription-inspired display type; "
+            "Body uses Source Han Sans Regular / Latin: Inter Regular for readability; "
+            "keep typography sharp, carved, and historically grounded rather than rounded or product-launch oriented."
+        ),
+        "page_rule": (
+            "封面/章节/金句页可使用火山岩黑、血酒红、斗兽场暗部和青铜纹理制造史诗感；"
+            "目录/正文/表格页使用石灰白或浅石材基底，保留旧青铜编号和暗红强调，保证阅读效率。"
+        ),
+        "rhythm": (
+            "每页画面证据必须来自古罗马角斗士主题：斗兽场、短剑、盾牌、盔甲、雕塑、石柱、观众席、地图或制度图解；"
+            "整体保持历史史诗和古典材质方向，以题材物件和场景作为主要视觉来源。"
+        ),
+    }
+]
 
 
 def _extract_text(content_plan: List[Dict]) -> str:
@@ -37,6 +66,13 @@ def _has_unnegated_tech(text: str) -> bool:
     for negation in TECH_NEGATIONS:
         cleaned = cleaned.replace(negation, "")
     return any(term in cleaned for term in TECH_TERMS)
+
+
+def _topic_style_preset(text: str) -> Optional[Dict]:
+    for preset in TOPIC_STYLE_PRESETS:
+        if preset["matches"](text):
+            return preset
+    return None
 
 
 def _extract_hex(value: object) -> Optional[str]:
@@ -99,15 +135,29 @@ def style_pack_from_selected_style(selected_style: dict | str | None) -> str | N
         )
     else:
         palette_text = str(palette)
+    visual_strategy = style_obj.get("visual_strategy") if isinstance(style_obj.get("visual_strategy"), dict) else None
+    visual_strategy_line = visual_strategy_text(visual_strategy)
+    if visual_strategy_line and visual_strategy.get("base_tone"):
+        visual_strategy_line = f"base_tone={visual_strategy.get('base_tone')}; {visual_strategy_line}"
+    texture_line = style_obj.get("texture") or style_obj.get("clone_rules") or ""
+    style_rationale = str(style_obj.get("description") or "").strip()
+    visual_rhythm = (
+        style_obj.get("content_style_hint")
+        or style_obj.get("visual_rhythm")
+        or style_rationale
+        or "每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
+    )
     return "\n".join(
         line for line in [
             f"Style: {style_obj.get('name', '用户确认风格')}",
             f"Palette: {palette_text}",
             f"Mood: {style_obj.get('mood', '保持用户确认的整体气质')}",
+            f"Visual strategy: {visual_strategy_line}" if visual_strategy_line else "",
             f"Typography: {style_obj.get('font') or 'Headline 思源黑体 Bold (Source Han Sans Bold) / Latin: Inter SemiBold; Body 思源黑体 Regular / Latin: Inter Regular; consistent hierarchy across all pages.'}",
+            f"Texture/material: {texture_line}" if texture_line else "",
             f"Page type adaptation: {style_obj.get('page_type_adaptation', '封面/章节页可强化情绪，内容/数据页优先可读')}",
             f"Reference usage: {style_obj.get('reference_usage', 'style text only unless template/page references are present')}",
-            f"Visual rhythm: {style_obj.get('content_style_hint', '') or '每页由文案决定画面证据，风格只统一色彩、材质和装饰强度'}",
+            f"Visual rhythm: {visual_rhythm}",
         ] if line and not line.endswith(": ")
     )
 
@@ -129,6 +179,8 @@ def derive_style_pack_from_content(
     brand = _score(text, BRAND_TERMS)
     tech = _score(text, TECH_TERMS) if _has_unnegated_tech(text) else 0
 
+    topic_preset = _topic_style_preset(text)
+
     if palette:
         style = ref_name or "参考图风格基因"
         mood = ref_mood or "贴合用户参考图，克制统一"
@@ -137,9 +189,16 @@ def derive_style_pack_from_content(
             "Body 思源黑体 Regular / Latin: Inter Regular; consistent hierarchy across all pages."
         )
         page_rule = (
-            "封面/章节/金句页可强化参考图主色和装饰；内容/数据/表格页使用浅底、高可读、少装饰。"
+            "封面/章节/金句页可强化参考图主色和装饰；内容/数据/表格页必须在同一视觉语言内保证高可读，不自动切换成另一套浅底风格。"
         )
         rhythm = ref_clone or ref_ornaments or "每页由文案决定画面证据，参考图只统一色彩、材质和装饰强度"
+    elif topic_preset:
+        style = topic_preset["style"]
+        palette = list(topic_preset["palette"])
+        mood = topic_preset["mood"]
+        typography = topic_preset["typography"]
+        page_rule = topic_preset["page_rule"]
+        rhythm = topic_preset["rhythm"]
     elif traditional and food:
         style = "中式红金非遗食品品牌"
         palette = ["#7A1511", "#D4AF37", "#F7F1E6", "#2A1A16"]
@@ -202,10 +261,26 @@ def derive_style_pack_from_content(
         page_rule = "封面/章节页可增强情绪；内容/数据/表格页优先浅底、高可读、少装饰。"
         rhythm = "每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
 
+    strategy = build_visual_strategy(
+        summary={
+            "industries": [],
+            "keywords": [],
+            "style_direction_hint": "",
+            "dense_page_ratio": 0,
+            "table_page_ratio": 0,
+        },
+        palette=palette,
+        reference_analysis=(reference_analyses or [None])[0] if reference_analyses else None,
+    )
+    strategy_line = visual_strategy_text(strategy)
+    if strategy_line and strategy.get("base_tone"):
+        strategy_line = f"base_tone={strategy.get('base_tone')}; {strategy_line}"
+
     return "\n".join([
         f"Style: {style}",
         f"Palette: {', '.join(palette[:5])}",
         f"Mood: {mood}",
+        f"Visual strategy: {strategy_line}" if strategy_line else "",
         f"Typography: {typography}",
         f"Page type adaptation: {page_rule}",
         "Reference usage: style text only unless template/page references are present",
