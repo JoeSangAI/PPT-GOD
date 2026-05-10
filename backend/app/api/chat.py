@@ -1,5 +1,7 @@
 import json
 import json_repair
+import copy
+import os
 import re
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -7,13 +9,15 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.models.base import get_db
-from app.models.models import Project, Slide
+from app.models.models import Project, ReferenceImage, Slide
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.utils.project_docs import load_project_documents
 from app.services.search_service import get_knowledge_augmenter
 from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VISUAL_ACTIONS, with_next_action
 from app.services.artifact_versions import content_signature, style_asset_signature
+from app.services.image_analyzer import describe_context_image
+from app.services.style_proposal import enforce_user_style_requirements
 
 router = APIRouter(prefix="/projects", tags=["chat"])
 
@@ -39,6 +43,7 @@ class ChatMessage(BaseModel):
     history: list[dict] = []
     page_context: dict | None = None
     agent_role: str = "content"  # "content" | "visual" | "finetune"
+    attachment_ids: list[str] = []
 
     @field_validator("agent_role")
     @classmethod
@@ -47,6 +52,70 @@ class ChatMessage(BaseModel):
         if v not in allowed:
             raise ValueError(f"agent_role must be one of {allowed}, got '{v}'")
         return v
+
+
+def _load_chat_attachments(db: Session, project_id: str, attachment_ids: list[str]) -> list[ReferenceImage]:
+    ids = [str(item) for item in (attachment_ids or []) if str(item).strip()]
+    if not ids:
+        return []
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.id.in_(ids),
+        ReferenceImage.role.in_(["chat_ref", "content_ref", "chart_ref", "visual_asset", "finetune_ref"]),
+    ).all()
+    by_id = {ref.id: ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
+    return [by_id[ref_id] for ref_id in ids if ref_id in by_id]
+
+
+def _message_mentions_images(message: str) -> bool:
+    return bool(re.search(r"(图|图片|截图|照片|素材|参考图|读图|识图|OCR|ocr|解读|这张|这两张|上传)", message or ""))
+
+
+def _load_ambient_chat_attachments(db: Session, project_id: str, agent_role: str, message: str) -> list[ReferenceImage]:
+    if not _message_mentions_images(message):
+        return []
+    allowed_roles = ["content_ref"]
+    if agent_role == "visual":
+        allowed_roles = ["content_ref", "visual_asset", "style_ref", "logo"]
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.role.in_(allowed_roles),
+    ).all()
+    usable: list[ReferenceImage] = []
+    for ref in refs:
+        if not ref.file_path or not os.path.exists(ref.file_path):
+            continue
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+        if ref.role == "content_ref" and analysis.get("pptx_source_page_num"):
+            continue
+        usable.append(ref)
+    return usable[-8:]
+
+
+def _build_attachment_context(attachments: list[ReferenceImage] | None, agent_role: str) -> str:
+    lines: list[str] = []
+    role_label_map = {
+        "chat_ref": "本轮对话图片",
+        "content_ref": "内容素材图",
+        "chart_ref": "图表参考图",
+        "visual_asset": "项目素材图",
+        "style_ref": "风格参考图",
+        "logo": "品牌 Logo",
+        "finetune_ref": "微调参考图",
+    }
+    purpose = "内容提取和PPT修改" if agent_role == "content" else "视觉参考、素材理解和PPT修改"
+    for idx, ref in enumerate(attachments or [], start=1):
+        label = ref.asset_name or os.path.basename(ref.file_path)
+        role_label = role_label_map.get(ref.role, "参考图")
+        description = describe_context_image(ref.file_path, label, role_label, purpose)
+        lines.append(f"### 图片 {idx}: {label}（{role_label}）")
+        if description:
+            lines.append(description)
+        else:
+            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+            fallback = analysis.get("description") or analysis.get("subject") or "图片已上传，但当前读图接口没有返回可用解读。"
+            lines.append(str(fallback))
+    return "\n".join(lines).strip()
 
 
 def _infer_requested_page_count(message: str) -> int | None:
@@ -100,13 +169,13 @@ def _has_content_mutation_intent(message: str) -> bool:
         return False
     mutation_then_target = (
         r"(重新|重做|重构|重写|改写|修改|调整|扩充|扩展|拓展|补充|增加|新增|删除|删掉|"
-        r"替换|改成|变成|改为|对齐|按照|基于|落实|突出|强化)"
-        r".{0,30}(内容|规划|页面|页|标题|正文|故事|结构|逻辑|原文|文档|MD|Markdown|大纲|PPT)"
+        r"替换|改成|变成|改为|对齐|按照|基于|落实|突出|强化|整合|合并|融入|放到|放进|做到|做进)"
+        r".{0,30}(内容|规划|页面|页|标题|正文|故事|结构|逻辑|信息|素材|图片|截图|图表|表格|数据|原文|文档|MD|Markdown|大纲|PPT)"
     )
     target_then_mutation = (
-        r"(内容|规划|页面|页|标题|正文|故事|结构|逻辑|原文|文档|MD|Markdown|大纲|PPT)"
+        r"(内容|规划|页面|页|标题|正文|故事|结构|逻辑|信息|素材|图片|截图|图表|表格|数据|原文|文档|MD|Markdown|大纲|PPT)"
         r".{0,30}(重新|重做|重构|重写|改写|修改|调整|扩充|扩展|拓展|补充|增加|新增|删除|删掉|"
-        r"替换|改成|变成|改为|对齐|落实|突出|强化)"
+        r"替换|改成|变成|改为|对齐|落实|突出|强化|整合|合并|融入|放到|放进|做到|做进)"
     )
     return bool(re.search(mutation_then_target, text, flags=re.IGNORECASE) or re.search(target_then_mutation, text, flags=re.IGNORECASE))
 
@@ -199,6 +268,65 @@ def _fallback_regenerate_plan(
     return coerced
 
 
+def _targets_current_page(message: str) -> bool:
+    return bool(re.search(r"(当前页|当前页面|这一页|这页|本页|这个页面|这一个页面|这张PPT|这一张PPT)", message or ""))
+
+
+def _mentions_attachment_material(message: str) -> bool:
+    return bool(re.search(r"(附件|上传|图片|截图|照片|这张|这两张|这几张|两页|几页|素材|信息|图表|表格|数据|OCR|ocr)", message or ""))
+
+
+def _fallback_update_current_slide_from_attachments(
+    *,
+    user_message: str,
+    page_context: dict | None,
+    attachment_context: str,
+    response: str | None = None,
+) -> dict | None:
+    if not attachment_context or not isinstance(page_context, dict):
+        return None
+    if page_context.get("mode") != "page":
+        return None
+    current_page = page_context.get("current_page")
+    if not isinstance(current_page, dict):
+        return None
+    if not (_targets_current_page(user_message) or _has_content_mutation_intent(user_message)):
+        return None
+    if not _mentions_attachment_material(user_message):
+        return None
+
+    content = copy.deepcopy(current_page.get("content_json") or {})
+    page_num = current_page.get("page_num") or content.get("page_num")
+    if not page_num:
+        return None
+    text_content = content.get("text_content")
+    if not isinstance(text_content, dict):
+        text_content = {}
+
+    summary = re.sub(r"\n{3,}", "\n\n", attachment_context).strip()
+    if len(summary) > 2200:
+        summary = summary[:2200].rstrip() + "..."
+    existing_body = str(text_content.get("body") or "").strip()
+    material_block = f"【本轮素材信息】\n{summary}"
+    text_content["body"] = f"{existing_body}\n\n{material_block}".strip() if existing_body else material_block
+    if not str(text_content.get("headline") or "").strip():
+        text_content["headline"] = "整合素材信息"
+    text_content.setdefault("subhead", "")
+
+    content["page_num"] = page_num
+    content["type"] = content.get("type") or current_page.get("type") or "content"
+    content.setdefault("section_title", "")
+    content["text_content"] = text_content
+    content.setdefault("speaker_notes", "")
+    content.setdefault("visual_suggestion", "")
+
+    return {
+        "action": "update_slide_content",
+        "updated_content": content,
+        "response": response or "收到，我已把本轮附件信息整理进当前页内容，请检查文字取舍。",
+    }
+
+
 def _parse_json_object(text: str) -> dict | None:
     text = (text or "").strip()
     if not text:
@@ -251,8 +379,9 @@ def _build_content_contract_prompt() -> str:
 4. 如果用户只是确认内容已经可以进入视觉阶段，返回 action="forward_to_visual"。
 5. 如果用户给的是整体质量反馈，或者局部补丁风险较高，优先返回 action="regenerate_plan"，把用户反馈写进 topic，让后台重新生成内容规划。
 6. 如果用户指定单页且当前页内容足够明确，返回 action="update_slide_content"，updated_content 必须是该页完整 content_json。
-7. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
-8. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
+7. 如果用户在单页上下文里说把附件、截图、图片、这两页或素材信息放到当前页，优先返回 action="update_slide_content"，不要重做整套内容规划。
+8. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
+9. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
 
 只输出合法 JSON 对象。允许的 action：
 - regenerate_plan
@@ -280,6 +409,7 @@ def _compile_content_instruction_with_llm(
     page_context: dict | None,
     slides_context: list[dict] | None,
     initial_result: dict,
+    attachment_context: str = "",
 ) -> dict | None:
     payload = {
         "project_context": project_context,
@@ -288,6 +418,7 @@ def _compile_content_instruction_with_llm(
         "page_context_from_frontend": page_context,
         "current_deck_content": slides_context or [],
         "uploaded_documents_excerpt": (documents or "")[:12000],
+        "current_message_attachment_context": (attachment_context or "")[:12000],
     }
     response = client.chat.completions.create(
         model=get_minimax_llm_model(),
@@ -325,6 +456,7 @@ def _enforce_content_action_contract(
     documents: str = "",
     page_context: dict | None = None,
     slides_context: list[dict] | None = None,
+    attachment_context: str = "",
     history: list[dict] | None = None,
     compiler=None,
     logger=None,
@@ -353,6 +485,7 @@ def _enforce_content_action_contract(
                 documents=documents,
                 page_context=page_context,
                 slides_context=slides_context,
+                attachment_context=attachment_context,
                 initial_result=result,
             )
         else:
@@ -363,6 +496,7 @@ def _enforce_content_action_contract(
                 documents=documents,
                 page_context=page_context,
                 slides_context=slides_context,
+                attachment_context=attachment_context,
                 initial_result=result,
             )
     except Exception as exc:
@@ -371,7 +505,24 @@ def _enforce_content_action_contract(
         compiled = None
 
     if _content_contract_result_usable(compiled):
+        if compiled.get("action") == "regenerate_plan":
+            page_update = _fallback_update_current_slide_from_attachments(
+                user_message=user_message,
+                page_context=page_context,
+                attachment_context=attachment_context,
+                response=result.get("response"),
+            )
+            if page_update:
+                return page_update
         if compiled.get("action") in {"answer", "forward_to_visual"} and strong_mutation_intent:
+            page_update = _fallback_update_current_slide_from_attachments(
+                user_message=user_message,
+                page_context=page_context,
+                attachment_context=attachment_context,
+                response=result.get("response"),
+            )
+            if page_update:
+                return page_update
             return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
         if logger:
             logger.info(
@@ -382,8 +533,24 @@ def _enforce_content_action_contract(
         return compiled
 
     if result.get("action") in CONTENT_MUTATION_ACTIONS and not _content_action_payload_complete(result):
+        page_update = _fallback_update_current_slide_from_attachments(
+            user_message=user_message,
+            page_context=page_context,
+            attachment_context=attachment_context,
+            response=result.get("response"),
+        )
+        if page_update:
+            return page_update
         return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
     if strong_mutation_intent:
+        page_update = _fallback_update_current_slide_from_attachments(
+            user_message=user_message,
+            page_context=page_context,
+            attachment_context=attachment_context,
+            response=result.get("response"),
+        )
+        if page_update:
+            return page_update
         return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
     if result.get("action") in {"answer", "collect_content"}:
         return {
@@ -724,6 +891,20 @@ def _history_has_prior_proposal(history: list[dict], agent_role: str) -> bool:
     return False
 
 
+def _visual_style_requirement_text(user_message: str, result: dict, history: list[dict] | None = None) -> str:
+    parts: list[str] = []
+    for item in (history or [])[-10:]:
+        if item.get("role") in {"user", "system"}:
+            content = str(item.get("content") or "").strip()
+            if content:
+                parts.append(content)
+    if user_message:
+        parts.append(user_message)
+    if isinstance(result, dict) and result.get("response"):
+        parts.append(str(result.get("response") or ""))
+    return "\n".join(parts)
+
+
 def _stream_intent(
     user_message: str,
     project_context: dict,
@@ -734,6 +915,7 @@ def _stream_intent(
     content_plan_summary: str = "",
     assets_summary: str = "",
     slides_context: list[dict] | None = None,
+    attachments: list[ReferenceImage] | None = None,
 ):
     """流式解析用户意图，yield SSE 事件。"""
     import logging
@@ -744,7 +926,7 @@ def _stream_intent(
     # draft 阶段：没有 slides 时（无论 status 是 draft 还是 planning），都视为内容收集阶段
     is_draft = project_context["total_slides"] == 0
     has_documents = bool(documents and documents.strip())
-    logger.info(f"Chat stream: project={project_context['title']}, role={agent_role}, is_draft={is_draft}, has_documents={has_documents}, doc_len={len(documents) if documents else 0}")
+    logger.info(f"Chat stream: project={project_context['title']}, role={agent_role}, is_draft={is_draft}, has_documents={has_documents}, doc_len={len(documents) if documents else 0}, attachments={len(attachments or [])}")
 
     # 【关键】视觉总监按钮短路：用户点「素材已齐，开始生成」/「重新生成提案」按钮时，
     # 前端发出固定魔法消息，后端直接短路跳过 LLM，确保稳定推进到 Celery 生图，避免被 LLM 卡住。
@@ -800,9 +982,16 @@ def _stream_intent(
         else:
             system_prompt = _build_normal_prompt()
 
-    # 把文档内容放到系统 prompt 中（内容总监和视觉总监都需要）
-    if has_documents and agent_role != "visual":
-        system_prompt += f"\n\n=== 用户已上传的文档内容（你必须基于这些文档回答） ===\n{documents}\n=== 文档结束 ==="
+    # 把用户从 Brief / Agent 窗口上传的文件内容放到上下文中。
+    if has_documents:
+        if agent_role == "visual":
+            system_prompt += (
+                "\n\n=== 用户已上传的文件内容（作为视觉理解、页面修改和素材使用依据） ===\n"
+                f"{documents}\n"
+                "=== 文件内容结束 ==="
+            )
+        else:
+            system_prompt += f"\n\n=== 用户已上传的文件内容（你必须基于这些文件回答） ===\n{documents}\n=== 文件内容结束 ==="
 
     # 把页面上下文放到 system prompt 中
     if page_context:
@@ -833,6 +1022,33 @@ def _stream_intent(
                 system_prompt += f"\n\n=== 当前正在编辑的单页上下文 ===\n{page_json}\n=== 单页上下文结束 ==="
         except Exception as e:
             logger.warning(f"Failed to serialize page_context: {e}")
+
+    attachment_context = ""
+    if attachments:
+        attachment_lines = []
+        for idx, ref in enumerate(attachments, start=1):
+            label = ref.asset_name or os.path.basename(ref.file_path)
+            role_label = {
+                "chat_ref": "用户本轮拖入的图片",
+                "content_ref": "内容参考图",
+                "chart_ref": "图表参考图",
+                "visual_asset": "项目素材",
+                "finetune_ref": "微调参考图",
+            }.get(ref.role, "参考图")
+            attachment_lines.append(f"{idx}. {role_label}：{label}")
+        system_prompt += (
+            "\n\n【用户本轮随消息上传的图片】\n"
+            + "\n".join(attachment_lines)
+            + "\n你可以直接识别这些图片中的文字、图表、版式和视觉问题。"
+            "如果用户要求修改 PPT，必须把图片信息转化为可执行的内容、视觉或单页微调建议/动作。"
+        )
+        attachment_context = _build_attachment_context(attachments, agent_role)
+        if attachment_context:
+            system_prompt += (
+                "\n\n【图片 OCR 与读图结果】\n"
+                f"{attachment_context}\n"
+                "必须优先基于这些读图结果回答，不要说自己无法读取图片。"
+            )
 
     context = f"项目：{project_context['title']}，状态：{project_context['status']}，共 {project_context['total_slides']} 页，已完成 {project_context['completed_slides']} 页，内容规划已确认：{'是' if project_context.get('content_plan_confirmed') else '否'}"
 
@@ -1059,6 +1275,7 @@ def _stream_intent(
             documents=documents,
             page_context=page_context,
             slides_context=slides_context or [],
+            attachment_context=attachment_context,
             history=history,
             logger=logger,
         )
@@ -1156,6 +1373,18 @@ def _stream_intent(
                 "response": "好的，正在基于你的素材生成风格提案，请稍候..."
             }
 
+    if (
+        result
+        and isinstance(result, dict)
+        and agent_role == "visual"
+        and result.get("action") in {"propose_styles", "adjust_style"}
+        and isinstance(result.get("style_proposal"), dict)
+    ):
+        result["style_proposal"] = enforce_user_style_requirements(
+            result["style_proposal"],
+            _visual_style_requirement_text(user_message, result, history),
+        )
+
     logger.info(f"Chat stream: yielding result, action={result.get('action') if isinstance(result, dict) else 'n/a'}, content_len={len(result.get('response', '')) if isinstance(result, dict) else 0}")
     yield {"type": "result", "data": result}
 
@@ -1192,7 +1421,10 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
         "num_proposals": num_proposals,
     }
 
-    documents = load_project_documents(project_id)
+    documents = load_project_documents(project_id, parse_missing=True)
+    chat_attachments = _load_chat_attachments(db, project_id, body.attachment_ids)
+    if not chat_attachments:
+        chat_attachments = _load_ambient_chat_attachments(db, project_id, body.agent_role, body.message)
 
     # 为视觉总监构建内容规划摘要
     content_plan_summary = ""
@@ -1353,9 +1585,30 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
         _logger.info(f"Chat API: starting stream for project={project_id}, role={body.agent_role}")
         result_data = None
         try:
+            if chat_attachments:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "thinking",
+                            "delta": f"已收到 {len(chat_attachments)} 张图片，正在读取图片内容并结合当前页面判断修改方式。\n",
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+            elif documents and documents.strip():
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {"type": "thinking", "delta": "正在读取已上传文件内容并结合当前页面判断下一步。\n"},
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
             for event in _stream_intent(
                 body.message, context, body.history, documents,
-                body.page_context, body.agent_role, content_plan_summary, assets_summary, slides_context
+                body.page_context, body.agent_role, content_plan_summary, assets_summary, slides_context, chat_attachments
             ):
                 if event.get("type") == "result":
                     event = {**event, "data": with_next_action(event.get("data"), context, body.agent_role)}

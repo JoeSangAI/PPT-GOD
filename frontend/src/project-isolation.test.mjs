@@ -6,6 +6,7 @@ const sourcePath = join(import.meta.dirname, "App.tsx");
 const source = readFileSync(sourcePath, "utf8");
 const css = readFileSync(join(import.meta.dirname, "index.css"), "utf8");
 const workflow = readFileSync(join(import.meta.dirname, "workflow.ts"), "utf8");
+const client = readFileSync(join(import.meta.dirname, "api/client.ts"), "utf8");
 const lines = source.split(/\r?\n/);
 
 assert.match(source, /projectId\?: string;/, "ChatMessage must carry projectId ownership");
@@ -21,7 +22,7 @@ assert.equal(
 );
 assert.match(
   source,
-  /const addSystemLog = \(content: string\) => \{[\s\S]*appendProjectChatMessage\(projectId, "content"[\s\S]*appendProjectChatMessage\(projectId, "visual"/,
+  /const addSystemLog = \(content: string(?:, attachments\?: ChatAttachment\[\])?\) => \{[\s\S]*appendProjectChatMessage\(projectId, "content"[\s\S]*appendProjectChatMessage\(projectId, "visual"/,
   "system logs must go through project-scoped append"
 );
 assert.match(
@@ -68,6 +69,21 @@ assert.match(
   source,
   /result\.action === "regenerate_plan"[\s\S]*appendRequestMessage[\s\S]*dispatchGateAction\([\s\S]*"generate_content_plan"[\s\S]*allowWhileChatLoading: true[\s\S]*source: "agent"/,
   "content-stage regenerate_plan must acknowledge the user and execute instead of being silently blocked by chatLoading"
+);
+assert.match(
+  source,
+  /result\.action === "regenerate_plan"[\s\S]*dispatchGateAction\([\s\S]*attachment_ids: attachmentIdsForRequest/,
+  "Agent-triggered content-plan regeneration must carry the same attachment ids that informed the chat reply"
+);
+assert.match(
+  client,
+  /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\]\)[\s\S]*body\.attachment_ids = attachmentIds/,
+  "content-plan API requests must support explicit attachment ids"
+);
+assert.match(
+  source,
+  /currentSlides\.find\(\(s: Slide\) => s\.page_num === currentEditingSlide\.page_num\)/,
+  "content-plan regeneration must rebind the active editor to the fresh slide with the same page number"
 );
 assert.match(
   workflow,
@@ -136,7 +152,7 @@ assert.match(
 );
 assert.match(
   source,
-  /withCrossStageContext\(pageContext, requestAgentRole\)[\s\S]*chatWithAgentStream\(requestProjectId, userMsg, history, ctrl\.signal, effectivePageContext, requestAgentRole\)/,
+  /withCrossStageContext\(pageContext, requestAgentRole\)[\s\S]*chatWithAgentStream\(\s*requestProjectId,\s*[\s\S]*history,\s*ctrl\.signal,\s*effectivePageContext,\s*requestAgentRole/,
   "Agent chat requests must include cross-stage context in page_context"
 );
 assert.match(
@@ -146,7 +162,32 @@ assert.match(
 );
 assert.match(
   source,
-  /const addSystemLog = \(content: string\) => \{[\s\S]*appendProjectChatMessage\(projectId, "content"[\s\S]*if \(isVisualRelevantStageContext\(content, "system"\)\) \{[\s\S]*appendProjectChatMessage\(projectId, "visual"/,
+  /function buildVisualStyleGenerationContext\([\s\S]*用户：\$\{content\}[\s\S]*视觉总监：\$\{content\}/,
+  "style proposal generation must preserve recent visual chat requirements instead of only sending the fixed trigger text"
+);
+assert.match(
+  source,
+  /const isBackendStyleGenerationRequest = isVisualStyleGenerationMessage\(userMsg\)[\s\S]*const styleGenerationContext = buildVisualStyleGenerationContext\([\s\S]*history,[\s\S]*userMsg,[\s\S]*buildCrossStageContext\("visual"\)/,
+  "visual style generation must build backend context from the same chat that produced the visible reply"
+);
+assert.match(
+  source,
+  /const fallbackProposal = !isBackendStyleGenerationRequest && !canStartBackendStyleProposal && !proposalFromAgent && fallbackBaseStyle/,
+  "visual style-stage adjustments must use backend regeneration instead of locally falling back to the previous proposal"
+);
+assert.match(
+  source,
+  /generateStyleProposals\(requestProjectId, shouldForceStyleProposal, styleGenerationContext\)/,
+  "backend style generation must receive visual chat requirements"
+);
+assert.match(
+  client,
+  /JSON\.stringify\(\{ user_description: trimmedDescription \}\)/,
+  "style proposal API client must send chat-derived user style requirements"
+);
+assert.match(
+  source,
+  /const addSystemLog = \(content: string(?:, attachments\?: ChatAttachment\[\])?\) => \{[\s\S]*appendProjectChatMessage\(projectId, "content"[\s\S]*if \(isVisualRelevantStageContext\(content, "system"\)\) \{[\s\S]*appendProjectChatMessage\(projectId, "visual"/,
   "system logs must only enter the visual Agent when they affect visual decisions"
 );
 assert.match(
@@ -163,6 +204,16 @@ assert.match(
   source,
   /function normalizeProjectsForActiveSelection\(projects: Project\[], activeProjectId: string \| null\)[\s\S]*clearProjectNotification\(project\)/,
   "project lists must normalize unread notifications for the active project"
+);
+assert.match(
+  source,
+  /function projectStyleLabel\(project: Project\)[\s\S]*project\.selected_style\?\.name[\s\S]*project\.style_proposal\?\.proposals\?\.\[0\]\?\.name[\s\S]*默认风格/,
+  "project sidebar style labels must reflect the generated style proposal before final style selection"
+);
+assert.match(
+  source,
+  /statusLabel\[p\.status\][\s\S]*projectStyleLabel\(p\)/,
+  "project sidebar must use the generated proposal label instead of falling back to 默认风格"
 );
 assert.match(
   source,

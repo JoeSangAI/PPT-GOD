@@ -178,8 +178,8 @@ export default function VisualAssetsPanel({
     handler?.();
   };
   const uploadChoices = [
-    { key: "logo", title: "Logo", detail: "品牌标识 / 联合标识", action: onUploadLogo },
-    { key: "asset", title: "产品/主视觉", detail: "按页面内容自动推荐", action: onUploadVisualAsset },
+    { key: "logo", title: "品牌 Logo", detail: "作为角标或品牌标识", action: onUploadLogo },
+    { key: "asset", title: "可复用素材", detail: "产品、主视觉、人物、物料图", action: onUploadVisualAsset },
     { key: "style", title: "风格参考", detail: "学习气质，不强制出现", action: onUploadStyleRef },
     { key: "template", title: "版式模板", detail: "参考页面结构", action: onUploadTemplate },
   ];
@@ -402,7 +402,9 @@ export default function VisualAssetsPanel({
               项目素材 <span className="pg-assets-count-badge">{referenceImages.length}</span>
             </div>
             <div className="pg-assets-onboarding-subtitle">
-              整份 PPT 可复用的图片和 Logo；每页具体用哪些，请在单页编辑里的「本页图片确认」查看。
+              {showInVisualStage && referenceImages.length === 0
+                ? "生成视觉方向前，如果有 Logo、产品图、风格参考或模板，先放这里；没有也可以直接生成。"
+                : "跨页复用的图片和 Logo；只给某一页用的图，请在单页编辑里加「本页参考图」。"}
             </div>
           </div>
           <div className="pg-assets-lite-actions">
@@ -436,9 +438,14 @@ export default function VisualAssetsPanel({
           </div>
         )}
         {previewItems.length === 0 && (
-          <div className="pg-project-asset-empty-state">
-            <b>还没有项目素材</b>
-            <em>点击右上角「添加/管理素材」上传 Logo、产品图、风格参考或版式模板。</em>
+          <div className={`pg-project-asset-empty-state ${showInVisualStage ? "is-onboarding" : ""}`}>
+            <b>{showInVisualStage ? "先补充会影响视觉方向的素材" : "还没有项目素材"}</b>
+            <em>
+              {showInVisualStage
+                ? "有品牌 Logo、产品/主视觉、风格参考或版式模板就上传；没有也可以直接生成视觉方向。"
+                : "点击右上角「添加/管理素材」上传 Logo、产品图、风格参考或版式模板。"}
+            </em>
+            {showInVisualStage && <AddChoiceGrid compact />}
           </div>
         )}
       </section>
@@ -474,7 +481,7 @@ export default function VisualAssetsPanel({
             <div className="pg-manager-head">
               <div>
                 <div className="pg-assets-onboarding-title">项目素材库</div>
-                <div className="pg-assets-onboarding-subtitle">上传、筛选、编辑和删除都在这里；需要固定到某一页时，到单页编辑的「本页图片确认」里设置。</div>
+                <div className="pg-assets-onboarding-subtitle">这里管理跨页复用素材；当前页专用的图会留在对应页面的「本页图片确认」里。</div>
               </div>
               <button type="button" onClick={() => setShowManager(false)}>关闭</button>
             </div>

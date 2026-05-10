@@ -316,3 +316,40 @@ def test_confirmation_after_unapplied_plan_offer_generates_before_visual_handoff
 
 def test_page_reference_is_not_misread_as_deck_page_count():
     assert _infer_requested_page_count("第12页现在是什么作用？") is None
+
+
+def test_page_attachment_feedback_updates_current_slide_instead_of_regenerating_deck():
+    result = {"action": "answer", "response": "收到，正在把这两页信息做到当前页里。"}
+    page_context = {
+        "mode": "page",
+        "current_page": {
+            "page_num": 7,
+            "type": "content",
+            "content_json": {
+                "page_num": 7,
+                "type": "content",
+                "section_title": "",
+                "text_content": {"headline": "", "subhead": "", "body": ""},
+                "speaker_notes": "",
+                "visual_suggestion": "",
+            },
+        },
+    }
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="把这两页的信息做到这一页的 PPT 里面去",
+        project_context={"title": "非凡产研", "total_slides": 12},
+        page_context=page_context,
+        attachment_context="### 图片 1: 第一页\n关键数据：OpenDay 39 场。\n\n### 图片 2: 第二页\n累计参会约 2 万人。",
+        compiler=lambda **_: {
+            "action": "regenerate_plan",
+            "topic": "非凡产研。重新生成内容规划。",
+            "response": "收到，正在重新生成内容规划。",
+        },
+    )
+
+    assert compiled["action"] == "update_slide_content"
+    assert compiled["updated_content"]["page_num"] == 7
+    assert "OpenDay 39 场" in compiled["updated_content"]["text_content"]["body"]
+    assert "累计参会约 2 万人" in compiled["updated_content"]["text_content"]["body"]

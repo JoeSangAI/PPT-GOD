@@ -1984,6 +1984,64 @@ def test_visual_asset_upload_rejects_slide_level_asset(tmp_path, monkeypatch):
     assert "project-level" in exc.value.detail
 
 
+def test_page_reference_upload_attaches_directly_to_slide_and_cleans_overlay(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Page ref upload", status="visual_ready")
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="visual_ready",
+        visual_json={"visual_description": "old", "overlay_layers": []},
+        prompt_text="old prompt",
+    )
+    db.add(slide)
+    db.commit()
+
+    monkeypatch.setattr(slides_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = slides_api.upload_file(
+        project.id,
+        png_upload("page-product.png"),
+        role="content_ref",
+        slide_id=slide.id,
+        process_mode="blend",
+        asset_name="本页产品图",
+        asset_kind=None,
+        usage_note="只给第一页使用",
+        db=db,
+    )
+
+    ref = db.query(ReferenceImage).filter(ReferenceImage.id == result["id"]).first()
+    ref_id = ref.id
+    assert ref.role == "content_ref"
+    assert ref.slide_id == slide.id
+    assert ref.asset_name == "本页产品图"
+    assert ref.usage_note == "只给第一页使用"
+    assert result["process_mode"] == "blend"
+
+    slides_api.update_slide_overlay_layers(
+        project.id,
+        slide.id,
+        slides_api.OverlayLayersRequest(
+            layers=[slides_api.OverlayLayerRequest(asset_id=ref_id, preset="right-card")]
+        ),
+        db=db,
+    )
+    db.expire_all()
+    overlaid_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+    overlaid_ref = db.query(ReferenceImage).filter(ReferenceImage.id == ref_id).first()
+    assert overlaid_slide.visual_json["overlay_layers"][0]["asset_id"] == ref_id
+    assert overlaid_ref.process_mode == "original"
+
+    slides_api.delete_reference_image(project.id, ref_id, db=db)
+    db.expire_all()
+    cleaned_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+    assert cleaned_slide.visual_json.get("overlay_layers") == []
+    assert db.query(ReferenceImage).filter(ReferenceImage.id == ref_id).first() is None
+
+
 def test_logo_upload_keeps_existing_global_logos(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="Logo upload", status="planning")

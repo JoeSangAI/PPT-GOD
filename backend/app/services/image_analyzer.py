@@ -244,6 +244,34 @@ def analyze_visual_asset(image_path: str, asset_name: str = "", asset_kind: str 
     return result
 
 
+def describe_context_image(image_path: str, image_name: str = "", role: str = "", purpose: str = "") -> str:
+    """
+    Read a user-supplied context image for Agent chat and content planning.
+    This is content-facing: OCR first, then summarize the visual material so
+    text-only downstream prompts still receive the image's substance.
+    """
+    if not os.path.exists(image_path):
+        logger.warning(f"Context image file not found: {image_path}")
+        return ""
+
+    filename = os.path.basename(image_path)
+    prompt = f"""你是 PPT Agent 的读图助手。请忠实解读这张用户上传的图片，重点服务于 PPT 内容提取、页面修改和视觉参考。
+
+请按以下结构输出，尽量具体，不要编造图片外信息：
+
+1. OCR文字：逐条列出图片中可读的标题、正文、数字、标签、品牌名、流程节点、图表文字；如果没有文字，写“无明显文字”。
+2. 图像内容：客观描述图片中的主体、版式、图表/流程/产品/场景，以及层级关系。
+3. 可用于PPT的信息：提炼可以写进 PPT 的要点、数据、结构或修改建议。
+4. 视觉参考：如果图片适合作为视觉参考，描述配色、排版、构图、素材主体和必须保留的识别特征。
+
+图片名称：{image_name or filename}
+图片角色：{role or "用户上传图片"}
+使用场景：{purpose or "Agent 对话上下文"}"""
+
+    raw = _call_vision_model(image_path, prompt)
+    return (raw or "").strip()[:4000]
+
+
 def _parse_analysis_result(raw: str, analysis_type: str) -> Dict:
     """解析视觉模型返回的 JSON，失败时返回默认值。"""
     raw = raw.strip()

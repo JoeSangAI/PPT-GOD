@@ -61,7 +61,7 @@ from app.services.visual_plan import generate_visual_plan, _recall_visual_assets
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 from app.services.visual_strategy import detect_logo_tone_from_image
-from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset
+from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
 from app.services.artifact_versions import dependency_signature, with_artifact_meta
 from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
@@ -97,7 +97,7 @@ logger = logging.getLogger(__name__)
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
-ALLOWED_UPLOAD_ROLES = {"style_ref", "logo", "template", "visual_asset", "content_ref", "chart_ref", "finetune_ref"}
+ALLOWED_UPLOAD_ROLES = {"style_ref", "logo", "template", "visual_asset", "content_ref", "chart_ref", "finetune_ref", "chat_ref"}
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg",
     "image/png",
@@ -1139,6 +1139,122 @@ def _mark_generation_idle(project: Project | None, db: Session, reason: str):
         db.commit()
 
 
+def _celery_task_id_from_payload(payload: dict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    task_id = payload.get("id")
+    if task_id:
+        return str(task_id)
+    request = payload.get("request")
+    if isinstance(request, dict) and request.get("id"):
+        return str(request["id"])
+    return None
+
+
+def _celery_task_present_in_worker(task_id: str) -> bool | None:
+    """Return whether a task is visible to the currently connected workers."""
+    try:
+        from app.celery_app import celery_app
+
+        inspector = celery_app.control.inspect(timeout=1.0)
+        snapshots = [inspector.active(), inspector.reserved(), inspector.scheduled()]
+    except Exception as exc:
+        logger.warning(f"Failed to inspect Celery workers for task {task_id}: {exc}")
+        return None
+
+    saw_worker = False
+    saw_snapshot = False
+    for snapshot in snapshots:
+        if snapshot is None:
+            continue
+        if not isinstance(snapshot, dict):
+            continue
+        saw_snapshot = True
+        if snapshot:
+            saw_worker = True
+        for tasks in snapshot.values():
+            if not isinstance(tasks, list):
+                continue
+            for item in tasks:
+                if _celery_task_id_from_payload(item) == task_id:
+                    return True
+    if not saw_snapshot or not saw_worker:
+        return None
+    return False
+
+
+def _celery_result_state(task_id: str) -> str:
+    try:
+        from app.celery_app import celery_app
+
+        return str(AsyncResult(task_id, app=celery_app).state)
+    except Exception as exc:
+        logger.warning(f"Failed to read Celery result state for task {task_id}: {exc}")
+        return "UNKNOWN"
+
+
+def _run_seconds_since(value) -> float:
+    if not value:
+        return 0
+    try:
+        return max(0, time.time() - float(value.timestamp()))
+    except Exception:
+        return 0
+
+
+def _task_age_seconds(project_id: str, active_run) -> float:
+    started_raw = redis_client.get(f"project:{project_id}:task_started_at")
+    try:
+        started_at = float(started_raw.decode() if isinstance(started_raw, bytes) else started_raw)
+    except (TypeError, ValueError):
+        started_at = 0
+    if started_at > 0:
+        return max(0, time.time() - started_at)
+    return _run_seconds_since(getattr(active_run, "started_at", None))
+
+
+def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, active_run) -> bool:
+    if not project or not active_run or not active_run.task_id:
+        return False
+
+    try:
+        timeout = int(settings.GENERATION_PENDING_TIMEOUT_SECONDS or 0)
+    except (TypeError, ValueError):
+        timeout = 0
+    timeout = max(30, timeout)
+
+    task_id = str(active_run.task_id)
+    state = _celery_result_state(task_id)
+    task_age = _task_age_seconds(project.id, active_run)
+    inactive_for = _run_seconds_since(active_run.updated_at or active_run.started_at)
+    reason = None
+
+    if state == "PENDING" and task_age > timeout:
+        reason = "后台生成服务没有接收本次任务，已停止本次生成。请重试未完成页面。"
+    elif state in {"STARTED", "RETRY"} and inactive_for > timeout:
+        present = _celery_task_present_in_worker(task_id)
+        if present is False:
+            reason = "后台生成服务中断，本次生成已停止。请重试未完成页面。"
+
+    if not reason:
+        return False
+
+    logger.warning(
+        "Marking lost Celery task stale: project=%s run=%s task=%s state=%s",
+        project.id,
+        active_run.id,
+        task_id,
+        state,
+    )
+    _mark_generation_idle(project, db, reason)
+    stale_active_run(db, project.id, reason)
+    generation_progress.pop(project.id, None)
+    redis_client.delete(f"project:{project.id}:task_id")
+    redis_client.delete(f"project:{project.id}:task_started_at")
+    db.commit()
+    return True
+
+
 def _format_reference_analysis(analysis: dict) -> str:
     parts = []
     if analysis.get("description"):
@@ -1321,6 +1437,7 @@ class PageNumsRequest(BaseModel):
 class ContentPlanRequest(BaseModel):
     topic: Optional[str] = None
     page_count: Optional[int] = None
+    attachment_ids: Optional[List[str]] = None
 
 
 class CreateSlideRequest(BaseModel):
@@ -1364,7 +1481,43 @@ class ReorderRequest(BaseModel):
     page_nums: List[int]
 
 
-def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | None = None, run_id: str | None = None):
+def _content_plan_attachment_context(db: Session, project_id: str, attachment_ids: list[str] | None) -> str:
+    ids = [str(item) for item in (attachment_ids or []) if str(item).strip()]
+    if not ids:
+        return ""
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.id.in_(ids),
+        ReferenceImage.role.in_(["chat_ref", "content_ref", "chart_ref", "visual_asset"]),
+    ).all()
+    by_id = {ref.id: ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
+    parts: list[str] = []
+    role_label = {
+        "chat_ref": "本轮对话图片",
+        "content_ref": "内容素材图",
+        "chart_ref": "图表参考图",
+        "visual_asset": "项目素材图",
+    }
+    for idx, ref_id in enumerate(ids, start=1):
+        ref = by_id.get(ref_id)
+        if not ref:
+            continue
+        label = ref.asset_name or os.path.basename(ref.file_path)
+        description = describe_context_image(ref.file_path, label, role_label.get(ref.role, "参考图"), "内容规划生成")
+        if not description:
+            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+            description = analysis.get("description") or analysis.get("subject") or "图片已上传，但当前没有可用解读。"
+        parts.append(f"--- 本轮附件 {idx}: {label} ---\n{description}")
+    return "\n\n".join(parts).strip()
+
+
+def _generate_content_plan_bg(
+    project_id: str,
+    topic: str,
+    page_count: int | None = None,
+    run_id: str | None = None,
+    attachment_ids: list[str] | None = None,
+):
     """后台任务：异步生成 Content Plan。"""
     import logging
     logger = logging.getLogger(__name__)
@@ -1377,6 +1530,37 @@ def _generate_content_plan_bg(project_id: str, topic: str, page_count: int | Non
         _update_progress(project_id, {"stage": "document_parse", "message": "正在读取上传材料...", "current_page": 0, "total_pages": page_count or 10}, run_id)
 
         documents = load_project_documents(project_id, parse_missing=True)
+        explicit_attachment_context = _content_plan_attachment_context(db, project_id, attachment_ids)
+        if explicit_attachment_context:
+            documents = "\n\n".join(
+                part for part in [
+                    documents,
+                    "【本轮 Agent 指令附件】\n这些素材来自触发本次生成的同一条用户消息，优先级高于历史项目素材。\n"
+                    + explicit_attachment_context,
+                ] if part
+            )
+        explicit_attachment_ids = {str(item) for item in (attachment_ids or []) if str(item).strip()}
+        image_context_parts: list[str] = []
+        content_refs = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.role == "content_ref",
+            ReferenceImage.slide_id.is_(None),
+        ).all()
+        for idx, ref in enumerate(content_refs[:8], start=1):
+            if ref.id in explicit_attachment_ids:
+                continue
+            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+            if analysis.get("pptx_source_page_num"):
+                continue
+            if not ref.file_path or not os.path.exists(ref.file_path):
+                continue
+            label = ref.asset_name or os.path.basename(ref.file_path)
+            description = describe_context_image(ref.file_path, label, "内容素材图", "内容规划生成")
+            if description:
+                image_context_parts.append(f"--- 图片素材 {idx}: {label} ---\n{description}")
+        if image_context_parts:
+            image_context = "\n\n".join(image_context_parts)
+            documents = "\n\n".join(part for part in [documents, image_context] if part)
         if documents:
             logger.info(f"[ContentPlan BG] Loaded documents, length={len(documents)}")
             inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
@@ -1528,7 +1712,7 @@ def create_content_plan(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    background_tasks.add_task(_generate_content_plan_bg, project_id, topic, page_count, run.id)
+    background_tasks.add_task(_generate_content_plan_bg, project_id, topic, page_count, run.id, body.attachment_ids or [])
     return {"message": "Content plan generation started", "status": project.status, "run": serialize_run(run)}
 
 
@@ -2509,7 +2693,9 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         .all()
     )
 
-    stale_run = stale_inactive_run_if_needed(db, project_id)
+    active_run = get_active_run(db, project_id)
+    lost_celery_task = _stale_missing_celery_task_if_needed(project, db, active_run)
+    stale_run = None if lost_celery_task else stale_inactive_run_if_needed(db, project_id)
     if stale_run and stale_run.status == "stale":
         db.commit()
     active_run = get_active_run(db, project_id)
@@ -2544,7 +2730,9 @@ def get_generation_progress(project_id: str, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    stale_run = stale_inactive_run_if_needed(db, project_id)
+    active_run = get_active_run(db, project_id)
+    lost_celery_task = _stale_missing_celery_task_if_needed(project, db, active_run)
+    stale_run = None if lost_celery_task else stale_inactive_run_if_needed(db, project_id)
     if stale_run and stale_run.status == "stale":
         db.commit()
     active_run = get_active_run(db, project_id)
@@ -2656,7 +2844,7 @@ def upload_file(
             raise HTTPException(status_code=404, detail="Slide not found")
 
     # 数量限制：页面级长期参考图最多 10 张；项目级素材库不设硬上限。
-    if role != "visual_asset" and role != "finetune_ref":
+    if slide_id and role not in {"visual_asset", "finetune_ref", "chat_ref"}:
         existing_count = db.query(ReferenceImage).filter(
             ReferenceImage.project_id == project_id,
             ReferenceImage.slide_id == slide_id,
@@ -2779,9 +2967,9 @@ def upload_file(
         file_path=file_path,
         role=role,
         process_mode=process_mode,
-        asset_name=cleaned_asset_name if role == "visual_asset" else None,
+        asset_name=cleaned_asset_name if role == "visual_asset" or role in {"content_ref", "chart_ref"} else None,
         asset_kind=normalized_asset_kind if role == "visual_asset" else None,
-        usage_note=cleaned_usage_note if role == "visual_asset" else None,
+        usage_note=cleaned_usage_note if role == "visual_asset" or role in {"content_ref", "chart_ref"} else None,
         asset_analysis=asset_analysis if role == "visual_asset" or role in REFERENCE_ANALYSIS_ROLES or role == "logo" else None,
         logo_anchor=normalized_logo_anchor if role == "logo" else None,
     )
@@ -3074,6 +3262,8 @@ def delete_reference_image(
     if ref.slide_id and ref.role != "finetune_ref":
         slide = db.query(Slide).filter(Slide.id == ref.slide_id, Slide.project_id == project_id).first()
         if slide:
+            if ref.role in {"content_ref", "chart_ref"}:
+                slide.visual_json = remove_asset_from_overlay_layers(slide.visual_json, ref_id)
             _invalidate_visual_plan_dependent_outputs(project, [slide])
     if ref.role == "visual_asset":
         slides = db.query(Slide).filter(Slide.project_id == project_id).all()

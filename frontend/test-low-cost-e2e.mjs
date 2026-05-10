@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const APP_URL = process.env.APP_URL || "http://127.0.0.1:5173";
+const APP_URL = process.env.APP_URL || "http://127.0.0.1:8000";
 const API_BASE = process.env.VITE_API_BASE_URL || "http://localhost:8000";
 const APP_ORIGIN = new URL(APP_URL).origin;
 const API_ORIGIN = new URL(API_BASE, APP_URL).origin;
@@ -55,9 +55,10 @@ async function isAppReachable(url) {
 
 async function startPreviewServer() {
   const viteJs = path.join(__dirname, "node_modules", "vite", "bin", "vite.js");
+  const previewUrl = new URL(APP_URL);
   const proc = spawn(
     process.execPath,
-    [viteJs, "preview", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+    [viteJs, "preview", "--host", previewUrl.hostname, "--port", previewUrl.port || "8000", "--strictPort"],
     { cwd: __dirname, stdio: "ignore" },
   );
   for (let i = 0; i < 60; i++) {
@@ -247,7 +248,7 @@ try {
   project.status = "failed";
   slides[0].status = "failed";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: "一键重试失败页" }).click();
+  await page.getByRole("button", { name: "一键重试失败页" }).first().click();
   await page.getByText("已启动 1 个失败页面的重试", { exact: true }).waitFor({ timeout: 10_000 });
 
   project.status = "prompt_ready";

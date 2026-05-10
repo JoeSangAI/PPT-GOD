@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
@@ -10,7 +11,12 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import Project, Slide
-from app.services.image_generation import generate_slide_image, save_slide_image
+from app.services.image_generation import (
+    generate_slide_image,
+    get_image_call_events,
+    reset_image_call_events,
+    save_slide_image,
+)
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
 from app.services.logo_overlay_layout import resolve_logo_overlay_box
 from app.services.logo_policy import is_logo_confirmed, should_show_logo, should_use_logo_as_scene_asset
@@ -23,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
+_MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千万0-9]+)")
 
 
 def _existing_path(path: str | None, output_dir: str | None = None) -> str | None:
@@ -35,6 +42,25 @@ def _existing_path(path: str | None, output_dir: str | None = None) -> str | Non
         if os.path.exists(candidate):
             return candidate
     return path
+
+
+def _tag_reference_image(img: Image.Image, role: str, source_path: str | None = None) -> Image.Image:
+    tagged = img.copy()
+    tagged.info["pptgod_reference_role"] = role
+    if source_path:
+        tagged.info["pptgod_reference_source_path"] = source_path
+        try:
+            stat = os.stat(source_path)
+            tagged.info["pptgod_reference_source_mtime_ns"] = stat.st_mtime_ns
+            tagged.info["pptgod_reference_source_size"] = stat.st_size
+        except OSError:
+            pass
+    return tagged
+
+
+def _open_reference_image(path: str, role: str) -> Image.Image:
+    with Image.open(path) as img:
+        return _tag_reference_image(img, role or "reference", path)
 
 
 def _reference_input_priority(ref: Dict) -> int:
@@ -50,11 +76,71 @@ def _reference_input_priority(ref: Dict) -> int:
         return 2
     if role == "visual_asset":
         return 3
-    if role == "seed_ref":
+    if role in {"seed_ref", "seed_ref_hint"}:
         return 4
     if role == "template":
         return 5
     return 9
+
+
+def _slide_text_content(slide: Slide) -> Dict:
+    content = slide.content_json if isinstance(slide.content_json, dict) else {}
+    text = content.get("text_content")
+    return text if isinstance(text, dict) else {}
+
+
+def _module_marker_from_slide(slide: Slide) -> str:
+    text = _slide_text_content(slide)
+    candidates = [
+        str(text.get("headline") or ""),
+        str((slide.content_json or {}).get("section_title") or "") if isinstance(slide.content_json, dict) else "",
+    ]
+    for value in candidates:
+        match = _MODULE_MARKER_RE.search(value)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _uses_seed_base_edit_contract(slide: Slide) -> bool:
+    return (slide.type or "").lower() == "section"
+
+
+def _seed_reference_limit(slide: Slide) -> int:
+    return 1 if _uses_seed_base_edit_contract(slide) else 2
+
+
+def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
+    if seed_image_count <= 0 or not _uses_seed_base_edit_contract(slide):
+        return ""
+
+    content = slide.content_json if isinstance(slide.content_json, dict) else {}
+    text = _slide_text_content(slide)
+    section_title = str(content.get("section_title") or "").strip()
+    headline = str(text.get("headline") or "").strip()
+    subhead = str(text.get("subhead") or "").strip()
+    marker = _module_marker_from_slide(slide)
+
+    targets = []
+    if marker:
+        targets.append(f"module marker 「{marker}」")
+    if section_title:
+        targets.append(f"main title 「{section_title}」")
+    if headline:
+        targets.append(f"headline 「{headline}」")
+    if subhead:
+        targets.append(f"subhead 「{subhead}」")
+    target_text = "; ".join(targets) or "this slide's own section text"
+
+    return (
+        "\n\nDIRECT SEED IMAGE EDIT CONTRACT: Use Reference Image 1 as the base slide image. "
+        "Keep its background, texture, ornament placement, left-right composition, typography scale, "
+        "spacing, and alignment as unchanged as possible. Only update the visible chapter marker and "
+        f"chapter text to: {target_text}. Remove old seed chapter text. Do not copy the seed's old "
+        "module marker or title. Do not add Arabic numerals such as 03 unless they already exist in "
+        "the base image. This contract overrides any earlier layout or composition wording that conflicts "
+        "with the base image."
+    )
 
 
 def _load_reference_images(
@@ -94,7 +180,7 @@ def _load_reference_images(
         if os.path.exists(finetune_base_path):
             try:
                 refs.append({
-                    "image": Image.open(finetune_base_path),
+                    "image": _open_reference_image(finetune_base_path, "finetune_base"),
                     "process_mode": "original",
                     "role": "finetune_base",
                     "label": "Current Slide Image",
@@ -138,7 +224,7 @@ def _load_reference_images(
             if os.path.exists(ref.file_path):
                 try:
                     refs.append({
-                        "image": Image.open(ref.file_path),
+                        "image": _open_reference_image(ref.file_path, ref.role),
                         "process_mode": ref.process_mode or "blend",
                         "role": ref.role,
                         "label": f"Reference Image {idx}",
@@ -171,7 +257,7 @@ def _load_reference_images(
             if os.path.exists(ref.file_path):
                 try:
                     refs.append({
-                        "image": Image.open(ref.file_path),
+                        "image": _open_reference_image(ref.file_path, ref.role),
                         "process_mode": ref.process_mode or default_visual_asset_process_mode(getattr(ref, "asset_kind", None)),
                         "role": ref.role,
                         "label": f"Protected Project Visual Asset {idx}",
@@ -207,7 +293,7 @@ def _load_reference_images(
             try:
                 logo_path = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) or prepare_logo_overlay_image(logo_refs[0].file_path)
                 refs.append({
-                    "image": Image.open(logo_path),
+                    "image": _open_reference_image(logo_path, "logo"),
                     "process_mode": "blend",
                     "role": "logo",
                     "label": "Protected Brand Logo Lockup" if len(logo_refs) > 1 else "Protected Brand Logo",
@@ -260,7 +346,7 @@ def _load_reference_images(
                         "original" if route_mode == "overlay" else "blend"
                     )
                     refs.append({
-                        "image": Image.open(ref.file_path),
+                        "image": _open_reference_image(ref.file_path, ref.role),
                         "process_mode": effective_process_mode,
                         "asset_route_mode": route_mode,
                         "role": ref.role,
@@ -281,8 +367,24 @@ def _load_reference_images(
 
     # 4. 同家族种子页：版式锚点。仅取最多 2 张，避免抢主体权重。
     seed_loaded = False
-    if seed_image_paths:
-        for seed_idx, seed_path in enumerate(seed_image_paths[:2], start=1):
+    use_seed_reference_images = bool(settings.IMAGE_USE_SEED_REFERENCE_IMAGES)
+    seed_reference_limit = _seed_reference_limit(slide)
+    if seed_image_paths and not use_seed_reference_images:
+        valid_seed_paths = [seed_path for seed_path in seed_image_paths[:seed_reference_limit] if seed_path and os.path.exists(seed_path)]
+        for seed_idx, seed_path in enumerate(valid_seed_paths, start=1):
+            refs.append({
+                "role": "seed_ref_hint",
+                "label": f"Family Seed Layout {seed_idx}",
+                "file_path": seed_path,
+            })
+        seed_loaded = bool(valid_seed_paths)
+        if seed_loaded:
+            logger.info(
+                f"Slide {slide.page_num}: 检测到同家族种子页 {len(valid_seed_paths)} 张，"
+                "默认只作为文字一致性提示，不上传到图片编辑接口"
+            )
+    elif seed_image_paths:
+        for seed_idx, seed_path in enumerate(seed_image_paths[:seed_reference_limit], start=1):
             if len(refs) >= MAX_REFERENCE_INPUTS:
                 break
             if not seed_path or not os.path.exists(seed_path):
@@ -290,7 +392,7 @@ def _load_reference_images(
                 continue
             try:
                 refs.append({
-                    "image": Image.open(seed_path),
+                    "image": _open_reference_image(seed_path, "seed_ref"),
                     "process_mode": "blend",
                     "role": "seed_ref",
                     "label": f"Family Seed Layout {seed_idx}",
@@ -312,7 +414,7 @@ def _load_reference_images(
             if os.path.exists(tmpl_path) and len(refs) < MAX_REFERENCE_INPUTS:
                 try:
                     refs.append({
-                        "image": Image.open(tmpl_path),
+                        "image": _open_reference_image(tmpl_path, "template"),
                         "process_mode": "blend",
                         "role": "template",
                         "label": "Template Reference",
@@ -323,16 +425,28 @@ def _load_reference_images(
                     logger.warning(f"无法加载模板参考图 {tmpl_path}: {e}")
 
     refs = sorted(refs, key=_reference_input_priority)
-    if len(refs) > MAX_REFERENCE_INPUTS:
+    image_ref_count = sum(1 for ref in refs if ref.get("image") is not None)
+    if image_ref_count > MAX_REFERENCE_INPUTS:
         logger.warning(
             "Slide %s: 参考图 %s 张超过 API 上限 %s，仅前 %s 张进入本次生图",
             slide.page_num,
-            len(refs),
+            image_ref_count,
             MAX_REFERENCE_INPUTS,
             MAX_REFERENCE_INPUTS,
         )
-    logger.info(f"Slide {slide.page_num}: 共加载 {len(refs)} 张参考图（种子: {'有' if seed_loaded else '无'}）")
-    return refs[:MAX_REFERENCE_INPUTS]
+    limited_refs = []
+    kept_image_refs = 0
+    for ref in refs:
+        if ref.get("image") is not None:
+            if kept_image_refs >= MAX_REFERENCE_INPUTS:
+                continue
+            kept_image_refs += 1
+        limited_refs.append(ref)
+    logger.info(
+        f"Slide {slide.page_num}: 共加载 {kept_image_refs} 张图片参考"
+        f"（种子: {'有' if seed_loaded else '无'}）"
+    )
+    return limited_refs
 
 
 def _map_slide_type_to_template_key(slide_type: str) -> str:
@@ -441,6 +555,8 @@ def _uses_direct_finetune_ref(ref_data: List[Dict]) -> bool:
 def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
     refs = []
     for ref in ref_data:
+        if not ref.get("image"):
+            continue
         route_mode = str(ref.get("asset_route_mode") or "").lower()
         if route_mode == "blend":
             continue
@@ -494,27 +610,37 @@ def _generate_one_slide(
     if not slide.prompt_text:
         return {"slide": slide, "error": "缺少 prompt"}
 
+    reset_image_call_events()
     try:
         ref_data = list(preloaded_ref_data) if preloaded_ref_data else []
         product_refs = _product_refinement_refs(ref_data)
         use_product_refinement = bool(product_refs) and not _uses_direct_finetune_ref(ref_data)
         first_pass_ref_data = list(ref_data)
-        ref_images = [r["image"] for r in first_pass_ref_data]
+        ref_images = [r["image"] for r in first_pass_ref_data if r.get("image") is not None]
         prompt = slide.prompt_text
 
         # 当本页带有种子参考图时，在 prompt 末尾追加一行明确告知模型，
         # 让它把同家族种子页当作版式锚点 — 不复制内容、只复用视觉系统。
-        seed_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref")
-        if seed_count > 0:
-            seed_instruction = (
+        seed_image_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref")
+        seed_hint_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref_hint")
+        seed_count = seed_image_count + seed_hint_count
+        if seed_image_count > 0:
+            seed_instruction = _seed_base_edit_instruction(slide, seed_image_count) or (
                 f"\n\nIMPORTANT — SAME-FAMILY LAYOUT REFERENCE: "
-                f"{seed_count} of the attached reference images are previously generated slides from the same page family in this deck. "
+                f"{seed_image_count} of the attached reference images are previously generated slides from the same page family in this deck. "
                 f"They are LAYOUT ANCHORS only: reuse their typography choices, color palette, ornament language, grid system, and hierarchy. "
                 f"DO NOT copy any of their text content, headlines, body, photographs, illustrations, or scene subjects. "
                 f"DO NOT copy a logo from the seed unless this slide also has the uploaded logo attached as its own reference. "
                 f"Render this slide's own text and visual evidence in the SAME design DNA so the deck feels visually consistent."
             )
             prompt = prompt + seed_instruction
+        elif seed_hint_count > 0:
+            prompt = prompt + (
+                "\n\nIMPORTANT — SAME-FAMILY VISUAL CONTINUITY: Previously generated seed slides exist for this page family, "
+                "but they are not attached as image inputs to keep generation reliable. Follow the deck's selected style pack, "
+                "typography, palette, ornament language, grid system, and hierarchy closely so this slide feels like the same design system. "
+                "Do not change the requested slide text or visual evidence."
+            )
 
         if use_product_refinement:
             prompt = _background_pass_prompt(prompt, product_refs)
@@ -565,10 +691,19 @@ def _generate_one_slide(
         logger.info(f"Pipeline: 第 {slide.page_num} 页生成完成"
                     + (f" (使用 {seed_count} 张同家族种子参考)" if seed_count else "")
                     + (f" (产品二次生成 {len(product_refs)} 张参考)" if use_product_refinement else ""))
-        return {"slide": slide, "image_path": image_path, "error": None}
+        return {
+            "slide": slide,
+            "image_path": image_path,
+            "error": None,
+            "image_generation_events": get_image_call_events(),
+        }
     except Exception as e:
         logger.error(f"Pipeline: 第 {slide.page_num} 页生成失败: {e}")
-        return {"slide": slide, "error": str(e)[:500]}
+        return {
+            "slide": slide,
+            "error": str(e)[:500],
+            "image_generation_events": get_image_call_events(),
+        }
 
 
 def run_generation_pipeline(
@@ -635,6 +770,19 @@ def run_generation_pipeline(
     output_dir = settings.OUTPUT_DIR or "./outputs"
     slide_images = []
 
+    def attach_generation_audit(slide: Slide, result: Dict) -> None:
+        events = result.get("image_generation_events") or []
+        if not events and not result.get("error"):
+            return
+        visual = dict(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+        visual["last_image_generation"] = {
+            "status": "failed" if result.get("error") else "completed",
+            "events": events[-8:],
+            "error": result.get("error"),
+        }
+        slide.visual_json = visual
+        flag_modified(slide, "visual_json")
+
     def record_generation_result(result: Dict) -> None:
         if not current_run_active():
             logger.info(f"Pipeline: run {run_id} is no longer active; skipping stale slide writeback")
@@ -643,6 +791,7 @@ def run_generation_pipeline(
         if result.get("error"):
             slide.status = "failed"
             slide.error_msg = result["error"]
+            attach_generation_audit(slide, result)
         else:
             slide.image_path = result["image_path"]
             slide.status = "completed"
@@ -658,6 +807,7 @@ def run_generation_pipeline(
                     }
                 }
                 flag_modified(slide, "visual_json")
+            attach_generation_audit(slide, result)
             speaker_notes = ""
             if slide.content_json and isinstance(slide.content_json, dict):
                 speaker_notes = slide.content_json.get("speaker_notes", "")

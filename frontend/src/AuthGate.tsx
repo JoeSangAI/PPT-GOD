@@ -14,13 +14,19 @@ import {
 } from "./api/client";
 
 const LOCAL_ADMIN_AUTH: MvpAuth = { testerId: "local-admin", displayName: "本地管理员" };
-const SERVER_MANAGED_PROVIDERS = import.meta.env.PROD;
+const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+function isLocalHost() {
+  return LOCAL_HOSTS.has(window.location.hostname);
+}
+
+const LOCAL_DEBUG_MODE = isLocalHost();
+const SERVER_MANAGED_PROVIDERS = import.meta.env.PROD || LOCAL_DEBUG_MODE;
 
 function isLocalAdminUrl() {
-  const host = window.location.hostname;
-  if (!["127.0.0.1", "localhost", "::1"].includes(host)) return false;
+  if (!isLocalHost()) return false;
   const params = new URLSearchParams(window.location.search);
-  return params.get("local_admin") === "1" || params.get("admin") === "1";
+  return LOCAL_DEBUG_MODE || params.get("local_admin") === "1" || params.get("admin") === "1";
 }
 
 function getInitialAuth(): MvpAuth | null {

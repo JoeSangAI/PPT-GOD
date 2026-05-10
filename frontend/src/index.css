@@ -526,6 +526,13 @@ body {
 
 .pg-editor-toolbar {
   border-color: var(--pg-line);
+  background: var(--pg-surface);
+}
+
+.pg-single-slide-editor {
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .pg-editor label,
@@ -3455,6 +3462,16 @@ body {
   line-height: 1.4;
 }
 
+.pg-project-asset-empty-state.is-onboarding {
+  gap: 8px;
+}
+
+.pg-project-asset-empty-state.is-onboarding .pg-add-menu {
+  margin: 2px 0 0;
+  border-style: dashed;
+  background: var(--pg-surface-muted);
+}
+
 .pg-lite-subsection {
   margin-bottom: 7px;
 }
@@ -4822,6 +4839,82 @@ body {
   background: #fbfaf8;
   border-color: #e7e1d8 !important;
   padding: 12px 14px !important;
+}
+
+.pg-oracle-panel .pg-composer-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pg-oracle-panel .pg-composer-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 4px;
+}
+
+.pg-oracle-panel .pg-composer-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 5px 9px;
+  border: 1px solid #d8dee8;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.06);
+  transition: border-color 0.16s ease, color 0.16s ease, background-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.pg-oracle-panel .pg-composer-attach svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.pg-oracle-panel .pg-composer-attach:hover {
+  border-color: #aab4c2;
+  background: #f8fafc;
+  color: #111827;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.1);
+}
+
+.pg-oracle-panel .pg-composer-attach:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.pg-oracle-panel .pg-composer-tools-hint {
+  overflow: hidden;
+  color: #98a2b3;
+  font-size: 11px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pg-icon-action {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border-width: 1px;
+  border-radius: 999px;
+  background: #ffffff;
+  transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease;
+}
+
+.pg-icon-action svg {
+  width: 15px;
+  height: 15px;
 }
 
 .pg-oracle-panel .pg-composer-row {

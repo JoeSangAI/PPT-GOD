@@ -108,6 +108,10 @@ class StyleUpdateRequest(BaseModel):
     selected_style: dict | None = None
 
 
+class StyleProposalRequest(BaseModel):
+    user_description: str | None = None
+
+
 @router.patch("/{project_id}/style", response_model=ProjectResponse)
 def update_project_style(
     project_id: str,
@@ -142,6 +146,7 @@ def update_project_style(
 @router.post("/{project_id}/style-proposals")
 def create_style_proposals(
     project_id: str,
+    payload: StyleProposalRequest | None = None,
     force: bool = False,
     tester_id: str = Depends(tester_id_from_header),
     db: Session = Depends(get_db),
@@ -167,6 +172,8 @@ def create_style_proposals(
 
     current_asset_signature = compute_style_asset_signature(project)
     current_content_signature = content_signature(slides)
+    user_description = (payload.user_description if payload else None) or ""
+    user_description = user_description.strip()[:4000]
     has_global_style_ref = any(
         ref.role == "style_ref" and not ref.slide_id
         for ref in (project.reference_images or [])
@@ -177,6 +184,7 @@ def create_style_proposals(
     if not force and project.style_proposal and project.style_proposal.get("proposals"):
         cached_asset_signature = project.style_proposal.get("asset_signature")
         cached_content_signature = project.style_proposal.get("content_signature")
+        cached_user_description = (project.style_proposal.get("user_description") or "").strip()
         cached_proposals = project.style_proposal.get("proposals") or []
         cached_is_style_dna = any(
             isinstance(p, dict)
@@ -186,6 +194,7 @@ def create_style_proposals(
         cache_signature_matches = (
             (cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature))
             and (cached_content_signature == current_content_signature or not cached_content_signature)
+            and cached_user_description == user_description
         )
         if cache_signature_matches and (not has_global_style_ref or cached_is_style_dna):
             return {
@@ -219,7 +228,7 @@ def create_style_proposals(
     has_assets = any(
         ref.role in {"logo", "style_ref", "template"}
         for ref in (project.reference_images or [])
-    )
+    ) or bool(user_description)
     total_count = 1 if has_assets else 3
 
     if not ensure_celery_worker():
@@ -240,7 +249,7 @@ def create_style_proposals(
         raise HTTPException(status_code=409, detail=str(exc))
 
     credential_id = store_current_provider_credentials(redis_client)
-    task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id)
+    task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id, user_description=user_description)
     set_run_task(db, run.id, task.id)
     db.commit()
     redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)

@@ -10,6 +10,7 @@ from sqlalchemy import inspect, text
 from app.core.config import settings
 from app.core.provider_credentials import ProviderCredentials, reset_provider_credentials, set_provider_credentials
 from app.core.tester_auth import (
+    LOCAL_ADMIN_TESTER_ID,
     TESTER_ID_HEADER,
     reset_current_request_is_local,
     reset_current_tester_id,
@@ -82,7 +83,10 @@ async def mvp_context_and_project_guard(request: Request, call_next):
     tester_token = set_current_tester_id(tester_id)
     client_host = (request.client.host if request.client else "") or ""
     host_header = (request.headers.get("host") or "").split(":", 1)[0]
-    is_local_request = client_host in {"127.0.0.1", "::1", "localhost"} and host_header in {"127.0.0.1", "::1", "localhost"}
+    local_hosts = {"127.0.0.1", "::1", "localhost"}
+    # Docker Desktop forwards browser requests through a bridge IP, so localhost
+    # debug traffic is best identified by the Host header.
+    is_local_request = client_host in local_hosts or host_header in local_hosts
     local_token = set_current_request_is_local(is_local_request)
     try:
         match = None if request.method == "OPTIONS" else _project_path_re.match(request.url.path)
@@ -91,7 +95,8 @@ async def mvp_context_and_project_guard(request: Request, call_next):
             db = SessionLocal()
             try:
                 project = db.query(models.Project).filter(models.Project.id == project_id).first()
-                if project and project.tester_id and project.tester_id != tester_id:
+                local_admin_allowed = tester_id == LOCAL_ADMIN_TESTER_ID and is_local_request
+                if project and project.tester_id and project.tester_id != tester_id and not local_admin_allowed:
                     return JSONResponse(
                         status_code=403,
                         content={"detail": "这个项目属于其他测试账号，请切换账号后再试"},
@@ -132,5 +137,5 @@ if os.path.exists(_frontend_dist):
         index_path = os.path.join(_frontend_dist, "index.html")
         if os.path.exists(index_path):
             from fastapi.responses import FileResponse
-            return FileResponse(index_path)
+            return FileResponse(index_path, headers={"Cache-Control": "no-store"})
         return {"detail": "Not Found"}

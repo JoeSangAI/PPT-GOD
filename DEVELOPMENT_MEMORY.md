@@ -18,3 +18,12 @@ PPT God is an Agent-driven PPT tool. The highest product contract is: understand
 - When the Agent says it will change, generate, confirm, switch, retry, or apply something, there must be a corresponding executable workflow action or a visible reason why no action ran.
 - Do not let chat copy get ahead of system state. User-facing wording should say "正在..." before the action succeeds and only claim completion after the state actually changes.
 - Stage boundaries are implementation details. If a request belongs to a later stage, acknowledge it now, carry it forward as context, and surface the next action that will apply it.
+
+## Image Generation Architecture Constraint
+
+Recorded 2026-05-10 from user direction.
+
+- Do not propose or implement a default workflow that first generates a background image and then programmatically types the slide text on top.
+- The product direction is direct full-slide image generation for slide content. Text, layout, and visual composition should remain part of the generated image unless the user explicitly asks for an overlay/paste workflow.
+- Programmatic overlay remains acceptable only for explicit overlay assets such as pasted images/logos/materials, not as the general solution for slide text or section-page layout consistency.
+- For consistency issues, prefer improving reference-image use, prompt contracts, seed selection, and generation strategy within the direct-generation workflow before considering any deterministic text-rendering layer.

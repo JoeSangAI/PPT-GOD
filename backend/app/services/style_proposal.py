@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import copy
 from typing import List, Dict, Optional
 
 import yaml
@@ -13,6 +14,91 @@ from app.core.provider_credentials import get_minimax_llm_model
 from app.services.visual_strategy import build_visual_strategy
 
 logger = logging.getLogger(__name__)
+
+
+DARK_DECK_SCOPE_TERMS = [
+    "全页", "全部页面", "所有页面", "整套", "每页", "正文", "正文页", "内容页", "数据页", "页面都", "都用", "也用", "也可以",
+]
+DARK_DECK_TONE_TERMS = ["黑色", "黑底", "深色", "暗色", "深底", "暗底", "墨色", "深黑", "黑的"]
+DARK_DECK_NEGATIONS = ["不要黑", "不要深色", "不用黑", "不用深色", "避免黑", "避免深色", "不是黑", "不是深色"]
+DARK_DECK_CONFLICT_RE = re.compile(
+    r"(?:正文页|内容页|数据页|整体|页面)?[^。；;.!！?\n]{0,18}(?:浅底|浅色信息基底|浅色基底|暖玉白为浅底|浅底保证|白底|米白底)",
+    flags=re.IGNORECASE,
+)
+
+
+def _requests_deck_wide_dark_style(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    if not normalized or any(term in normalized for term in DARK_DECK_NEGATIONS):
+        return False
+    has_dark = any(term.lower() in normalized for term in DARK_DECK_TONE_TERMS)
+    has_scope = any(term.lower() in normalized for term in DARK_DECK_SCOPE_TERMS)
+    return has_dark and has_scope
+
+
+def _palette_color_by(predicate, palette: list[dict], fallback: str) -> str:
+    for color in palette:
+        if isinstance(color, dict):
+            hex_color = _extract_hex(str(color.get("hex") or ""))
+            if hex_color and predicate(hex_color):
+                return hex_color
+    return fallback
+
+
+def _dark_deck_palette(palette: list | None) -> list[dict]:
+    normalized = [item for item in (palette or []) if isinstance(item, dict)]
+    primary = _palette_color_by(_is_dark, normalized, "#0B0B0B")
+    accent = _palette_color_by(_is_warm_accent, normalized, "#FFCD00")
+    text = _palette_color_by(lambda c: _brightness(c) >= 180, normalized, "#FFF9E6")
+    texture = "#1A1A1A"
+    if primary.upper() == texture:
+        texture = "#24201A"
+    return [
+        {"name": "深墨黑", "hex": primary, "role": "整套页面背景/内容页深色基底"},
+        {"name": _get_color_name(accent), "hex": accent, "role": "标题、重点信息和装饰线"},
+        {"name": "檀墨", "hex": texture, "role": "正文页内容区、卡片和纹理层次"},
+        {"name": _get_color_name(text), "hex": text, "role": "正文、图表和 Logo 的高对比文字色"},
+    ]
+
+
+def enforce_user_style_requirements(proposal: Dict, user_description: str) -> Dict:
+    """Make structured style output obey explicit user chat requirements."""
+    if not isinstance(proposal, dict):
+        return proposal
+    if not _requests_deck_wide_dark_style(user_description):
+        return proposal
+
+    normalized = copy.deepcopy(proposal)
+    normalized["palette"] = _dark_deck_palette(normalized.get("palette") if isinstance(normalized.get("palette"), list) else [])
+    name = str(normalized.get("name") or "深色视觉方案").strip()
+    if "深" not in name and "黑" not in name and "暗" not in name:
+        name = f"全页深色{name}"
+    normalized["name"] = name
+    normalized["mood"] = normalized.get("mood") or "深色、克制、沉稳、高对比"
+
+    base_description = re.sub(DARK_DECK_CONFLICT_RE, "", str(normalized.get("description") or "")).strip()
+    contract_sentence = (
+        "按用户最新要求，整套 PPT 包括正文页、内容页和数据页都使用黑色/深色纹理基底；"
+        "不再把正文页切成浅色或白底。深墨背景负责统一气质，金色只做标题、重点信息和装饰线，"
+        "正文与图表用高对比浅色文字保证可读。"
+    )
+    normalized["description"] = f"{contract_sentence}{base_description}"[:520]
+    normalized["visual_strategy"] = {
+        "base_tone": "dark",
+        "summary": "整体使用黑色/深色纹理基底，包括正文页、内容页和数据页。",
+        "background_policy": "封面、章节、正文、数据和表格页都沿用同一深色基底，通过深浅层次、卡片和留白组织信息。",
+        "content_treatment": "正文页不使用浅底；使用深色内容区、高对比浅色文字、金色小面积强调和清晰字号层级保证阅读效率。",
+    }
+    normalized["page_type_adaptation"] = (
+        "页面类型适配规则：整套页面统一深色基底。封面/章节页可以放大深墨背景、金色装饰和纹理；"
+        "正文/内容/数据/表格页也必须保持黑色或深色底，通过檀墨卡片、浅色正文、金色编号和充足留白解决可读性，"
+        "不得自动切换成白底、米白底或浅色信息基底。"
+    )
+    normalized["content_style_hint"] = (
+        "用户明确要求内容页也以黑色/深色底为主；生成画面方案和 Prompt 时必须继承这个深色基底，不得回退到浅底正文页。"
+    )
+    normalized["source"] = normalized.get("source") or "agent_adjustment_contract"
+    return normalized
 
 
 TRADITIONAL_CULTURE_TERMS = [
@@ -1289,7 +1375,7 @@ def _generate_asset_based_proposal(
     user_desc = assets.get("user_description", "").strip()
     template = assets.get("template_analysis") or {}
 
-    if _has_clone_reference(ref, template):
+    if _has_clone_reference(ref, template) and not user_desc:
         logger.info("StyleProposal(AssetBased): using deterministic strict reference clone proposal")
         return [_build_reference_clone_proposal(summary, assets)]
 
@@ -1308,7 +1394,7 @@ def _generate_asset_based_proposal(
     if user_desc:
         asset_sections.append(f"【用户风格描述】\n{user_desc}")
 
-    prompt = f"""你是一位顶级 PPT 视觉总监。客户提供了参考风格图，你的任务是提取这套风格的视觉基因，并把它转成可用于整套 PPT 的风格系统。
+    prompt = f"""你是一位顶级 PPT 视觉总监。客户提供了参考风格资料和/或文字风格要求，你的任务是提取这套风格的视觉基因，并把它转成可用于整套 PPT 的风格系统。
 
 【PPT 内容概览】（用于判断页面类型、阅读密度和具体配图方向；不用于篡改参考图本身的风格判断）
 - 主题关键词：{"、".join(summary["keywords"]) if summary["keywords"] else "商务演示"}
@@ -1319,6 +1405,11 @@ def _generate_asset_based_proposal(
 
 【用户提供的素材】（参考图决定风格基因，具体页面画面仍由页面文案决定）
 {"\n\n".join(asset_sections)}
+
+【聊天要求优先级】
+- 如果出现【用户风格描述】，它来自用户和视觉总监的最新对话，是本次生成必须执行的最新要求。
+- 用户风格描述中明确点名的配色、字体、质感、布局节奏、不要/改掉的方向，优先级高于旧参考图或旧提案中冲突的部分。
+- 用户没有提到的部分，才继续继承参考图、模板或 Logo 的风格基因。
 
 【输出格式】
 严格输出 JSON 对象（不是数组）：
@@ -1336,7 +1427,7 @@ def _generate_asset_based_proposal(
 }}
 
 【核心原则】
-1. **忠实定调**：风格名、主色关系、材质、装饰语言必须来自参考图，不得根据文案另造风格
+1. **忠实定调**：风格名、主色关系、材质、装饰语言必须来自参考资料和用户最新风格描述，不得只根据文案另造风格
 2. **不是逐页照搬**：参考图只提供风格基因，不是每一页的画面模板
 3. **先定整套基底，再按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，但要在同一视觉语言内通过卡片、内容区、字号层级和留白解决，不要机械切成另一套浅底风格
 4. **内容决定配图**：地图、图表、业务场景、产品场景和人物/物件选择由该页文案决定，不机械复制参考图里的画面对象
@@ -1417,5 +1508,6 @@ def _generate_asset_based_proposal(
         proposal.get("palette") or [],
         proposal.get("visual_strategy"),
     )
+    proposal = enforce_user_style_requirements(proposal, user_desc)
 
     return [proposal]

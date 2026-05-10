@@ -252,7 +252,7 @@ export function getGuidanceText(state: WorkflowState) {
     case "visual_ready":
       if (state.hasSelectedStyle && !state.hasPrompt) return "视觉方向已确认，请先生成每页画面方案";
       if (state.hasSelectedStyle) return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
-      return "生成或选择视觉方向，也可以告诉视觉总监你的偏好";
+      return "生成视觉方向前，可先上传 Logo、风格参考、可复用素材或模板";
     case "prompt_ready":
       return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
     case "prototype":

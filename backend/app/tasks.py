@@ -185,14 +185,20 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
 
 
 @celery_app.task(bind=True, max_retries=2)
-def generate_style_proposals_task(self, project_id: str, run_id: str = None, credential_id: str = None):
+def generate_style_proposals_task(
+    self,
+    project_id: str,
+    run_id: str = None,
+    credential_id: str = None,
+    user_description: str | None = None,
+):
     """Celery task: 生成风格提案。"""
     credentials = load_task_provider_credentials(redis_client, credential_id)
     with provider_credentials_context(credentials):
-        return _generate_style_proposals_task_inner(self, project_id, run_id)
+        return _generate_style_proposals_task_inner(self, project_id, run_id, user_description=user_description)
 
 
-def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = None):
+def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = None, user_description: str | None = None):
     """Style proposal task body with provider credentials installed in context."""
     db = SessionLocal()
     try:
@@ -218,6 +224,9 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
 
         # 自动分析项目素材（失败不阻断主流程）
         assets = {}
+        user_description = (user_description or "").strip()
+        if user_description:
+            assets["user_description"] = user_description[:4000]
         if project.reference_images:
             update_run_progress(db, run_id, stage="asset_analysis", message="正在读取项目素材...")
             db.commit()
@@ -312,6 +321,7 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
             "asset_based": asset_based,
             "asset_signature": compute_style_asset_signature(project),
             "content_signature": content_signature(project.slides or []),
+            "user_description": user_description[:4000],
         }
         # 风格提案生成后，项目进入视觉方案待确认阶段
         if project.status in ("planning", "draft"):

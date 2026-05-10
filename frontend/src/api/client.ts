@@ -188,10 +188,11 @@ export async function deleteProject(projectId: string) {
   return (await checkRes(res)).json();
 }
 
-export async function generateContentPlan(projectId: string, topic?: string, pageCount?: number) {
+export async function generateContentPlan(projectId: string, topic?: string, pageCount?: number, attachmentIds?: string[]) {
   const body: any = {};
   if (topic) body.topic = topic;
   if (pageCount) body.page_count = pageCount;
+  if (attachmentIds?.length) body.attachment_ids = attachmentIds;
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/content-plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -287,7 +288,7 @@ export function getContentPlanMarkdownUrl(projectId: string) {
 export async function uploadFile(
   projectId: string,
   file: File,
-  role: "style_ref" | "logo" | "template" | "visual_asset" | "content_ref" | "chart_ref" | "finetune_ref",
+  role: "style_ref" | "logo" | "template" | "visual_asset" | "content_ref" | "chart_ref" | "finetune_ref" | "chat_ref",
   slideId?: string,
   processMode?: "blend" | "crop" | "original",
   metadata?: { asset_name?: string; asset_kind?: string; usage_note?: string; logo_anchor?: string }
@@ -431,14 +432,21 @@ export async function* chatWithAgentStream(
   history?: { role: string; content: string }[],
   signal?: AbortSignal,
   pageContext?: any,
-  agentRole?: string
+  agentRole?: string,
+  attachmentIds?: string[]
 ) {
   let response: Response;
   try {
     response = await apiFetch(`${API_BASE}/projects/${projectId}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, history, page_context: pageContext, agent_role: agentRole || "content" }),
+      body: JSON.stringify({
+        message,
+        history,
+        page_context: pageContext,
+        agent_role: agentRole || "content",
+        attachment_ids: attachmentIds || [],
+      }),
       signal,
     });
   } catch {
@@ -607,11 +615,18 @@ export async function updateProjectStyle(projectId: string, selectedStyle: any) 
   return (await checkRes(res)).json();
 }
 
-export async function generateStyleProposals(projectId: string, force: boolean = false): Promise<any> {
+export async function generateStyleProposals(projectId: string, force: boolean = false, userDescription: string = ""): Promise<any> {
   const url = makeApiUrl(`/projects/${projectId}/style-proposals`);
   if (force) url.searchParams.set("force", "true");
+  const trimmedDescription = userDescription.trim();
   const res = await apiFetch(url.toString(), {
     method: "POST",
+    ...(trimmedDescription
+      ? {
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_description: trimmedDescription }),
+        }
+      : {}),
   });
   return (await checkRes(res)).json();
 }

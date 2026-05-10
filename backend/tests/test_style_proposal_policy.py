@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from app.services import style_proposal
+from app.api.chat import _visual_style_requirement_text
 from app.services.prompt_engine import _compact_style_pack, generate_prompt_for_page
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 
@@ -56,6 +57,113 @@ class _FakeCompletions:
 class _FakeClient:
     def __init__(self):
         self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+
+def test_user_style_description_overrides_reference_clone_shortcut(monkeypatch):
+    captured = {}
+
+    class _AssetCompletions:
+        def create(self, **kwargs):
+            captured["prompt"] = kwargs["messages"][-1]["content"]
+            proposal = {
+                "name": "冷白极简",
+                "palette": [
+                    {"name": "冷白", "hex": "#F8FAFC", "role": "正文页基底"},
+                    {"name": "雾灰", "hex": "#CBD5E1", "role": "分割线"},
+                    {"name": "炭黑", "hex": "#111827", "role": "标题文字"},
+                    {"name": "冰蓝", "hex": "#38BDF8", "role": "少量强调"},
+                ],
+                "mood": "冷静、留白、克制",
+                "font": "几何无衬线体",
+                "description": "按最新聊天要求去掉红色暖调，改成冷白留白系统，内容页保持清晰克制。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal, ensure_ascii=False)))]
+            )
+
+    class _AssetClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_AssetCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _AssetClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "品牌策略", "body": "年度沟通材料"}}],
+        assets={
+            "reference_analysis": {
+                "style_name": "红色暖调",
+                "description": "大面积红色背景，暖色装饰。",
+                "dominant_palette": [{"hex": "#B91C1C", "share": 0.6}],
+                "colors": {"primary": "#B91C1C"},
+            },
+            "user_description": "不要原来的红色暖调，改成冷白极简、更多留白。",
+        },
+    )
+
+    assert proposals[0]["name"] == "冷白极简"
+    assert "不要原来的红色暖调" in captured["prompt"]
+    assert "聊天要求优先级" in captured["prompt"]
+
+
+def test_explicit_deck_wide_dark_request_removes_light_content_policy():
+    proposal = {
+        "name": "墨韵金调",
+        "palette": [
+            {"name": "琥珀金", "hex": "#FFCD00", "role": "品牌主色"},
+            {"name": "檀墨", "hex": "#2B2316", "role": "强视觉页主色"},
+            {"name": "暖玉白", "hex": "#FFF9E6", "role": "正文页基底"},
+            {"name": "焦墨", "hex": "#1A1A1A", "role": "正文数据文字"},
+        ],
+        "description": "整体以浅色信息基底为主；正文页以浅底和留白保证阅读效率。",
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "正文也可以用黑色的，主要都是以黑色的、深色的底作为内容页，全页深色背景。",
+    )
+
+    joined = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("name", "description", "page_type_adaptation", "content_style_hint")
+    )
+    assert normalized["visual_strategy"]["base_tone"] == "dark"
+    assert normalized["palette"][0]["role"] == "整套页面背景/内容页深色基底"
+    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
+    assert "不得自动切换成白底" in normalized["page_type_adaptation"]
+    assert "浅色信息基底为主" not in joined
+    assert "正文页以浅底" not in joined
+
+
+def test_visual_chat_confirmation_is_part_of_style_action_alignment():
+    proposal = {
+        "name": "墨韵金调",
+        "palette": [
+            {"name": "琥珀金", "hex": "#FFCD00", "role": "品牌主色"},
+            {"name": "檀墨", "hex": "#2B2316", "role": "强视觉页主色"},
+            {"name": "暖玉白", "hex": "#FFF9E6", "role": "正文页基底"},
+            {"name": "焦墨", "hex": "#1A1A1A", "role": "正文数据文字"},
+        ],
+        "description": "整体以浅色信息基底为主；正文页以浅底和留白保证阅读效率。",
+    }
+
+    requirement = _visual_style_requirement_text(
+        "重新生成视觉方案",
+        {"response": "我会把正文页也改为黑色/深色底，全套页面保持全页深色背景。"},
+        history=[{"role": "user", "content": "不要浅色正文页，主要以黑色深色底作为内容页。"}],
+    )
+    normalized = style_proposal.enforce_user_style_requirements(proposal, requirement)
+
+    joined = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("description", "page_type_adaptation", "content_style_hint")
+    )
+    assert normalized["visual_strategy"]["base_tone"] == "dark"
+    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
+    assert "浅色信息基底为主" not in joined
+    assert "正文页以浅底" not in joined
 
 
 def test_ancient_rome_topic_rejects_generic_business_proposals(monkeypatch):

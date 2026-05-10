@@ -1,5 +1,7 @@
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import io
 import logging
@@ -27,14 +29,19 @@ logger = logging.getLogger(__name__)
 _image_client = None
 _image_client_lock = threading.Lock()
 _run_state_lock = threading.Lock()
+_image_call_events = threading.local()
 _image_api_semaphore = threading.BoundedSemaphore(
     max(1, int(settings.IMAGE_API_MAX_CONCURRENCY or 1))
 )
 _real_image_calls_this_run = 0
+_REFERENCE_UPLOAD_CACHE_MAX_ITEMS = 128
+_reference_upload_cache_lock = threading.Lock()
+_reference_upload_cache: OrderedDict[str, tuple[str, bytes, str, int]] = OrderedDict()
+_reference_upload_inflight: dict[str, threading.Event] = {}
 
 
 class ReferenceUploadTimeoutError(RuntimeError):
-    """Raised when reference images fail before the image API starts generation."""
+    """Raised when an image-edit request is interrupted and should not be retried."""
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,46 @@ def _get_image_client() -> OpenAI:
                     max_retries=0,  # 禁用 SDK 自动重试，由本模块手动控制，防止重复计费
                 )
     return _image_client
+
+
+def reset_image_call_events() -> None:
+    _image_call_events.events = []
+
+
+def get_image_call_events() -> list[dict]:
+    return list(getattr(_image_call_events, "events", []) or [])
+
+
+def _clear_reference_upload_cache() -> None:
+    with _reference_upload_cache_lock:
+        _reference_upload_cache.clear()
+        _reference_upload_inflight.clear()
+
+
+def _utc_iso(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).isoformat()
+
+
+def _response_request_id(resp) -> str | None:
+    request_id = getattr(resp, "_request_id", None)
+    if request_id:
+        return str(request_id)
+    headers = getattr(resp, "headers", None)
+    if headers:
+        for name in ("x-request-id", "request-id", "x-deer-request-id", "x-deerapi-request-id"):
+            value = headers.get(name) or headers.get(name.title())
+            if value:
+                return str(value)
+    return None
+
+
+def _record_image_call_event(**event) -> None:
+    events = getattr(_image_call_events, "events", None)
+    if events is None:
+        events = []
+        _image_call_events.events = events
+    clean = {k: v for k, v in event.items() if v is not None}
+    events.append(clean)
 
 
 def _reserve_real_image_call() -> None:
@@ -248,39 +295,145 @@ def _prepare_reference_image_for_upload(
     return img
 
 
+def _effective_reference_upload_settings(
+    ref: Image.Image,
+    upload_profile: _ReferenceUploadProfile,
+) -> tuple[int | None, int, int, str]:
+    role = str((getattr(ref, "info", {}) or {}).get("pptgod_reference_role") or "")
+    role_max_side = None
+    jpeg_quality = upload_profile.jpeg_quality
+    png_threshold_bytes = upload_profile.png_threshold_bytes
+    if role == "seed_ref":
+        configured_seed_max = int(settings.IMAGE_SEED_REFERENCE_MAX_SIDE or 0)
+        if configured_seed_max > 0:
+            role_max_side = configured_seed_max
+        jpeg_quality = max(60, min(92, int(settings.IMAGE_SEED_REFERENCE_JPEG_QUALITY or jpeg_quality)))
+        seed_png_threshold_kb = max(16, int(settings.IMAGE_SEED_REFERENCE_PNG_THRESHOLD_KB or 128))
+        png_threshold_bytes = seed_png_threshold_kb * 1024
+
+    max_side = upload_profile.max_side
+    if role_max_side:
+        max_side = min(max_side, role_max_side) if max_side else role_max_side
+    return max_side, jpeg_quality, png_threshold_bytes, role
+
+
+def _reference_source_fingerprint(ref: Image.Image) -> str:
+    info = getattr(ref, "info", {}) or {}
+    source_path = str(info.get("pptgod_reference_source_path") or "")
+    source_mtime = info.get("pptgod_reference_source_mtime_ns")
+    source_size = info.get("pptgod_reference_source_size")
+    if source_path and source_mtime is not None and source_size is not None:
+        return f"path:{source_path}:{source_mtime}:{source_size}"
+
+    h = hashlib.sha256()
+    h.update(str(ref.size).encode("utf-8"))
+    h.update(str(ref.mode).encode("utf-8"))
+    h.update(ref.tobytes())
+    return f"bytes:{h.hexdigest()}"
+
+
+def _reference_upload_cache_key(
+    ref: Image.Image,
+    upload_profile: _ReferenceUploadProfile,
+) -> str:
+    max_side, jpeg_quality, png_threshold_bytes, role = _effective_reference_upload_settings(ref, upload_profile)
+    h = hashlib.sha256()
+    h.update(_reference_source_fingerprint(ref).encode("utf-8"))
+    h.update(str(role).encode("utf-8"))
+    h.update(str(max_side).encode("utf-8"))
+    h.update(str(jpeg_quality).encode("utf-8"))
+    h.update(str(png_threshold_bytes).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _store_cached_reference_upload(
+    key: str,
+    extension: str,
+    payload: bytes,
+    mime_type: str,
+    size_bytes: int,
+) -> None:
+    with _reference_upload_cache_lock:
+        _reference_upload_cache[key] = (extension, payload, mime_type, size_bytes)
+        _reference_upload_cache.move_to_end(key)
+        while len(_reference_upload_cache) > _REFERENCE_UPLOAD_CACHE_MAX_ITEMS:
+            _reference_upload_cache.popitem(last=False)
+
+
+def _claim_reference_upload_encoding(key: str, index: int) -> tuple[tuple[str, io.BytesIO, str, int] | None, threading.Event | None]:
+    while True:
+        with _reference_upload_cache_lock:
+            cached = _reference_upload_cache.get(key)
+            if cached:
+                _reference_upload_cache.move_to_end(key)
+                extension, payload, mime_type, size_bytes = cached
+                return (f"ref_{index}.{extension}", io.BytesIO(payload), mime_type, size_bytes), None
+            in_flight = _reference_upload_inflight.get(key)
+            if in_flight is None:
+                in_flight = threading.Event()
+                _reference_upload_inflight[key] = in_flight
+                return None, in_flight
+
+        in_flight.wait()
+
+
+def _release_reference_upload_encoding(key: str, event: threading.Event | None) -> None:
+    if event is None:
+        return
+    with _reference_upload_cache_lock:
+        current = _reference_upload_inflight.get(key)
+        if current is event:
+            _reference_upload_inflight.pop(key, None)
+        event.set()
+
+
 def _reference_upload_file(
     ref: Image.Image,
     index: int,
     profile: _ReferenceUploadProfile | None = None,
 ) -> tuple[str, io.BytesIO, str, int]:
     upload_profile = profile or _base_reference_upload_profile()
-    img = _prepare_reference_image_for_upload(ref, max_side=upload_profile.max_side)
-    buf = io.BytesIO()
-    png_buf = io.BytesIO()
-    img.save(png_buf, format="PNG", optimize=True)
-    png_size = png_buf.tell()
+    cache_key = _reference_upload_cache_key(ref, upload_profile)
+    cached, in_flight = _claim_reference_upload_encoding(cache_key, index)
+    if cached:
+        return cached
 
-    # PPT-extracted references are often full-slide photos or screenshots. Sending
-    # several lossless PNGs can dominate request time and make the image API upload
-    # fail before generation starts. Prefer a high-quality JPEG for normal RGB
-    # references, while keeping tiny PNGs lossless for marks/screenshots where PNG is
-    # already compact.
-    if png_size <= upload_profile.png_threshold_bytes:
-        png_buf.seek(0)
-        buf = png_buf
-        size_bytes = png_size
-        return f"ref_{index}.png", buf, "image/png", size_bytes
+    try:
+        max_side, jpeg_quality, png_threshold_bytes, _role = _effective_reference_upload_settings(ref, upload_profile)
+        img = _prepare_reference_image_for_upload(ref, max_side=max_side)
+        buf = io.BytesIO()
+        png_buf = io.BytesIO()
+        img.save(png_buf, format="PNG", optimize=True)
+        png_size = png_buf.tell()
 
-    img.save(
-        buf,
-        format="JPEG",
-        quality=upload_profile.jpeg_quality,
-        optimize=True,
-        progressive=True,
-    )
-    size_bytes = buf.tell()
-    buf.seek(0)
-    return f"ref_{index}.jpg", buf, "image/jpeg", size_bytes
+        # PPT-extracted references are often full-slide photos or screenshots. Sending
+        # several lossless PNGs can dominate request time and make the image API upload
+        # fail before generation starts. Prefer a high-quality JPEG for normal RGB
+        # references, while keeping tiny PNGs lossless for marks/screenshots where PNG is
+        # already compact.
+        if png_size <= png_threshold_bytes:
+            payload = png_buf.getvalue()
+            filename = f"ref_{index}.png"
+            mime_type = "image/png"
+            size_bytes = len(payload)
+            _store_cached_reference_upload(cache_key, "png", payload, mime_type, size_bytes)
+            return filename, io.BytesIO(payload), mime_type, size_bytes
+
+        img.save(
+            buf,
+            format="JPEG",
+            quality=jpeg_quality,
+            optimize=True,
+            progressive=True,
+        )
+        payload = buf.getvalue()
+        filename = f"ref_{index}.jpg"
+        mime_type = "image/jpeg"
+        size_bytes = len(payload)
+        _store_cached_reference_upload(cache_key, "jpg", payload, mime_type, size_bytes)
+        return filename, io.BytesIO(payload), mime_type, size_bytes
+    finally:
+        _release_reference_upload_encoding(cache_key, in_flight)
 
 
 def _build_reference_upload_files(
@@ -330,22 +483,51 @@ def _call_gpt_image_2_generate(
     headers = {}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
-    resp = client.images.generate(
-        model=get_deer_image_model(),
-        prompt=prompt,
-        size=size,
-        quality="high",
-        n=1,
-        extra_headers=headers or None,
-    )
-    image_data = resp.data[0]
-    if image_data.b64_json:
-        img_bytes = base64.b64decode(image_data.b64_json)
-    elif image_data.url:
-        img_bytes = _download_image_bytes(image_data.url)
-    else:
-        raise ValueError("DeerAPI returned no image content")
-    return Image.open(io.BytesIO(img_bytes))
+    started_at = time.time()
+    resp = None
+    try:
+        resp = client.images.generate(
+            model=get_deer_image_model(),
+            prompt=prompt,
+            size=size,
+            quality="high",
+            n=1,
+            extra_headers=headers or None,
+        )
+        image_data = resp.data[0]
+        if image_data.b64_json:
+            img_bytes = base64.b64decode(image_data.b64_json)
+        elif image_data.url:
+            img_bytes = _download_image_bytes(image_data.url)
+        else:
+            raise ValueError("DeerAPI returned no image content")
+        _record_image_call_event(
+            endpoint="/v1/images/generations",
+            model=get_deer_image_model(),
+            status="succeeded",
+            size=size,
+            reference_count=0,
+            idempotency_key=idempotency_key,
+            request_id=_response_request_id(resp),
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+        )
+        return Image.open(io.BytesIO(img_bytes))
+    except Exception as exc:
+        _record_image_call_event(
+            endpoint="/v1/images/generations",
+            model=get_deer_image_model(),
+            status="failed",
+            size=size,
+            reference_count=0,
+            idempotency_key=idempotency_key,
+            request_id=getattr(exc, "request_id", None) or _response_request_id(resp),
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+            error_type=exc.__class__.__name__,
+            error=str(exc)[:500],
+        )
+        raise
 
 
 def _call_gpt_image_2_edit(
@@ -355,7 +537,9 @@ def _call_gpt_image_2_edit(
     """使用 requests 直接调用 DeerAPI images/edit，支持 additional_images[] 多图垫图。"""
     if not reference_images:
         raise ValueError("reference_images required for edit")
+    prepare_started_at = time.time()
     files, upload_bytes, upload_profile = _build_reference_upload_files(reference_images)
+    upload_prepare_seconds = round(time.time() - prepare_started_at, 3)
     data = {
         "model": get_deer_image_model(),
         "prompt": prompt,
@@ -367,11 +551,14 @@ def _call_gpt_image_2_edit(
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     logger.info(
-        "ImageGen: calling edit API with %s reference images, upload=%.2fMB, profile=%s",
+        "ImageGen: calling edit API with %s reference images, upload=%.2fMB, profile=%s, prepare=%.3fs",
         len(reference_images),
         upload_bytes / (1024 * 1024),
         upload_profile.label,
+        upload_prepare_seconds,
     )
+    started_at = time.time()
+    resp = None
     try:
         resp = requests.post(
             f"{credentials.deer_api_base}/images/edits",
@@ -383,22 +570,105 @@ def _call_gpt_image_2_edit(
                 int(settings.IMAGE_EDIT_READ_TIMEOUT_SECONDS or 900),
             ),
         )
+    except requests.exceptions.ConnectTimeout as e:
+        _record_image_call_event(
+            endpoint="/v1/images/edits",
+            model=get_deer_image_model(),
+            status="failed",
+            size=size,
+            reference_count=len(reference_images),
+            upload_bytes=upload_bytes,
+            upload_profile=upload_profile.label,
+            upload_prepare_seconds=upload_prepare_seconds,
+            idempotency_key=idempotency_key,
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+            error_type=e.__class__.__name__,
+            error=str(e)[:500],
+        )
+        raise ReferenceUploadTimeoutError(
+            "图片接口连接超时：请求未稳定送达，已停止自动重试，避免重复消耗生图额度"
+        ) from e
+    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+        _record_image_call_event(
+            endpoint="/v1/images/edits",
+            model=get_deer_image_model(),
+            status="interrupted",
+            size=size,
+            reference_count=len(reference_images),
+            upload_bytes=upload_bytes,
+            upload_profile=upload_profile.label,
+            upload_prepare_seconds=upload_prepare_seconds,
+            idempotency_key=idempotency_key,
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+            error_type=e.__class__.__name__,
+            error=str(e)[:500],
+        )
+        raise ReferenceUploadTimeoutError(
+            "图片接口响应中断：本次请求可能已进入生成并产生费用，已停止自动重试。请稍后重试失败页，避免重复扣费。"
+        ) from e
     except requests.exceptions.RequestException as e:
-        if _is_connection_timeout(e):
-            raise ReferenceUploadTimeoutError(
-                "图片接口上传超时：参考图上传在进入生成前中断，已停止自动重试，避免重复消耗生图额度"
-            ) from e
+        _record_image_call_event(
+            endpoint="/v1/images/edits",
+            model=get_deer_image_model(),
+            status="failed",
+            size=size,
+            reference_count=len(reference_images),
+            upload_bytes=upload_bytes,
+            upload_profile=upload_profile.label,
+            upload_prepare_seconds=upload_prepare_seconds,
+            idempotency_key=idempotency_key,
+            request_id=_response_request_id(getattr(e, "response", None)),
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+            error_type=e.__class__.__name__,
+            error=str(e)[:500],
+        )
         raise
-    resp.raise_for_status()
-    body = resp.json()
-    image_data = body["data"][0]
-    if image_data.get("b64_json"):
-        img_bytes = base64.b64decode(image_data["b64_json"])
-    elif image_data.get("url"):
-        img_bytes = _download_image_bytes(image_data["url"])
-    else:
-        raise ValueError("DeerAPI returned no image content")
-    return Image.open(io.BytesIO(img_bytes))
+    try:
+        resp.raise_for_status()
+        body = resp.json()
+        image_data = body["data"][0]
+        if image_data.get("b64_json"):
+            img_bytes = base64.b64decode(image_data["b64_json"])
+        elif image_data.get("url"):
+            img_bytes = _download_image_bytes(image_data["url"])
+        else:
+            raise ValueError("DeerAPI returned no image content")
+        _record_image_call_event(
+            endpoint="/v1/images/edits",
+            model=get_deer_image_model(),
+            status="succeeded",
+            size=size,
+            reference_count=len(reference_images),
+            upload_bytes=upload_bytes,
+            upload_profile=upload_profile.label,
+            upload_prepare_seconds=upload_prepare_seconds,
+            idempotency_key=idempotency_key,
+            request_id=_response_request_id(resp),
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+        )
+        return Image.open(io.BytesIO(img_bytes))
+    except Exception as exc:
+        _record_image_call_event(
+            endpoint="/v1/images/edits",
+            model=get_deer_image_model(),
+            status="failed",
+            size=size,
+            reference_count=len(reference_images),
+            upload_bytes=upload_bytes,
+            upload_profile=upload_profile.label,
+            upload_prepare_seconds=upload_prepare_seconds,
+            idempotency_key=idempotency_key,
+            request_id=getattr(exc, "request_id", None) or _response_request_id(resp),
+            started_at=_utc_iso(started_at),
+            duration_seconds=round(time.time() - started_at, 3),
+            error_type=exc.__class__.__name__,
+            error=str(exc)[:500],
+        )
+        raise
 
 
 def _call_gemini_chat_generate(
