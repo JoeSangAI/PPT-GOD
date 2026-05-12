@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_SOCKET_TIMEOUT_SECONDS: float = 3.0
     CELERY_BROKER_CONNECTION_TIMEOUT_SECONDS: float = 3.0
+    CELERY_TEXT_QUEUE: str = "text"
+    CELERY_IMAGE_QUEUE: str = "image"
+    CELERY_LOCAL_WORKER_CONCURRENCY: int = 2
 
     MINIMAX_API_KEY: str = ""
     MINIMAX_API_BASE: str = "https://api.minimaxi.com/v1"
@@ -25,7 +28,9 @@ class Settings(BaseSettings):
     IMAGE_API_MAX_CONCURRENCY: int = 1
     IMAGE_GPT_QUALITY: str = "high"  # low | medium | high | auto
     IMAGE_PROVIDER_GATEWAY_CUTOFF_SECONDS: int = 120
-    IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS: int = 1
+    IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS: int = 2
+    IMAGE_ASPECT_RATIO_TOLERANCE: float = 0.04
+    IMAGE_ASPECT_RATIO_MAX_RETRIES: int = 1
     # 0 means keep source dimensions unless upload-size fallback is required.
     IMAGE_REFERENCE_MAX_SIDE: int = 0
     IMAGE_REFERENCE_JPEG_QUALITY: int = 85
@@ -39,6 +44,7 @@ class Settings(BaseSettings):
     IMAGE_EDIT_CONNECT_TIMEOUT_SECONDS: int = 120
     IMAGE_EDIT_READ_TIMEOUT_SECONDS: int = 1800
     GENERATION_PENDING_TIMEOUT_SECONDS: int = 120
+    CELERY_QUEUE_WAIT_TIMEOUT_SECONDS: int = 3600
     AUTO_START_CELERY_WORKER: bool = True
     CELERY_WORKER_STARTUP_TIMEOUT_SECONDS: int = 8
     RUN_HEARTBEAT_TIMEOUT_SECONDS: int = 300

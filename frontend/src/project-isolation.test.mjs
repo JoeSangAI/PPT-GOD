@@ -32,17 +32,17 @@ assert.match(
 );
 assert.match(
   source,
-  /if \(!isRequestCurrentGate\(\)\) \{[\s\S]*pendingChatRef\.current = null;[\s\S]*return;[\s\S]*const frontendWillHandleAgentReply/,
+  /if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*const frontendWillHandleAgentReply/,
   "stale Agent responses must be dropped before replies or actions are applied"
 );
 assert.match(
   source,
-  /if \(\(!chatResultLooksValid\(result\) \|\| streamRetryReason\)[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*pendingChatRef\.current = null;[\s\S]*return;/,
+  /if \(\(!chatResultLooksValid\(result\) \|\| streamRetryReason\)[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;/,
   "stale incomplete Agent streams must be dropped before retrying or warning"
 );
 assert.match(
   source,
-  /if \(!chatResultLooksValid\(result\)\) \{[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*pendingChatRef\.current = null;[\s\S]*return;[\s\S]*响应未返回完整结果/,
+  /if \(!chatResultLooksValid\(result\)\) \{[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*响应未返回完整结果/,
   "incomplete result warnings must only be shown for the current gate"
 );
 assert.match(
@@ -52,13 +52,48 @@ assert.match(
 );
 assert.match(
   source,
-  /chatInProgressRef\.current &&[\s\S]*activeChatProjectIdRef\.current !== projectId[\s\S]*activeChatRoleRef\.current !== currentAgentRoleRef\.current[\s\S]*activeChatGateRef\.current !== gateContextRef\.current\.gate[\s\S]*return;/,
+  /chatInProgressRef\.current &&[\s\S]*activeChatProjectIdRef\.current !== projectId[\s\S]*activeChatRoleRef\.current !== role[\s\S]*activeChatGateRef\.current !== gateContextRef\.current\.gate[\s\S]*return;/,
   "active chat writes must not jump to another project, Agent role, or Gate revision"
 );
 assert.match(
   source,
-  /const abortActiveChat = \(silent = true\)[\s\S]*silentChatAbortRef\.current = silent[\s\S]*pendingChatRef\.current = null;/,
+  /const abortActiveChat = \(silent = true\)[\s\S]*silentChatAbortRef\.current = silent[\s\S]*clearPendingChatRequest\(\);/,
   "programmatic chat aborts must be silent and clear pending retries"
+);
+assert.match(
+  source,
+  /const getPendingChatStorageKey[\s\S]*readPendingChat[\s\S]*writePendingChat/,
+  "in-flight Agent requests must be persisted so tab switches or reloads can recover them"
+);
+assert.match(
+  source,
+  /const appendProjectChatMessage[\s\S]*const nextStored = appendStoredChatMessage\(projectId, role, normalized\);[\s\S]*set(?:Content|Visual)ChatHistory\(nextStored\)/,
+  "active project chat appends must synchronously persist instead of waiting for a later React effect"
+);
+assert.match(
+  source,
+  /const setActiveChatMessages[\s\S]*updateRoleChatMessages\([\s\S]*projectId,[\s\S]*role,[\s\S]*slideId[\s\S]*\);/,
+  "manual active chat updates must use the same synchronous storage path as background updates"
+);
+assert.match(
+  source,
+  /const updateFinetuneChatMessages[\s\S]*updateRoleChatMessages\(projectId, "finetune", updater, slideId\)/,
+  "single-page finetune messages must persist by project and slide instead of living only in React state"
+);
+assert.match(
+  source,
+  /const clearLegacyChatStorageIfNeeded =?\s*function clearLegacyChatStorageIfNeeded|function clearLegacyChatStorageIfNeeded/,
+  "chat storage schema handling must be centralized"
+);
+assert.doesNotMatch(
+  source,
+  /function clearLegacyChatStorageIfNeeded\(\) \{[\s\S]*keysToRemove[\s\S]*removeItem\(key\)/,
+  "schema checks must not wipe project chat history as a recovery shortcut"
+);
+assert.match(
+  source,
+  /pendingChatRef\.current \|\| \(projectId \? restoreStoredPendingChatForProject\(projectId\) : null\)[\s\S]*const initialRecoveryTimer = window\.setTimeout\(recoverPendingChat, 600\)/,
+  "pending Agent requests must be restored on focus and initial project load"
 );
 assert.match(
   source,
@@ -222,8 +257,13 @@ assert.match(
 );
 assert.match(
   source,
-  /function buildVisualStyleGenerationContext\([\s\S]*用户：\$\{content\}[\s\S]*视觉总监：\$\{content\}/,
-  "style proposal generation must preserve recent visual chat requirements instead of only sending the fixed trigger text"
+  /const isVisualRelevantStageContext = \([\s\S]*if \(role === "user"\) return true;/,
+  "cross-stage context must treat user inputs as requirements without keyword filtering"
+);
+assert.match(
+  source,
+  /function buildVisualStyleGenerationContext\([\s\S]*if \(role === "用户"\) \{[\s\S]*lines\.push\(`用户：\$\{content\}`\)/,
+  "style proposal generation must preserve recent user inputs as action requirements instead of filtering by style keywords"
 );
 assert.match(
   source,
@@ -370,9 +410,30 @@ assert.doesNotMatch(
   /pg-visual-inspector|pg-slide-grid-style-preview/,
   "removed visual inspector/style-preview classes must not linger in CSS"
 );
+assert.match(
+  source,
+  /保存并重新生成/,
+  "single-slide edit primary action must say it will regenerate, not just generate"
+);
+assert.match(
+  source,
+  /const handleRegenerateSlideFromEdits = async[\s\S]*generateVisualPlan\(projectId, pageNums, stageContext\)[\s\S]*generatePrompts\(projectId, pageNums, stageContext\)[\s\S]*startGeneration\(projectId, pageNums\)/,
+  "save-and-regenerate must refresh the page visual description and prompt before regenerating the page image"
+);
+assert.match(
+  source,
+  /const handleRegenerateSlideFromEdits = async[\s\S]*updateSinglePageRunMessage\(`正在保存修改并重新生成第 \$\{slide\.page_num\} 页\.\.\.`\)[\s\S]*updateFinetuneChatMessages\(slideId[\s\S]*第 \$\{slide\.page_num\} 页已重新生成/,
+  "save-and-regenerate must leave visible single-page progress and completion feedback"
+);
+assert.match(
+  source,
+  /视觉阶段的内容变动只影响相关页面[\s\S]*setStaleMap[\s\S]*content: true[\s\S]*setContentPlanSnapshot\(data\)/,
+  "visual-stage content edits must mark affected pages stale instead of reopening content confirmation"
+);
 
 const allowedDirectSetContexts = [
   "const setActiveChatMessages",
+  "const updateRoleChatMessages",
   "const appendProjectChatMessage",
   "const updateProjectChatMessages",
   "const ensureContentGreetingIfNeeded",

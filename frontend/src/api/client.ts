@@ -639,7 +639,7 @@ export async function generateStyleProposals(projectId: string, force: boolean =
 export async function pollForStyleProposals(
   projectId: string,
   maxAttempts = 120,
-  intervalMs = 5000
+  intervalMs = 2000
 ): Promise<any[]> {
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, intervalMs));

@@ -42,6 +42,7 @@ from app.services.content_plan import (
     LONG_DECK_CHUNK_SIZE,
     LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT,
     LOW_CONTENT_DRAFT_STATUSES,
+    PAGE_MAP_DOCUMENT_LIMIT,
     build_document_driven_long_deck_draft,
     build_long_deck_skeleton,
     generate_content_plan,
@@ -104,8 +105,8 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_generation_worker_ready():
-    if not ensure_celery_worker():
-        raise HTTPException(status_code=503, detail="后台生成服务未启动，任务没有开始。请启动 worker 后重试。")
+    if not ensure_celery_worker(queue=settings.CELERY_IMAGE_QUEUE):
+        raise HTTPException(status_code=503, detail="图片生成服务未启动，任务没有开始。请启动 worker 后重试。")
 
 
 def _enqueue_generation_task(
@@ -1231,6 +1232,21 @@ def _celery_task_present_in_worker(task_id: str) -> bool | None:
     return False
 
 
+def _celery_workers_online() -> bool | None:
+    try:
+        from app.celery_app import celery_app
+
+        replies = celery_app.control.inspect(timeout=1.0).ping()
+    except Exception as exc:
+        logger.warning(f"Failed to ping Celery workers: {exc}")
+        return None
+    if replies is None:
+        return False
+    if not isinstance(replies, dict):
+        return None
+    return bool(replies)
+
+
 def _celery_result_state(task_id: str) -> str:
     try:
         from app.celery_app import celery_app
@@ -1261,6 +1277,13 @@ def _task_age_seconds(project_id: str, active_run) -> float:
     return _run_seconds_since(getattr(active_run, "started_at", None))
 
 
+def _queued_celery_timeout_seconds() -> int:
+    try:
+        return max(120, int(settings.CELERY_QUEUE_WAIT_TIMEOUT_SECONDS or 0))
+    except (TypeError, ValueError):
+        return 3600
+
+
 def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, active_run) -> bool:
     if not project or not active_run or not active_run.task_id:
         return False
@@ -1278,7 +1301,11 @@ def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, a
     reason = None
 
     if state == "PENDING" and task_age > timeout:
-        reason = "后台生成服务没有接收本次任务，已停止本次生成。请重试未完成页面。"
+        workers_online = _celery_workers_online()
+        if workers_online is False:
+            reason = "后台生成服务未在线，本次生成已停止。请启动 worker 后重试未完成页面。"
+        elif task_age > _queued_celery_timeout_seconds():
+            reason = "后台生成服务长时间没有接收本次任务，已停止本次生成。请重试未完成页面。"
     elif state in {"STARTED", "RETRY"} and inactive_for > timeout:
         present = _celery_task_present_in_worker(task_id)
         if present is False:
@@ -1853,7 +1880,7 @@ def _generate_content_plan_bg(
         db.commit()
         _update_progress(project_id, {"stage": "document_parse", "message": "正在读取上传材料...", "current_page": 0, "total_pages": page_count or 10}, run_id)
 
-        documents = load_project_documents(project_id, parse_missing=True)
+        documents = load_project_documents(project_id, parse_missing=True, text_limit=PAGE_MAP_DOCUMENT_LIMIT)
         explicit_attachment_context = _content_plan_attachment_context(db, project_id, attachment_ids)
         if explicit_attachment_context:
             documents = "\n\n".join(
@@ -1894,16 +1921,20 @@ def _generate_content_plan_bg(
                 db.commit()
                 logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
 
+        target_page_count, _, _ = resolve_content_plan_page_target(topic, page_count, documents)
+        update_run_progress(db, run_id, total_count=target_page_count)
+        db.commit()
+
         mark_run_running(db, run_id, stage="content_plan", message="开始生成 Content Plan...")
         db.commit()
-        _update_progress(project_id, {"stage": "content_plan", "message": "开始生成 Content Plan...", "current_page": 0, "total_pages": page_count or 10}, run_id)
+        _update_progress(project_id, {"stage": "content_plan", "message": "开始生成 Content Plan...", "current_page": 0, "total_pages": target_page_count}, run_id)
 
         def report_progress(data: dict):
             _update_progress(project_id, data, run_id)
 
         outline = generate_content_plan(
             topic=topic,
-            page_count=page_count or 10,
+            page_count=page_count,
             documents=documents,
             on_progress=report_progress,
         )
@@ -2674,6 +2705,9 @@ async def get_generation_status(project_id: str, db: Session = Depends(get_db)):
     task = _running_tasks.get(project_id)
     project = db.query(Project).filter(Project.id == project_id).first()
     active_run = get_active_run(db, project_id)
+    lost_celery_task = _stale_missing_celery_task_if_needed(project, db, active_run)
+    if lost_celery_task:
+        active_run = None
     if project and not active_run:
         slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
         before_status = project.status
@@ -2692,20 +2726,6 @@ async def get_generation_status(project_id: str, db: Session = Depends(get_db)):
             from app.celery_app import celery_app
             celery_task = AsyncResult(task_id.decode() if isinstance(task_id, bytes) else task_id, app=celery_app)
             if celery_task.state in ("PENDING", "STARTED", "RETRY"):
-                if celery_task.state == "PENDING":
-                    started_raw = redis_client.get(f"project:{project_id}:task_started_at")
-                    try:
-                        started_at = float(started_raw.decode() if isinstance(started_raw, bytes) else started_raw)
-                    except (TypeError, ValueError):
-                        started_at = 0
-                    timeout = int(settings.GENERATION_PENDING_TIMEOUT_SECONDS or 0)
-                    if timeout > 0 and started_at and time.time() - started_at > timeout:
-                        _mark_generation_idle(project, db, "生成任务长时间未被 worker 接收，请检查 Celery worker")
-                        stale_active_run(db, project_id, "生成任务长时间未被 worker 接收，请检查 Celery worker")
-                        db.commit()
-                        redis_client.delete(f"project:{project_id}:task_id")
-                        redis_client.delete(f"project:{project_id}:task_started_at")
-                        return {"generation_status": "idle", "project_status": project.status if project else None, "active_run": None}
                 return {"generation_status": "running", "project_status": project.status if project else None, "active_run": serialize_run(active_run)}
     except Exception as e:
         logger.warning(f"Failed to check Celery status for {project_id}: {e}")
@@ -3271,7 +3291,7 @@ def upload_file(
         asset_analysis = _reference_analysis_placeholder(role, safe_name, cleaned_usage_note)
     elif role == "logo":
         asset_analysis = {
-            "analysis_status": "completed",
+            "analysis_status": "tone_detected",
             "analysis_type": "logo",
             "review_status": "auto_confirmed",
             "review_reason": "用户手动上传的品牌 Logo",
@@ -4313,7 +4333,6 @@ def update_slide_content(
         existing["speaker_notes"] = new_content["speaker_notes"]
 
     slide.content_json = existing
-    _invalidate_content_dependent_outputs(project)
     db.commit()
 
     return {

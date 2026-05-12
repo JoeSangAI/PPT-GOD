@@ -16,10 +16,12 @@ from app.services.content_plan import (
     _is_general_transform_request,
     _should_generate_deck_blueprint,
     generate_long_deck_outline_chunk,
+    _infer_document_driven_page_count,
     parse_page_map_markdown,
     parse_exported_content_plan_markdown,
     resolve_content_plan_page_target,
     should_generate_incremental_long_deck,
+    _soft_page_bounds,
 )
 
 
@@ -59,6 +61,31 @@ def test_long_deck_target_uses_incremental_generation():
     assert should_generate_incremental_long_deck("做成 60 到 80 页课程", 80, "")
     assert not should_generate_incremental_long_deck("做成 60 到 80 页课程", 80, sparse_material)
     assert not should_generate_incremental_long_deck("做成 12 页课程", 12, "课程材料")
+
+
+def test_short_soft_page_target_stays_close_to_requested_count():
+    assert _soft_page_bounds(8) == (7, 9)
+    assert resolve_content_plan_page_target("做一份约 8 页儿童课", 8) == (8, 7, 9)
+
+
+def test_long_uploaded_document_infers_larger_default_page_count():
+    documents = "# AI 时代企业营与销课程\n\n" + "\n\n".join(
+        f"## 模块 {idx}\n\n"
+        f"### 关键问题 {idx}\n\n"
+        f"- 第 {idx} 组事实、数据和案例\n"
+        f"- 第 {idx} 组企业主启示\n"
+        f"- 第 {idx} 组落地动作"
+        for idx in range(1, 100)
+    )
+
+    inferred = _infer_document_driven_page_count(documents)
+    target, min_pages, max_pages = resolve_content_plan_page_target("帮我做成 PPT", None, documents)
+
+    assert inferred is not None
+    assert target >= 32
+    assert min_pages < target == max_pages
+    assert target <= 60
+    assert resolve_content_plan_page_target("帮我做成 10 页 PPT", 10, documents) == (10, 9, 11)
 
 
 def test_requested_range_trim_preserves_closing_page():
@@ -185,6 +212,8 @@ P3｜ending｜总结｜下一步
             prompt = kwargs["messages"][1]["content"]
             assert "逐页内容地图" in prompt
             assert "不要输出 JSON" in prompt
+            assert "不要把同一个来源主题拆成" in prompt
+            assert "不能出现连续两页同标题" in prompt
             return FakeResponse()
 
     class FakeChat:
@@ -290,6 +319,68 @@ def test_page_map_falls_back_to_source_draft_when_model_fails(monkeypatch):
     assert len(page_map) == 10
     assert "ChatGPT 达到 1 亿规模只用了 2 个月" in rendered
     assert all(page["generation_status"] == "page_map_source" for page in page_map)
+
+
+def test_page_map_without_bullets_keeps_source_draft_body(monkeypatch):
+    documents = """# 面向AI时代，企业营与销该如何布局
+
+## 模块一：道
+
+- ChatGPT 达到 1 亿规模只用了 2 个月
+- AI 正在成为消费决策的新中介
+
+## 模块二：术
+
+- 先打动 AI，再让客户拍板
+- 内容要同时给人看，也给 AI 读
+"""
+
+    class FakeMessage:
+        content = """P1｜cover｜封面｜面向AI时代，企业营与销该如何布局
+备注：开场定调。
+视觉：课程主视觉
+
+P2｜content｜道｜AI时代，客户已经变了
+备注：直接用数据和事实砸。
+视觉：全屏数据可视化
+来源：模块一
+
+P3｜ending｜总结｜下一步
+备注：收束。
+视觉：总结页"""
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    seen_prompts: list[str] = []
+
+    class FakeCompletions:
+        def create(self, **_kwargs):
+            seen_prompts.append(_kwargs["messages"][1]["content"])
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(content_plan_module.get_knowledge_augmenter(), "augment", lambda *_args, **_kwargs: "")
+
+    outline = generate_content_plan(
+        topic="做一份 5 页课程",
+        documents=documents,
+        page_count=5,
+    )
+
+    bodies = "\n".join(str(page["text_content"].get("body") or "") for page in outline)
+    assert "系统预生成的正文底稿" in seen_prompts[0]
+    assert "AI 正在成为消费决策的新中介" in bodies or "先打动 AI，再让客户拍板" in bodies
+    assert any(str(page["text_content"].get("body") or "").strip() for page in outline[1:])
 
 
 def test_generate_deck_blueprint_uses_global_page_ranges(monkeypatch):

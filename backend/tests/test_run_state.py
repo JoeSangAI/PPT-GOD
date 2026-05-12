@@ -99,6 +99,28 @@ def test_stale_queued_run_unblocks_next_run():
     assert next_run.status == "queued"
 
 
+def test_celery_queued_run_uses_longer_queue_timeout():
+    db = make_session()
+    project = Project(title="Queued Celery run", status="prompt_ready")
+    db.add(project)
+    db.flush()
+
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        total_count=1,
+    )
+    run.task_id = "queued-task"
+    run.started_at = utc_now() - timedelta(seconds=300)
+    db.flush()
+
+    stale_inactive_run_if_needed(db, project.id)
+
+    assert run.status == "queued"
+
+
 def test_stale_running_run_without_heartbeat():
     db = make_session()
     project = Project(title="Dead background task", status="visual_ready")
@@ -156,7 +178,7 @@ def test_reconcile_clears_downstream_outputs_without_selected_style():
     assert slide.status == "pending"
 
 
-def test_reconcile_invalidates_signed_visual_outputs_when_content_changes():
+def test_reconcile_preserves_signed_visual_outputs_when_content_changes():
     db = make_session()
     project = Project(
         title="Signed outputs",
@@ -186,11 +208,10 @@ def test_reconcile_invalidates_signed_visual_outputs_when_content_changes():
 
     reconcile_project_state(project, [slide])
 
-    assert project.status == "visual_ready"
-    assert slide.prompt_text is None
-    assert slide.image_path is None
-    assert slide.status == "pending"
-    assert slide.visual_json == {}
+    assert project.status == "prompt_ready"
+    assert slide.prompt_text == "old prompt"
+    assert slide.status == "prompt_ready"
+    assert slide.visual_json["layout"] == "old"
 
 
 def test_rollback_to_prompt_requires_selected_style():

@@ -1,6 +1,9 @@
 import json
 from types import SimpleNamespace
 
+from PIL import Image
+
+from app.services import image_analyzer
 from app.services import style_proposal
 from app.api.chat import _visual_style_requirement_text
 from app.services.prompt_engine import _compact_style_pack, generate_prompt_for_page
@@ -57,6 +60,112 @@ class _FakeCompletions:
 class _FakeClient:
     def __init__(self):
         self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+
+def test_ai_marketing_summary_does_not_misread_generic_traditional_words():
+    summary = style_proposal._extract_content_summary(
+        [
+            {
+                "type": "cover",
+                "text_content": {
+                    "headline": "AI大模型驱动下的品牌营销新范式",
+                    "body": "技术演进 × 场景落地 × 分众实践",
+                },
+            },
+            {
+                "type": "content",
+                "text_content": {
+                    "headline": "从传统搜索到智能投放",
+                    "body": "传统搜索是关键词匹配；AI 大模型、数据和算法让营销投放从经验判断走向智能决策。",
+                },
+            },
+            {
+                "type": "content",
+                "text_content": {
+                    "headline": "组织文化转变",
+                    "body": "企业需要围绕智能体、Agent 工作流、品牌增长和分众传媒场景重构协作方式。",
+                },
+            },
+        ]
+    )
+
+    assert "科技/数据/AI" in summary["style_direction_hint"]
+    assert "传统文化" not in summary["style_direction_hint"]
+    assert "古法非遗/传统文化" not in summary["industries"]
+    assert "科技/数据" in summary["industries"]
+    assert style_proposal._fallback_style_ids_for_summary(summary)[0] == "minimal_data"
+
+
+def test_logo_analysis_uses_local_palette_when_vlm_misses_colors(monkeypatch, tmp_path):
+    logo_path = tmp_path / "brand-logo.png"
+    img = Image.new("RGBA", (120, 40), (255, 208, 0, 255))
+    for x in range(0, 40):
+        for y in range(0, 40):
+            img.putpixel((x, y), (16, 16, 16, 255))
+    img.save(logo_path)
+
+    monkeypatch.setattr(image_analyzer, "_call_vision_model", lambda *_args, **_kwargs: "")
+
+    result = image_analyzer.analyze_logo(str(logo_path))
+
+    assert result["primary_color"] == "#FFD000"
+    assert "#101010" in result["secondary_colors"]
+    assert result["dominant_palette"]
+
+
+def test_asset_based_ai_marketing_rejects_unjustified_traditional_drift(monkeypatch):
+    class _DriftCompletions:
+        def create(self, **kwargs):
+            bad = {
+                "name": "金墨典藏",
+                "palette": [
+                    {"name": "琥珀金", "hex": "#9C6926", "role": "品牌主色/封面主色"},
+                    {"name": "朱砂红", "hex": "#C0362C", "role": "传统文化装饰色"},
+                    {"name": "宣纸米", "hex": "#F5F1E8", "role": "正文页基底"},
+                    {"name": "墨黑", "hex": "#1A1A1A", "role": "高可读文字"},
+                ],
+                "mood": "传统东方、数字科技、典雅权威",
+                "font": "标题用宋体/书法体，正文用黑体。",
+                "description": "以分众传媒 Logo 的琥珀金为核心锚点，融合传统文化和非遗内容的东方审美。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(bad, ensure_ascii=False)))]
+            )
+
+    class _DriftClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_DriftCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _DriftClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [
+            {
+                "type": "cover",
+                "text_content": {
+                    "headline": "AI大模型驱动下的品牌营销新范式",
+                    "body": "技术演进 × 场景落地 × 分众实践",
+                },
+            },
+            {
+                "type": "content",
+                "text_content": {
+                    "headline": "从传统搜索到智能投放",
+                    "body": "传统搜索是关键词匹配；AI 大模型、数据、算法和智能体让营销投放更高效。",
+                },
+            },
+        ],
+        assets={"user_description": "用户上传了品牌 Logo：分众传媒logo.png"},
+    )
+
+    proposal_text = style_proposal._proposal_text(proposals[0])
+    assert proposals[0]["name"] == "智能增长蓝图"
+    assert proposals[0]["source"] == "asset_drift_guard"
+    for unwanted in ("传统东方", "传统文化", "非遗", "宣纸", "朱砂", "水墨"):
+        assert unwanted not in proposal_text
 
 
 def test_user_style_description_overrides_reference_clone_shortcut(monkeypatch):
@@ -135,6 +244,172 @@ def test_explicit_deck_wide_dark_request_removes_light_content_policy():
     assert "不得自动切换成白底" in normalized["page_type_adaptation"]
     assert "浅色信息基底为主" not in joined
     assert "正文页以浅底" not in joined
+
+
+def test_explicit_brand_gold_request_inserts_visible_gold_accent():
+    proposal = {
+        "name": "冷蓝科技",
+        "palette": [
+            {"name": "科技蓝", "hex": "#0066CC", "role": "品牌主色/标题强调"},
+            {"name": "深空灰", "hex": "#1A1A2E", "role": "封面主色/装饰元素"},
+            {"name": "雾白", "hex": "#F5F7FA", "role": "内容页基底/卡片底色"},
+            {"name": "碳黑", "hex": "#2D3142", "role": "正文/数据文字"},
+        ],
+        "description": "以深空灰与科技蓝构建冷调秩序感，体现AI/大模型/智能体的技术理性。",
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "整体风格科技一点没问题，但是最好加入一些分众的金色，就是 logo 的金色作为一些点缀，这样子比较符合分众的调性。",
+    )
+
+    visible_palette_text = " ".join(
+        f"{color.get('name')} {color.get('hex')} {color.get('role')}"
+        for color in normalized["palette"][:4]
+    )
+    combined = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("name", "description", "page_type_adaptation", "content_style_hint")
+    )
+    assert "分众金" in visible_palette_text
+    assert "#9C6926" in visible_palette_text
+    assert "Logo 呼应" in visible_palette_text
+    assert "分众金" in combined
+    assert "关键数字" in combined
+
+
+def test_asset_based_generation_repairs_missing_gold_from_llm(monkeypatch):
+    class _GoldCompletions:
+        def create(self, **kwargs):
+            proposal = {
+                "name": "冷蓝科技",
+                "palette": [
+                    {"name": "科技蓝", "hex": "#0066CC", "role": "品牌主色/标题强调"},
+                    {"name": "深空灰", "hex": "#1A1A2E", "role": "封面主色"},
+                    {"name": "雾白", "hex": "#F5F7FA", "role": "内容页基底"},
+                    {"name": "碳黑", "hex": "#2D3142", "role": "正文文字"},
+                ],
+                "mood": "科技秩序、数据理性",
+                "font": "现代无衬线",
+                "description": "冷蓝科技风格。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal, ensure_ascii=False)))]
+            )
+
+    class _GoldClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_GoldCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _GoldClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "AI大模型驱动下的品牌营销新范式", "body": "分众实践"}}],
+        assets={
+            "user_description": "加入一些分众的金色，就是 logo 的金色作为一些点缀。",
+            "logo_analysis": {"logo_tone": "light"},
+        },
+    )
+
+    proposal_text = style_proposal._proposal_text(proposals[0])
+    assert "分众金" in proposal_text
+    assert "#9C6926" in [color["hex"] for color in proposals[0]["palette"][:4]]
+    assert "用户明确要求加入分众金" in proposals[0]["content_style_hint"]
+
+
+def test_logo_colors_override_content_drift_when_no_user_color_preference(monkeypatch):
+    class _PurpleCompletions:
+        def create(self, **kwargs):
+            proposal = {
+                "name": "深紫科技秩序感",
+                "palette": [
+                    {"name": "深紫蓝", "hex": "#1A1A2E", "role": "品牌主色/封面基底"},
+                    {"name": "电光紫", "hex": "#7B2CBF", "role": "强调色"},
+                    {"name": "深灰紫", "hex": "#16213E", "role": "正文页基底"},
+                    {"name": "冰白", "hex": "#E8E8F0", "role": "正文"},
+                ],
+                "mood": "科技秩序、未来感、数据理性",
+                "font": "无衬线黑体",
+                "description": "基于混沌品牌名和AI内容方向，提炼冷调深紫蓝。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal, ensure_ascii=False)))]
+            )
+
+    class _PurpleClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_PurpleCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _PurpleClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "面向AI时代", "body": "企业营与销该如何布局"}}],
+        assets={
+            "user_description": "用户：🎯 已上传品牌 Logo：混沌logo.png",
+            "logo_analysis": {
+                "primary_color": "#FFD000",
+                "secondary_colors": ["#101010"],
+                "logo_tone": "mixed",
+            },
+        },
+    )
+
+    palette = [color["hex"] for color in proposals[0]["palette"][:4]]
+    assert palette[:2] == ["#FFD000", "#101010"]
+    assert "#7B2CBF" not in palette[:2]
+    assert "Logo" in proposals[0]["description"]
+    assert "不能在没有用户明确要求时改写品牌主色" in proposals[0]["description"]
+
+
+def test_explicit_user_color_preference_can_override_logo_default(monkeypatch):
+    class _PurpleCompletions:
+        def create(self, **kwargs):
+            proposal = {
+                "name": "紫色科技",
+                "palette": [
+                    {"name": "深紫蓝", "hex": "#1A1A2E", "role": "主色"},
+                    {"name": "电光紫", "hex": "#7B2CBF", "role": "强调色"},
+                    {"name": "深灰紫", "hex": "#16213E", "role": "正文页基底"},
+                    {"name": "冰白", "hex": "#E8E8F0", "role": "正文"},
+                ],
+                "mood": "科技",
+                "font": "无衬线",
+                "description": "用户明确要紫色科技感。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal, ensure_ascii=False)))]
+            )
+
+    class _PurpleClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_PurpleCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _PurpleClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "面向AI时代"}}],
+        assets={
+            "user_description": "当前要求：主色改成紫色科技感。",
+            "logo_analysis": {
+                "primary_color": "#FFD000",
+                "secondary_colors": ["#101010"],
+                "logo_tone": "mixed",
+            },
+        },
+    )
+
+    palette = [color["hex"] for color in proposals[0]["palette"][:4]]
+    assert palette[:2] == ["#1A1A2E", "#7B2CBF"]
+    assert "#FFD000" not in palette[:2]
 
 
 def test_explicit_deck_wide_light_request_overrides_dark_reference_policy():

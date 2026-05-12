@@ -32,7 +32,12 @@ LONG_DECK_SECTION_TITLES = [
 LOW_CONTENT_DRAFT_STATUSES = {"skeleton", "needs_review"}
 PAGE_MAP_MODEL_TIMEOUT_SECONDS = 150.0
 PAGE_MAP_DOCUMENT_LIMIT = 30000
+PAGE_MAP_SOURCE_DRAFT_LIMIT = 18000
 PAGE_MAP_USEFUL_RATIO = 0.75
+AUTO_DOCUMENT_PAGE_MIN_CHARS = 5000
+AUTO_DOCUMENT_PAGE_MIN = 12
+AUTO_DOCUMENT_PAGE_MAX = 60
+AUTO_DOCUMENT_CHARS_PER_SLIDE = 700
 
 
 def _clean_json_response(content: str) -> str:
@@ -279,8 +284,15 @@ def infer_page_count_from_topic(topic: str) -> int | None:
 
 def _soft_page_bounds(page_count: int) -> tuple[int, int]:
     target = max(1, int(page_count or 1))
-    lower = max(1, int(target * 0.7))
-    upper = max(target, int(target * 1.3 + 0.999)) + 1
+    if target <= 12:
+        lower = max(1, target - 1)
+        upper = target + 1
+    elif target <= 30:
+        lower = max(1, target - 2)
+        upper = target + 2
+    else:
+        lower = max(1, int(target * 0.85))
+        upper = max(target, int(target * 1.15 + 0.999))
     return lower, upper
 
 
@@ -556,6 +568,46 @@ def _estimate_document_page_capacity(documents: str) -> int | None:
     )
 
 
+def _infer_document_driven_page_count(documents: str) -> int | None:
+    """Pick a practical default page count when the user uploads a dense brief."""
+    text = (documents or "").strip()
+    if len(text) < AUTO_DOCUMENT_PAGE_MIN_CHARS:
+        return None
+
+    units = extract_document_outline_units(text)
+    content_units = [
+        unit for unit in units
+        if str(unit.get("title") or "").strip() != "用户上传材料"
+    ]
+    root_title = ""
+    for unit in content_units:
+        if int(unit.get("level") or 9) <= 1:
+            root_title = str(unit.get("title") or "").strip()
+            break
+    source_units = [
+        unit for unit in content_units
+        if str(unit.get("title") or "").strip() != root_title
+    ] or content_units
+
+    char_count = len(text)
+    heading_count = sum(1 for unit in source_units if int(unit.get("level") or 9) <= 4)
+    char_target = int(char_count / AUTO_DOCUMENT_CHARS_PER_SLIDE) + 4
+    structure_target = int(heading_count * 0.45) + 4 if heading_count else 0
+    target = max(char_target, structure_target, AUTO_DOCUMENT_PAGE_MIN)
+
+    if char_count >= 20_000:
+        target = max(target, 32)
+    elif char_count >= 12_000:
+        target = max(target, 24)
+    elif char_count >= 7_000:
+        target = max(target, 16)
+
+    capacity = _estimate_document_page_capacity(text)
+    if capacity is not None:
+        target = min(target, capacity)
+    return max(AUTO_DOCUMENT_PAGE_MIN, min(AUTO_DOCUMENT_PAGE_MAX, target))
+
+
 def _resolve_soft_range_target(
     *,
     topic: str,
@@ -578,15 +630,20 @@ def _resolve_soft_range_target(
 def resolve_content_plan_page_target(topic: str, page_count: int | None, documents: str = "") -> tuple[int, int, int]:
     """Return target, min, max pages using the same policy as content-plan generation."""
     requested_page_range = infer_page_count_range_from_topic(topic)
-    resolved_page_count = max(1, int(page_count or 10))
+    explicit_page_count = page_count or infer_page_count_from_topic(topic)
+    auto_document_page_count = None if explicit_page_count or requested_page_range else _infer_document_driven_page_count(documents)
+    resolved_page_count = max(1, int(explicit_page_count or auto_document_page_count or 10))
     if requested_page_range and resolved_page_count == 10:
         resolved_page_count = requested_page_range[1]
     strict_page_count = _is_strict_page_count_request(topic) and not requested_page_range
-    min_pages, max_pages = (
-        requested_page_range
-        if requested_page_range
-        else (resolved_page_count, resolved_page_count) if strict_page_count else _soft_page_bounds(resolved_page_count)
-    )
+    if requested_page_range:
+        min_pages, max_pages = requested_page_range
+    elif strict_page_count:
+        min_pages, max_pages = resolved_page_count, resolved_page_count
+    elif auto_document_page_count:
+        min_pages, max_pages = max(1, int(resolved_page_count * 0.8)), resolved_page_count
+    else:
+        min_pages, max_pages = _soft_page_bounds(resolved_page_count)
     target_count = max(min_pages, min(max_pages, resolved_page_count if resolved_page_count else max_pages))
     if requested_page_range:
         target_count = _resolve_soft_range_target(
@@ -1120,6 +1177,11 @@ def _normalize_page_map(page_map: list[dict]) -> list[dict]:
     return normalized
 
 
+def _page_map_requires_body_bullets(page: dict) -> bool:
+    page_type = str(page.get("type") or "content").strip().lower() or "content"
+    return page_type in {"agenda", "toc", "content", "data"}
+
+
 def _page_map_is_useful(page_map: list[dict], *, target_count: int, min_pages: int, strict: bool) -> bool:
     if not page_map:
         return False
@@ -1130,19 +1192,43 @@ def _page_map_is_useful(page_map: list[dict], *, target_count: int, min_pages: i
     if len(page_map) < max(3, int(target_count * PAGE_MAP_USEFUL_RATIO)):
         return False
     contentful = 0
+    body_required = 0
     for page in page_map:
         bullets = page.get("bullets") if isinstance(page.get("bullets"), list) else []
-        if str(page.get("headline") or "").strip() and (bullets or str(page.get("speaker_notes") or "").strip()):
+        has_headline = bool(str(page.get("headline") or "").strip())
+        if _page_map_requires_body_bullets(page):
+            body_required += 1
+            if not bullets:
+                return False
+        if has_headline and (bullets or str(page.get("speaker_notes") or "").strip()):
             contentful += 1
+    if body_required <= 0:
+        return False
     return contentful >= max(1, int(len(page_map) * 0.8))
 
 
 def _merge_page_map_with_fallback(page_map: list[dict], fallback: list[dict], *, target_count: int) -> list[dict]:
     by_num = {int(page.get("page_num") or 0): page for page in page_map if isinstance(page, dict)}
+    fallback_by_num = {int(page.get("page_num") or 0): page for page in fallback if isinstance(page, dict)}
     merged: list[dict] = []
     for idx in range(1, target_count + 1):
         if idx in by_num:
-            merged.append(by_num[idx])
+            page = {**by_num[idx]}
+            fallback_page = fallback_by_num.get(idx)
+            bullets = page.get("bullets") if isinstance(page.get("bullets"), list) else []
+            fallback_bullets = (
+                fallback_page.get("bullets")
+                if isinstance(fallback_page, dict) and isinstance(fallback_page.get("bullets"), list)
+                else []
+            )
+            if _page_map_requires_body_bullets(page) and not bullets and fallback_bullets:
+                page["bullets"] = list(fallback_bullets)
+                if not str(page.get("subhead") or "").strip():
+                    page["subhead"] = str(fallback_page.get("subhead") or "").strip()
+                if not page.get("source_refs"):
+                    page["source_refs"] = fallback_page.get("source_refs") if isinstance(fallback_page.get("source_refs"), list) else []
+                page["generation_status"] = "page_map_model_with_source_body"
+            merged.append(page)
         elif idx - 1 < len(fallback):
             merged.append(fallback[idx - 1])
     return _normalize_page_map(merged[:target_count])
@@ -1158,6 +1244,7 @@ def _generate_model_page_map(
     min_pages: int,
     max_pages: int,
     search_context: str = "",
+    source_page_map_markdown: str = "",
     on_progress: Callable[[dict], None] | None = None,
 ) -> list[dict]:
     if on_progress:
@@ -1181,10 +1268,13 @@ def _generate_model_page_map(
 
 【页数目标】
 {page_goal_text}
-本轮建议按约 {target_count} 页规划；如果材料明显不足，可以减少页数，但不能用空话凑页数。
+本轮建议按约 {target_count} 页规划；如果材料明显不足，可以减少页数，但不能用空话或重复页凑页数。
 
 【用户上传材料】
 {doc_text or "无"}
+
+【系统预生成的正文底稿】
+{source_page_map_markdown or "无"}
 
 【实时搜索上下文】
 {search_context or "无"}
@@ -1196,9 +1286,12 @@ def _generate_model_page_map(
 1. 一次性给出全局逐页内容地图，必须覆盖整场演讲/课程的开场、主线、转场、案例、复盘和结尾。
 2. 每页都要有标题、2-3 个具体 bullet、演讲者备注；不要只写章节名或空泛框架。
 3. 标题和 bullet 必须尽量来自用户材料或 Brief，不能为了凑页数发明不相干内容。
-4. 页间要有连续叙事：上一页为什么引出下一页要想清楚。
-5. 封面页可以没有 bullet；封底页只收束，不引入新论点。
-6. 输出格式必须固定为：
+4. 如果提供了“系统预生成的正文底稿”，你必须以它为基础优化标题、顺序和取舍；content/agenda/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
+5. 不要把同一个来源主题拆成“简短版”和“展开版”两页；如果两页标题、bullet 或来源线索接近，必须合并为一页，只保留更完整的一版。
+6. 相邻页面必须有明确的新信息、新问题、新活动或新叙事功能；不能出现连续两页同标题、同 bullet、同来源框架。
+7. 页间要有连续叙事：上一页为什么引出下一页要想清楚。
+8. 封面页可以没有 bullet；封底页只收束，不引入新论点。
+9. 输出格式必须固定为：
 P1｜cover｜封面｜标题
 - bullet
 - bullet
@@ -1274,7 +1367,7 @@ def generate_content_page_map(
     *,
     topic: str,
     audience: str = "通用受众",
-    page_count: int = 10,
+    page_count: int | None = None,
     documents: str = "",
     search_context: str = "",
     on_progress: Callable[[dict], None] | None = None,
@@ -1290,7 +1383,10 @@ def generate_content_page_map(
     elif strict_page_count:
         page_goal_text = f"用户明确要求必须 {target_count} 页。"
     else:
-        page_goal_text = f"{target_count} 页左右，可在 {min_pages}-{max_pages} 页范围内浮动。"
+        page_goal_text = (
+            f"优先生成约 {target_count} 页；只有内容结构确实需要时才在 {min_pages}-{max_pages} 页内小幅浮动，"
+            "不要为了靠近上限而拆出重复页。"
+        )
 
     fallback = _fallback_page_map(
         topic=topic,
@@ -1299,6 +1395,12 @@ def generate_content_page_map(
         min_pages=min_pages,
         max_pages=max_pages,
     )
+    source_page_map_markdown = render_page_map_markdown(fallback)
+    if len(source_page_map_markdown) > PAGE_MAP_SOURCE_DRAFT_LIMIT:
+        source_page_map_markdown = _document_excerpt_for_extension(
+            source_page_map_markdown,
+            limit=PAGE_MAP_SOURCE_DRAFT_LIMIT,
+        )
     try:
         model_map = _generate_model_page_map(
             topic=topic,
@@ -1309,7 +1411,13 @@ def generate_content_page_map(
             min_pages=min_pages,
             max_pages=max_pages,
             search_context=search_context,
+            source_page_map_markdown=source_page_map_markdown,
             on_progress=on_progress,
+        )
+        model_map = _merge_page_map_with_fallback(
+            model_map,
+            fallback,
+            target_count=max(target_count, len(model_map)),
         )
         if _page_map_is_useful(model_map, target_count=target_count, min_pages=min_pages, strict=strict_page_count):
             if strict_page_count and len(model_map) < target_count:
@@ -1956,7 +2064,7 @@ def _normalize_punchline_page_content(page: Dict) -> None:
 def generate_content_plan(
     topic: str,
     audience: str = "通用受众",
-    page_count: int = 10,
+    page_count: int | None = None,
     documents: str = "",
     on_progress: Callable[[dict], None] | None = None,
 ) -> List[Dict]:

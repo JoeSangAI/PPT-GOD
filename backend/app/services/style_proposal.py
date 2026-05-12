@@ -15,6 +15,8 @@ from app.services.visual_strategy import build_visual_strategy
 
 logger = logging.getLogger(__name__)
 
+STYLE_PROPOSAL_POLICY_VERSION = "2026-05-12-style-requirements-v3"
+
 
 DARK_DECK_SCOPE_TERMS = [
     "全页", "全部页面", "所有页面", "整套", "每页", "正文", "正文页", "内容页", "数据页", "页面都", "都用", "也用", "也可以",
@@ -41,6 +43,14 @@ LIGHT_DECK_CONFLICT_RE = re.compile(
     r"(?:整体以深色视觉基底为主|先保持整套深色视觉基底|信息页保持同一深色系基底|深色背景|深色基底|深色系语言|高对比暗色卡片|黑色/深色纹理基底)[^。；;.!！?\n]*[。；;.!！?]?",
     flags=re.IGNORECASE,
 )
+GOLD_ACCENT_NEGATIONS = [
+    "不要金色", "不用金色", "避免金色", "去掉金色", "别用金色", "不要金", "不用金",
+]
+GOLD_ACCENT_TERMS = [
+    "分众金", "分众的金色", "logo的金色", "logo金色", "logo 金色", "品牌金", "品牌金色",
+    "金色点缀", "金色作为点缀", "金色元素", "加金色", "加入金色", "一些金色",
+    "一点金色", "金色", "琥珀金", "香槟金",
+]
 
 
 def _requests_deck_wide_dark_style(text: str) -> bool:
@@ -151,21 +161,239 @@ def _enforce_light_deck_style(proposal: Dict) -> Dict:
     return normalized
 
 
-def enforce_user_style_requirements(proposal: Dict, user_description: str) -> Dict:
-    """Make structured style output obey explicit user chat requirements."""
-    if not isinstance(proposal, dict):
-        return proposal
-    wants_light = _requests_deck_wide_light_style(user_description)
-    wants_dark = _requests_deck_wide_dark_style(user_description)
-    if wants_light and (
-        not wants_dark
-        or _latest_term_index(user_description, LIGHT_DECK_TONE_TERMS + LIGHT_DECK_DARK_REJECTIONS)
-        >= _latest_term_index(user_description, DARK_DECK_TONE_TERMS)
-    ):
-        return _enforce_light_deck_style(proposal)
-    if not wants_dark:
+def _requests_gold_accent(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    if not normalized or any(term.lower() in normalized for term in GOLD_ACCENT_NEGATIONS):
+        return False
+    return any(term.lower().replace(" ", "") in normalized for term in GOLD_ACCENT_TERMS)
+
+
+def _is_gold_like_color(color: dict) -> bool:
+    text = f"{color.get('name') or ''} {color.get('role') or ''}".lower()
+    if any(term.lower() in text for term in ("金", "gold", "amber", "琥珀", "香槟")):
+        return True
+    hex_color = _extract_hex(str(color.get("hex") or ""))
+    return bool(hex_color and _is_warm_accent(hex_color) and _brightness(hex_color) >= 80)
+
+
+def _normalize_palette_item(item, index: int) -> dict:
+    if isinstance(item, dict):
+        color = dict(item)
+        color.setdefault("name", f"颜色{index + 1}")
+        color.setdefault("hex", _extract_hex(str(color.get("hex") or "")) or "#CCCCCC")
+        color.setdefault("role", "")
+        return color
+    hex_color = _extract_hex(str(item or "")) or "#CCCCCC"
+    return {"name": _get_color_name(hex_color), "hex": hex_color, "role": ""}
+
+
+UPLOAD_CONTEXT_TERMS = [
+    "已上传", "上传了", "上传品牌logo", "上传品牌 Logo", "Brief Studio", "素材清单",
+    "图片会作为", "文件名", "项目素材说明",
+]
+LOGO_COLOR_OVERRIDE_NEGATIONS = [
+    "不要logo色", "不用logo色", "避免logo色", "不要logo颜色", "不用logo颜色",
+    "不要品牌色", "不用品牌色", "避免品牌色", "不要按logo", "不用按logo",
+    "不要按品牌色", "不用按品牌色",
+]
+LOGO_COLOR_AFFIRM_TERMS = [
+    "logo色", "logo颜色", "logo的", "logo 的", "品牌色", "品牌黄", "品牌金", "Logo 呼应",
+]
+EXPLICIT_COLOR_WORDS = [
+    "红", "橙", "黄", "金", "绿", "蓝", "紫", "粉", "黑", "白", "灰", "棕",
+    "暖色", "冷色", "浅色", "深色", "配色", "颜色", "色调", "主色",
+]
+
+
+def _style_preference_text(user_description: str) -> str:
+    """Remove upload/system bookkeeping so it is not treated as visual taste."""
+    lines: list[str] = []
+    for raw_line in str(user_description or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        compact = re.sub(r"\s+", "", line).lower()
+        is_upload_record = any(re.sub(r"\s+", "", term).lower() in compact for term in UPLOAD_CONTEXT_TERMS)
+        has_instruction = any(term in line for term in ("希望", "想要", "不要", "不用", "避免", "改成", "换成", "主色", "配色", "颜色"))
+        if is_upload_record and not has_instruction:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _user_overrides_logo_default_colors(user_description: str) -> bool:
+    preference = _style_preference_text(user_description)
+    normalized = re.sub(r"\s+", "", preference or "").lower()
+    if not normalized:
+        return False
+    if any(term.lower() in normalized for term in LOGO_COLOR_OVERRIDE_NEGATIONS):
+        return True
+    if any(re.sub(r"\s+", "", term).lower() in normalized for term in LOGO_COLOR_AFFIRM_TERMS):
+        return False
+    return any(term.lower() in normalized for term in EXPLICIT_COLOR_WORDS)
+
+
+def _logo_brand_colors(logo: Dict | None) -> list[str]:
+    logo = logo or {}
+    colors: list[str] = []
+    for value in [logo.get("primary_color"), *(logo.get("secondary_colors") or [])]:
+        hex_color = _extract_hex(str(value or ""))
+        if hex_color and hex_color not in colors:
+            colors.append(hex_color)
+    for item in logo.get("dominant_palette") or []:
+        hex_color = _extract_hex(str(item.get("hex") if isinstance(item, dict) else item))
+        if hex_color and hex_color not in colors:
+            colors.append(hex_color)
+    return colors
+
+
+def _logo_color_role(index: int, hex_color: str) -> str:
+    if index == 0:
+        return "Logo 提取主色/标题、关键数字和品牌装饰"
+    if _is_dark(hex_color):
+        return "Logo 提取辅助色/背景、正文文字和对比层次"
+    if _brightness(hex_color) >= 220:
+        return "Logo 提取辅助色/内容页浅底和留白"
+    return "Logo 提取辅助色/装饰线、标签和图表重点"
+
+
+def _should_apply_logo_default_colors(logo: Dict, ref: Dict, template: Dict, user_description: str) -> bool:
+    if not _logo_brand_colors(logo):
+        return False
+    if _has_clone_reference(ref, template) or template.get("has_template"):
+        return False
+    return not _user_overrides_logo_default_colors(user_description)
+
+
+def _enforce_logo_default_colors(proposal: Dict, logo: Dict) -> Dict:
+    logo_colors = _logo_brand_colors(logo)
+    if not logo_colors:
         return proposal
 
+    normalized = copy.deepcopy(proposal)
+    original_palette = [
+        _normalize_palette_item(item, index)
+        for index, item in enumerate(normalized.get("palette") or [])
+    ]
+    original_hexes = {
+        _extract_hex(str(color.get("hex") or ""))
+        for color in original_palette
+        if isinstance(color, dict)
+    }
+    already_uses_logo = any(hex_color in original_hexes for hex_color in logo_colors[:2])
+
+    logo_palette = [
+        {
+            "name": _get_color_name(hex_color),
+            "hex": hex_color,
+            "role": _logo_color_role(index, hex_color),
+        }
+        for index, hex_color in enumerate(logo_colors[:3])
+    ]
+    remaining = [
+        color
+        for color in original_palette
+        if _extract_hex(str(color.get("hex") or "")) not in {item["hex"] for item in logo_palette}
+    ]
+    normalized["palette"] = (logo_palette + remaining)[:5]
+
+    color_names = "、".join(color["name"] for color in logo_palette[:2])
+    if not already_uses_logo:
+        normalized["name"] = f"Logo{color_names}品牌风"
+        normalized["description"] = (
+            f"默认按上传 Logo 提取色建立视觉系统：{color_names}必须进入整套 PPT 的配色。"
+            "内容主题可以影响科技秩序、网格、光效和数据表达，但不能在没有用户明确要求时改写品牌主色。"
+            "封面和章节页可放大品牌色，正文和数据页用同一组颜色控制标题、重点数字、装饰线和 Logo 对比。"
+        )[:560]
+    else:
+        description = str(normalized.get("description") or "")
+        if "Logo" not in description and "品牌色" not in description:
+            normalized["description"] = (
+                f"默认沿用上传 Logo 的{color_names}作为品牌色。"
+                f"{description}"
+            )[:560]
+
+    hint = str(normalized.get("content_style_hint") or "").strip()
+    logo_hint = f"无用户明确配色覆盖时，必须优先沿用上传 Logo 提取色：{', '.join(logo_colors[:3])}。"
+    normalized["content_style_hint"] = f"{logo_hint}{hint}"[:520]
+    return normalized
+
+
+def _gold_accent_for_request(user_description: str) -> dict:
+    normalized = re.sub(r"\s+", "", user_description or "").lower()
+    if "分众" in normalized or "logo" in normalized:
+        return {"name": "分众金", "hex": "#9C6926", "role": "Logo 呼应色/关键数字和装饰线点缀"}
+    if "香槟" in normalized:
+        return {"name": "香槟金", "hex": "#D6B56D", "role": "品牌高级感点缀/重点信息"}
+    return {"name": "琥珀金", "hex": "#D4AF37", "role": "重点信息、编号和装饰线点缀"}
+
+
+def _enforce_gold_accent_style(proposal: Dict, user_description: str) -> Dict:
+    normalized = copy.deepcopy(proposal)
+    palette = [
+        _normalize_palette_item(item, index)
+        for index, item in enumerate(normalized.get("palette") or [])
+    ]
+    gold = _gold_accent_for_request(user_description)
+
+    if palette and any(_is_gold_like_color(color) for color in palette):
+        palette = [
+            {
+                **color,
+                "name": color.get("name") or gold["name"],
+                "role": (
+                    color.get("role")
+                    if "点缀" in str(color.get("role") or "") or "Logo" in str(color.get("role") or "")
+                    else f"{color.get('role') or '重点信息'} / Logo 呼应点缀"
+                ),
+            }
+            if _is_gold_like_color(color)
+            else color
+            for color in palette
+        ]
+    else:
+        palette.insert(1 if palette else 0, gold)
+    normalized["palette"] = palette[:5]
+
+    name = str(normalized.get("name") or "视觉方案").strip()
+    if "金" not in name and "分众" not in name:
+        name = f"{name}（分众金点缀）" if "分众" in re.sub(r"\s+", "", user_description or "") else f"{name}（金色点缀）"
+    normalized["name"] = name
+
+    base_description = str(normalized.get("description") or "").strip()
+    contract_sentence = (
+        f"按用户最新要求，{gold['name']}必须进入配色系统，但只做少量点缀：用于关键数字、页眉细线、编号、"
+        "图表重点和 Logo 呼应，不把整套 PPT 改成传统金色或奢华风。"
+    )
+    if gold["name"] not in base_description and "金色" not in base_description:
+        normalized["description"] = f"{contract_sentence}{base_description}"[:620]
+
+    strategy = normalized.get("visual_strategy") if isinstance(normalized.get("visual_strategy"), dict) else {}
+    strategy = {
+        **strategy,
+        "brand_accent": f"{gold['name']}作为低占比品牌点缀，服务关键数字、编号、细线和 Logo 呼应。",
+    }
+    summary = str(strategy.get("summary") or "").strip()
+    if gold["name"] not in summary:
+        strategy["summary"] = f"{summary} {gold['name']}仅作低占比品牌点缀。".strip()
+    normalized["visual_strategy"] = strategy
+
+    adaptation = str(normalized.get("page_type_adaptation") or "").strip()
+    accent_rule = (
+        f"页面类型适配规则补充：{gold['name']}必须在封面、章节、关键数据和图表页中作为少量点缀出现，"
+        "建议控制在 5%-10% 面积内；正文页用它做编号、细线、标签或重点数字，不可整页铺成金色。"
+    )
+    if gold["name"] not in adaptation and "金色" not in adaptation:
+        normalized["page_type_adaptation"] = f"{accent_rule}{adaptation}"[:820]
+
+    content_hint = str(normalized.get("content_style_hint") or "").strip()
+    gold_hint = f"用户明确要求加入{gold['name']}作为品牌点缀；后续画面方案和 Prompt 必须保留这个点缀色。"
+    normalized["content_style_hint"] = f"{gold_hint}{content_hint}"[:520]
+    normalized["source"] = normalized.get("source") or "agent_adjustment_contract"
+    return normalized
+
+
+def _enforce_dark_deck_style(proposal: Dict) -> Dict:
     normalized = copy.deepcopy(proposal)
     normalized["palette"] = _dark_deck_palette(normalized.get("palette") if isinstance(normalized.get("palette"), list) else [])
     name = str(normalized.get("name") or "深色视觉方案").strip()
@@ -199,12 +427,45 @@ def enforce_user_style_requirements(proposal: Dict, user_description: str) -> Di
     return normalized
 
 
+def enforce_user_style_requirements(proposal: Dict, user_description: str) -> Dict:
+    """Make structured style output obey explicit user chat requirements."""
+    if not isinstance(proposal, dict):
+        return proposal
+    wants_light = _requests_deck_wide_light_style(user_description)
+    wants_dark = _requests_deck_wide_dark_style(user_description)
+    normalized = proposal
+    if wants_light and (
+        not wants_dark
+        or _latest_term_index(user_description, LIGHT_DECK_TONE_TERMS + LIGHT_DECK_DARK_REJECTIONS)
+        >= _latest_term_index(user_description, DARK_DECK_TONE_TERMS)
+    ):
+        normalized = _enforce_light_deck_style(proposal)
+    elif wants_dark:
+        normalized = _enforce_dark_deck_style(proposal)
+
+    if _requests_gold_accent(user_description):
+        normalized = _enforce_gold_accent_style(normalized, user_description)
+    return normalized
+
+
 TRADITIONAL_CULTURE_TERMS = [
-    "古法", "非遗", "传承", "匠心", "老字号", "古朴", "传统", "文化",
-    "中式", "东方", "国潮", "节庆", "喜庆", "宴会", "礼赠",
+    "古法", "非遗", "文化传承", "传统文化", "中华文化", "东方审美", "东方美学",
+    "中式", "国风", "国潮", "水墨", "宣纸", "朱砂", "青花", "宋韵", "唐风",
+    "古朴", "古典", "匠心", "老字号", "纹样", "祥云",
+]
+TRADITIONAL_STYLE_DRIFT_TERMS = [
+    "传统东方", "传统文化", "非遗", "东方审美", "东方美学", "中式", "国风", "国潮",
+    "水墨", "宣纸", "朱砂", "青花", "宋韵", "唐风", "古朴", "金墨", "墨韵", "祥云",
 ]
 FOOD_AGRI_TERMS = ["食品", "餐饮", "农业", "花生油", "粮油", "调味品", "食用油", "风味", "香"]
-TECH_TERMS = ["科技", "AI", "人工智能", "数据", "算法", "数字化", "芯片", "云计算"]
+TECH_TERMS = [
+    "科技", "AI", "人工智能", "大模型", "智能体", "智能投放", "智能营销", "数智化",
+    "数据", "算法", "数字化", "芯片", "云计算", "AIGC", "Agent", "ChatGPT", "Copilot",
+]
+BRAND_BUSINESS_TERMS = [
+    "消费", "品牌", "零售", "产品", "战略", "营销", "广告", "传媒", "媒体", "媒介",
+    "投放", "渠道", "增长", "转化", "商业", "ROI",
+]
 ANCIENT_ROME_TERMS = [
     "古罗马", "罗马", "角斗士", "角斗", "斗兽场", "竞技场", "Colosseum", "gladiator",
     "gladius", "凯撒", "帝国", "元老院", "军团", "罗马帝国", "血腥舞台",
@@ -279,11 +540,22 @@ def _contains_unnegated_tech(text: str) -> bool:
         text = text
         for pattern in TECH_NEGATION_PATTERNS:
             text = text.replace(pattern, "")
-    return any(term in text for term in TECH_TERMS)
+    return _contains_any_term(text, TECH_TERMS)
 
 
 def _score_terms(text: str, terms: List[str]) -> int:
-    return sum(text.count(term) for term in terms)
+    normalized = text.lower()
+    total = 0
+    for term in terms:
+        if not term:
+            continue
+        total += normalized.count(term.lower())
+    return total
+
+
+def _contains_any_term(text: str, terms: List[str]) -> bool:
+    normalized = text.lower()
+    return any(term and term.lower() in normalized for term in terms)
 
 
 def _infer_topic_style_profile(text: str) -> Optional[Dict]:
@@ -411,8 +683,8 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
         # 简单关键词提取（从 headline + subhead + body 中找行业/场景词）
         text_to_search = f"{h} {sub} {str(body) if body else ''}"
         keyword_pool = [
-            "金融", "医疗", "教育", "消费", "品牌", "学术", "艺术", "设计", "汽车",
-            "地产", "零售", "投资", "产品", "战略", *TECH_TERMS,
+            "金融", "医疗", "教育", "学术", "艺术", "设计", "汽车", "地产", "投资",
+            *BRAND_BUSINESS_TERMS, *TECH_TERMS,
             *FOOD_AGRI_TERMS, *TRADITIONAL_CULTURE_TERMS, *ANCIENT_ROME_TERMS, *HISTORICAL_EPIC_TERMS,
         ]
         for kw in keyword_pool:
@@ -425,7 +697,7 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
     traditional_score = _score_terms(full_text, TRADITIONAL_CULTURE_TERMS)
     food_score = _score_terms(full_text, FOOD_AGRI_TERMS)
     tech_score = _score_terms(full_text, TECH_TERMS) if _contains_unnegated_tech(full_text) else 0
-    brand_score = _score_terms(full_text, ["消费", "品牌", "零售", "产品", "战略"])
+    brand_score = _score_terms(full_text, BRAND_BUSINESS_TERMS)
     topic_style_profile = _infer_topic_style_profile(full_text)
 
     # 推断行业/场景。先处理强语义，避免“拒绝科技与狠活”一类反向表达误判为科技。
@@ -474,6 +746,8 @@ def _extract_content_summary(content_plan: List[Dict]) -> Dict:
 
 
 def _build_content_style_direction(traditional_score: int, food_score: int, tech_score: int, brand_score: int) -> str:
+    if tech_score >= 2 and tech_score >= max(traditional_score * 2, food_score + traditional_score):
+        return "内容核心偏科技/数据/AI，可考虑冷色、秩序感、数据化的现代视觉方向。"
     if traditional_score and food_score:
         return "内容核心更接近古法非遗、传统食品/农业品牌，应优先考虑传统质感、品牌主色、暖性浅底、纹样装饰与可信赖的商业表达。"
     if traditional_score:
@@ -493,10 +767,75 @@ def _topic_profile(summary: Dict) -> Dict:
 
 
 def _proposal_text(proposal: Dict) -> str:
-    return " ".join(
+    parts = [
         str(proposal.get(key) or "")
-        for key in ("name", "mood", "font", "description", "source", "texture", "ornaments", "clone_rules")
+        for key in (
+            "name", "mood", "font", "description", "source", "texture", "ornaments",
+            "clone_rules", "page_type_adaptation", "content_style_hint",
+        )
+    ]
+    palette = proposal.get("palette")
+    if isinstance(palette, list):
+        for color in palette:
+            if isinstance(color, dict):
+                parts.extend([str(color.get("name") or ""), str(color.get("role") or "")])
+            else:
+                parts.append(str(color))
+    return " ".join(parts)
+
+
+def _summary_evidence_text(summary: Dict) -> str:
+    return " ".join(
+        [
+            " ".join(str(item) for item in summary.get("headlines") or []),
+            " ".join(str(item) for item in summary.get("topic_hints") or []),
+            " ".join(str(item) for item in summary.get("keywords") or []),
+            " ".join(str(item) for item in summary.get("industries") or []),
+            str(summary.get("style_direction_hint") or ""),
+        ]
     )
+
+
+def _summary_prefers_tech(summary: Dict) -> bool:
+    text = _summary_evidence_text(summary)
+    return "科技/数据" in text or _contains_unnegated_tech(text)
+
+
+def _asset_evidence_text(assets: Optional[Dict]) -> str:
+    if not assets:
+        return ""
+    fields: List[str] = []
+    fields.append(str(assets.get("user_description") or ""))
+    for section_key in ("logo_analysis", "reference_analysis", "template_analysis"):
+        section = assets.get(section_key)
+        if isinstance(section, dict):
+            for value in section.values():
+                if isinstance(value, (str, int, float)):
+                    fields.append(str(value))
+                elif isinstance(value, list):
+                    fields.extend(str(item) for item in value if isinstance(item, (str, int, float)))
+                elif isinstance(value, dict):
+                    fields.extend(str(item) for item in value.values() if isinstance(item, (str, int, float)))
+    return " ".join(fields)
+
+
+def _has_explicit_traditional_style_signal(text: str) -> bool:
+    return _contains_any_term(text, TRADITIONAL_CULTURE_TERMS)
+
+
+def _proposal_has_unjustified_traditional_drift(
+    proposal: Dict,
+    summary: Dict,
+    assets: Optional[Dict] = None,
+) -> bool:
+    if not _summary_prefers_tech(summary):
+        return False
+
+    evidence_text = f"{_summary_evidence_text(summary)} {_asset_evidence_text(assets)}"
+    if _has_explicit_traditional_style_signal(evidence_text):
+        return False
+
+    return _contains_any_term(_proposal_text(proposal), TRADITIONAL_STYLE_DRIFT_TERMS)
 
 
 def _proposal_matches_topic(proposal: Dict, summary: Dict) -> bool:
@@ -838,14 +1177,41 @@ def _proposal_from_style_library(style: Dict, summary: Dict) -> Dict:
     }
 
 
+def _modern_tech_fallback_proposal(summary: Dict, source: str = "original_tech_modern") -> Dict:
+    headline = (summary.get("headlines") or ["AI/数据驱动的商业主题"])[0]
+    return {
+        "name": "智能增长蓝图",
+        "palette": [
+            {"name": "深海蓝", "hex": "#0B1F3A", "role": "封面/章节页主色"},
+            {"name": "电光蓝", "hex": "#2F7DFF", "role": "关键数据、路径和强调色"},
+            {"name": "冷白", "hex": "#F7FAFC", "role": "正文页基底/内容区"},
+            {"name": "石墨灰", "hex": "#111827", "role": "正文/图表文字"},
+        ],
+        "mood": "现代、清晰、可信、数据化",
+        "font": "几何无衬线体，标题加粗，正文保持高可读。",
+        "description": (
+            f"这份 PPT 讲的是{headline}，视觉应围绕 AI、数据和商业增长建立现代感。"
+            "深海蓝负责专业可信，电光蓝用于算法路径、关键数字和智能投放线索；正文页用冷白底和清晰图表保证讲解效率。"
+        ),
+        "decision_label": "科技清晰",
+        "best_for": "想突出 AI、数据能力和商业落地，同时让正文页、图表页读得清楚。",
+        "tradeoff": "文化装饰和情绪化纹理会被压低，整体更像现代科技商业路演。",
+        "visual_focus": "用数据网格、流程线、仪表盘式模块和冷色强调构建智能营销的专业感。",
+        "source": source,
+    }
+
+
 def _fallback_style_ids_for_summary(summary: Dict) -> List[str]:
     profile = _topic_profile(summary)
     if profile.get("recommended_library_ids"):
         return list(profile["recommended_library_ids"])
     industries = " ".join(summary.get("industries") or [])
     keywords = " ".join(summary.get("keywords") or [])
-    text = f"{industries} {keywords} {summary.get('style_direction_hint', '')}"
-    if any(term in text for term in TRADITIONAL_CULTURE_TERMS):
+    hint = str(summary.get("style_direction_hint") or "")
+    text = f"{industries} {keywords} {hint}"
+    if _contains_unnegated_tech(hint):
+        return ["minimal_data", "blueprint", "executive_dashboard"]
+    if _contains_any_term(hint, TRADITIONAL_CULTURE_TERMS):
         return ["traditional_chinese", "magazine_editorial", "modern_newspaper"]
     if any(term in text for term in FOOD_AGRI_TERMS):
         return ["magazine_editorial", "paper_craft", "sharp_minimalism"]
@@ -860,6 +1226,8 @@ def _append_content_aware_fallbacks(proposals: List[Dict], summary: Dict, style_
     topic_original = _topic_original_proposal(summary)
     if topic_original and not any(_proposal_matches_topic(p, summary) for p in proposals):
         proposals.append(topic_original)
+    if not proposals and _summary_prefers_tech(summary):
+        proposals.append(_modern_tech_fallback_proposal(summary))
 
     fallback_map = {s["id"]: s for s in style_library}
     used_sources = {str(p.get("source") or "") for p in proposals if isinstance(p, dict)}
@@ -1293,7 +1661,7 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     # 判断是否有有效用户素材（内容不为空才算）
     logo = assets.get("logo_analysis") or {}
     ref = assets.get("reference_analysis") or {}
-    has_logo = bool(logo.get("primary_color") or logo.get("description"))
+    has_logo = bool(logo.get("primary_color") or logo.get("description") or logo.get("dominant_palette"))
     has_ref = bool(
         ref.get("description")
         or ref.get("style_name")
@@ -1347,6 +1715,9 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 - 如果内容主题已经指向明确时代、地域、人物、场景或文化类型，三套方案都必须围绕这个题材建立视觉语言。
 - 风格库只能作为表现手法，不能替代题材本身；例如古罗马角斗士不能被改写成瑞士设计、苹果发布会或泛奢侈品风。
 - 任何方案名称和说明都必须让客户一眼看出它服务于当前 PPT 主题，而不是通用模板。
+- 不得把“传统方式/传统搜索/组织文化/文化转变”这类普通业务表达误读成传统文化、非遗、东方审美或国潮风格。
+- 只有标题、正文、用户要求或参考素材明确出现传统文化、非遗、中式、国潮、水墨、宣纸、朱砂等强题材信号时，才允许使用这类方向。
+- AI、大模型、数据、算法、智能投放、智能营销类主题，默认从现代商业、科技秩序、增长效率出发；不得把宣纸、朱砂、水墨、非遗作为主风格。
 
 【三套方案必须是三种明确选择】
 - 不是给 3 个相似名字，而是给 3 种不同取舍：第一眼记忆、信息可读、表达冲击。
@@ -1448,6 +1819,17 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     else:
         logger.warning("StyleProposal: LLM 返回空内容，使用默认方案")
 
+    drift_filtered = [
+        p for p in proposals
+        if isinstance(p, dict) and not _proposal_has_unjustified_traditional_drift(p, summary)
+    ]
+    if len(drift_filtered) != len(proposals):
+        logger.warning(
+            "StyleProposal: filtered %s unjustified traditional-style proposals for tech/business content",
+            len(proposals) - len(drift_filtered),
+        )
+    proposals = drift_filtered
+
     filtered_proposals = _filter_topic_mismatched_proposals(proposals, summary)
     if len(filtered_proposals) != len(proposals):
         logger.warning(
@@ -1478,15 +1860,17 @@ def _generate_asset_based_proposal(
     logo = assets.get("logo_analysis") or {}
     ref = assets.get("reference_analysis") or {}
     user_desc = assets.get("user_description", "").strip()
+    style_user_desc = _style_preference_text(user_desc)
     template = assets.get("template_analysis") or {}
 
-    if _has_clone_reference(ref, template) and not user_desc:
+    if _has_clone_reference(ref, template) and not style_user_desc:
         logger.info("StyleProposal(AssetBased): using deterministic strict reference clone proposal")
         return [_build_reference_clone_proposal(summary, assets)]
 
     asset_sections = []
-    if logo.get("description") or logo.get("primary_color"):
-        asset_sections.append(f"【Logo 分析】\n主色: {logo.get('primary_color', 'N/A')}\n辅助色: {', '.join(logo.get('secondary_colors', []))}\n调性: {logo.get('mood', 'N/A')}\n字体风格: {logo.get('font_style', 'N/A')}\n行业气质: {logo.get('industry_vibe', 'N/A')}\n描述: {logo.get('description', 'N/A')}")
+    logo_palette = ", ".join(_logo_brand_colors(logo))
+    if logo.get("description") or logo.get("primary_color") or logo_palette:
+        asset_sections.append(f"【Logo 分析】\n主色: {logo.get('primary_color', 'N/A')}\n辅助色: {', '.join(logo.get('secondary_colors', []))}\n本地提取色: {logo_palette or 'N/A'}\n调性: {logo.get('mood', 'N/A')}\n字体风格: {logo.get('font_style', 'N/A')}\n行业气质: {logo.get('industry_vibe', 'N/A')}\n描述: {logo.get('description', 'N/A')}")
 
     if ref.get("description") or ref.get("colors", {}).get("primary"):
         colors = ref.get("colors", {})
@@ -1496,8 +1880,8 @@ def _generate_asset_based_proposal(
     if template.get("has_template"):
         asset_sections.append(f"【模板信息】\n用户提供了参考模板，包含封面、目录、内容、结尾页。模板页的配色和布局应作为核心参考。")
 
-    if user_desc:
-        asset_sections.append(f"【用户风格描述】\n{user_desc}")
+    if style_user_desc:
+        asset_sections.append(f"【用户风格描述】\n{style_user_desc}")
 
     prompt = f"""你是一位顶级 PPT 视觉总监。客户提供了参考风格资料和/或文字风格要求，你的任务是提取这套风格的视觉基因，并把它转成可用于整套 PPT 的风格系统。
 
@@ -1515,6 +1899,14 @@ def _generate_asset_based_proposal(
 - 如果出现【用户风格描述】，它来自用户和视觉总监的最新对话，是本次生成必须执行的最新要求。
 - 用户风格描述中明确点名的配色、字体、质感、布局节奏、不要/改掉的方向，优先级高于旧参考图或旧提案中冲突的部分。
 - 用户没有提到的部分，才继续继承参考图、模板或 Logo 的风格基因。
+- 如果【用户风格描述】只是上传素材清单、项目素材说明、Logo 文件名或系统代用户确认的素材状态，不代表审美偏好；不得把文件名、地点或 Logo 名称扩写成传统文化、东方审美、非遗、国潮等题材。
+- 如果用户明确要求加入某个品牌色或 Logo 色（例如“分众金色”“Logo 的金色作为点缀”），该颜色必须出现在 palette 前 4 个颜色中，并在 description/page_type_adaptation 中说明它如何用于关键数字、细线、编号或图表重点。
+
+【题材一致性红线】
+- 内容标题和内容风格提示决定题材方向；素材只决定可用色彩、Logo 对比和参考版式，不能把 PPT 主题改写成无关叙事。
+- 不得把“传统方式/传统搜索/组织文化/文化转变”这类普通业务表达误读成传统文化、非遗、东方审美或国潮风格。
+- 只有标题、正文、用户要求或参考素材明确出现传统文化、非遗、中式、国潮、水墨、宣纸、朱砂等强题材信号时，才允许使用这类方向。
+- AI、大模型、数据、算法、智能投放、智能营销类主题，默认从现代商业、科技秩序、增长效率出发；不得把宣纸、朱砂、水墨、非遗作为主风格。
 
 【输出格式】
 严格输出 JSON 对象（不是数组）：
@@ -1528,7 +1920,7 @@ def _generate_asset_based_proposal(
   ],
   "mood": "氛围标签（忠实来自参考图，不发明新风格）",
   "font": "字体建议（延续参考图字体气质，同时保证正文可读）",
-  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清风格基因和页面类型调节即可。版式特征如'参考图本身是三栏布局'可以在这里说明"在合适的页面会复用这种分栏感"）"
+  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清风格基因和页面类型调节即可。版式特征如'参考图本身是三栏布局'可以在这里说明：'在合适的页面会复用这种分栏感'）"
 }}
 
 【核心原则】
@@ -1572,6 +1964,15 @@ def _generate_asset_based_proposal(
         fallbacks = _append_content_aware_fallbacks([], summary, style_library)
         proposal = fallbacks[0] if fallbacks else {}
 
+    if proposal and _proposal_has_unjustified_traditional_drift(proposal, summary, assets):
+        logger.warning(
+            "StyleProposal(AssetBased): rejected traditional-style drift for tech/business content"
+        )
+        fallbacks = _append_content_aware_fallbacks([], summary, style_library)
+        proposal = fallbacks[0] if fallbacks else _modern_tech_fallback_proposal(summary, source="asset_drift_guard")
+        if proposal.get("source") == "original_tech_modern":
+            proposal = {**proposal, "source": "asset_drift_guard"}
+
     # 标准化
     proposal.setdefault("name", "基于素材的定制风格")
     if not proposal.get("palette"):
@@ -1602,6 +2003,9 @@ def _generate_asset_based_proposal(
     if len(proposal.get("description", "")) < 60:
         first_name = proposal["palette"][0].get("name", "主色") if proposal["palette"] and isinstance(proposal["palette"][0], dict) else "主色"
         proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页在同一视觉语言内保证可读性与留白。"
+
+    if _should_apply_logo_default_colors(logo, ref, template, user_desc):
+        proposal = _enforce_logo_default_colors(proposal, logo)
 
     proposal["visual_strategy"] = build_visual_strategy(
         summary=summary,

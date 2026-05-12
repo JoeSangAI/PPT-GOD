@@ -52,6 +52,10 @@ class ProviderGatewayCutoffError(RuntimeError):
     """Raised when the upstream/proxy cuts off a long-running image request."""
 
 
+class ImageAspectRatioMismatchError(RuntimeError):
+    """Raised when a generated slide image is clearly outside the requested shape."""
+
+
 @dataclass(frozen=True)
 class _ReferenceUploadProfile:
     max_side: int | None
@@ -417,6 +421,40 @@ def _is_api_retryable(exc: Exception) -> bool:
     if any(marker in text for marker in retryable_markers):
         return True
     return False
+
+
+def _target_aspect_ratio(aspect_ratio: str) -> float | None:
+    try:
+        width_text, height_text = str(aspect_ratio or "").split(":", 1)
+        width = float(width_text)
+        height = float(height_text)
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width / height
+
+
+def _aspect_ratio_tolerance() -> float:
+    return max(0.0, float(settings.IMAGE_ASPECT_RATIO_TOLERANCE or 0.0))
+
+
+def _validate_generated_image_aspect_ratio(img: Image.Image, aspect_ratio: str) -> None:
+    target = _target_aspect_ratio(aspect_ratio)
+    if target is None:
+        return
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        raise ImageAspectRatioMismatchError("Image API returned an empty image")
+    actual = width / height
+    tolerance = _aspect_ratio_tolerance()
+    relative_delta = abs(actual - target) / target
+    if relative_delta <= tolerance:
+        return
+    raise ImageAspectRatioMismatchError(
+        f"Image API returned {width}x{height} (aspect {actual:.3f}); "
+        f"expected {aspect_ratio} (aspect {target:.3f}) within {tolerance:.0%}"
+    )
 
 
 def _retry_after_seconds(exc: Exception, fallback: int) -> int:
@@ -984,6 +1022,8 @@ def _generate_real_slide_image(
         size = "1024x1024"
     idempotency_key = str(uuid.uuid4())
     api_backoff = [0, 5, 15]
+    aspect_ratio_retries = 0
+    max_aspect_ratio_retries = max(0, int(settings.IMAGE_ASPECT_RATIO_MAX_RETRIES or 0))
     for attempt, delay in enumerate(api_backoff):
         if delay > 0:
             logger.info(f"ImageGen: waiting {delay}s before API call...")
@@ -1004,6 +1044,7 @@ def _generate_real_slide_image(
                 img = _call_gemini_chat_generate(
                     prompt, reference_images, aspect_ratio, resolution
                 )
+            _validate_generated_image_aspect_ratio(img, aspect_ratio)
             logger.info(f"ImageGen: success, model={get_deer_image_model()}, size={img.size}")
             return img
         except Exception as e:
@@ -1014,6 +1055,22 @@ def _generate_real_slide_image(
             logger.warning(
                 f"ImageGen: API call failed (attempt {attempt + 1}/{len(api_backoff)}): {err_detail}"
             )
+            if isinstance(e, ImageAspectRatioMismatchError):
+                if aspect_ratio_retries >= max_aspect_ratio_retries or attempt == len(api_backoff) - 1:
+                    logger.error(
+                        "ImageGen: aspect ratio gate failed after %s retry attempt(s): %s",
+                        aspect_ratio_retries,
+                        err_detail,
+                    )
+                    raise
+                aspect_ratio_retries += 1
+                idempotency_key = str(uuid.uuid4())
+                api_backoff[attempt + 1] = 0
+                logger.warning(
+                    "ImageGen: aspect ratio gate rejected result; retrying current slide once "
+                    "with a fresh idempotency key"
+                )
+                continue
             if attempt == len(api_backoff) - 1:
                 logger.error(f"ImageGen: all retries exhausted: {err_detail}")
                 raise

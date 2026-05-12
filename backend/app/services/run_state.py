@@ -89,6 +89,12 @@ def stale_inactive_run_if_needed(
     except (TypeError, ValueError):
         queued_timeout = 0
 
+    if run.status == "queued" and run.task_id and queued_timeout_seconds is None:
+        try:
+            queued_timeout = max(queued_timeout, int(settings.CELERY_QUEUE_WAIT_TIMEOUT_SECONDS or 0))
+        except (TypeError, ValueError):
+            pass
+
     if run.status == "queued" and queued_timeout > 0:
         queued_for = _seconds_since(run.started_at or run.updated_at)
         if queued_for > queued_timeout:
@@ -572,7 +578,9 @@ def enforce_project_invariants(project: Project, slides: list[Slide]) -> str:
         visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
         meta = artifact_meta(visual)
         deps = meta.get("dependencies") if isinstance(meta.get("dependencies"), dict) else {}
-        if deps and any(deps.get(key) != current_deps.get(key) for key in ("content", "style_assets", "visual_assets", "selected_style")):
+        # Content edits are page-local stale state; preserving old images avoids
+        # turning a small text change into a whole-deck rollback.
+        if deps and any(deps.get(key) != current_deps.get(key) for key in ("style_assets", "visual_assets", "selected_style")):
             preserved = {
                 key: value
                 for key, value in visual.items()

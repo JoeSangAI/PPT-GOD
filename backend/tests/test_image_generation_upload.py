@@ -53,10 +53,75 @@ def test_provider_gateway_cutoff_is_not_retryable():
     assert image_generation._is_api_retryable(error) is False
 
 
-def test_default_image_generation_is_single_flight_high_quality():
+def test_default_image_generation_is_serial_high_quality_with_one_gateway_retry():
     assert image_generation.settings.IMAGE_API_MAX_CONCURRENCY == 1
-    assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 1
+    assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 2
     assert image_generation._image_quality() == "high"
+
+
+def test_aspect_ratio_gate_accepts_current_wide_output(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_TOLERANCE", 0.04)
+
+    image_generation._validate_generated_image_aspect_ratio(
+        Image.new("RGB", (1659, 948), "white"),
+        "16:9",
+    )
+
+    with pytest.raises(image_generation.ImageAspectRatioMismatchError):
+        image_generation._validate_generated_image_aspect_ratio(
+            Image.new("RGB", (1536, 1024), "white"),
+            "16:9",
+        )
+
+
+def test_aspect_ratio_gate_retries_once_with_fresh_idempotency_key(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_TOLERANCE", 0.04)
+    monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_MAX_RETRIES", 1)
+    monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
+
+    def fake_generate(_prompt, size="1792x1024", idempotency_key=None):
+        calls.append((size, idempotency_key))
+        if len(calls) == 1:
+            return Image.new("RGB", (1536, 1024), "white")
+        return Image.new("RGB", (1792, 1024), "white")
+
+    monkeypatch.setattr(image_generation, "_call_gpt_image_2_generate", fake_generate)
+
+    img = image_generation._generate_real_slide_image(
+        "prompt",
+        reference_images=None,
+        aspect_ratio="16:9",
+    )
+
+    assert img.size == (1792, 1024)
+    assert [call[0] for call in calls] == ["1792x1024", "1792x1024"]
+    assert calls[0][1] != calls[1][1]
+
+
+def test_aspect_ratio_gate_fails_after_one_retry(monkeypatch):
+    calls = 0
+
+    monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_TOLERANCE", 0.04)
+    monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_MAX_RETRIES", 1)
+    monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return Image.new("RGB", (1536, 1024), "white")
+
+    monkeypatch.setattr(image_generation, "_call_gpt_image_2_generate", fake_generate)
+
+    with pytest.raises(image_generation.ImageAspectRatioMismatchError):
+        image_generation._generate_real_slide_image(
+            "prompt",
+            reference_images=None,
+            aspect_ratio="16:9",
+        )
+
+    assert calls == 2
 
 
 def test_image_api_slot_uses_redis_global_queue(monkeypatch):

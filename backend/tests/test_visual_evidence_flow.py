@@ -1858,7 +1858,7 @@ def test_confirm_content_plan_advances_backend_stage():
     assert updated.status == "visual_ready"
 
 
-def test_content_edit_reopens_confirmation_and_clears_downstream_outputs():
+def test_content_edit_preserves_confirmed_workflow_and_existing_outputs():
     db = make_session()
     project = Project(
         title="Content edit",
@@ -1892,14 +1892,15 @@ def test_content_edit_reopens_confirmation_and_clears_downstream_outputs():
     refreshed_project = db.query(Project).filter(Project.id == project.id).first()
     refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
 
-    assert refreshed_project.status == "planning"
-    assert refreshed_project.content_plan_confirmed is False
-    assert refreshed_project.selected_style is None
-    assert refreshed_project.style_proposal is None
-    assert refreshed_slide.visual_json == {}
-    assert refreshed_slide.prompt_text is None
-    assert refreshed_slide.image_path is None
-    assert refreshed_slide.status == "pending"
+    assert refreshed_project.status == "prompt_ready"
+    assert refreshed_project.content_plan_confirmed is True
+    assert refreshed_project.selected_style == {"name": "Old"}
+    assert refreshed_project.style_proposal == {"proposals": [{"name": "Old"}]}
+    assert refreshed_slide.content_json["text_content"]["headline"] == "新标题"
+    assert refreshed_slide.visual_json == {"visual_description": "old visual"}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.image_path == "/tmp/old.png"
+    assert refreshed_slide.status == "completed"
 
 
 def test_style_reference_upload_after_confirmation_stays_in_visual_stage(tmp_path, monkeypatch):

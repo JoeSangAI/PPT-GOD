@@ -19,6 +19,14 @@ PPT God is an Agent-driven PPT tool. The highest product contract is: understand
 - Do not let chat copy get ahead of system state. User-facing wording should say "正在..." before the action succeeds and only claim completion after the state actually changes.
 - Stage boundaries are implementation details. If a request belongs to a later stage, acknowledge it now, carry it forward as context, and surface the next action that will apply it.
 
+## Simplicity Principle
+
+Recorded 2026-05-12 from user direction.
+
+- Prefer the smallest root-cause fix that removes a whole class of failures.
+- Do not add extra orchestration, queues, or recovery layers when a single source of truth or a synchronous state write solves the problem.
+- Use Occam's razor in workflow/state bugs: first remove duplicated state paths and hidden async handoffs before adding new fallback behavior.
+
 ## Image Generation Architecture Constraint
 
 Recorded 2026-05-10 from user direction.

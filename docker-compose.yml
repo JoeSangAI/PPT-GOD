@@ -36,15 +36,41 @@ services:
       - ./backend/uploads:/app/uploads
       - ./backend/outputs:/app/outputs
 
-  celery_worker:
+  celery_text_worker:
     build:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    command: celery -A app.celery_app worker -l info --concurrency=${PPTGOD_CELERY_CONCURRENCY:-1}
+    command: celery -A app.celery_app worker -l info --queues=${PPTGOD_TEXT_QUEUE:-text} --concurrency=${PPTGOD_TEXT_CELERY_CONCURRENCY:-2}
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - CELERY_TEXT_QUEUE=${PPTGOD_TEXT_QUEUE:-text}
+      - CELERY_IMAGE_QUEUE=${PPTGOD_IMAGE_QUEUE:-image}
+      - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
+      - HTTPS_PROXY=${PPTGOD_HTTPS_PROXY:-}
+      - ALL_PROXY=${PPTGOD_ALL_PROXY:-}
+      - NO_PROXY=${PPTGOD_NO_PROXY:-localhost,127.0.0.1,db,redis}
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./backend/uploads:/app/uploads
+      - ./backend/outputs:/app/outputs
+
+  celery_image_worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: celery -A app.celery_app worker -l info --queues=${PPTGOD_IMAGE_QUEUE:-image} --concurrency=${PPTGOD_IMAGE_CELERY_CONCURRENCY:-2}
+    environment:
+      - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_TEXT_QUEUE=${PPTGOD_TEXT_QUEUE:-text}
+      - CELERY_IMAGE_QUEUE=${PPTGOD_IMAGE_QUEUE:-image}
       - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
       - HTTPS_PROXY=${PPTGOD_HTTPS_PROXY:-}
       - ALL_PROXY=${PPTGOD_ALL_PROXY:-}

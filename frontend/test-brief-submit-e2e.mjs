@@ -86,6 +86,7 @@ if (!(await isAppReachable(APP_URL))) {
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
 const contentPlanBodies = [];
+const uploadedDocuments = [];
 
 await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
@@ -107,7 +108,7 @@ await page.route("**/*", async (route) => {
   if (method === "GET" && pathName === `/projects/${project.id}`) return route.fulfill({ json: project });
   if (method === "GET" && pathName === `/projects/${project.id}/slides`) return route.fulfill({ json: [] });
   if (method === "GET" && pathName === `/projects/${project.id}/reference-images`) return route.fulfill({ json: [] });
-  if (method === "GET" && pathName === `/projects/${project.id}/documents`) return route.fulfill({ json: [] });
+  if (method === "GET" && pathName === `/projects/${project.id}/documents`) return route.fulfill({ json: uploadedDocuments });
   if (method === "GET" && pathName === `/projects/${project.id}/template-pages`) return route.fulfill({ json: [] });
   if (method === "GET" && pathName === `/projects/${project.id}/generation-progress`) {
     return route.fulfill({ json: { project_id: project.id, project_status: project.status } });
@@ -129,6 +130,18 @@ await page.route("**/*", async (route) => {
       },
     });
   }
+  if (method === "POST" && pathName === `/projects/${project.id}/upload-document`) {
+    const doc = {
+      filename: "deck.md",
+      char_count: 0,
+      text_parse_status: "queued",
+      text_preview: "",
+      asset_extraction_status: "not_applicable",
+      extracted_assets: {},
+    };
+    uploadedDocuments.splice(0, uploadedDocuments.length, doc);
+    return route.fulfill({ json: doc });
+  }
 
   if (pathName.startsWith("/projects") || pathName.startsWith("/auth")) {
     return route.fulfill({ status: 404, json: { detail: `Unhandled mock route: ${method} ${pathName}` } });
@@ -143,16 +156,24 @@ try {
   const brief =
     "把这个 MD 文件做成 60 到 80 页的 PPT。用户群体是大连混沌的学员，目标是上课，演讲时长 1.5 小时。";
   await page.locator(".pg-brief-editor").first().fill(brief);
+  const dataTransfer = await page.evaluateHandle(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(["# Deck\n\nSource notes."], "deck.md", { type: "text/markdown" }));
+    return transfer;
+  });
+  await page.locator(".pg-brief-studio").first().dispatchEvent("drop", { dataTransfer });
+  await page.locator(".pg-brief-inline-chip").filter({ hasText: "deck.md" }).waitFor({ timeout: 10_000 });
   const submitButton = page.getByRole("button", { name: "生成内容规划" }).first();
   await submitButton.click({ clickCount: 3, delay: 0 });
 
-  await page.getByText("本次要求：").waitFor({ timeout: 10_000 });
-  await page.getByText("识别到页数目标：约 80 页").waitFor({ timeout: 10_000 });
-  await page.waitForTimeout(750);
+  for (let i = 0; i < 50 && contentPlanBodies.length === 0; i += 1) {
+    await page.waitForTimeout(100);
+  }
 
   assert.equal(contentPlanBodies.length, 1, "rapid clicks should create exactly one content-plan request");
   assert.equal(contentPlanBodies[0].page_count, 80);
   assert.match(contentPlanBodies[0].topic, /60 到 80 页/);
+  assert.match(contentPlanBodies[0].topic, /【文件：deck\.md】/);
   assert.match(contentPlanBodies[0].topic, /大连混沌/);
   assert.match(contentPlanBodies[0].topic, /1\.5 小时/);
   console.log("Brief submit E2E passed.");

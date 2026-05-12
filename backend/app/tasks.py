@@ -16,7 +16,7 @@ from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.logo_policy import is_logo_confirmed
 from app.services.run_state import finish_run, is_run_active, mark_run_running, update_run_progress
-from app.services.style_proposal import generate_style_proposals
+from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION, generate_style_proposals
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +38,17 @@ def _cached_reference_analysis(ref) -> dict | None:
     analysis = ref.asset_analysis if isinstance(getattr(ref, "asset_analysis", None), dict) else {}
     if not analysis:
         return None
-    if analysis.get("analysis_status") == "completed":
-        return analysis
-    if any(analysis.get(key) for key in ("description", "style_name", "dominant_palette", "colors", "composition_style", "mood")):
+    meaningful_keys = (
+        "primary_color",
+        "secondary_colors",
+        "description",
+        "style_name",
+        "dominant_palette",
+        "colors",
+        "composition_style",
+        "mood",
+    )
+    if any(analysis.get(key) for key in meaningful_keys):
         return analysis
     return None
 
@@ -302,14 +310,22 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
             template_refs = [r for r in project.reference_images if r.role == "template"]
 
             if logo_refs:
-                try:
-                    logger.info(f"[StyleProposals Celery] Analyzing logo lockup for project={project_id}")
-                    existing_logo_paths = [r.file_path for r in logo_refs if os.path.exists(r.file_path)]
-                    logo_path = prepare_logo_lockup_image(existing_logo_paths) if existing_logo_paths else None
-                    if logo_path:
-                        assets["logo_analysis"] = analyze_logo(logo_path)
-                except Exception as e:
-                    logger.warning(f"[StyleProposals Celery] Logo analysis failed: {e}")
+                cached = _first_cached_reference_analysis(logo_refs)
+                if cached:
+                    logger.info(f"[StyleProposals Celery] Reusing cached logo analysis for project={project_id}")
+                    assets["logo_analysis"] = cached
+                else:
+                    try:
+                        logger.info(f"[StyleProposals Celery] Analyzing logo lockup for project={project_id}")
+                        existing_logo_paths = [r.file_path for r in logo_refs if os.path.exists(r.file_path)]
+                        logo_path = prepare_logo_lockup_image(existing_logo_paths) if existing_logo_paths else None
+                        if logo_path:
+                            logo_analysis = analyze_logo(logo_path)
+                            assets["logo_analysis"] = logo_analysis
+                            if logo_analysis and logo_refs:
+                                logo_refs[0].asset_analysis = {"analysis_status": "completed", **logo_analysis}
+                    except Exception as e:
+                        logger.warning(f"[StyleProposals Celery] Logo analysis failed: {e}")
 
             if style_refs:
                 cached = _first_cached_reference_analysis(style_refs)
@@ -327,7 +343,10 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                     else:
                         try:
                             logger.info(f"[StyleProposals Celery] Analyzing reference image for project={project_id}")
-                            assets["reference_analysis"] = analyze_reference_image(style_ref.file_path)
+                            reference_analysis = analyze_reference_image(style_ref.file_path)
+                            assets["reference_analysis"] = reference_analysis
+                            if reference_analysis:
+                                style_ref.asset_analysis = {"analysis_status": "completed", **reference_analysis}
                         except Exception as e:
                             logger.warning(f"[StyleProposals Celery] Reference analysis failed: {e}")
 
@@ -354,7 +373,10 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                 elif template_sample and _file_exists(template_sample):
                     try:
                         logger.info(f"[StyleProposals Celery] Analyzing template reference for project={project_id}")
-                        assets["template_analysis"]["reference_analysis"] = analyze_reference_image(template_sample)
+                        template_analysis = analyze_reference_image(template_sample)
+                        assets["template_analysis"]["reference_analysis"] = template_analysis
+                        if template_analysis and template_ref:
+                            template_ref.asset_analysis = {"analysis_status": "completed", **template_analysis}
                     except Exception as e:
                         logger.warning(f"[StyleProposals Celery] Template analysis failed: {e}")
                 elif template_refs:
@@ -377,7 +399,7 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
             db.commit()
             return {"project_id": project_id, "status": "not_found"}
         asset_based = any(
-            p.get("source") == "asset_clone" or p.get("clone_mode") == "strict_reference"
+            p.get("source") in {"asset_clone", "asset_based"} or p.get("clone_mode") == "strict_reference"
             for p in proposals
             if isinstance(p, dict)
         )
@@ -385,6 +407,7 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
         project.style_proposal = {
             "proposals": proposals,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "policy_version": STYLE_PROPOSAL_POLICY_VERSION,
             "asset_based": asset_based,
             "asset_signature": compute_style_asset_signature(project),
             "content_signature": content_signature(project.slides or []),

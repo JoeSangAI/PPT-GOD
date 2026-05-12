@@ -1,7 +1,13 @@
 from celery import Celery
+from kombu import Exchange, Queue
+
 from app.core.config import settings
 
 redis_url = settings.REDIS_URL or "redis://localhost:6379/0"
+text_queue = settings.CELERY_TEXT_QUEUE or "text"
+image_queue = settings.CELERY_IMAGE_QUEUE or "image"
+text_exchange = Exchange(text_queue, type="direct")
+image_exchange = Exchange(image_queue, type="direct")
 
 celery_app = Celery(
     "ppt_god",
@@ -11,6 +17,25 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
+    task_default_queue=text_queue,
+    task_default_exchange=text_queue,
+    task_default_routing_key=text_queue,
+    task_queues=(
+        Queue(text_queue, text_exchange, routing_key=text_queue),
+        Queue(image_queue, image_exchange, routing_key=image_queue),
+    ),
+    task_routes={
+        "app.tasks.generate_style_proposals_task": {
+            "queue": text_queue,
+            "exchange": text_queue,
+            "routing_key": text_queue,
+        },
+        "app.tasks.generate_slides_task": {
+            "queue": image_queue,
+            "exchange": image_queue,
+            "routing_key": image_queue,
+        },
+    },
     task_track_started=True,
     task_serializer="json",
     accept_content=["json"],

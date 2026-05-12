@@ -3,6 +3,7 @@ from collections import Counter
 import json
 import logging
 import os
+import re
 from typing import Dict
 
 from PIL import Image as PILImage
@@ -74,6 +75,81 @@ def extract_image_palette(image_path: str, max_colors: int = 6) -> list[Dict]:
         return []
 
 
+def _extract_hex(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"#[0-9a-fA-F]{6}", value)
+    return match.group(0).upper() if match else None
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int] | None:
+    hex_color = _extract_hex(hex_color) or ""
+    try:
+        return (int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16))
+    except Exception:
+        return None
+
+
+def _color_saturation(hex_color: str) -> float:
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return 0.0
+    max_val = max(rgb)
+    min_val = min(rgb)
+    if max_val <= 0:
+        return 0.0
+    return (max_val - min_val) / max_val
+
+
+def _color_brightness(hex_color: str) -> float:
+    rgb = _hex_to_rgb(hex_color)
+    if not rgb:
+        return 0.0
+    return sum(rgb) / 3
+
+
+def _logo_palette_hexes(local_palette: list[Dict]) -> list[str]:
+    hexes: list[str] = []
+    for item in local_palette or []:
+        hex_color = _extract_hex(str(item.get("hex") if isinstance(item, dict) else item))
+        if hex_color and hex_color not in hexes:
+            hexes.append(hex_color)
+    return hexes
+
+
+def _infer_logo_primary_color(local_palette: list[Dict]) -> str:
+    colors = _logo_palette_hexes(local_palette)
+    if not colors:
+        return ""
+    chromatic = [
+        color
+        for color in colors
+        if _color_saturation(color) >= 0.18 and 24 <= _color_brightness(color) <= 235
+    ]
+    return (chromatic or colors)[0]
+
+
+def _merge_logo_local_palette(result: Dict, local_palette: list[Dict]) -> Dict:
+    """Use visible pixels as a deterministic fallback when VLM misses logo colors."""
+    result = result if isinstance(result, dict) else _default_logo_analysis()
+    result["dominant_palette"] = local_palette
+
+    primary = _extract_hex(str(result.get("primary_color") or "")) or _infer_logo_primary_color(local_palette)
+    if primary:
+        result["primary_color"] = primary
+
+    secondaries: list[str] = []
+    for color in result.get("secondary_colors") or []:
+        hex_color = _extract_hex(str(color))
+        if hex_color and hex_color != primary and hex_color not in secondaries:
+            secondaries.append(hex_color)
+    for hex_color in _logo_palette_hexes(local_palette):
+        if hex_color != primary and hex_color not in secondaries:
+            secondaries.append(hex_color)
+    result["secondary_colors"] = secondaries[:4]
+    return result
+
+
 def _minimax_coding_plan_url() -> str:
     base = get_provider_credentials().minimax_api_base.rstrip("/")
     if base.endswith("/v1"):
@@ -117,6 +193,7 @@ def analyze_logo(image_path: str) -> Dict:
         logger.warning(f"Logo file not found: {image_path}")
         return _default_logo_analysis()
 
+    local_palette = extract_image_palette(image_path)
     prompt = """你是一位品牌设计分析师。请分析这张 Logo 图片，提取以下信息并严格输出 JSON 格式：
 
 {
@@ -136,6 +213,7 @@ def analyze_logo(image_path: str) -> Dict:
     raw = _call_vision_model(image_path, prompt)
     result = _parse_analysis_result(raw, "logo")
     if isinstance(result, dict):
+        result = _merge_logo_local_palette(result, local_palette)
         result.update(detect_logo_tone_from_image(image_path))
     return result
 
@@ -300,6 +378,7 @@ def _default_logo_analysis() -> Dict:
     return {
         "primary_color": "",
         "secondary_colors": [],
+        "dominant_palette": [],
         "mood": "",
         "font_style": "",
         "industry_vibe": "",

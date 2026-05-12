@@ -11,13 +11,27 @@ from app.models.models import Project, Slide
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.core.tester_auth import is_local_admin_request, require_tester_id, tester_id_from_header, verify_project_access
 from app.core.provider_credentials import store_current_provider_credentials
+from app.core.config import settings
 from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
+from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+def _clear_stale_style_proposal(project: Project) -> bool:
+    proposal = project.style_proposal if isinstance(project.style_proposal, dict) else None
+    if not proposal or project.selected_style:
+        return False
+    if proposal.get("policy_version") == STYLE_PROPOSAL_POLICY_VERSION:
+        return False
+    if not proposal.get("proposals"):
+        return False
+    project.style_proposal = None
+    return True
 
 
 @router.post("", response_model=ProjectResponse)
@@ -48,7 +62,7 @@ def list_projects(tester_id: str = Depends(require_tester_id), db: Session = Dep
     for project in projects:
         before = project.status
         reconcile_project_state(project, list(project.slides or []), get_active_run(db, project.id))
-        changed = changed or project.status != before or bool(db.dirty)
+        changed = _clear_stale_style_proposal(project) or changed or project.status != before or bool(db.dirty)
     if changed:
         db.commit()
     return projects
@@ -60,11 +74,12 @@ def get_project(project_id: str, tester_id: str = Depends(tester_id_from_header)
     verify_project_access(project, tester_id)
     before = project.status
     reconcile_project_state(project, list(project.slides or []), get_active_run(db, project_id))
+    style_proposal_changed = _clear_stale_style_proposal(project)
     # 用户已进入项目详情，清除未读通知
     if project.has_unread_notification:
         project.has_unread_notification = False
         project.unread_notification_message = None
-    if project.status != before or not project.has_unread_notification or db.dirty:
+    if project.status != before or style_proposal_changed or not project.has_unread_notification or db.dirty:
         db.commit()
         db.refresh(project)
     return project
@@ -185,6 +200,7 @@ def create_style_proposals(
         cached_asset_signature = project.style_proposal.get("asset_signature")
         cached_content_signature = project.style_proposal.get("content_signature")
         cached_user_description = (project.style_proposal.get("user_description") or "").strip()
+        cached_policy_version = project.style_proposal.get("policy_version")
         cached_proposals = project.style_proposal.get("proposals") or []
         cached_is_style_dna = any(
             isinstance(p, dict)
@@ -195,6 +211,7 @@ def create_style_proposals(
             (cached_asset_signature == current_asset_signature or (not cached_asset_signature and not current_asset_signature))
             and (cached_content_signature == current_content_signature or not cached_content_signature)
             and cached_user_description == user_description
+            and cached_policy_version == STYLE_PROPOSAL_POLICY_VERSION
         )
         if cache_signature_matches and (not has_global_style_ref or cached_is_style_dna):
             return {
@@ -209,7 +226,7 @@ def create_style_proposals(
             )
         else:
             logger.info(
-                "Style proposal cache invalidated for project=%s: cached assets changed",
+                "Style proposal cache invalidated for project=%s: cached assets, content, requirements, or policy changed",
                 project_id,
             )
         project.style_proposal = None
@@ -231,8 +248,8 @@ def create_style_proposals(
     ) or bool(user_description)
     total_count = 1 if has_assets else 3
 
-    if not ensure_celery_worker():
-        raise HTTPException(status_code=503, detail="后台生成服务未启动，任务没有开始。请启动 worker 后重试。")
+    if not ensure_celery_worker(queue=settings.CELERY_TEXT_QUEUE):
+        raise HTTPException(status_code=503, detail="视觉方向生成服务未启动，任务没有开始。请启动 worker 后重试。")
 
     # 改用 Celery 队列执行，比 FastAPI BackgroundTasks 更可靠
     try:

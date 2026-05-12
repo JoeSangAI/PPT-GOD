@@ -160,7 +160,7 @@ def _wait_for_extracted_text(project_id: str, filename: str, *, timeout_seconds:
     return ""
 
 
-def load_project_documents(project_id: str, *, parse_missing: bool = False) -> str:
+def load_project_documents(project_id: str, *, parse_missing: bool = False, text_limit: int | None = None) -> str:
     """读取项目已上传文档的提取文本，必要时在后台生成任务内补解析。"""
     docs_dir = get_project_docs_dir(project_id)
     if not os.path.exists(docs_dir):
@@ -182,7 +182,10 @@ def load_project_documents(project_id: str, *, parse_missing: bool = False) -> s
                         text = result.get("text") or ""
             if not text:
                 continue
-            max_chars = 40_000 if "--- PPT_SOURCE" in text[:500] else 12_000
+            if text_limit is not None:
+                max_chars = text_limit
+            else:
+                max_chars = 40_000 if "--- PPT_SOURCE" in text[:500] else 12_000
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n\n[文档内容过长，已截断]"
             parts.append(f"--- 文档: {filename} ---\n{text}")
