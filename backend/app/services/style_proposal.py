@@ -25,6 +25,22 @@ DARK_DECK_CONFLICT_RE = re.compile(
     r"(?:正文页|内容页|数据页|整体|页面)?[^。；;.!！?\n]{0,18}(?:浅底|浅色信息基底|浅色基底|暖玉白为浅底|浅底保证|白底|米白底)",
     flags=re.IGNORECASE,
 )
+LIGHT_DECK_SCOPE_TERMS = [
+    "ppt", "整套", "整体", "全页", "全部页面", "所有页面", "每页", "页面", "正文", "正文页", "内容页", "数据页", "背景", "基底",
+]
+LIGHT_DECK_TONE_TERMS = [
+    "白色为主", "以白色为主", "白底", "浅底", "浅色", "浅色基底", "浅色信息基底", "米白", "暖白",
+    "明亮", "亮一点", "明亮一点", "亮色", "浅紫", "淡紫",
+]
+LIGHT_DECK_DARK_REJECTIONS = [
+    "不喜欢黑紫", "不要黑紫", "不用黑紫", "避免黑紫", "不是黑紫", "去掉黑紫", "舍弃黑紫",
+    "不喜欢深色", "不要深色", "不用深色", "避免深色", "不是深色", "不是那种很深邃", "不要很深",
+]
+LIGHT_DECK_NEGATIONS = ["不要浅色", "不用浅色", "避免浅色", "不要浅底", "不用浅底", "不要白底", "不用白底", "不要明亮", "不要亮"]
+LIGHT_DECK_CONFLICT_RE = re.compile(
+    r"(?:整体以深色视觉基底为主|先保持整套深色视觉基底|信息页保持同一深色系基底|深色背景|深色基底|深色系语言|高对比暗色卡片|黑色/深色纹理基底)[^。；;.!！?\n]*[。；;.!！?]?",
+    flags=re.IGNORECASE,
+)
 
 
 def _requests_deck_wide_dark_style(text: str) -> bool:
@@ -34,6 +50,21 @@ def _requests_deck_wide_dark_style(text: str) -> bool:
     has_dark = any(term.lower() in normalized for term in DARK_DECK_TONE_TERMS)
     has_scope = any(term.lower() in normalized for term in DARK_DECK_SCOPE_TERMS)
     return has_dark and has_scope
+
+
+def _requests_deck_wide_light_style(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    if not normalized or any(term.lower() in normalized for term in LIGHT_DECK_NEGATIONS):
+        return False
+    has_light = any(term.lower() in normalized for term in LIGHT_DECK_TONE_TERMS)
+    rejects_dark = any(term.lower() in normalized for term in LIGHT_DECK_DARK_REJECTIONS)
+    has_scope = any(term.lower() in normalized for term in LIGHT_DECK_SCOPE_TERMS)
+    return (has_light and (has_scope or rejects_dark)) or ("以白色为主" in normalized) or (has_light and rejects_dark)
+
+
+def _latest_term_index(text: str, terms: list[str]) -> int:
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    return max((normalized.rfind(term.lower()) for term in terms), default=-1)
 
 
 def _palette_color_by(predicate, palette: list[dict], fallback: str) -> str:
@@ -61,11 +92,78 @@ def _dark_deck_palette(palette: list | None) -> list[dict]:
     ]
 
 
+def _light_deck_palette(palette: list | None) -> list[dict]:
+    normalized = [item for item in (palette or []) if isinstance(item, dict)]
+    background = _palette_color_by(lambda c: _brightness(c) >= 225, normalized, "#F9F8F5")
+    primary = _palette_color_by(lambda c: 105 <= _brightness(c) < 225 and _saturation(c) >= 0.08, normalized, "#C4B4E0")
+    surface = _palette_color_by(
+        lambda c: c.upper() != background.upper() and _brightness(c) >= 205,
+        normalized,
+        "#E8E0F0",
+    )
+    accent = _palette_color_by(
+        lambda c: c.upper() not in {background.upper(), primary.upper(), surface.upper()} and _brightness(c) >= 160,
+        normalized,
+        "#E8C8D8",
+    )
+    text = _palette_color_by(lambda c: 45 <= _brightness(c) <= 115, normalized, "#3A3038")
+    return [
+        {"name": _get_color_name(background), "hex": background, "role": "整套页面主背景/内容页浅色基底"},
+        {"name": _get_color_name(primary), "hex": primary, "role": "标题、页眉、编号和品牌装饰"},
+        {"name": _get_color_name(surface), "hex": surface, "role": "内容区、卡片和浅紫层次"},
+        {"name": _get_color_name(accent), "hex": accent, "role": "温暖点缀/装饰线/标签"},
+        {"name": _get_color_name(text), "hex": text, "role": "正文、标题和图表文字"},
+    ]
+
+
+def _enforce_light_deck_style(proposal: Dict) -> Dict:
+    normalized = copy.deepcopy(proposal)
+    normalized["palette"] = _light_deck_palette(normalized.get("palette") if isinstance(normalized.get("palette"), list) else [])
+    name = str(normalized.get("name") or "浅色视觉方案").strip()
+    if not any(term in name for term in ("白", "浅", "亮", "暖")):
+        name = f"明亮{name}"
+    normalized["name"] = name
+    normalized["mood"] = normalized.get("mood") or "明亮、温柔、精致、高可读"
+
+    base_description = re.sub(LIGHT_DECK_CONFLICT_RE, "", str(normalized.get("description") or "")).strip()
+    contract_sentence = (
+        "按用户最新要求，整套 PPT 以白色/米白/浅色明亮基底为主；"
+        "使用明亮柔紫作为品牌主色，保留原有纹理和装饰气质，但不再使用黑紫或深邃暗色作为整体基底。"
+        "内容页、数据页和表格页必须优先浅底高可读，深色只能作为少量文字、细线或局部强调。"
+    )
+    normalized["description"] = f"{contract_sentence}{base_description}"[:560]
+    normalized["visual_strategy"] = {
+        "base_tone": "light",
+        "summary": "整体以白色/米白/浅色明亮基底为主，明亮柔紫做品牌识别和装饰。",
+        "background_policy": "封面、章节、正文、数据和表格页都以浅色基底为主；只允许少量深色文字、细线或局部强调。",
+        "content_treatment": "正文页、内容页、数据页和表格页使用白色/米白/淡紫浅底，通过柔紫标题、浅色卡片、留白和墨灰紫文字保证阅读效率。",
+        "exception_policy": "深色页只在用户明确要求时使用；不得因为参考图偏暗而回到黑紫或深色整页基底。",
+    }
+    normalized["page_type_adaptation"] = (
+        "页面类型适配规则：整套页面以白色、米白或淡紫浅底为主。"
+        "内容页、数据页、表格页必须保持明亮基底和高可读正文；封面、章节页可以放大柔紫、玫瑰粉、浅金和法式纹理，"
+        "但不能回到黑紫或深邃暗色整页背景。"
+    )
+    normalized["content_style_hint"] = (
+        "用户明确要求以白色为主、明亮紫色、不要黑紫深邃感；生成画面方案和 Prompt 时必须继承浅色基底。"
+    )
+    normalized["source"] = normalized.get("source") or "agent_adjustment_contract"
+    return normalized
+
+
 def enforce_user_style_requirements(proposal: Dict, user_description: str) -> Dict:
     """Make structured style output obey explicit user chat requirements."""
     if not isinstance(proposal, dict):
         return proposal
-    if not _requests_deck_wide_dark_style(user_description):
+    wants_light = _requests_deck_wide_light_style(user_description)
+    wants_dark = _requests_deck_wide_dark_style(user_description)
+    if wants_light and (
+        not wants_dark
+        or _latest_term_index(user_description, LIGHT_DECK_TONE_TERMS + LIGHT_DECK_DARK_REJECTIONS)
+        >= _latest_term_index(user_description, DARK_DECK_TONE_TERMS)
+    ):
+        return _enforce_light_deck_style(proposal)
+    if not wants_dark:
         return proposal
 
     normalized = copy.deepcopy(proposal)
@@ -1065,10 +1163,17 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
             "除非用户明确要求或出现极端表格/长文页，不要把正文页自动切成米白、浅灰等另一套视觉语言。"
         )
     if base_tone == "light":
+        brand = _palette_color_by(lambda c: 105 <= _brightness(c) < 225 and _saturation(c) >= 0.08, palette, primary)
+        light_base = _palette_color_by(lambda c: _brightness(c) >= 225, palette, "#F9F8F5")
+        accent_light = _palette_color_by(
+            lambda c: c.upper() != brand.upper() and 150 <= _brightness(c) < 245 and _saturation(c) >= 0.04,
+            palette,
+            accent,
+        )
         return (
-            "页面类型适配规则：正文页以浅底和留白保证阅读效率，强视觉页可使用更深的主色或装饰区形成节奏。"
-            f"用 {primary} 做标题、页眉、编号、强调块，用 {accent} 做少量装饰线和重点信息；"
-            "深色页只用于封面、章节、金句或明确需要情绪冲击的页面，不能在正文页随机混用。"
+            f"页面类型适配规则：整套页面以 {light_base} 一类浅底和留白保证阅读效率，强视觉页也保持明亮基底。"
+            f"用 {brand} 做标题、页眉、编号和品牌装饰，用 {accent_light} 做少量装饰线和重点信息；"
+            "深色只用于文字、细线或局部强调，不能在封面、章节或正文页随机回到黑紫/深色整页背景。"
         )
     if palette and _needs_page_type_modulation(primary):
         return (

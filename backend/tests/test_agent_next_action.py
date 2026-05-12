@@ -2,9 +2,18 @@ from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VI
 from app.api.chat import (
     _content_result_needs_contract_review,
     _enforce_content_action_contract,
+    _enforce_visual_action_contract,
     _infer_requested_page_count,
+    _has_page_count_change_intent,
+    _visual_result_needs_contract_review,
 )
 from app.api.slides import PageNumsRequest
+from app.services.content_plan import (
+    _enforce_requested_page_range,
+    _is_strict_page_count_request,
+    infer_page_count_from_topic,
+    infer_page_count_range_from_topic,
+)
 from app.services.visual_plan import _build_batch_prompt
 
 
@@ -24,6 +33,73 @@ def test_content_proposal_gets_generate_plan_next_action():
         "payload": {"topic": "品牌年轻化策略提案", "page_count": 12},
     }
     assert "next_action" not in result
+
+
+def test_brief_page_count_range_is_inferred_from_initial_topic():
+    topic = "把这个 MD 文件做成 60 到 80 页的 PPT，给大连混沌学员讲 1.5 小时"
+
+    assert infer_page_count_range_from_topic(topic) == (60, 80)
+    assert infer_page_count_from_topic(topic) == 80
+    assert _infer_requested_page_count(topic) == 80
+
+
+def test_brief_page_count_range_handles_real_user_variants():
+    variants = [
+        "页数控制在 60-80，适合 90 分钟内训",
+        "做成60页到80页的PPT",
+        "不少于 60 页，不超过 80 页，做成课程课件",
+        "最多 80 页，至少 60 页",
+        "Make this into 60-80 slides for a workshop",
+        "做 120-150 页，越细越好",
+    ]
+
+    assert [infer_page_count_from_topic(text) for text in variants] == [80, 80, 80, 80, 80, 150]
+
+
+def test_upper_bound_page_count_is_not_strict_exact_count():
+    assert infer_page_count_range_from_topic("不要超过80页") == (1, 80)
+    assert infer_page_count_from_topic("不要超过80页") == 80
+    assert not _is_strict_page_count_request("不要超过80页")
+
+
+def test_page_count_inference_ignores_slide_references():
+    assert infer_page_count_from_topic("第 3 页标题更锐利") is None
+    assert _infer_requested_page_count("第 3 页标题更锐利") is None
+    assert infer_page_count_from_topic("P12 页标题改小") is None
+    assert infer_page_count_from_topic("12页标题改小") is None
+    assert not _has_page_count_change_intent("12页标题改小", {"total_slides": 40})
+
+
+def test_explicit_page_range_allows_shorter_outline_when_material_is_insufficient():
+    outline = [{"page_num": i, "text_content": {"headline": f"P{i}"}} for i in range(1, 15)]
+
+    accepted = _enforce_requested_page_range(outline, (60, 80))
+
+    assert len(accepted) == 14
+
+
+def test_explicit_page_range_trims_only_far_above_soft_upper_bound():
+    outline = [{"page_num": i, "text_content": {"headline": f"P{i}"}} for i in range(1, 87)]
+
+    trimmed = _enforce_requested_page_range(outline, (60, 80))
+
+    assert len(trimmed) == 84
+
+
+def test_small_page_range_accepts_slight_overshoot():
+    outline = [{"page_num": i, "text_content": {"headline": f"P{i}"}} for i in range(1, 18)]
+
+    accepted = _enforce_requested_page_range(outline, (10, 15))
+
+    assert len(accepted) == 17
+
+
+def test_upper_bound_page_count_still_trims_at_upper_bound():
+    outline = [{"page_num": i, "text_content": {"headline": f"P{i}"}} for i in range(1, 86)]
+
+    trimmed = _enforce_requested_page_range(outline, (1, 80))
+
+    assert len(trimmed) == 80
 
 
 def test_agent_action_contract_includes_handoffs_and_content_regeneration():
@@ -98,6 +174,51 @@ def test_request_generate_image_is_explicit_confirmation_action():
         "payload": {"page_nums": [2, 3]},
         "confirm": True,
     }
+
+
+def test_visual_generation_answer_is_coerced_to_confirmation_action():
+    result = {"action": "answer", "response": "好的，我开始生成图片。"}
+
+    compiled = _enforce_visual_action_contract(
+        result=result,
+        user_message="可以了，出图",
+        page_context={"mode": "global", "target_page_nums": [2, 3]},
+    )
+
+    assert compiled["action"] == "request_generate_image"
+    assert compiled["page_nums"] == [2, 3]
+
+
+def test_visual_page_edit_answer_is_coerced_to_reroll_action():
+    result = {"action": "answer", "response": "好的，我会把背景换成深蓝。"}
+
+    compiled = _enforce_visual_action_contract(
+        result=result,
+        user_message="这一页背景换成深蓝，标题更亮",
+        page_context={"mode": "page", "current_page": {"page_num": 5}},
+    )
+
+    assert compiled["action"] == "reroll_page_visual_plan"
+    assert compiled["page_nums"] == [5]
+
+
+def test_visual_deck_edit_answer_is_coerced_to_adjust_style_action():
+    result = {"action": "answer", "response": "好的，我会把整套统一成深色医疗科技感。"}
+
+    compiled = _enforce_visual_action_contract(
+        result=result,
+        user_message="所有页面统一换成深色医疗科技感",
+        page_context={"mode": "global", "scope": "deck", "target_page_nums": []},
+    )
+
+    assert compiled["action"] == "adjust_style"
+    assert "全局视觉要求" in compiled["response"]
+
+
+def test_visual_answer_without_mutation_intent_does_not_need_review():
+    result = {"action": "answer", "response": "这个风格更适合路演场景。"}
+
+    assert not _visual_result_needs_contract_review(result, "为什么这套风格适合路演？")
 
 
 def test_content_forward_to_visual_gets_switch_action():

@@ -12,6 +12,8 @@ export const API_BASE =
     : import.meta.env.DEV
     ? "http://localhost:8000"
     : "";
+export const CLIENT_PROVIDER_SETTINGS_ENABLED =
+  import.meta.env.VITE_ENABLE_CLIENT_PROVIDER_SETTINGS === "1";
 
 function makeApiUrl(path: string): URL {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
@@ -92,11 +94,14 @@ function headerSafe(value: string): string {
 
 function providerHeaders(): Record<string, string> {
   const auth = getStoredAuth();
-  const provider = getProviderSettings();
   const headers: Record<string, string> = {};
   if (auth?.testerId) {
     headers["x-pptgod-tester-id"] = auth.testerId;
   }
+  if (!CLIENT_PROVIDER_SETTINGS_ENABLED) {
+    return headers;
+  }
+  const provider = getProviderSettings();
   const minimaxApiKey = headerSafe(provider.minimaxApiKey);
   const minimaxApiBase = headerSafe(provider.minimaxApiBase);
   const minimaxLlmModel = headerSafe(provider.minimaxLlmModel);

@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     IMAGE_GEN_MODE: str = "real"  # real | mock | cached
     IMAGE_GEN_CACHE_DIR: str = "./outputs/image-cache"
     MAX_REAL_IMAGES_PER_RUN: int = 0  # 0 means unlimited
-    IMAGE_API_MAX_CONCURRENCY: int = 2
+    IMAGE_API_MAX_CONCURRENCY: int = 1
+    IMAGE_GPT_QUALITY: str = "high"  # low | medium | high | auto
+    IMAGE_PROVIDER_GATEWAY_CUTOFF_SECONDS: int = 120
+    IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS: int = 1
     # 0 means keep source dimensions unless upload-size fallback is required.
     IMAGE_REFERENCE_MAX_SIDE: int = 0
     IMAGE_REFERENCE_JPEG_QUALITY: int = 85

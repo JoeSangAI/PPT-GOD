@@ -18,6 +18,7 @@ from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VI
 from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.image_analyzer import describe_context_image
 from app.services.style_proposal import enforce_user_style_requirements
+from app.services.content_plan import infer_page_count_from_topic
 
 router = APIRouter(prefix="/projects", tags=["chat"])
 
@@ -36,6 +37,13 @@ CONTENT_CONTRACT_REVIEW_ACTIONS = frozenset({
     "forward_to_visual",
     *CONTENT_MUTATION_ACTIONS,
 })
+VISUAL_MUTATION_PAYLOAD_KEYS = {
+    "update_slide_visual": "updated_visual",
+    "update_all_slides_visual": "updated_slides_visual",
+    "adjust_style": "style_proposal",
+    "confirm_style": "style",
+}
+VISUAL_MUTATION_ACTIONS = frozenset(VISUAL_MUTATION_PAYLOAD_KEYS)
 
 
 class ChatMessage(BaseModel):
@@ -119,14 +127,7 @@ def _build_attachment_context(attachments: list[ReferenceImage] | None, agent_ro
 
 
 def _infer_requested_page_count(message: str) -> int | None:
-    explicit = re.search(r"(?<![第\d])(\d{1,3})\s*页", message.strip())
-    if not explicit:
-        return None
-    try:
-        value = int(explicit.group(1))
-    except ValueError:
-        return None
-    return value if 1 <= value <= 80 else None
+    return infer_page_count_from_topic(message)
 
 
 def _is_simple_confirmation(message: str) -> bool:
@@ -324,6 +325,169 @@ def _fallback_update_current_slide_from_attachments(
         "action": "update_slide_content",
         "updated_content": content,
         "response": response or "收到，我已把本轮附件信息整理进当前页内容，请检查文字取舍。",
+    }
+
+
+def _has_visual_generation_intent(message: str) -> bool:
+    return bool(re.search(r"(出图|生图|生成图片|生成成图|生成全部|批量生成|打样|确认生成|开始生成图片|就按这个生成|可以了.*生成)", message or "", flags=re.IGNORECASE))
+
+
+def _has_visual_mutation_intent(message: str) -> bool:
+    text = message or ""
+    if not text.strip():
+        return False
+    mutation_then_target = (
+        r"(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化)"
+        r".{0,35}(视觉|画面|图片|图|背景|配色|颜色|字体|排版|版式|风格|素材|Logo|logo|参考图|主色|标题|页面|整套|PPT|科技感|商务感)"
+    )
+    target_then_mutation = (
+        r"(视觉|画面|图片|图|背景|配色|颜色|字体|排版|版式|风格|素材|Logo|logo|参考图|主色|标题|页面|整套|PPT|科技感|商务感)"
+        r".{0,35}(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化)"
+    )
+    return bool(re.search(mutation_then_target, text, flags=re.IGNORECASE) or re.search(target_then_mutation, text, flags=re.IGNORECASE))
+
+
+def _response_promises_visual_mutation(response: str | None) -> bool:
+    text = response or ""
+    if not text:
+        return False
+    promise = r"(已根据|已经|我会|会把|正在|开始|将|准备).{0,40}(调整|修改|更新|重新|生成|换成|改成|加入|添加|统一)"
+    target = r"(视觉|画面|图片|背景|配色|颜色|字体|排版|版式|风格|生图|页面|整套|PPT|科技感|商务感)"
+    return bool(re.search(promise, text, flags=re.IGNORECASE) and re.search(target, text, flags=re.IGNORECASE))
+
+
+def _visual_action_payload_complete(result: dict) -> bool:
+    action = result.get("action")
+    payload_key = VISUAL_MUTATION_PAYLOAD_KEYS.get(action)
+    if not payload_key:
+        return True
+    payload = result.get(payload_key)
+    if action == "adjust_style" and not payload:
+        # Adjustments can still be handled by backend regeneration when the UI is
+        # in a state that can produce fresh proposal cards.
+        return bool(result.get("response"))
+    if isinstance(payload, list):
+        return len(payload) > 0
+    if isinstance(payload, dict):
+        return bool(payload)
+    return bool(payload)
+
+
+def _infer_visual_page_nums(user_message: str, page_context: dict | None) -> list[int]:
+    nums = []
+    for match in re.finditer(r"第\s*(\d{1,3})\s*(?:页|頁|张|張)", user_message or ""):
+        try:
+            nums.append(int(match.group(1)))
+        except ValueError:
+            pass
+    if isinstance(page_context, dict):
+        target_nums = page_context.get("target_page_nums")
+        if isinstance(target_nums, list):
+            nums.extend(int(n) for n in target_nums if isinstance(n, int) or str(n).isdigit())
+        if page_context.get("mode") == "page":
+            current_page = page_context.get("current_page")
+            if isinstance(current_page, dict):
+                page_num = current_page.get("page_num")
+                if isinstance(page_num, int):
+                    nums.append(page_num)
+    seen = set()
+    ordered = []
+    for num in nums:
+        if num <= 0 or num in seen:
+            continue
+        seen.add(num)
+        ordered.append(num)
+    return ordered
+
+
+def _is_deck_visual_scope(page_context: dict | None) -> bool:
+    if not isinstance(page_context, dict):
+        return False
+    if page_context.get("scope") == "deck":
+        return True
+    target_nums = page_context.get("target_page_nums")
+    return page_context.get("mode") == "global" and not target_nums
+
+
+def _visual_result_needs_contract_review(result: dict, user_message: str) -> bool:
+    if not isinstance(result, dict):
+        return False
+    action = result.get("action")
+    if action == "answer":
+        return (
+            _has_visual_generation_intent(user_message)
+            or _has_visual_mutation_intent(user_message)
+            or _response_promises_visual_mutation(result.get("response"))
+        )
+    if action in VISUAL_MUTATION_ACTIONS:
+        return not _visual_action_payload_complete(result)
+    return False
+
+
+def _enforce_visual_action_contract(
+    *,
+    result: dict,
+    user_message: str,
+    page_context: dict | None = None,
+    compiler=None,
+    logger=None,
+) -> dict:
+    if not _visual_result_needs_contract_review(result, user_message):
+        return result
+
+    page_nums = _infer_visual_page_nums(user_message, page_context)
+
+    try:
+        compiled = compiler(
+            user_message=user_message,
+            page_context=page_context,
+            initial_result=result,
+        ) if compiler else None
+    except Exception as exc:
+        if logger:
+            logger.warning("[Chat] Visual action contract compiler failed: %s", exc)
+        compiled = None
+
+    if isinstance(compiled, dict) and compiled.get("action") in VISUAL_ACTIONS:
+        action = compiled.get("action")
+        if action == "answer" and not compiled.get("no_change_reason"):
+            return {
+                "action": "answer",
+                "response": "我理解这是视觉修改请求，但没有拿到可安全应用到 PPT 的结构化结果，所以这次没有修改画面。请指定页码或说明要改的画面元素。",
+                "no_change_reason": "visual_instruction_compiler_returned_answer",
+            }
+        if action not in VISUAL_MUTATION_ACTIONS or _visual_action_payload_complete(compiled):
+            return compiled
+
+    if _has_visual_generation_intent(user_message):
+        response = "可以生成图片，但这会产生生图成本。请确认后我再继续。"
+        payload = {"action": "request_generate_image", "response": response}
+        if page_nums:
+            payload["page_nums"] = page_nums
+        return payload
+
+    if _has_visual_mutation_intent(user_message) or _response_promises_visual_mutation(result.get("response")):
+        if page_nums:
+            return {
+                "action": "reroll_page_visual_plan",
+                "page_nums": page_nums,
+                "response": f"收到，我会先为第 {', '.join(str(n) for n in page_nums)} 页重写画面方案；这一步不会直接生图。",
+            }
+        if _is_deck_visual_scope(page_context):
+            return {
+                "action": "adjust_style",
+                "response": "收到，我会把这条全局视觉要求转成新的整套风格方案或画面描述调整；请查看后续可确认的方案卡片。",
+            }
+        return {
+            "action": "answer",
+            "response": "我理解这是视觉修改请求，但还缺少明确页码或当前页上下文，所以没有修改 PPT。请说明要改哪一页，或进入单页后再发送。",
+            "no_change_reason": "missing_visual_target",
+        }
+
+    return {
+        "action": "answer",
+        "response": "我没有修改 PPT；这条视觉指令没有被解析成可安全执行的动作。请换成更具体的修改要求。",
+        "no_change_reason": "visual_instruction_compiler_failed",
     }
 
 
@@ -693,7 +857,7 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "", nu
 
 【工作流 action 说明】
 - "collect_assets"：用户还没有素材，或素材不够，你需要引导用户上传/描述更多设计素材。**不要直接输出风格提案**。
-- "propose_styles"：用户已上传素材，或在聊天中明确表示"没有素材""直接提案吧""你推荐吧""生成风格提案""确认素材"之后，基于已有信息输出风格提案。如果有素材，必须基于素材来阐述风格；如果没有素材，基于内容自行推荐。当用户点击「确认素材已齐，生成风格提案」按钮时，系统会发送一条确认消息，你也必须返回 propose_styles。
+- "propose_styles"：用户已上传素材，或在聊天中明确表示"没有素材""直接提案吧""你推荐吧""生成风格提案""确认素材"之后，基于已有信息输出风格提案。如果有素材，必须基于素材来阐述风格；如果没有素材，基于内容自行推荐。
 - "adjust_style"：用户对已有提案提出调整意见（如"太冷了"、"太花哨"、"更商务一点"），你在 response 中说明调整思路。
 - "confirm_style"：用户明确确认选择某个风格（如说"ok"、"就用这个"、"确认"、"选这个"等），返回此 action 并带上完整的风格对象。系统会自动保存该风格并进入下一步。
 - "reroll_page_visual_plan"：用户在单页/页面上下文里表达"再来一版"、"这个不满意"、"换个方向"等，希望**重新生成**这一页画面方案（由 LLM 自动重新写）。这个 action 只更新画面描述和生图提示词，不生图。
@@ -927,37 +1091,6 @@ def _stream_intent(
     is_draft = project_context["total_slides"] == 0
     has_documents = bool(documents and documents.strip())
     logger.info(f"Chat stream: project={project_context['title']}, role={agent_role}, is_draft={is_draft}, has_documents={has_documents}, doc_len={len(documents) if documents else 0}, attachments={len(attachments or [])}")
-
-    # 【关键】视觉总监按钮短路：用户点「素材已齐，开始生成」/「重新生成提案」按钮时，
-    # 前端发出固定魔法消息，后端直接短路跳过 LLM，确保稳定推进到 Celery 生图，避免被 LLM 卡住。
-    if agent_role == "visual":
-        # 提案数量：有素材 → 1 套；无素材 → 3 套
-        num_proposals = project_context.get("num_proposals", 3)
-        MAGIC_PROPOSE_FIRST = "请基于我已上传的素材帮我生成风格提案。"
-        MAGIC_PROPOSE_REGEN = "请基于当前最新的素材和我们之前的讨论，重新给我一套风格提案。"
-        msg_stripped = user_message.strip()
-        if msg_stripped == MAGIC_PROPOSE_FIRST:
-            logger.info(f"[Chat] Visual button short-circuit: first propose, num={num_proposals}")
-            yield {"type": "thinking", "delta": "用户点了「素材已齐，开始生成」按钮，直接进入提案生成。"}
-            yield {
-                "type": "result",
-                "data": {
-                    "action": "propose_styles",
-                    "response": f"好的，正在基于你上传的素材生成 {num_proposals} 套风格提案，请稍候片刻..."
-                }
-            }
-            return
-        if msg_stripped == MAGIC_PROPOSE_REGEN:
-            logger.info(f"[Chat] Visual button short-circuit: regen propose, num={num_proposals}")
-            yield {"type": "thinking", "delta": "用户点了「重新生成提案」按钮，基于最新素材重新生成。"}
-            yield {
-                "type": "result",
-                "data": {
-                    "action": "propose_styles",
-                    "response": f"好的，基于你最新上传的素材和我们的讨论，重新给你生成 {num_proposals} 套提案..."
-                }
-            }
-            return
 
     # 根据 agent_role 选择 system prompt
     if agent_role == "visual":
@@ -1366,12 +1499,20 @@ def _stream_intent(
             "生成风格", "出方案", "出提案", "做风格", "出风格",
             "素材已齐", "可以生成", "开始做"
         ]
-        if any(k in user_message for k in propose_keywords):
+        if any(k in user_message for k in propose_keywords) and not _has_visual_generation_intent(user_message):
             logger.info(f"[Chat] Visual director keyword fallback: forced propose_styles from answer (msg={user_message[:50]!r})")
             result = {
                 "action": "propose_styles",
                 "response": "好的，正在基于你的素材生成风格提案，请稍候..."
             }
+
+    if result and isinstance(result, dict) and agent_role == "visual":
+        result = _enforce_visual_action_contract(
+            result=result,
+            user_message=user_message,
+            page_context=page_context,
+            logger=logger,
+        )
 
     if (
         result

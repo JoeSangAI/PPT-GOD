@@ -343,6 +343,33 @@ def test_prompt_text_contract_strips_unbalanced_markdown():
     assert 'Body: "**第四部分' not in prompt
 
 
+def test_section_prompt_requires_chapter_label_from_section_title():
+    prompts = prompt_engine.generate_prompts_for_all_pages(
+        visual_plan=[{
+            "page_num": 2,
+            "type": "section",
+            "layout": "section",
+            "visual_evidence": "章节过渡",
+            "visual_description": "章节标题居中。",
+        }],
+        content_plan=[{
+            "page_num": 2,
+            "type": "section",
+            "section_title": "第一章",
+            "text_content": {
+                "headline": "我们是谁？",
+                "subhead": "Who We Are",
+                "body": "",
+            },
+        }],
+        style_text_override="Style: 浅色\nPalette: #FFFFFF, #6B5B7A",
+    )
+
+    prompt = prompts[0]["prompt"]
+    assert 'Chapter label: "第一章"' in prompt
+    assert 'Headline: "我们是谁？"' in prompt
+
+
 def test_fallback_visual_plan_uses_concrete_visual_evidence():
     plan = _fallback_visual_plan(
         [
@@ -576,6 +603,46 @@ def test_logo_overlay_layout_avoids_dense_ending_content(tmp_path):
     )
 
 
+def test_logo_overlay_layout_avoids_light_ending_title_text(tmp_path):
+    bg_path = tmp_path / "light-ending.png"
+    logo_path = tmp_path / "logo.png"
+
+    bg = Image.new("RGB", (1792, 1024), (249, 246, 241))
+    draw = ImageDraw.Draw(bg)
+    # Simulate the Ling Coffee ending page: a large brush headline and body
+    # text centered on a light watercolor background.
+    draw.rectangle((420, 210, 1490, 350), fill=(105, 85, 122))
+    for y in (470, 550, 630, 710):
+        draw.rectangle((560, y, 1250, y + 40), fill=(55, 48, 68))
+    bg.save(bg_path)
+
+    Image.new("RGBA", (520, 330), (90, 70, 120, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "ending", "lower-center", "large")
+
+    assert resolved is not None
+    logo_box = (
+        resolved["left"],
+        resolved["top"],
+        resolved["left"] + resolved["width"],
+        resolved["top"] + resolved["height"],
+    )
+    title_box = (420 / 1792, 210 / 1024, 1490 / 1792, 350 / 1024)
+    body_box = (560 / 1792, 470 / 1024, 1250 / 1792, 750 / 1024)
+
+    def overlap(a, b):
+        left = max(a[0], b[0])
+        top = max(a[1], b[1])
+        right = min(a[2], b[2])
+        bottom = min(a[3], b[3])
+        if right <= left or bottom <= top:
+            return 0
+        return (right - left) * (bottom - top)
+
+    assert overlap(logo_box, title_box) == 0
+    assert overlap(logo_box, body_box) == 0
+
+
 def test_cover_center_logo_placement_is_physical_center(tmp_path):
     bg_path = tmp_path / "cover.png"
     logo_path = tmp_path / "logo.png"
@@ -591,6 +658,31 @@ def test_cover_center_logo_placement_is_physical_center(tmp_path):
     assert resolved["strategy"] == "static:center"
     assert abs((resolved["left"] + resolved["width"] / 2) - 0.5) < 0.01
     assert abs((resolved["top"] + resolved["height"] / 2) - 0.5) < 0.01
+
+
+def test_small_corner_logo_is_readable_default_size(tmp_path):
+    bg_path = tmp_path / "content.png"
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGB", (1792, 1024), (20, 20, 24)).save(bg_path)
+    Image.new("RGBA", (300, 120), (255, 255, 255, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "content", "top-right", "small")
+
+    assert resolved is not None
+    assert resolved["width"] == pytest.approx(0.085, abs=0.002)
+
+
+def test_ending_small_corner_logo_respects_small_scale(tmp_path):
+    bg_path = tmp_path / "ending.png"
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGB", (1792, 1024), (249, 246, 241)).save(bg_path)
+    Image.new("RGBA", (300, 120), (80, 60, 120, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "ending", "top-right", "small")
+
+    assert resolved is not None
+    assert resolved["width"] == pytest.approx(0.085, abs=0.002)
+    assert resolved["strategy"] == "static:top-right"
 
 
 def test_pptx_assembler_uses_resolved_logo_overlay_box(tmp_path):
@@ -888,6 +980,7 @@ def test_visual_plan_prompt_allows_logo_policy_with_project_logo():
 
     assert "title-block-center" in prompt
     assert '"show_logo": true' in prompt
+    assert "不要要求底图为 Logo 绘制占位框、虚线框、圆角框、底板、徽章或任何容器" in prompt
 
 
 def test_default_visual_asset_usage_does_not_describe_product_appearance():
@@ -916,12 +1009,12 @@ def test_prompt_does_not_reserve_logo_area_without_uploaded_logo_policy():
         style_text_override="Style: 品牌提案\nPalette: #FFFFFF, #B01622",
     )
 
-    assert "Logo Overlay Reservation" not in prompt
+    assert "Logo Placement Note" not in prompt
     assert "exact overlay" not in prompt
     assert "do not draw or invent logos" in prompt
 
 
-def test_prompt_reserves_logo_overlay_area_when_policy_is_enabled():
+def test_prompt_leaves_unframed_logo_space_when_policy_is_enabled():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 1,
@@ -936,10 +1029,12 @@ def test_prompt_reserves_logo_overlay_area_when_policy_is_enabled():
         style_text_override="Style: 品牌提案\nPalette: #FFFFFF, #B01622",
     )
 
-    assert "Logo Overlay Reservation" in prompt
+    assert "Logo Placement Note" in prompt
     assert "center brand lockup area" in prompt
+    assert "Do not draw any logo placeholder" in prompt
+    assert "dashed frame" in prompt
+    assert "reserved logo area" not in prompt
     assert "do not draw, invent, or stylize any logo" in prompt
-    assert "exact overlay" in prompt
 
 
 def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
@@ -960,6 +1055,37 @@ def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
 
     assert intent["logo_policy"]["show_logo"] is False
     assert intent["logo_policy"]["use_as_scene_asset"] is False
+    assert "resolved_overlay_box" not in intent["logo_policy"]
+
+
+def test_ending_logo_policy_uses_small_confirmed_corner_signature(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGBA", (120, 60), (80, 60, 120, 255)).save(logo_path)
+    logo = SimpleNamespace(
+        id="logo-1",
+        role="logo",
+        slide_id=None,
+        file_path=str(logo_path),
+        logo_anchor="top-right",
+        asset_analysis={},
+    )
+    project = SimpleNamespace(reference_images=[logo])
+
+    intent = slides_api._with_project_logo_policy(
+        {
+            "type": "ending",
+            "logo_policy": {
+                "show_logo": True,
+                "placement": "lower-center",
+                "scale": "large",
+                "resolved_overlay_box": {"left": 0.45},
+            },
+        },
+        project,
+    )
+
+    assert intent["logo_policy"]["placement"] == "top-right"
+    assert intent["logo_policy"]["scale"] == "small"
     assert "resolved_overlay_box" not in intent["logo_policy"]
 
 

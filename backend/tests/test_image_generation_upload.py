@@ -1,4 +1,5 @@
 import io
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -6,7 +7,7 @@ from types import SimpleNamespace
 from PIL import Image
 import pytest
 
-from app.services import image_generation
+from app.services import image_generation, image_task_audit
 
 
 def test_prepare_reference_image_keeps_source_size_without_max_side():
@@ -44,6 +45,97 @@ def test_reference_upload_timeout_is_not_retryable():
     error = image_generation.ReferenceUploadTimeoutError("图片接口上传超时")
 
     assert image_generation._is_api_retryable(error) is False
+
+
+def test_provider_gateway_cutoff_is_not_retryable():
+    error = image_generation.ProviderGatewayCutoffError("图片接口被上游连接窗口截断")
+
+    assert image_generation._is_api_retryable(error) is False
+
+
+def test_default_image_generation_is_single_flight_high_quality():
+    assert image_generation.settings.IMAGE_API_MAX_CONCURRENCY == 1
+    assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 1
+    assert image_generation._image_quality() == "high"
+
+
+def test_image_api_slot_uses_redis_global_queue(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.set_calls = []
+            self.eval_calls = []
+
+        def set(self, key, token, nx=False, ex=None):
+            self.set_calls.append((key, token, nx, ex))
+            return True
+
+        def eval(self, *args):
+            self.eval_calls.append(args)
+            return 1
+
+    fake = FakeRedis()
+    monkeypatch.setattr(image_generation, "_get_image_redis_client", lambda: fake)
+
+    with image_generation._image_api_slot():
+        assert image_generation._current_image_queue_wait_seconds() is not None
+
+    assert fake.set_calls
+    assert fake.eval_calls
+
+
+def test_image_generation_audit_log_writes_jsonl(tmp_path, monkeypatch):
+    monkeypatch.setattr(image_task_audit.settings, "OUTPUT_DIR", str(tmp_path))
+
+    path = image_task_audit.append_image_generation_log(
+        "project id",
+        "run id",
+        "slide_started",
+        page_num=1,
+        prompt_length=123,
+    )
+
+    rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+    assert rows[0]["event"] == "slide_started"
+    assert rows[0]["project_id"] == "project id"
+    assert rows[0]["run_id"] == "run id"
+    assert rows[0]["page_num"] == 1
+    assert path.endswith("project_id/run_id.jsonl")
+
+
+def test_invalid_image_quality_falls_back_to_high(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "IMAGE_GPT_QUALITY", "typo")
+
+    assert image_generation._image_quality() == "high"
+
+
+def test_gateway_cutoff_detection_matches_120_second_connection_drop(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "IMAGE_PROVIDER_GATEWAY_CUTOFF_SECONDS", 120)
+    error = image_generation.requests.exceptions.ConnectionError("Connection error.")
+
+    assert image_generation._is_gateway_idle_cutoff(error, 121.2) is True
+    assert image_generation._is_gateway_idle_cutoff(error, 12.0) is False
+
+
+def test_gateway_cutoff_stops_after_configured_attempts(monkeypatch):
+    attempts = 0
+
+    monkeypatch.setattr(image_generation.settings, "IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation.time, "sleep", lambda _seconds: None)
+
+    def fake_generate(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        error = image_generation.requests.exceptions.ConnectionError("Connection error.")
+        setattr(error, "pptgod_gateway_idle_cutoff", True)
+        raise error
+
+    monkeypatch.setattr(image_generation, "_call_gpt_image_2_generate", fake_generate)
+
+    with pytest.raises(image_generation.ProviderGatewayCutoffError):
+        image_generation._generate_real_slide_image("prompt", reference_images=None)
+
+    assert attempts == 2
 
 
 def test_image_call_events_are_thread_local():

@@ -20,6 +20,7 @@ def get_llm_client() -> OpenAI:
             api_key=credentials.minimax_api_key,
             base_url=credentials.minimax_api_base,
             timeout=120.0,
+            max_retries=0,
         )
     if _client is None:
         api_key = settings.MINIMAX_API_KEY
@@ -29,5 +30,6 @@ def get_llm_client() -> OpenAI:
             api_key=api_key,
             base_url=credentials.minimax_api_base,
             timeout=120.0,
+            max_retries=0,
         )
     return _client

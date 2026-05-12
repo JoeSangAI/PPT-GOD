@@ -137,6 +137,100 @@ def test_explicit_deck_wide_dark_request_removes_light_content_policy():
     assert "正文页以浅底" not in joined
 
 
+def test_explicit_deck_wide_light_request_overrides_dark_reference_policy():
+    proposal = {
+        "name": "柔紫暖白",
+        "palette": [
+            {"name": "柔紫", "hex": "#C4B4E0", "role": "品牌主色/视觉锚点色"},
+            {"name": "米白", "hex": "#F9F8F5", "role": "页面基底/主背景"},
+            {"name": "淡紫", "hex": "#E8E0F0", "role": "内容区/卡片底色"},
+            {"name": "墨灰紫", "hex": "#3A3038", "role": "正文/标题文字"},
+        ],
+        "description": "舍弃黑紫色调，改为以米白为基底、柔紫为主色的明亮组合。",
+        "visual_strategy": {
+            "base_tone": "dark",
+            "summary": "整体以深色视觉基底为主；信息页保持同一深色系基底。",
+            "content_treatment": "信息页保持同一深色系基底，用高对比暗色卡片保证阅读效率。",
+        },
+        "page_type_adaptation": "页面类型适配规则：先保持整套深色视觉基底，再按页面功能调节强弱。",
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "客户说他不喜欢这个黑紫的整个调性，我们要换成以白色为主，也就是明亮一点的颜色。使用明亮一点的紫色，而不是那种很深邃的黑紫感觉。",
+    )
+
+    joined = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("description", "page_type_adaptation", "content_style_hint")
+    )
+    assert normalized["visual_strategy"]["base_tone"] == "light"
+    assert normalized["palette"][0]["role"] == "整套页面主背景/内容页浅色基底"
+    assert "白色/米白/浅色明亮基底" in normalized["visual_strategy"]["summary"]
+    assert "黑紫或深邃暗色整页背景" in normalized["page_type_adaptation"]
+    assert "整体以深色视觉基底为主" not in joined
+
+
+def test_selected_style_pack_repairs_stale_dark_strategy_for_light_contract():
+    selected_style = {
+        "name": "柔紫暖白",
+        "palette": [
+            {"name": "柔紫", "hex": "#C4B4E0", "role": "品牌主色/视觉锚点色"},
+            {"name": "米白", "hex": "#F9F8F5", "role": "页面基底/主背景"},
+            {"name": "淡紫", "hex": "#E8E0F0", "role": "内容区/卡片底色"},
+            {"name": "墨灰紫", "hex": "#3A3038", "role": "正文/标题文字"},
+        ],
+        "description": "舍弃黑紫色调，改为以米白为基底、柔紫为主色、玫瑰粉与浅金作温暖点缀的明亮组合。",
+        "visual_strategy": {
+            "base_tone": "dark",
+            "summary": "整体以深色视觉基底为主；信息页保持同一深色系基底。",
+            "content_treatment": "信息页保持同一深色系基底。",
+        },
+        "page_type_adaptation": "页面类型适配规则：先保持整套深色视觉基底，再按页面功能调节强弱。",
+    }
+
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    assert "Visual strategy: base_tone=light" in style_pack
+    assert "整体以深色视觉基底为主" not in style_pack
+    assert "先保持整套深色视觉基底" not in style_pack
+    assert "白色、米白或淡紫浅底" in style_pack
+
+
+def test_prompt_rewrites_stale_dark_visual_intent_when_selected_style_is_light():
+    selected_style = {
+        "name": "柔紫暖白",
+        "palette": [
+            {"name": "柔紫", "hex": "#C4B4E0", "role": "品牌主色/视觉锚点色"},
+            {"name": "米白", "hex": "#F9F8F5", "role": "页面基底/主背景"},
+            {"name": "淡紫", "hex": "#E8E0F0", "role": "内容区/卡片底色"},
+            {"name": "墨灰紫", "hex": "#3A3038", "role": "正文/标题文字"},
+        ],
+        "description": "舍弃黑紫色调，改为以米白为基底、柔紫为主色的明亮组合。",
+        "visual_strategy": {"base_tone": "dark", "summary": "整体以深色视觉基底为主。"},
+    }
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 3,
+            "type": "content",
+            "layout": "content_top",
+            "visual_evidence": "深色背景中的三层关系图示",
+            "visual_description": "保持深色基底统一，使用高对比暗色卡片承载内容，保证阅读效率同时延续深色视觉基调。",
+        },
+        content_text={"headline": "定位", "body": ["灵咖啡不仅仅是一家咖啡店。"]},
+        style_text_override=style_pack,
+    )
+
+    assert "Visual strategy: base_tone=light" in prompt
+    assert "保持深色基底统一" not in prompt
+    assert "高对比暗色卡片" not in prompt
+    assert "延续深色视觉基调" not in prompt
+    assert "保持浅色基底统一" in prompt
+    assert "白色/米白浅色背景" in prompt
+
+
 def test_visual_chat_confirmation_is_part_of_style_action_alignment():
     proposal = {
         "name": "墨韵金调",

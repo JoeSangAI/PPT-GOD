@@ -11,6 +11,7 @@ from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.generation_pipeline import run_generation_pipeline
+from app.services.image_task_audit import append_image_generation_log
 from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.logo_policy import is_logo_confirmed
@@ -66,8 +67,16 @@ def _resolve_target_pages(project_id: str, page_nums: list = None) -> list:
         db.close()
 
 
-def _acquire_page_locks(project_id: str, page_nums: list, ttl: int = 600) -> list:
+def _page_lock_ttl_seconds() -> int:
+    try:
+        return max(600, int(settings.CELERY_TASK_TIME_LIMIT or 2100) + 300)
+    except (TypeError, ValueError):
+        return 2400
+
+
+def _acquire_page_locks(project_id: str, page_nums: list, ttl: int | None = None) -> list:
     """Try to acquire per-page locks. Returns list of page_nums that were successfully locked."""
+    ttl = ttl or _page_lock_ttl_seconds()
     acquired = []
     for pn in page_nums:
         lock_key = f"project:{project_id}:slide:{pn}:generating"
@@ -116,9 +125,17 @@ def generate_slides_task(project_id: str, page_nums: list = None, prototype: boo
 
 def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None):
     """Celery task body with provider credentials installed in context."""
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "task_started",
+        requested_page_nums=page_nums,
+        prototype=prototype,
+    )
     target_pages = _resolve_target_pages(project_id, page_nums)
     if not target_pages:
         logger.warning(f"No pages to generate for project {project_id}")
+        append_image_generation_log(project_id, run_id, "task_skipped", reason="no_pages")
         db = SessionLocal()
         try:
             finish_run(db, run_id, status="stale", message="没有可生成的页面", error_msg="no_pages")
@@ -131,6 +148,13 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
     acquired_pages = _acquire_page_locks(project_id, target_pages)
     if not acquired_pages:
         logger.info(f"All target pages for project {project_id} are already being generated")
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "task_skipped",
+            reason="all_pages_locked",
+            target_page_nums=target_pages,
+        )
         _cleanup_stale_generating_slides(project_id, target_pages)
         db = SessionLocal()
         try:
@@ -143,6 +167,13 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
     skipped_pages = [p for p in target_pages if p not in acquired_pages]
     if skipped_pages:
         logger.info(f"Skipping locked pages: {skipped_pages}")
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "task_partially_locked",
+            acquired_page_nums=acquired_pages,
+            skipped_page_nums=skipped_pages,
+        )
         _cleanup_stale_generating_slides(project_id, skipped_pages)
 
     db = SessionLocal()
@@ -156,11 +187,29 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
         if project:
             project.has_unread_notification = True
             project.unread_notification_message = "打样完成" if prototype else "图片生成完成"
-            db.commit()
+        db.commit()
         logger.info(f"Celery task completed: project={project_id}")
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "task_finished",
+            status="completed",
+            acquired_page_nums=acquired_pages,
+            skipped_page_nums=skipped_pages,
+            prototype=prototype,
+        )
         return {"project_id": project_id, "status": "completed", "page_nums": acquired_pages, "prototype": prototype, "skipped_pages": skipped_pages}
     except Exception as exc:
         logger.error(f"Celery task failed: {exc}")
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "task_finished",
+            status="failed",
+            error=str(exc)[:1000],
+            acquired_page_nums=acquired_pages,
+            prototype=prototype,
+        )
         try:
             project = db.query(Project).filter(Project.id == project_id).first()
             if project:

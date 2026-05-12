@@ -15,7 +15,7 @@ export default function ToastContainer({
   onRemove: (id: string) => void;
 }) {
   return (
-    <div className="fixed top-4 right-4 z-50 space-y-2 pointer-events-none">
+    <div className="pg-toast-container" aria-live="polite" aria-atomic="false">
       {toasts.map((toast) => (
         <ToastItemComponent key={toast.id} toast={toast} onRemove={onRemove} />
       ))}
@@ -35,17 +35,23 @@ function ToastItemComponent({
     return () => clearTimeout(timer);
   }, [toast.id, toast.duration, onRemove]);
 
-  const colors = {
-    success: "bg-green-600",
-    error: "bg-red-600",
-    info: "bg-blue-600",
-  };
-
   return (
     <div
-      className={`pointer-events-auto text-white px-4 py-2 rounded shadow-lg text-sm min-w-[200px] max-w-[400px] animate-fade-in ${colors[toast.type]}`}
+      className={`pg-toast pg-toast-${toast.type}`}
+      role={toast.type === "error" ? "alert" : "status"}
     >
-      {toast.message}
+      <div className="pg-toast-content">
+        <span className="pg-toast-dot" aria-hidden="true" />
+        <span className="pg-toast-message">{toast.message}</span>
+      </div>
+      <button
+        type="button"
+        className="pg-toast-close"
+        onClick={() => onRemove(toast.id)}
+        aria-label="关闭提示"
+      >
+        ×
+      </button>
     </div>
   );
 }

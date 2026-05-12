@@ -76,9 +76,49 @@ assert.match(
   "Agent-triggered content-plan regeneration must carry the same attachment ids that informed the chat reply"
 );
 assert.match(
+  source,
+  /const notifyStartBlocked = \(message: string\)[\s\S]*没有启动重新生成：\$\{message\}[\s\S]*Content plan start latch check failed/,
+  "content-plan regeneration must not silently die behind a stale local start latch"
+);
+assert.match(
+  source,
+  /const CONTENT_PLAN_START_LATCH_GRACE_MS[\s\S]*contentPlanStartingAtRef\.current = Date\.now\(\)/,
+  "content-plan local start latch must be timestamped so stale latches can recover"
+);
+assert.match(
   client,
   /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\]\)[\s\S]*body\.attachment_ids = attachmentIds/,
   "content-plan API requests must support explicit attachment ids"
+);
+assert.match(
+  source,
+  /const getLatestComposerTextForSubmission = \(forcedMsg\?: string\)[\s\S]*isBriefStudioActive \? readBriefEditorValue\(\) : chatInput/,
+  "Brief Studio submission must read the latest contenteditable value instead of relying only on stale React state"
+);
+assert.doesNotMatch(
+  source,
+  /正在解析上传内容/,
+  "Brief Studio must not present document parsing as a blocking composer state"
+);
+assert.match(
+  source,
+  /const briefComposerSupportText = uploadingDoc[\s\S]*正在加入材料；你可以继续写 Brief[\s\S]*材料解析中；你可以继续补充 Brief/,
+  "Brief Studio upload status must keep the writing entry visible while files are being prepared"
+);
+assert.match(
+  source,
+  /disabled=\{!selectedProject \|\| chatLoading \|\| isBusy \|\| uploadingDoc \|\| \(!chatInput\.trim\(\) && !hasBriefAttachments\)\}/,
+  "Brief Studio must wait for the upload request to finish before starting content planning"
+);
+assert.match(
+  source,
+  /const userBrief = payload\?\.topic \|\| getLatestComposerTextForSubmission\(\);[\s\S]*const inferredPageCount = payload\?\.page_count \|\| inferRequestedPageCount\(userBrief\)/,
+  "content-plan submission must infer explicit page-count goals from the submitted Brief"
+);
+assert.match(
+  source,
+  /function buildSubmittedBriefDisplayContent[\s\S]*本次要求：\\n\$\{brief\}/,
+  "submitted Brief messages must show the actual request in the Agent sidebar"
 );
 assert.match(
   source,
@@ -132,6 +172,26 @@ assert.match(
 );
 assert.match(
   source,
+  /contentPlanStartingProjectRef\.current === projectId[\s\S]*return \{ ok: false, reason: "busy"/,
+  "content-plan generation must have a synchronous guard against rapid duplicate submissions"
+);
+assert.match(
+  source,
+  /contentPlanStartingProjectRef\.current = projectId[\s\S]*generateContentPlan\(projectId, topic, pageCount/,
+  "content-plan duplicate-submit guard must be set before the API request starts"
+);
+assert.match(
+  source,
+  /\["failed", "stale", "cancelled"\]\.includes\(String\(workflow\.last_run\.status \|\| ""\)\)/,
+  "content-plan polling must surface stale/cancelled runs as visible failures"
+);
+assert.match(
+  source,
+  /if \(currentSlides\.length > 0 && currentSlideIds !== previousSlideIds\) \{[\s\S]*options\?\.onStarted\?\.\(\);[\s\S]*setContentPlanSnapshot/,
+  "Brief Studio draft should only be cleared after new content-plan slides actually exist"
+);
+assert.match(
+  source,
   /if \(isBusy \|\| chatLoading\) \{[\s\S]*当前还有任务或消息在处理中[\s\S]*return;/,
   "manual next actions must show why they cannot run instead of returning silently"
 );
@@ -179,6 +239,31 @@ assert.match(
   source,
   /generateStyleProposals\(requestProjectId, shouldForceStyleProposal, styleGenerationContext\)/,
   "backend style generation must receive visual chat requirements"
+);
+assert.match(
+  source,
+  /failed to fetch\|networkerror\|network request failed\|load failed/,
+  "raw browser network errors must be translated before showing generation failures"
+);
+assert.match(
+  source,
+  /const resolveWorkflowFailureMessage = async \([\s\S]*fetchWorkflowStatus\(projectId\)[\s\S]*\["failed", "stale", "cancelled"\]\.includes\(String\(run\.status \|\| ""\)\)/,
+  "generation failure handlers must re-check workflow state before falling back to local fetch errors"
+);
+assert.match(
+  source,
+  /风格提案生成失败："\s*\+\s*errorMessage[\s\S]*视觉方向生成失败："\s*\+\s*errorMessage/,
+  "both chat-triggered and button-triggered style generation failures must use resolved workflow errors"
+);
+assert.doesNotMatch(
+  source,
+  /handleSendChat\(fakeUserMsg\)/,
+  "style proposal buttons must call explicit generation actions instead of sending magic chat messages"
+);
+assert.match(
+  source,
+  /case "generate_style_proposals": \{[\s\S]*buildVisualStyleGenerationContext\([\s\S]*generateStyleProposals\(\s*currentProject\.id,[\s\S]*styleGenerationContext/,
+  "style proposal buttons must preserve visual requirements while using the explicit generation API"
 );
 assert.match(
   client,
@@ -274,6 +359,11 @@ assert.match(
   source,
   /整体基底/,
   "selected style summary must show the visual background strategy so users can revise it"
+);
+assert.match(
+  source,
+  /const wantsLight =[\s\S]*不喜欢黑紫[\s\S]*const wantsDarkTech = !wantsLight/,
+  "fallback style adjustments must not treat '不喜欢黑紫' as a dark-style request"
 );
 assert.doesNotMatch(
   css,

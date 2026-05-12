@@ -155,16 +155,16 @@ def build_visual_strategy(
         content_treatment = "信息页保持同一深色系基底，用高对比暗色卡片、局部浅色内容区、清晰字号层级和留白提高可读性。"
         exception_policy = "只有用户明确要求或出现极端表格/长文页时，才允许成组使用浅底信息页，且必须保留同一色系和品牌装饰。"
         logo_contrast = (
-            "Logo 偏浅，优先放在深色安全区或深色底托上，避免浅底吞掉标识。"
+            "Logo 偏浅，优先放在低干扰的深色区域，避免浅底吞掉标识；不要在底图里绘制固定 Logo 框或底板。"
             if logo_tone == "light"
-            else "Logo 区域必须保持足够对比，必要时使用安全底托。"
+            else "Logo 区域必须保持足够对比，优先通过低干扰角落和局部明暗关系解决，不在底图里绘制固定 Logo 框。"
         )
         label = "整体以深色视觉基底为主"
     elif base_tone == "light":
         content_treatment = "正文页以浅底和留白保证阅读效率，强视觉页可使用更深的主色或装饰区形成节奏。"
         exception_policy = "深色页只用于封面、章节、金句或明确需要情绪冲击的页面，不能在正文页随机混用。"
         logo_contrast = (
-            "Logo 偏浅时，浅底页必须提供深色安全角、深色底托或改用深色页眉承载标识。"
+            "Logo 偏浅时，浅底页应选择低干扰深色角落或深色页眉承载标识；不要在底图里绘制固定 Logo 框或底板。"
             if logo_tone == "light"
             else "Logo 区域必须保持足够对比，避免和背景融合。"
         )
@@ -172,7 +172,7 @@ def build_visual_strategy(
     else:
         content_treatment = "先保持同一套色彩和材质语言，再按页面功能分组调整明暗；同类正文页使用同一种信息页处理。"
         exception_policy = "深浅变化必须按封面/正文/金句/结尾等功能成组出现，不能逐页随机切换。"
-        logo_contrast = "Logo 区域必须根据明暗分组设置安全底或安全角，保证全 deck 可见。"
+        logo_contrast = "Logo 区域必须根据明暗分组选择低干扰角落和足够对比，保证全 deck 可见；不要在底图里绘制固定 Logo 框或底板。"
         label = "按页面功能分组控制明暗"
 
     strategy = {

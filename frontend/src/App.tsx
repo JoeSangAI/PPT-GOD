@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, SyntheticEvent } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
@@ -86,6 +86,13 @@ import {
   type GateActionKey,
   type WorkflowGate,
 } from "./workflow";
+import {
+  inferAgentRequestContext,
+  inferRequestedPageCount,
+  type AgentRequestContext,
+  type AgentRequestScope,
+  type AgentRole,
+} from "./agentRequestContext";
 
 import {
   API_BASE,
@@ -314,29 +321,88 @@ function getBriefSubmissionDisplayContent(content: string, explicitDisplayConten
   const match = text.match(/^(已提交 Brief，开始生成内容规划|确认建议，开始生成内容规划)(?:\s|$)/);
   if (!match) return text;
 
-  return match[1] === "确认建议，开始生成内容规划"
+  const intro = match[1] === "确认建议，开始生成内容规划"
     ? "建议已确认，正在生成内容规划。"
     : "Brief 已提交，正在生成内容规划。";
+  const details = text.slice(match[0].length).trim();
+  return details ? `${intro}\n\n${details}` : intro;
+}
+
+function truncateBriefDisplay(text: string, limit = 1200) {
+  const cleaned = (text || "").trim();
+  if (!cleaned || cleaned.length <= limit) return cleaned;
+  return `${cleaned.slice(0, limit).trimEnd()}\n...`;
+}
+
+function buildSubmittedBriefDisplayContent({
+  fromSuggestion,
+  userBrief,
+  attachmentSummary,
+  pageCount,
+}: {
+  fromSuggestion: boolean;
+  userBrief: string;
+  attachmentSummary?: string;
+  pageCount?: number;
+}) {
+  const lines = [fromSuggestion ? "建议已确认，正在生成内容规划。" : "Brief 已提交，正在生成内容规划。"];
+  const brief = truncateBriefDisplay(userBrief);
+  if (brief) lines.push(`本次要求：\n${brief}`);
+  if (pageCount) lines.push(`识别到页数目标：约 ${pageCount} 页`);
+  if (attachmentSummary) lines.push(`已上传材料：\n${attachmentSummary}`);
+  return lines.join("\n\n");
 }
 
 function buildRunCompletionFollowup({
   runKind,
+  runStatus,
+  runError,
   projectStatus,
   completedCount,
+  targetCompletedCount,
+  failedCount,
+  targetCount,
   totalSlides,
   hasSelectedStyle,
   hasPrompt,
   styleProposalCount,
 }: {
   runKind: string | null;
+  runStatus?: string | null;
+  runError?: string | null;
   projectStatus: string | null;
   completedCount: number;
+  targetCompletedCount?: number;
+  failedCount?: number;
+  targetCount?: number;
   totalSlides: number;
   hasSelectedStyle: boolean;
   hasPrompt: boolean;
   styleProposalCount: number;
 }): RunCompletionFollowup {
   const status = projectStatus || "未知";
+  const runFinishedWithProblem = ["failed", "stale", "cancelled"].includes(String(runStatus || ""));
+  if (runFinishedWithProblem) {
+    const scopedCompleted = Math.max(0, Number(targetCompletedCount ?? completedCount ?? 0));
+    const scopedTotal = Math.max(0, Number(targetCount ?? totalSlides ?? scopedCompleted));
+    const scopedFailed = Math.max(0, Number(failedCount ?? Math.max(0, scopedTotal - scopedCompleted)));
+    const scopeLabel = runKind === "prototype_generation"
+      ? "打样"
+      : runKind === "content_plan"
+      ? "内容规划"
+      : runKind === "style_proposal"
+      ? "视觉方向"
+      : runKind === "visual_prompts"
+      ? "画面方案"
+      : "图片生成";
+    const errorLine = runError ? `\n\n错误：${runError}` : "";
+    const canRetryFailedPages = isImageRunKind(runKind) && scopedFailed > 0 && runStatus !== "cancelled";
+    return {
+      agentRole: runKind === "content_plan" ? "content" : "visual",
+      content: `⚠️ ${scopeLabel}没有成功完成，当前完成 ${scopedCompleted} / ${scopedTotal || scopedCompleted} 页${scopedFailed ? `，失败 ${scopedFailed} 页` : ""}。${errorLine}\n\n👉 下一步：${canRetryFailedPages ? "检查失败页后点击「一键重试失败页」。" : "检查当前页面状态后重新发起任务。"}`,
+      nextAction: canRetryFailedPages ? { type: "retry_failed", label: "一键重试失败页", confirm: true } : undefined,
+    };
+  }
   if (runKind === "content_plan") {
     return {
       agentRole: "content",
@@ -364,7 +430,7 @@ function buildRunCompletionFollowup({
       nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
     };
   }
-  if (runKind === "prototype_generation" || projectStatus === "prototype_ready") {
+  if (projectStatus === "prototype_ready") {
     return {
       agentRole: "visual",
       content: "✅ 打样图片已生成，页面已刷新。\n\n👉 下一步：检查样张效果；满意后点击「确认打样，生成全部」，不满意可以重新打样或调整风格。",
@@ -443,6 +509,7 @@ interface StageNudge {
 }
 
 const CONTENT_PLAN_TIMEOUT_MS = 300_000; // 内容规划 LLM 调用预留 5 分钟
+const CONTENT_PLAN_START_LATCH_GRACE_MS = 8_000;
 const VISUAL_PROMPT_MAX_POLL_ERRORS = 5;
 const GENERATION_MAX_POLL_ERRORS = 5;
 const IMAGE_URL_SESSION_KEY = Date.now();
@@ -573,6 +640,9 @@ function userFacingGenerationError(message?: string) {
     style_reference_file_missing: "风格参考原图暂时不可用，已改为使用已提取的风格信息继续生成。请重试一次。",
   };
   if (known[text]) return known[text];
+  if (/failed to fetch|networkerror|network request failed|load failed/i.test(text)) {
+    return "连接中断，未能确认后台任务状态。请刷新状态或重试生成。";
+  }
   if (text.includes("图片接口上传超时")) {
     return "参考图上传超时：已停止自动重试，避免重复消耗额度。可把必须完整保留的图片改为「精确粘贴」，或稍后重试。";
   }
@@ -797,7 +867,10 @@ function normalizeStylePalette(palette: any[] | undefined) {
 
 function buildFallbackStyleAdjustment(baseStyle: any, userFeedback: string, agentResponse: string): StyleProposal {
   const feedback = [userFeedback, agentResponse].filter(Boolean).join(" ");
-  const wantsDarkTech = /(科技|未来|赛博|深色|暗色|黑|酷|炫|低幼|幼|emoji|可爱)/i.test(feedback);
+  const compactFeedback = feedback.replace(/\s+/g, "");
+  const wantsLight = /(白色为主|以白色为主|白底|浅底|浅色|米白|暖白|明亮|亮一点|明亮一点|不喜欢黑紫|不要黑紫|不用黑紫|避免黑紫|不是黑紫|舍弃黑紫|不是那种很深邃)/i.test(compactFeedback)
+    && !/(不要浅色|不用浅色|避免浅色|不要浅底|不要白底|不用白底|不要明亮)/i.test(compactFeedback);
+  const wantsDarkTech = !wantsLight && /(科技|未来|赛博|深色|暗色|黑|酷|炫|低幼|幼|emoji|可爱)/i.test(feedback);
   const basePalette = normalizeStylePalette(baseStyle?.palette);
   const palette = wantsDarkTech
     ? [
@@ -805,6 +878,13 @@ function buildFallbackStyleAdjustment(baseStyle: any, userFeedback: string, agen
         { name: "电紫", hex: "#8B5CF6", role: "主视觉光效" },
         { name: "霓虹蓝", hex: "#38BDF8", role: "数据与线条点缀" },
         { name: "冷白", hex: "#F8FAFC", role: "文字与 Logo 留白" },
+      ]
+    : wantsLight
+    ? [
+        { name: "米白", hex: "#F9F8F5", role: "整套页面主背景/内容页浅色基底" },
+        { name: "柔紫", hex: "#C4B4E0", role: "标题、页眉、编号和品牌装饰" },
+        { name: "淡紫", hex: "#E8E0F0", role: "内容区、卡片和浅紫层次" },
+        { name: "玫瑰粉", hex: "#E8C8D8", role: "温暖点缀/装饰线/标签" },
       ]
     : basePalette.length >= 4
     ? basePalette.slice(0, 4)
@@ -817,6 +897,8 @@ function buildFallbackStyleAdjustment(baseStyle: any, userFeedback: string, agen
       ].slice(0, 4);
   const name = wantsDarkTech
     ? "调整后方案：深色科技感"
+    : wantsLight
+    ? "调整后方案：明亮浅紫"
     : `调整后方案：${baseStyle?.name || "自定义风格"}`;
   const description = stripHexCodes(agentResponse || userFeedback)
     || "根据你的反馈调整现有风格。确认后会重新生成每页画面描述和生图 Prompt。";
@@ -824,9 +906,11 @@ function buildFallbackStyleAdjustment(baseStyle: any, userFeedback: string, agen
     ...(baseStyle || {}),
     name,
     palette,
-    mood: wantsDarkTech ? "科技感, 克制, 深色, 专业" : (baseStyle?.mood || "调整后, 克制, 专业"),
+    mood: wantsDarkTech ? "科技感, 克制, 深色, 专业" : wantsLight ? "明亮, 温柔, 精致, 高可读" : (baseStyle?.mood || "调整后, 克制, 专业"),
     font: wantsDarkTech
       ? "几何无衬线体，标题加粗，正文保持高可读"
+      : wantsLight
+      ? "延续现有字体气质，正文保持清晰高可读"
       : (baseStyle?.font || "清晰无衬线体，标题加粗，正文高可读"),
     description: `${description} 确认后会把这套方向应用到整份 PPT，并重新生成页面画面描述。`,
     source: "agent_adjustment",
@@ -1045,7 +1129,8 @@ function App() {
     message: string;
     history: any[];
     pageContext: any;
-    agentRole: string;
+    agentRole: AgentRole;
+    requestContext?: AgentRequestContext;
     attachmentIds?: string[];
     retryCount?: number;
   } | null>(null);
@@ -1190,6 +1275,8 @@ function App() {
   const visualPromptIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const loadedChatProjectIdRef = useRef<string | null>(null);
   const contentPlanStopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contentPlanStartingProjectRef = useRef<string | null>(null);
+  const contentPlanStartingAtRef = useRef(0);
   const loadingProjectIdRef = useRef<string | null>(null);
   const missingProjectHandledRef = useRef<Set<string>>(new Set());
   const softLockWarnedRef = useRef(false);
@@ -1198,7 +1285,7 @@ function App() {
   const [contentPlanProgress, setContentPlanProgress] = useState<any>(null);
   const currentContentPlanProgress = contentPlanProgress?.project_id === selectedProject?.id ? contentPlanProgress : null;
   const [, setShowStylePanel] = useState(false);
-  const [currentAgentRole, setCurrentAgentRole] = useState<"content" | "visual" | "finetune">("content");
+  const [currentAgentRole, setCurrentAgentRole] = useState<AgentRole>("content");
   const currentAgentRoleRef = useRef(currentAgentRole);
   // 三 Agent 聊天历史隔离（必须在 currentAgentRole 之后定义）
   const [contentChatHistory, setContentChatHistory] = useState<ChatMessage[]>([]);
@@ -1463,17 +1550,17 @@ function App() {
   };
 
   // Toast 系统
-  const showToast = (message: string, type: ToastItem["type"] = "info") => {
+  const showToast = useCallback((message: string, type: ToastItem["type"] = "info") => {
     const id = Math.random().toString(36).slice(2);
     const duration = type === "error" ? 5000 : type === "success" ? 2200 : 2600;
     setToasts((prev) => {
       const withoutDuplicate = prev.filter((toast) => !(toast.message === message && toast.type === type));
       return [...withoutDuplicate, { id, message, type, duration }].slice(-3);
     });
-  };
-  const removeToast = (id: string) => {
+  }, []);
+  const removeToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
-  };
+  }, []);
 
   const isProjectNotFoundError = (err: any) => {
     return String(err?.message || err || "").includes("HTTP 404") &&
@@ -1913,6 +2000,29 @@ function App() {
     }
   };
 
+  const resolveWorkflowFailureMessage = async (
+    projectId: string,
+    runKind: string,
+    fallbackMessage: string
+  ): Promise<string> => {
+    try {
+      const workflow = await fetchWorkflowStatus(projectId);
+      if (selectedProjectIdRef.current === projectId) {
+        setProjectStatus(workflow?.project_id === projectId ? workflow : null);
+      }
+      const failedRun = [workflow?.last_run, workflow?.active_run].find(
+        (run) =>
+          run?.kind === runKind &&
+          ["failed", "stale", "cancelled"].includes(String(run.status || ""))
+      );
+      const workflowMessage = failedRun?.message || failedRun?.error_msg;
+      if (workflowMessage) return userFacingGenerationError(workflowMessage);
+    } catch (statusErr) {
+      console.warn("Workflow failure status lookup failed:", statusErr);
+    }
+    return fallbackMessage;
+  };
+
   const loadReferenceImages = async (projectId: string) => {
     try {
       const data = await fetchReferenceImages(projectId);
@@ -1975,9 +2085,48 @@ function App() {
       attachmentIds?: string[];
     }
   ): Promise<GateActionResult> => {
-    if (operatingProjectId === projectId) {
-      return { ok: false, reason: "busy", message: "内容规划已经在处理中，请稍候。" };
+    const notifyStartBlocked = (message: string) => {
+      if (source === "agent") {
+        updateProjectChatMessages(projectId, "content", (prev) => [
+          ...prev,
+          {
+            role: "agent",
+            content: `没有启动重新生成：${message}`,
+            agentRole: "content",
+          },
+        ]);
+      } else {
+        showToast(message, "info");
+      }
+    };
+    const hasLocalStartLatch =
+      operatingProjectId === projectId || contentPlanStartingProjectRef.current === projectId;
+    if (hasLocalStartLatch) {
+      let recoveredStaleLatch = false;
+      const latchAge = Date.now() - (contentPlanStartingAtRef.current || 0);
+      if (latchAge > CONTENT_PLAN_START_LATCH_GRACE_MS) {
+        try {
+          const workflow = await fetchWorkflowStatus(projectId);
+          const activeContentPlan =
+            workflow?.active_run?.kind === "content_plan" && isRunActive(workflow.active_run);
+          if (!activeContentPlan) {
+            contentPlanStartingProjectRef.current = null;
+            contentPlanStartingAtRef.current = 0;
+            if (operatingProjectId === projectId) setOperatingProjectId(null);
+            recoveredStaleLatch = true;
+          }
+        } catch (err) {
+          console.warn("Content plan start latch check failed:", err);
+        }
+      }
+      if (!recoveredStaleLatch) {
+        const message = "内容规划已经在处理中，请稍候。";
+        notifyStartBlocked(message);
+        return { ok: false, reason: "busy", message };
+      }
     }
+    contentPlanStartingProjectRef.current = projectId;
+    contentPlanStartingAtRef.current = Date.now();
     abortActiveChat(true);
     const loadingId = `cp-${Date.now()}`;
     const submittedContent = options?.submittedContent || options?.submittedLabel || "已提交 Brief，开始生成内容规划";
@@ -2016,7 +2165,6 @@ function App() {
       const previousSlideIds = previousSlides.map((s: any) => s.id).sort().join(",");
       updateLoadingMsg("正在向后台提交内容规划任务...");
       const result = await generateContentPlan(projectId, topic, pageCount, options?.attachmentIds);
-      options?.onStarted?.();
       if (result?.run?.id) {
         updateLoadingMsg(runProgressText(result.run));
       }
@@ -2033,6 +2181,10 @@ function App() {
         contentPlanProgressIntervalRef.current = null;
         contentPlanCheckIntervalRef.current = null;
         if (selectedProjectIdRef.current === projectId) setContentPlanProgress(null);
+        if (contentPlanStartingProjectRef.current === projectId) {
+          contentPlanStartingProjectRef.current = null;
+          contentPlanStartingAtRef.current = 0;
+        }
         setOperatingProjectId(null);
         removeLoadingMsg();
       };
@@ -2078,7 +2230,11 @@ function App() {
             const progressText = total ? `：${current || 0} / ${total} ${progress.unit || "页"}完成` : "";
             updateLoadingMsg(`${cleanProgressMessage(progress.message)}${progressText}`);
           }
-          if (workflow?.last_run?.kind === "content_plan" && workflow.last_run.status === "failed" && !isRunActive(workflow.active_run)) {
+          if (
+            workflow?.last_run?.kind === "content_plan" &&
+            ["failed", "stale", "cancelled"].includes(String(workflow.last_run.status || "")) &&
+            !isRunActive(workflow.active_run)
+          ) {
             failContentPlanPoll(workflow.last_run.error_msg || workflow.last_run.message || "后台处理异常");
           }
         } catch (e) {
@@ -2118,6 +2274,7 @@ function App() {
                 gateRevision: gateContext.gateRevision,
               },
             ]);
+            options?.onStarted?.();
             setContentPlanSnapshot(currentSlides);
             const currentEditingSlide = editingSlideRef.current;
             if (selectedProjectIdRef.current === projectId && currentEditingSlide) {
@@ -2135,6 +2292,10 @@ function App() {
       contentPlanCheckIntervalRef.current = checkInterval;
       return { ok: true, runId: result?.run?.id };
     } catch (err: any) {
+      if (contentPlanStartingProjectRef.current === projectId) {
+        contentPlanStartingProjectRef.current = null;
+        contentPlanStartingAtRef.current = 0;
+      }
       setOperatingProjectId(null);
       setContentPlanProgress(null);
       removeLoadingMsg();
@@ -2461,23 +2622,34 @@ function App() {
         void (async () => {
           let refreshedProject = selectedProject;
           let refreshedSlides = slides;
+          let refreshedWorkflow: any = null;
           try {
-            const [freshProjects, freshSlides] = await Promise.all([
+            const [freshProjects, freshSlides, freshWorkflow] = await Promise.all([
               loadProjects(),
               loadSlides(pid),
-              loadStatus(pid),
-            ]).then(([freshProjectsResult, freshSlidesResult]) => [freshProjectsResult, freshSlidesResult] as const);
+              fetchWorkflowStatus(pid),
+            ]);
             const freshProject = freshProjects.find((p: Project) => p.id === pid);
             if (freshProject) refreshedProject = freshProject;
             if (freshSlides.length > 0) refreshedSlides = freshSlides;
+            if (freshWorkflow?.project_id === pid) {
+              refreshedWorkflow = freshWorkflow;
+              setProjectStatus(freshWorkflow);
+            }
           } catch (err) {
             console.warn("Failed to refresh project after run completion:", err);
           }
           if (selectedProjectIdRef.current !== pid) return;
+          const latestRun = refreshedWorkflow?.last_run?.id === finishedRunId ? refreshedWorkflow.last_run : null;
           const followup = buildRunCompletionFollowup({
             runKind: finishedRunKind,
+            runStatus: latestRun?.status,
+            runError: latestRun?.error_msg || latestRun?.message,
             projectStatus: refreshedProject?.status || currentStatus,
             completedCount: refreshedSlides.filter((s) => s.status === "completed").length,
+            targetCompletedCount: latestRun?.completed_count,
+            failedCount: latestRun?.failed_count,
+            targetCount: latestRun?.total_count,
             totalSlides: refreshedSlides.length,
             hasSelectedStyle: Boolean(refreshedProject?.selected_style),
             hasPrompt: refreshedSlides.some((s) => Boolean(s.prompt_text)),
@@ -3305,6 +3477,10 @@ function App() {
       clearTimeout(contentPlanStopTimeoutRef.current);
       contentPlanStopTimeoutRef.current = null;
     }
+    if (contentPlanStartingProjectRef.current === projectId) {
+      contentPlanStartingProjectRef.current = null;
+      contentPlanStartingAtRef.current = 0;
+    }
 
     // 如果项目正在生成中，先停止生成任务，避免回退后任务完成又覆盖状态
     if (hasActiveRun) {
@@ -4034,11 +4210,18 @@ function App() {
         : `【图片：${getBriefAttachmentLabel(parsed.kind, parsed.id)}】`;
     });
 
+  const getLatestComposerTextForSubmission = (forcedMsg?: string) => {
+    if (forcedMsg !== undefined) return serializeBriefInputForPlan(forcedMsg).trim();
+    const rawValue = isBriefStudioActive ? readBriefEditorValue() : chatInput;
+    return serializeBriefInputForPlan(rawValue).trim();
+  };
+
   const uploadBriefFiles = async (files: File[]) => {
     if (!selectedProject || files.length === 0) return;
     setUploadingDoc(true);
     let uploadedDocs = 0;
     let uploadedImages = 0;
+    let docsParsingInBackground = 0;
     const uploadedImageAttachments: ChatAttachment[] = [];
     try {
       for (const file of files) {
@@ -4066,7 +4249,7 @@ function App() {
                 ["queued", "running"].includes(String(data.text_parse_status || "")) ||
                 ["queued", "running"].includes(String(data.asset_extraction_status || ""));
               if (hasBackgroundParsing) {
-                showToast(`"${file.name}" 已加入 Brief，正在后台解析文字和图片素材`, "success");
+                docsParsingInBackground += 1;
                 [1500, 3500, 8000, 15000, 30000].forEach((delay) => {
                   window.setTimeout(() => {
                     if (selectedProjectIdRef.current === selectedProject.id) {
@@ -4089,6 +4272,12 @@ function App() {
           `用户在 Brief Studio 上传了 ${uploadedDocs} 个文档、${uploadedImages} 张图片。图片会作为后续 Agent 对话和内容规划的素材。`,
           uploadedImageAttachments
         );
+        if (docsParsingInBackground > 0) {
+          showToast(
+            `已加入 ${docsParsingInBackground} 个文件，正在后台整理文字和图片素材`,
+            "success"
+          );
+        }
       }
     } finally {
       setUploadingDoc(false);
@@ -4316,9 +4505,30 @@ function App() {
     if (!selectedProject) return;
     const requestProject = selectedProject;
     const requestProjectId = requestProject.id;
-    const requestAgentRole = currentAgentRole;
     const requestGate = gateContext.gate;
     const requestGateRevision = gateContext.gateRevision;
+    const userMsg = getLatestComposerTextForSubmission(forcedMsg);
+    const retryRequestContext = isRetry ? pendingChatRef.current?.requestContext : null;
+    const requestContext =
+      retryRequestContext ||
+      inferAgentRequestContext({
+        message: userMsg,
+        activeAgentRole: currentAgentRole,
+        activeScope: activeAgentScope,
+        editingPageNum: editingSlide?.page_num,
+        selectedPageNums: selectedPageNumsForAgent,
+        projectStatus: requestProject.status,
+        slideCount: slides.length,
+        contentPlanConfirmed: Boolean(requestProject.content_plan_confirmed),
+        hasSelectedStyle: Boolean(requestProject.selected_style),
+        hasPrompt: slides.some(slideHasPrompt),
+        hasGeneratedImage: slides.some((slide) => Boolean(slide.image_path)),
+      });
+    const requestAgentRole = (isRetry ? pendingChatRef.current?.agentRole : requestContext.targetRole) || requestContext.targetRole;
+    if (!isRetry && requestAgentRole !== currentAgentRole) {
+      currentAgentRoleRef.current = requestAgentRole;
+      setCurrentAgentRole(requestAgentRole);
+    }
     const requestRoleCanPersist = requestAgentRole === "content" || requestAgentRole === "visual";
     const isRequestVisible = () =>
       selectedProjectIdRef.current === requestProjectId && currentAgentRoleRef.current === requestAgentRole;
@@ -4341,10 +4551,9 @@ function App() {
       }
       return true;
     };
-    const userMsg = serializeBriefInputForPlan(forcedMsg || chatInput).trim();
     const hasAttachments = pendingAttachments.length > 0;
     const ambientImageAttachments =
-      pendingChatAttachments.length > 0 ? [] : getProjectImageContextAttachments(userMsg, currentAgentRole);
+      pendingChatAttachments.length > 0 ? [] : getProjectImageContextAttachments(userMsg, requestAgentRole);
     const chatAttachmentsForRequest = mergeChatAttachments(pendingChatAttachments, ambientImageAttachments);
     const attachmentIdsForRequest =
       chatAttachmentsForRequest.length > 0
@@ -4354,7 +4563,7 @@ function App() {
         : [];
     const hasChatImageAttachments = chatAttachmentsForRequest.length > 0;
     const hasFinetunePendingAttachments =
-      currentAgentRole === "finetune" &&
+      requestAgentRole === "finetune" &&
       !!finetuneTargetSlideId &&
       (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length > 0;
     if (!userMsg && !hasAttachments && !hasChatImageAttachments && !hasFinetunePendingAttachments) return;
@@ -4407,7 +4616,7 @@ function App() {
         };
       };
 
-    if (currentAgentRole === "finetune") {
+    if (requestAgentRole === "finetune") {
       const targetSlideId = finetuneTargetSlideId || editingSlide?.id;
       const targetSlide = slides.find((s) => s.id === targetSlideId);
       if (!targetSlide || !targetSlideId) {
@@ -4505,7 +4714,10 @@ function App() {
 
     // 重试时不重复添加用户消息
     if (!isRetry) {
-      setActiveChatMessages((prev) => [...prev, { ...newMessage, attachments: chatAttachmentsForRequest }]);
+      appendRequestMessage(
+        { ...newMessage, attachments: chatAttachmentsForRequest, agentRole: requestAgentRole },
+        { allowStale: true }
+      );
       setChatInput("");
       setPendingAttachments([]);
       setPendingChatAttachments([]);
@@ -4526,7 +4738,13 @@ function App() {
     abortRef.current = ctrl;
 
     // 使用 baseHistory（编辑消息时传入）或当前 chatMessages，确保包含最新用户消息
-    const msgList = baseHistory || chatMessages;
+    const requestRoleMessages =
+      requestAgentRole === "content"
+        ? contentChatHistory
+        : requestAgentRole === "visual"
+        ? visualChatHistory
+        : chatMessages;
+    const msgList = baseHistory || requestRoleMessages;
     // 重试时 baseHistory 已包含用户消息，避免重复添加
     const history = (isRetry ? msgList : [...msgList, newMessage]).map((m) => ({
       role: m.role === "agent" ? "assistant" : m.role,
@@ -4545,60 +4763,70 @@ function App() {
         history: [...history],
         pageContext: undefined as any,
         agentRole: requestAgentRole,
+        requestContext,
         attachmentIds: attachmentIdsForRequest,
         retryCount: retryCountForRequest,
       };
 
-      // 根据 agentMode 构建 pageContext
+      // 根据本轮自然语言推断出的作用范围构建 pageContext。
       let pageContext: any = undefined;
-      if (agentMode === "page" && editingSlide) {
+      const summarizeSlideForAgent = (s: Slide) => {
+        const tc = s.content_json?.text_content || {};
+        return {
+          page_num: s.page_num,
+          type: s.type,
+          headline: tc.headline || "",
+          subhead: tc.subhead || "",
+          body_preview: typeof tc.body === "string"
+            ? tc.body.split("\n").filter(Boolean).slice(0, 2)
+            : (tc.body || []).slice(0, 2).map((item: any) =>
+                typeof item === "string" ? item : item?.content || ""
+              ),
+        };
+      };
+      const requestTargetSlide =
+        requestContext.scope === "current_slide"
+          ? slides.find((s) => requestContext.pageNums.includes(s.page_num)) || editingSlide
+          : null;
+      if (requestContext.scope === "current_slide" && requestTargetSlide) {
         const otherPages = slides
-          .filter((s) => s.id !== editingSlide.id)
+          .filter((s) => s.id !== requestTargetSlide.id)
           .map((s) => {
-            const tc = s.content_json?.text_content || {};
+            const summary = summarizeSlideForAgent(s);
             return {
-              page_num: s.page_num,
-              type: s.type,
-              headline: tc.headline || "",
-              subhead: tc.subhead || "",
-              body_preview: typeof tc.body === "string"
-                ? tc.body.split("\n").filter(Boolean).slice(0, 2).join("\n")
-                : (tc.body || []).slice(0, 2).map((item: any) =>
-                    typeof item === "string" ? item : item?.content || ""
-                  ).join("\n"),
+              ...summary,
+              body_preview: Array.isArray(summary.body_preview)
+                ? summary.body_preview.join("\n")
+                : summary.body_preview,
             };
           });
         pageContext = {
           mode: "page",
+          scope: requestContext.scope,
+          target_page_nums: [requestTargetSlide.page_num],
           current_page: {
-            page_num: editingSlide.page_num,
-            slide_id: editingSlide.id,
-            type: editingSlide.type,
-            content_json: editingSlide.content_json,
-            visual_json: editingSlide.visual_json,
-            prompt_text: editingSlide.prompt_text,
-            reference_images: dedupeReferenceImages(editingSlide.reference_images || []),
-            pending_state: staleMap[editingSlide.id] || null,
+            page_num: requestTargetSlide.page_num,
+            slide_id: requestTargetSlide.id,
+            type: requestTargetSlide.type,
+            content_json: requestTargetSlide.content_json,
+            visual_json: requestTargetSlide.visual_json,
+            prompt_text: requestTargetSlide.prompt_text,
+            reference_images: dedupeReferenceImages(requestTargetSlide.reference_images || []),
+            pending_state: staleMap[requestTargetSlide.id] || null,
           },
           other_pages: otherPages,
         };
-      } else if (agentMode === "global" && slides.length > 0) {
+      } else if (slides.length > 0) {
+        const targetPageSet = new Set(requestContext.pageNums);
+        const scopedSlides =
+          requestContext.scope === "selected_slides" && targetPageSet.size > 0
+            ? slides.filter((s) => targetPageSet.has(s.page_num))
+            : slides;
         pageContext = {
           mode: "global",
-          slides: slides.map((s) => {
-            const tc = s.content_json?.text_content || {};
-            return {
-              page_num: s.page_num,
-              type: s.type,
-              headline: tc.headline || "",
-              subhead: tc.subhead || "",
-              body_preview: typeof tc.body === "string"
-                ? tc.body.split("\n").filter(Boolean).slice(0, 2)
-                : (tc.body || []).slice(0, 2).map((item: any) =>
-                    typeof item === "string" ? item : item?.content || ""
-                  ),
-            };
-          }),
+          scope: requestContext.scope,
+          target_page_nums: requestContext.pageNums,
+          slides: scopedSlides.map(summarizeSlideForAgent),
         };
       }
 
@@ -4791,225 +5019,228 @@ function App() {
         }
       }
 
-      // Agent 在聊天中确认风格，自动保存并推进
-      if (result.action === "confirm_style" && result.style) {
-        await dispatchGateAction("confirm_style", { style: result.style }, { allowWhileChatLoading: true, source: "agent" });
-      }
-
-      // Agent 要求重新生成指定页
-      if (result.action === "regenerate_pages" && result.page_nums?.length > 0) {
-        const targetSlides = slides.filter((s) => result.page_nums.includes(s.page_num));
-        targetSlides.forEach((s) => markSlideStale(s.id, "image"));
-        setActiveChatMessages((prev) => [
-          ...prev,
-          {
-            role: "agent",
-            content: `已标记第 ${result.page_nums.join(", ")} 页为「需重新生成图片」。\n\n这一步会产生生图成本，请进入对应页面检查后点击「确认生成图片」。`,
-            agentRole: currentAgentRole,
-          },
-        ]);
-      }
-
-      // Agent 要求重试所有失败页
-      if (result.action === "retry_failed") {
-        const failed = slides.filter((s) => s.status === "failed");
-        failed.forEach((s) => markSlideStale(s.id, "image"));
-        setActiveChatMessages((prev) => [
-          ...prev,
-          {
-            role: "agent",
-            content: failed.length
-              ? `已找到 ${failed.length} 个失败页面。重试会重新生图并产生成本，请点击「一键重试失败页」或进入单页确认。`
-              : "当前没有失败页面需要重试。",
-            agentRole: currentAgentRole,
-          },
-        ]);
-      }
-
-      // Agent 要求重新抽一版当前/指定页面画面方案（不生图）
-      if (result.action === "reroll_page_visual_plan") {
-        const pageNums = result.page_nums?.length
-          ? result.page_nums
-          : editingSlide
-          ? [editingSlide.page_num]
-          : [];
-        const targetIds = slides
-          .filter((s) => pageNums.includes(s.page_num))
-          .map((s) => s.id);
-        if (targetIds.length > 0) {
-          await handleUpdateStaleSlides(targetIds, { local: true });
-          appendRequestMessage({
-            role: "agent",
-            content: `已为第 ${pageNums.join(", ")} 页再生成一版画面方案。请检查后再决定是否生成图片。`,
+        // Agent 在聊天中确认风格，自动保存并推进
+        if (result.action === "confirm_style" && result.style) {
+          await dispatchGateAction("confirm_style", { style: result.style }, { allowWhileChatLoading: true, source: "agent" });
+        }
+  
+        // Agent 要求重新生成指定页
+        if (result.action === "regenerate_pages" && result.page_nums?.length > 0) {
+          const regenPageNums = result.page_nums?.length ? result.page_nums : requestContext.pageNums;
+          const targetSlides = slides.filter((s) => regenPageNums.includes(s.page_num));
+          targetSlides.forEach((s) => markSlideStale(s.id, "image"));
+          setActiveChatMessages((prev) => [
+            ...prev,
+            {
+              role: "agent",
+              content: `已标记第 ${regenPageNums.join(", ")} 页为「需重新生成图片」。\n\n这一步会产生生图成本，请进入对应页面检查后点击「确认生成图片」。`,
+              agentRole: requestAgentRole,
+            },
+          ]);
+        }
+  
+        // Agent 要求重试所有失败页
+        if (result.action === "retry_failed") {
+          const failed = slides.filter((s) => s.status === "failed");
+          failed.forEach((s) => markSlideStale(s.id, "image"));
+          setActiveChatMessages((prev) => [
+            ...prev,
+            {
+              role: "agent",
+              content: failed.length
+                ? `已找到 ${failed.length} 个失败页面。重试会重新生图并产生成本，请点击「一键重试失败页」或进入单页确认。`
+                : "当前没有失败页面需要重试。",
+              agentRole: requestAgentRole,
+            },
+          ]);
+        }
+  
+        // Agent 要求重新抽一版当前/指定页面画面方案（不生图）
+        if (result.action === "reroll_page_visual_plan") {
+          const pageNums = result.page_nums?.length
+            ? result.page_nums
+            : requestContext.pageNums.length
+            ? requestContext.pageNums
+            : editingSlide
+            ? [editingSlide.page_num]
+            : [];
+          const targetIds = slides
+            .filter((s) => pageNums.includes(s.page_num))
+            .map((s) => s.id);
+          if (targetIds.length > 0) {
+            await handleUpdateStaleSlides(targetIds, { local: true });
+            appendRequestMessage({
+              role: "agent",
+              content: `已为第 ${pageNums.join(", ")} 页再生成一版画面方案。请检查后再决定是否生成图片。`,
               agentRole: "visual",
             });
-        } else {
+          } else {
+            appendRequestMessage({
+              role: "agent",
+              content: pageNums.length
+                ? `没有找到第 ${pageNums.join(", ")} 页，未生成新的画面方案。请先确认页码。`
+                : "请先选择要重做画面方案的页面。",
+              agentRole: "visual",
+            });
+          }
+        }
+  
+        // Agent 精确修改单页视觉描述
+        if (result.action === "update_slide_visual" && result.updated_visual) {
+          let pageNum = result.updated_visual.page_num;
+          if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
+            pageNum = requestContext.pageNums[0];
+          }
+          const targetSlide = slides.find((s) => s.page_num === pageNum);
+          if (targetSlide) {
+            appendRequestMessage({ role: "agent", content: "正在应用视觉描述修改...", agentRole: "visual" });
+            try {
+              await updateVisualPlan(selectedProject.id, pageNum, result.updated_visual.visual_json, targetSlide.id);
+              markSlideStale(targetSlide.id, "visual");
+              await loadSlides(selectedProject.id);
+              if (editingSlide && editingSlide.page_num === pageNum) {
+                const updated = await fetchSlides(selectedProject.id);
+                const freshSlide = updated.find((s: Slide) => s.page_num === pageNum);
+                if (freshSlide) setEditingSlide(freshSlide);
+              }
+              await handleUpdateStaleSlides([targetSlide.id], { local: true });
+              appendRequestMessage({
+                role: "agent",
+                content: `✅ 已更新第 ${pageNum} 页的视觉描述。图片不会自动重生成，请检查后再手动确认生成。`,
+                agentRole: "visual",
+              });
+            } catch (err: any) {
+              appendRequestMessage({
+                role: "agent",
+                content: "应用视觉描述修改失败：" + (err.message || "未知错误"),
+                agentRole: "visual",
+              });
+            }
+          } else {
+            appendRequestMessage({
+              role: "agent",
+              content: `没有找到第 ${pageNum || "?"} 页，未应用视觉修改。请先确认页码。`,
+              agentRole: "visual",
+            });
+          }
+        }
+  
+        // Agent 全局修改多页视觉描述
+        if (result.action === "update_all_slides_visual" && result.updated_slides_visual?.length > 0) {
+          appendRequestMessage({ role: "agent", content: `正在应用 ${result.updated_slides_visual.length} 页的视觉描述修改...`, agentRole: "visual" });
+          const existingPageNums = new Set(slides.map((s) => s.page_num));
+          const skipped: number[] = [];
+          const updatedPageNums: number[] = [];
+          const updatedSlideIds: string[] = [];
+          for (const patch of result.updated_slides_visual) {
+            const pageNum = patch.page_num;
+            if (!existingPageNums.has(pageNum)) {
+              skipped.push(pageNum);
+              continue;
+            }
+            const slide = slides.find((s) => s.page_num === pageNum);
+            if (!slide) continue;
+            try {
+              await updateVisualPlan(selectedProject.id, pageNum, patch.visual_json, slide.id);
+              markSlideStale(slide.id, "visual");
+              updatedPageNums.push(pageNum);
+              updatedSlideIds.push(slide.id);
+            } catch {
+              // 单页失败继续下一页
+            }
+          }
+          await loadSlides(selectedProject.id);
+          if (editingSlide && updatedPageNums.includes(editingSlide.page_num)) {
+            const updated = await fetchSlides(selectedProject.id);
+            const freshSlide = updated.find((s: Slide) => s.page_num === editingSlide.page_num);
+            if (freshSlide) setEditingSlide(freshSlide);
+          }
+          if (updatedSlideIds.length > 0) {
+            await handleUpdateStaleSlides(updatedSlideIds, { local: true });
+            appendRequestMessage({ role: "agent", content: `已更新第 ${updatedPageNums.join(", ")} 页的画面描述。图片不会自动重生成，请检查后再手动确认生成。`, agentRole: "visual" });
+          } else {
+            appendRequestMessage({
+              role: "agent",
+              content: skipped.length > 0
+                ? `没有找到第 ${skipped.join(", ")} 页，未应用视觉修改。请先确认页码。`
+                : "没有可应用的视觉修改，页面未变化。",
+              agentRole: "visual",
+            });
+            return;
+          }
+          let msg = `✅ 已更新第 ${updatedPageNums.join(", ")} 页的视觉描述。`;
+          if (skipped.length > 0) msg += `（跳过不存在的页：第 ${skipped.join(", ")} 页）`;
+          appendRequestMessage({ role: "agent", content: msg, agentRole: "visual" });
+        }
+  
+        // Agent 理解用户想生图，但成本动作必须由用户确认
+        if (result.action === "request_generate_image") {
+          const pageNums = result.page_nums?.length
+            ? result.page_nums
+            : requestContext.pageNums.length
+            ? requestContext.pageNums
+            : editingSlide
+            ? [editingSlide.page_num]
+            : [];
+          const targetSlides = slides.filter((s) => pageNums.includes(s.page_num));
+          targetSlides.forEach((s) => markSlideStale(s.id, "image"));
           appendRequestMessage({
             role: "agent",
             content: pageNums.length
-              ? `没有找到第 ${pageNums.join(", ")} 页，未生成新的画面方案。请先确认页码。`
-              : "请先选择要重做画面方案的页面。",
+              ? `可以生成第 ${pageNums.join(", ")} 页图片，但这会产生生图成本。请在单页中点击「确认生成图片」。`
+              : "可以生成图片，但这会产生生图成本。请先选择具体页面，并在单页中点击「确认生成图片」。",
             agentRole: "visual",
           });
         }
-      }
-
-      // Agent 精确修改单页视觉描述
-      if (result.action === "update_slide_visual" && result.updated_visual) {
-        let pageNum = result.updated_visual.page_num;
-        if (agentMode === "page" && editingSlide) {
-          pageNum = editingSlide.page_num;
-        }
-        const targetSlide = slides.find((s) => s.page_num === pageNum);
-        if (targetSlide) {
-          appendRequestMessage({ role: "agent", content: "正在应用视觉描述修改...", agentRole: "visual" });
-          try {
-            await updateVisualPlan(selectedProject.id, pageNum, result.updated_visual.visual_json, targetSlide.id);
-            markSlideStale(targetSlide.id, "visual");
-            await loadSlides(selectedProject.id);
-            // 同步更新 editingSlide
-            if (editingSlide && editingSlide.page_num === pageNum) {
-              const updated = await fetchSlides(selectedProject.id);
-              const freshSlide = updated.find((s: Slide) => s.page_num === pageNum);
-              if (freshSlide) setEditingSlide(freshSlide);
-            }
-            await handleUpdateStaleSlides([targetSlide.id], { local: true });
-            appendRequestMessage({
-              role: "agent",
-              content: `✅ 已更新第 ${pageNum} 页的视觉描述。图片不会自动重生成，请检查后再手动确认生成。`,
-              agentRole: "visual",
-            });
-          } catch (err: any) {
-            appendRequestMessage({
-              role: "agent",
-              content: "应用视觉描述修改失败：" + (err.message || "未知错误"),
-              agentRole: "visual",
-            });
-          }
-        } else {
+  
+        // 内容总监识别到内容已确认，自动转接视觉总监
+        if (result.action === "forward_to_visual" && requestAgentRole === "content") {
           appendRequestMessage({
             role: "agent",
-            content: `没有找到第 ${pageNum || "?"} 页，未应用视觉修改。请先确认页码。`,
-            agentRole: "visual",
+            content: "收到，正在请视觉总监介入。",
+            agentRole: "content",
           });
+          await dispatchGateAction("switch_to_visual", undefined, { allowWhileChatLoading: true, source: "agent" });
+          return;
         }
-      }
-
-      // Agent 全局修改多页视觉描述
-      if (result.action === "update_all_slides_visual" && result.updated_slides_visual?.length > 0) {
-        appendRequestMessage({ role: "agent", content: `正在应用 ${result.updated_slides_visual.length} 页的视觉描述修改...`, agentRole: "visual" });
-        const existingPageNums = new Set(slides.map((s) => s.page_num));
-        const skipped: number[] = [];
-        const updatedPageNums: number[] = [];
-        const updatedSlideIds: string[] = [];
-        for (const patch of result.updated_slides_visual) {
-          const pageNum = patch.page_num;
-          if (!existingPageNums.has(pageNum)) {
-            skipped.push(pageNum);
-            continue;
-          }
-          const slide = slides.find((s) => s.page_num === pageNum);
-          if (!slide) continue;
-          try {
-            await updateVisualPlan(selectedProject.id, pageNum, patch.visual_json, slide.id);
-            markSlideStale(slide.id, "visual");
-            updatedPageNums.push(pageNum);
-            updatedSlideIds.push(slide.id);
-          } catch {
-            // 单页失败继续下一页
-          }
-        }
-        await loadSlides(selectedProject.id);
-        if (editingSlide && updatedPageNums.includes(editingSlide.page_num)) {
-          const updated = await fetchSlides(selectedProject.id);
-          const freshSlide = updated.find((s: Slide) => s.page_num === editingSlide.page_num);
-          if (freshSlide) setEditingSlide(freshSlide);
-        }
-        if (updatedSlideIds.length > 0) {
-          await handleUpdateStaleSlides(updatedSlideIds, { local: true });
-          appendRequestMessage({ role: "agent", content: `已更新第 ${updatedPageNums.join(", ")} 页的画面描述。图片不会自动重生成，请检查后再手动确认生成。`, agentRole: "visual" });
-        } else {
-          appendRequestMessage({
+  
+        // 视觉总监识别到内容问题，自动转接内容总监
+        if (result.action === "forward_to_content" && requestAgentRole === "visual") {
+          setCurrentAgentRole("content");
+          appendProjectChatMessage(requestProjectId, "content", {
             role: "agent",
-            content: skipped.length > 0
-              ? `没有找到第 ${skipped.join(", ")} 页，未应用视觉修改。请先确认页码。`
-              : "没有可应用的视觉修改，页面未变化。",
-            agentRole: "visual",
+            content: result.response || "已为你转接内容总监，可以继续沟通内容相关的问题。",
+            agentRole: "content",
           });
           return;
         }
-        let msg = `✅ 已更新第 ${updatedPageNums.join(", ")} 页的视觉描述。`;
-        if (skipped.length > 0) msg += `（跳过不存在的页：${skipped.join(", ")}）`;
-        appendRequestMessage({ role: "agent", content: msg, agentRole: "visual" });
-      }
-
-      // Agent 理解用户想生图，但成本动作必须由用户确认
-      if (result.action === "request_generate_image") {
-        const pageNums = result.page_nums?.length
-          ? result.page_nums
-          : editingSlide
-          ? [editingSlide.page_num]
-          : [];
-        const targetSlides = slides.filter((s) => pageNums.includes(s.page_num));
-        targetSlides.forEach((s) => markSlideStale(s.id, "image"));
-        appendRequestMessage({
-          role: "agent",
-          content: pageNums.length
-            ? `可以生成第 ${pageNums.join(", ")} 页图片，但这会产生生图成本。请在单页中点击「确认生成图片」。`
-            : "可以生成图片，但这会产生生图成本。请先选择具体页面，并在单页中点击「确认生成图片」。",
-          agentRole: "visual",
-        });
-      }
-
-      // 内容总监识别到内容已确认，自动转接视觉总监
-      if (result.action === "forward_to_visual" && currentAgentRole === "content") {
-        appendRequestMessage({
-          role: "agent",
-          content: "收到，正在请视觉总监介入。",
-          agentRole: "content",
-        });
-        await dispatchGateAction("switch_to_visual", undefined, { allowWhileChatLoading: true, source: "agent" });
-        return;
-      }
-
-      // 视觉总监识别到内容问题，自动转接内容总监
-      if (result.action === "forward_to_content" && currentAgentRole === "visual") {
-        setCurrentAgentRole("content");
-        appendProjectChatMessage(requestProjectId, "content", {
-          role: "agent",
-          content: result.response || "已为你转接内容总监，可以继续沟通内容相关的问题。",
-          agentRole: "content",
-        });
-        return;
-      }
-
-      // Agent 要求重新生成内容规划（页数可能变化）
-      if (result.action === "regenerate_plan" && result.topic) {
-        // 视觉总监不应该触发内容规划重新生成
-        if (currentAgentRole === "visual") {
-          appendRequestMessage({
-            role: "agent",
-            content: "我是视觉总监，负责设计风格和画面效果。如果你想调整内容规划，请切换到内容总监继续。",
-            agentRole: "visual",
-          });
-        } else {
-          appendRequestMessage({
-            role: "agent",
-            content: result.page_count
-              ? `收到，正在按 ${result.page_count} 页重新生成内容规划。`
-              : "收到，正在把这条反馈落实到内容规划里重新生成。",
-            agentRole: "content",
-          });
-          await dispatchGateAction(
-            "generate_content_plan",
-            { topic: result.topic, page_count: result.page_count, attachment_ids: attachmentIdsForRequest },
-            { allowWhileChatLoading: true, source: "agent" }
-          );
+  
+        // Agent 要求重新生成内容规划（页数可能变化）
+        if (result.action === "regenerate_plan" && result.topic) {
+          if (requestAgentRole === "visual") {
+            appendRequestMessage({
+              role: "agent",
+              content: "我是视觉总监，负责设计风格和画面效果。如果你想调整内容规划，请切换到内容总监继续。",
+              agentRole: "visual",
+            });
+          } else {
+            appendRequestMessage({
+              role: "agent",
+              content: result.page_count
+                ? `收到，正在按 ${result.page_count} 页重新生成内容规划。`
+                : "收到，正在把这条反馈落实到内容规划里重新生成。",
+              agentRole: "content",
+            });
+            await dispatchGateAction(
+              "generate_content_plan",
+              { topic: result.topic, page_count: result.page_count, attachment_ids: attachmentIdsForRequest },
+              { allowWhileChatLoading: true, source: "agent" }
+            );
+          }
         }
-      }
-
-      // 视觉总监确认素材状态，触发风格提案生成；已进入后续阶段时，风格调整必须仍然落成可确认卡片。
-      if ((result.action === "propose_styles" || result.action === "adjust_style") && currentAgentRole === "visual" && selectedProject) {
+  
+        // 视觉总监确认素材状态，触发风格提案生成；已进入后续阶段时，风格调整必须仍然落成可确认卡片。
+        if ((result.action === "propose_styles" || result.action === "adjust_style") && requestAgentRole === "visual" && selectedProject) {
         const latestGateContext = gateContextRef.current || gateContext;
         const isAdjust = result.action === "adjust_style";
         const isBackendStyleGenerationRequest = isVisualStyleGenerationMessage(userMsg);
@@ -5159,7 +5390,11 @@ function App() {
               pendingChatRef.current = null;
               return;
             }
-            const errorMessage = userFacingGenerationError(err.message);
+            const errorMessage = await resolveWorkflowFailureMessage(
+              requestProjectId,
+              "style_proposal",
+              userFacingGenerationError(err?.message)
+            );
             showToast("风格提案生成失败：" + errorMessage, "error");
             updateProjectChatMessages(requestProjectId, "visual", (prev) => [
               ...prev.filter((m) => m.id !== styleLoadingId),
@@ -5184,12 +5419,12 @@ function App() {
         ]);
         setOperatingProjectId(selectedProject.id);
         try {
-          // 单页模式下强制校正 page_num，防止 LLM 改错页
-          let pageNum = result.updated_content.page_num;
-          if (agentMode === "page" && editingSlide) {
-            pageNum = editingSlide.page_num;
-            result.updated_content.page_num = pageNum;
-          }
+            // 单页模式下强制校正 page_num，防止 LLM 改错页
+            let pageNum = result.updated_content.page_num;
+            if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
+              pageNum = requestContext.pageNums[0];
+              result.updated_content.page_num = pageNum;
+            }
           if (!slides.some((s) => s.page_num === pageNum)) {
             throw new Error(`没有找到第 ${pageNum || "?"} 页，未应用内容修改`);
           }
@@ -5297,11 +5532,11 @@ function App() {
         ]);
         setOperatingProjectId(selectedProject.id);
         try {
-          let pageNum = result.new_slide.page_num;
-          if (agentMode === "page" && editingSlide) {
-            pageNum = editingSlide.page_num;
-            result.new_slide.page_num = pageNum;
-          }
+            let pageNum = result.new_slide.page_num;
+            if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
+              pageNum = requestContext.pageNums[0];
+              result.new_slide.page_num = pageNum;
+            }
           await createSlide(selectedProject.id, pageNum, result.new_slide);
           await loadProjects();
           await loadSlides(selectedProject.id);
@@ -5336,11 +5571,11 @@ function App() {
         ]);
         setOperatingProjectId(selectedProject.id);
         try {
-          let pageNum = result.new_slide.page_num;
-          if (agentMode === "page" && editingSlide) {
-            pageNum = editingSlide.page_num + 1;
-            result.new_slide.page_num = pageNum;
-          }
+            let pageNum = result.new_slide.page_num;
+            if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
+              pageNum = requestContext.pageNums[0] + 1;
+              result.new_slide.page_num = pageNum;
+            }
           await createSlide(selectedProject.id, pageNum, result.new_slide);
           await loadProjects();
           await loadSlides(selectedProject.id);
@@ -5476,7 +5711,8 @@ function App() {
           await handleSendChat();
           return { ok: true };
         case "generate_content_plan": {
-          const userBrief = payload?.topic || serializeBriefInputForPlan(chatInput.trim());
+          const userBrief = payload?.topic || getLatestComposerTextForSubmission();
+          const inferredPageCount = payload?.page_count || inferRequestedPageCount(userBrief);
           const topic = [userBrief, briefAttachmentSummary ? `【用户上传材料】\n${briefAttachmentSummary}` : ""]
             .filter(Boolean)
             .join("\n\n");
@@ -5485,11 +5721,16 @@ function App() {
             return reportBlockedAction("请先输入 PPT 主题或 Brief。", "invalid_input", "info");
           }
           const submittedLabel = payload?.topic ? "确认建议，开始生成内容规划" : "已提交 Brief，开始生成内容规划";
-          const submittedDisplayContent = payload?.topic ? "建议已确认，正在生成内容规划。" : "Brief 已提交，正在生成内容规划。";
           const submittedDetails = [userBrief, briefAttachmentSummary ? `已上传材料：\n${briefAttachmentSummary}` : ""]
             .filter(Boolean)
             .join("\n\n");
-          return await startContentPlanPoll(currentProject.id, topic, options.source || "button", payload?.page_count, {
+          const submittedDisplayContent = buildSubmittedBriefDisplayContent({
+            fromSuggestion: Boolean(payload?.topic),
+            userBrief,
+            attachmentSummary: briefAttachmentSummary,
+            pageCount: inferredPageCount,
+          });
+          return await startContentPlanPoll(currentProject.id, topic, options.source || "button", inferredPageCount, {
             onStarted: clearBriefComposerState,
             submittedLabel,
             submittedContent: [submittedLabel, submittedDetails].filter(Boolean).join("\n\n"),
@@ -5509,17 +5750,111 @@ function App() {
         case "switch_to_content":
           setCurrentAgentRole("content");
           return { ok: true };
-        case "generate_style_proposals": {
-          if (currentAgentRole !== "visual") {
-            setCurrentAgentRole("visual");
+          case "generate_style_proposals": {
+            if (currentAgentRole !== "visual") {
+              currentAgentRoleRef.current = "visual";
+              setCurrentAgentRole("visual");
+            }
+            const hasExistingStyleProposals = styleProposalsInChat.length > 0 || Boolean(currentProject.style_proposal?.proposals?.length);
+            const styleLoadingId = `sp-action-${Date.now()}`;
+            const visualHistoryForContext = visualChatHistory.map((message) => ({
+              role: message.role === "agent" ? "assistant" : message.role,
+              content: message.content,
+            }));
+            const styleGenerationContext = buildVisualStyleGenerationContext(
+              visualHistoryForContext,
+              "",
+              buildCrossStageContext("visual")
+            );
+            updateProjectChatMessages(currentProject.id, "visual", (prev) => [
+              ...prev,
+              {
+                role: "agent",
+                content: "正在生成视觉方向，请稍候...",
+                agentRole: "visual",
+                loading: true,
+                id: styleLoadingId,
+              },
+            ]);
+            setOperatingProjectId(currentProject.id);
+            let styleRunId: string | null = null;
+            try {
+              const freshReferenceImages = await fetchReferenceImages(currentProject.id);
+              const shouldForceStyleProposal =
+                hasExistingStyleProposals || freshReferenceImages.length > 0 || Boolean(styleGenerationContext);
+              const styleResult = await generateStyleProposals(
+                currentProject.id,
+                shouldForceStyleProposal,
+                styleGenerationContext
+              );
+              styleRunId = styleResult?.run?.id || null;
+              if (styleRunId) {
+                locallyHandledRunIdsRef.current.add(styleRunId);
+                updateProjectChatMessages(currentProject.id, "visual", (prev) =>
+                  prev.map((message) =>
+                    message.id === styleLoadingId
+                      ? { ...message, runId: styleRunId || undefined, content: runProgressText(styleResult.run) }
+                      : message
+                  )
+                );
+              }
+              if (styleResult.status === "generating") {
+                await pollForStyleProposals(currentProject.id);
+              }
+              await loadProjects();
+              const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
+              const updated = fresh.find((project: Project) => project.id === currentProject.id);
+              if (updated && selectedProjectIdRef.current === currentProject.id) {
+                setSelectedProject(clearProjectNotification(updated));
+              }
+              const proposals = updated?.style_proposal?.proposals || styleResult.proposals || [];
+              if (proposals.length > 0) {
+                if (selectedProjectIdRef.current === currentProject.id) setStyleProposalsInChat(proposals);
+                updateProjectChatMessages(currentProject.id, "visual", (prev) => [
+                  ...prev.filter((message) => message.id !== styleLoadingId),
+                  {
+                    role: "agent",
+                    content: hasExistingStyleProposals
+                      ? "视觉方向已重新生成，请查看下方卡片。"
+                      : "视觉方向已生成，请查看下方卡片。",
+                    agentRole: "visual",
+                    hasStyleProposal: true,
+                    styleProposals: proposals,
+                    gate: gateContext.gate,
+                    gateRevision: gateContext.gateRevision,
+                  },
+                ]);
+              } else {
+                updateProjectChatMessages(currentProject.id, "visual", (prev) => [
+                  ...prev.filter((message) => message.id !== styleLoadingId),
+                  {
+                    role: "agent",
+                    content: "视觉方向已生成，请在作品画布中查看。",
+                    agentRole: "visual",
+                  },
+                ]);
+              }
+            } catch (err: any) {
+              if (styleRunId) locallyHandledRunIdsRef.current.delete(styleRunId);
+              const errorMessage = await resolveWorkflowFailureMessage(
+                currentProject.id,
+                "style_proposal",
+                userFacingGenerationError(err?.message)
+              );
+              updateProjectChatMessages(currentProject.id, "visual", (prev) => [
+                ...prev.filter((message) => message.id !== styleLoadingId),
+                {
+                  role: "agent",
+                  content: "视觉方向生成失败：" + errorMessage,
+                  agentRole: "visual",
+                },
+              ]);
+              return { ok: false, reason: "failed", message: errorMessage };
+            } finally {
+              setOperatingProjectId(null);
+            }
+            return { ok: true };
           }
-          const hasExistingStyleProposals = styleProposalsInChat.length > 0 || Boolean(currentProject.style_proposal?.proposals?.length);
-          const fakeUserMsg = hasExistingStyleProposals
-            ? VISUAL_STYLE_REGENERATE_MESSAGE
-            : VISUAL_STYLE_PROPOSE_MESSAGE;
-          handleSendChat(fakeUserMsg);
-          return { ok: true };
-        }
         case "confirm_style":
           if (!payload?.style) {
             return reportBlockedAction("请先选择一套风格方案。", "invalid_input", "info");
@@ -5877,9 +6212,43 @@ function App() {
     selectedProject &&
     ((hasActiveRun && activeRun?.kind === "content_plan") ||
       (operatingProjectId === selectedProject.id && currentStatus === "draft" && currentAgentRole === "content"))
-  );
-  const agentComposerValue = !isBriefStudioActive && chatInput.includes("[[PPTGOD_ATTACHMENT:") ? "" : chatInput;
-  const activeComposerDraftKey = useMemo(() => {
+    );
+    const agentComposerValue = !isBriefStudioActive && chatInput.includes("[[PPTGOD_ATTACHMENT:") ? "" : chatInput;
+    const selectedPageNumsForAgent = useMemo(() => Array.from(selectedPages).sort((a, b) => a - b), [selectedPages]);
+    const activeAgentScope: AgentRequestScope =
+      agentMode === "page" && editingSlide
+        ? "current_slide"
+        : selectedPageNumsForAgent.length > 1
+        ? "selected_slides"
+        : "deck";
+    const composerRequestContext = useMemo(
+      () =>
+        inferAgentRequestContext({
+          message: agentComposerValue,
+          activeAgentRole: currentAgentRole,
+          activeScope: activeAgentScope,
+          editingPageNum: editingSlide?.page_num,
+          selectedPageNums: selectedPageNumsForAgent,
+          projectStatus: currentStatus,
+          slideCount: slides.length,
+          contentPlanConfirmed,
+          hasSelectedStyle: Boolean(selectedProject?.selected_style),
+          hasPrompt: slides.some(slideHasPrompt),
+          hasGeneratedImage: slides.some((slide) => Boolean(slide.image_path)),
+        }),
+      [
+        activeAgentScope,
+        agentComposerValue,
+        contentPlanConfirmed,
+        currentAgentRole,
+        currentStatus,
+        editingSlide?.page_num,
+        selectedPageNumsForAgent,
+        selectedProject?.selected_style,
+        slides,
+      ]
+    );
+    const activeComposerDraftKey = useMemo(() => {
     if (!selectedProject) return null;
     if (isBriefStudioActive) return getBriefDraftStorageKey(selectedProject.id);
     const targetSlideId = currentAgentRole === "finetune"
@@ -5944,6 +6313,17 @@ function App() {
     const analysis = ref.asset_analysis || {};
     return ref.role === "content_ref" && !ref.slide_id && !analysis.pptx_source_page_num;
   });
+  const isDocumentProcessingStatus = (status: any) =>
+    ["queued", "running"].includes(String(status || ""));
+  const briefDocumentsParsing = documents.some((doc: any) =>
+    isDocumentProcessingStatus(doc.text_parse_status) ||
+    isDocumentProcessingStatus(doc.asset_extraction_status)
+  );
+  const briefComposerSupportText = uploadingDoc
+    ? "正在加入材料；你可以继续写 Brief"
+    : briefDocumentsParsing
+    ? "材料解析中；你可以继续补充 Brief"
+    : "支持 PDF、Word、PPT、Markdown、TXT、图片";
   const hasBriefAttachments =
     pendingAttachments.length > 0 ||
     documents.length > 0 ||
@@ -6856,14 +7236,14 @@ function App() {
                         >
                           +
                         </button>
-                        <span>{uploadingDoc ? "正在解析上传内容..." : "支持 PDF、Word、PPT、Markdown、TXT、图片"}</span>
+                        <span>{briefComposerSupportText}</span>
                       </div>
                       <button
                         onClick={() => dispatchGateAction("generate_content_plan")}
-                        disabled={!selectedProject || chatLoading || isBusy || (!chatInput.trim() && !hasBriefAttachments)}
+                        disabled={!selectedProject || chatLoading || isBusy || uploadingDoc || (!chatInput.trim() && !hasBriefAttachments)}
                         className="pg-action pg-action-primary bg-slate-950 text-white px-4 py-2.5 rounded-lg text-sm font-medium disabled:opacity-50"
                       >
-                        {chatLoading || isBusy ? "规划中..." : "生成内容规划"}
+                        {uploadingDoc ? "正在加入材料..." : chatLoading || isBusy ? "规划中..." : "生成内容规划"}
                       </button>
                     </div>
                   </div>
@@ -7838,39 +8218,12 @@ function App() {
             </button>
           </div>
         </div>
-        {/* Agent 模式切换栏：内容规划阶段和视觉总监阶段都显示 */}
-        {selectedProject && slides.length > 0 && editingSlide && (currentStatus === "planning" || currentAgentRole === "visual") && (
-          <div className="pg-agent-modebar px-4 py-2 border-b bg-white flex items-center justify-between">
-            <div className="flex items-center gap-1 text-xs">
-              <span className="text-slate-500">调整范围：</span>
-              <button
-                onClick={() => setAgentMode("page")}
-                className={`px-2.5 py-1 rounded-md transition-colors text-sm ${
-                  agentMode === "page"
-                    ? "bg-blue-600 text-white"
-                    : "bg-white text-slate-600 hover:bg-slate-100 border border-slate-200"
-                }`}
-                title={currentAgentRole === "visual" ? "只修改当前正在编辑的那一页的视觉描述" : "只修改当前正在编辑的那一页"}
-              >
-                当前页
-              </button>
-              <button
-                onClick={() => setAgentMode("global")}
-                className={`px-2.5 py-1 rounded-md transition-colors text-sm ${
-                  agentMode === "global"
-                    ? "bg-blue-600 text-white"
-                    : "bg-white text-slate-600 hover:bg-slate-100 border border-slate-200"
-                }`}
-                title={currentAgentRole === "visual" ? "调整所有页面的视觉描述" : "调整所有页面的文字内容"}
-              >
-                全局
-              </button>
-            </div>
-            {currentStatus === "planning" && (
+          {selectedProject && slides.length > 0 && currentStatus === "planning" && (
+            <div className="pg-agent-modebar px-4 py-2 border-b bg-white flex items-center justify-end">
               <div className="flex items-center gap-1">
-                <button
-                  onClick={handleGlobalUndo}
-                  disabled={!canGlobalUndo || !!operatingProjectId || chatLoading}
+                  <button
+                    onClick={handleGlobalUndo}
+                    disabled={!canGlobalUndo || !!operatingProjectId || chatLoading}
                   title="撤销 (Ctrl+Z)"
                   className={`text-xs px-1.5 py-0.5 rounded transition-colors ${
                     canGlobalUndo && !operatingProjectId && !chatLoading
@@ -7889,13 +8242,12 @@ function App() {
                       ? "text-gray-600 hover:bg-gray-200 hover:text-gray-900"
                       : "text-gray-300 cursor-not-allowed"
                   }`}
-                >
-                  重做
-                </button>
+                  >
+                    重做
+                  </button>
               </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
         {currentStageNudge && currentStageNudge.role === currentAgentRole && (
           <div className={`pg-current-step px-4 py-3 border-b ${
             currentStageNudge.tone === "warning"
@@ -8130,9 +8482,9 @@ function App() {
                           const parts = visibleMessageContent.split("\n📎 ");
                           const text = parts[0];
                           const attachments = parts.slice(1);
-	                          return (
-	                            <div>
-	                              {text && <div className="whitespace-pre-wrap">{text}</div>}
+                            return (
+                              <div>
+                                {text && <div className="whitespace-pre-wrap">{text}</div>}
                               {msg.attachments && msg.attachments.length > 0 && (
                                 <div className="flex flex-wrap gap-2 mt-2 pt-2 border-t border-white/20">
                                   {msg.attachments.map((att) => (
@@ -8147,7 +8499,7 @@ function App() {
                                   ))}
                                 </div>
                               )}
-	                              {attachments.length > 0 && (
+                                {attachments.length > 0 && (
                                 <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-white/20">
                                   {attachments.map((att, idx) => (
                                     <span
@@ -8330,25 +8682,25 @@ function App() {
             </div>
           )}
           {/* 批量生成进度（生图 / 生成提示词）：跟在最新消息之后 */}
-	          {selectedProject && hasActiveRun && currentProjectStatus && activeRun?.kind !== "content_plan" && (
-	            <div className="flex justify-start">
-	              <div className="pg-progress-card bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-800 rounded-bl-none max-w-[80%] overflow-hidden w-72">
-	                <div className="px-3 py-2.5">
-	                  <div className="font-medium mb-1">
-	                    {activeProgressLabel}
-	                  </div>
-	                  <div className="w-full bg-purple-200 rounded-full h-2 mb-2">
-	                    <div
-	                      className="bg-purple-500 h-2 rounded-full transition-all"
-	                      style={{
-	                        width: `${activeProgress.percent}%`,
-	                      }}
-	                    />
-	                  </div>
-	                  <div>
-	                    {activeProgress.current} / {activeProgress.total} {activeProgress.unit}完成
-	                    {activeProgress.failed > 0 && `，${activeProgress.failed} ${activeProgress.unit}失败`}
-	                  </div>
+            {selectedProject && hasActiveRun && currentProjectStatus && activeRun?.kind !== "content_plan" && (
+              <div className="flex justify-start">
+                <div className="pg-progress-card bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-800 rounded-bl-none max-w-[80%] overflow-hidden w-72">
+                  <div className="px-3 py-2.5">
+                    <div className="font-medium mb-1">
+                      {activeProgressLabel}
+                    </div>
+                    <div className="w-full bg-purple-200 rounded-full h-2 mb-2">
+                      <div
+                        className="bg-purple-500 h-2 rounded-full transition-all"
+                        style={{
+                          width: `${activeProgress.percent}%`,
+                        }}
+                      />
+                    </div>
+                    <div>
+                      {activeProgress.current} / {activeProgress.total} {activeProgress.unit}完成
+                      {activeProgress.failed > 0 && `，${activeProgress.failed} ${activeProgress.unit}失败`}
+                    </div>
                     {activeProgress.activePageNums.length > 0 && (
                       <div className="mt-1 text-2xs text-purple-600">
                         {activeProgress.activePageNums.length === 1
@@ -8356,10 +8708,10 @@ function App() {
                           : `正在并行生成第 ${formatPageNums(activeProgress.activePageNums)} 页`}
                       </div>
                     )}
-	                </div>
-	              </div>
-	            </div>
-	          )}
+                  </div>
+                </div>
+              </div>
+            )}
           {/* 内容规划动态进度卡片：仅在项目处于生成中状态时显示，防止过时进度残留 */}
           {selectedProject && currentAgentRole === "content" && activeRun?.kind === "content_plan" && currentContentPlanProgress && currentContentPlanProgress.stage && currentContentPlanProgress.stage !== "error" && (
             <div className="flex justify-start">
@@ -8373,21 +8725,21 @@ function App() {
                     <div className="font-medium text-blue-800 text-xs truncate">
                       {currentContentPlanProgress.message || "生成中..."}
                     </div>
-	                    {Number(currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages ?? 0) > 0 && (
-	                      <div className="mt-1.5">
-	                        <div className="flex items-center justify-between text-2xs text-blue-600 mb-0.5">
-	                          <span>进度</span>
-	                          <span>
-	                            {currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0} / {currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages} {currentContentPlanProgress.unit || "页"}
-	                          </span>
-	                        </div>
-	                        <div className="h-1.5 bg-blue-100 rounded-full overflow-hidden">
-	                          <div
-	                            className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
-	                            style={{
-	                              width: `${Math.min(100, ((currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0) / (currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages)) * 100)}%`
-	                            }}
-	                          />
+                      {Number(currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages ?? 0) > 0 && (
+                        <div className="mt-1.5">
+                          <div className="flex items-center justify-between text-2xs text-blue-600 mb-0.5">
+                            <span>进度</span>
+                            <span>
+                              {currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0} / {currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages} {currentContentPlanProgress.unit || "页"}
+                            </span>
+                          </div>
+                          <div className="h-1.5 bg-blue-100 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
+                              style={{
+                                width: `${Math.min(100, ((currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0) / (currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages)) * 100)}%`
+                              }}
+                            />
                         </div>
                       </div>
                     )}
@@ -8671,10 +9023,51 @@ function App() {
                 停止生成
               </button>
             </div>
-          ) : (
-          <div className="pg-composer-shell">
-            {currentAgentRole !== "finetune" && (
-              <div className="pg-composer-tools">
+            ) : (
+            <div className="pg-composer-shell">
+              {currentAgentRole !== "finetune" && slides.length > 0 && (
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                  <span>作用范围：{composerRequestContext.scopeLabel}</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setAgentMode("page")}
+                      disabled={!editingSlide}
+                      className={`px-2 py-1 rounded-md border transition-colors ${
+                        composerRequestContext.scope === "current_slide"
+                          ? "bg-blue-600 border-blue-600 text-white"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50 disabled:text-slate-300 disabled:hover:bg-white"
+                      }`}
+                      title={editingSlide ? `默认作用于第 ${editingSlide.page_num} 页` : "进入单页后可锁定当前页"}
+                    >
+                      当前页
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAgentMode("global")}
+                      className={`px-2 py-1 rounded-md border transition-colors ${
+                        composerRequestContext.scope === "deck"
+                          ? "bg-blue-600 border-blue-600 text-white"
+                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                      title="默认作用于整套 PPT"
+                    >
+                      整套 PPT
+                    </button>
+                  </div>
+                  {composerRequestContext.explicitScope && (
+                    <span className="text-slate-400">已按指令识别</span>
+                  )}
+                  {composerRequestContext.risk === "cost" && (
+                    <span className="text-amber-600">会先确认生图成本</span>
+                  )}
+                  {composerRequestContext.risk === "destructive" && (
+                    <span className="text-amber-600">大范围改动会先确认</span>
+                  )}
+                </div>
+              )}
+              {currentAgentRole !== "finetune" && (
+                <div className="pg-composer-tools">
                 <button
                   type="button"
                   onClick={handlePickAgentAttachments}

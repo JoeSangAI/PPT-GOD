@@ -19,10 +19,14 @@ services:
       dockerfile: backend/Dockerfile
     restart: unless-stopped
     ports:
-      - "${PPTGOD_HOST_PORT:-8000}:8000"
+      - "${PPTGOD_HOST_PORT:-80}:8000"
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
+      - HTTPS_PROXY=${PPTGOD_HTTPS_PROXY:-}
+      - ALL_PROXY=${PPTGOD_ALL_PROXY:-}
+      - NO_PROXY=${PPTGOD_NO_PROXY:-localhost,127.0.0.1,db,redis}
     env_file:
       - ./backend/.env
     depends_on:
@@ -37,10 +41,14 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
-    command: celery -A app.celery_app worker -l info
+    command: celery -A app.celery_app worker -l info --concurrency=${PPTGOD_CELERY_CONCURRENCY:-1}
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
+      - HTTPS_PROXY=${PPTGOD_HTTPS_PROXY:-}
+      - ALL_PROXY=${PPTGOD_ALL_PROXY:-}
+      - NO_PROXY=${PPTGOD_NO_PROXY:-localhost,127.0.0.1,db,redis}
     env_file:
       - ./backend/.env
     depends_on:

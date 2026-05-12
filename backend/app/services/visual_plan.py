@@ -598,7 +598,8 @@ def _build_batch_prompt(
         "Logo 由后端按页面类型统一处理：内容页默认右上角小尺寸叠加；封面是品牌主标识，可以按封面构图选择 "
         "title-block-center / center / lower-center / top-right 等页面级位置，其中 title-block-center 表示相对标题/副标题/年份这一组内容居中，而不是页面物理居中；"
         "封底/结束页如果已经有 CTA、联系方式或多行收束信息，默认用 top-right+small 角标，只有页面非常空旷、以品牌收束为主体时才用 center/lower-center+large；"
-        "沉浸式 hero / 金句页默认不出现，除非本页明确需要角标或品牌招牌场景。你不要把 Logo 写进 visual_asset_ids。"
+        "沉浸式 hero / 金句页默认不出现，除非本页明确需要角标或品牌招牌场景。你不要把 Logo 写进 visual_asset_ids；"
+        "不要要求底图为 Logo 绘制占位框、虚线框、圆角框、底板、徽章或任何容器，只在对应位置保持低信息密度和适当留白，方便后端叠加或用户手动微调。"
         if has_project_logo
         else "当前项目没有已确认的用户 Logo。所有页面的 logo_policy 必须返回 show_logo=false；不要为 Logo、品牌角标、标识、徽标或占位框预留空间，也不要把空框画进封面。"
     )

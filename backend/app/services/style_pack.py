@@ -9,6 +9,11 @@ FOOD_TERMS = ("食品", "花生油", "食用油", "粮油", "农业", "风味", 
 BRAND_TERMS = ("品牌", "消费", "零售", "产品", "渠道", "营销", "心智", "提案", "战略")
 TECH_TERMS = ("科技", "AI", "人工智能", "数据", "算法", "数字化", "芯片", "云计算")
 TECH_NEGATIONS = ("拒绝科技", "科技与狠活", "科技狠活", "反科技", "非科技", "去科技", "拒绝工业化")
+LIGHT_STYLE_TERMS = (
+    "白色为主", "以白色为主", "米白为基底", "白底", "浅底", "浅色基底", "浅色信息基底",
+    "明亮", "亮一点", "明亮一点", "舍弃黑紫", "不要黑紫", "不喜欢黑紫", "不是黑紫",
+)
+LIGHT_STYLE_NEGATIONS = ("不要浅色", "不用浅色", "不要白底", "不用白底", "不要明亮")
 ANCIENT_ROME_TERMS = (
     "古罗马", "罗马", "角斗士", "角斗", "斗兽场", "竞技场", "Colosseum", "gladiator",
     "gladius", "凯撒", "帝国", "元老院", "军团", "罗马帝国", "血腥舞台",
@@ -36,6 +41,44 @@ TOPIC_STYLE_PRESETS = [
         ),
     }
 ]
+
+
+def _selected_style_requests_light(style_obj: dict) -> bool:
+    palette = style_obj.get("palette") if isinstance(style_obj.get("palette"), list) else []
+    palette_text = " ".join(
+        " ".join(str(item.get(key) or "") for key in ("name", "role", "hex"))
+        if isinstance(item, dict)
+        else str(item)
+        for item in palette
+    )
+    text = " ".join(
+        str(style_obj.get(key) or "")
+        for key in ("name", "description", "page_type_adaptation", "content_style_hint", "visual_rhythm")
+    )
+    normalized = re.sub(r"\s+", "", f"{text} {palette_text}").lower()
+    return bool(
+        normalized
+        and not any(term.lower() in normalized for term in LIGHT_STYLE_NEGATIONS)
+        and any(term.lower() in normalized for term in LIGHT_STYLE_TERMS)
+    )
+
+
+def _light_strategy_from_selected_style() -> dict:
+    return {
+        "base_tone": "light",
+        "summary": "整体以白色/米白/浅色明亮基底为主，明亮柔紫做品牌识别和装饰。",
+        "background_policy": "整套页面以浅色视觉基底为主",
+        "content_treatment": "正文页、内容页、数据页和表格页使用白色/米白/淡紫浅底，通过柔紫标题、浅色卡片、留白和墨灰紫文字保证阅读效率。",
+        "exception_policy": "深色只用于文字、细线或局部强调，不使用黑紫或深色整页基底。",
+    }
+
+
+def _light_page_type_adaptation_from_selected_style() -> str:
+    return (
+        "页面类型适配规则：整套页面以白色、米白或淡紫浅底为主。"
+        "内容页、数据页、表格页必须保持明亮基底和高可读正文；封面、章节页可以放大柔紫、玫瑰粉、浅金和保留纹理，"
+        "但不能回到黑紫或深邃暗色整页背景。"
+    )
 
 
 def _extract_text(content_plan: List[Dict]) -> str:
@@ -136,6 +179,14 @@ def style_pack_from_selected_style(selected_style: dict | str | None) -> str | N
     else:
         palette_text = str(palette)
     visual_strategy = style_obj.get("visual_strategy") if isinstance(style_obj.get("visual_strategy"), dict) else None
+    page_type_adaptation = style_obj.get("page_type_adaptation", "封面/章节页可强化情绪，内容/数据页优先可读")
+    if (
+        _selected_style_requests_light(style_obj)
+        and isinstance(visual_strategy, dict)
+        and str(visual_strategy.get("base_tone") or "").lower() == "dark"
+    ):
+        visual_strategy = _light_strategy_from_selected_style()
+        page_type_adaptation = _light_page_type_adaptation_from_selected_style()
     visual_strategy_line = visual_strategy_text(visual_strategy)
     if visual_strategy_line and visual_strategy.get("base_tone"):
         visual_strategy_line = f"base_tone={visual_strategy.get('base_tone')}; {visual_strategy_line}"
@@ -155,7 +206,7 @@ def style_pack_from_selected_style(selected_style: dict | str | None) -> str | N
             f"Visual strategy: {visual_strategy_line}" if visual_strategy_line else "",
             f"Typography: {style_obj.get('font') or 'Headline 思源黑体 Bold (Source Han Sans Bold) / Latin: Inter SemiBold; Body 思源黑体 Regular / Latin: Inter Regular; consistent hierarchy across all pages.'}",
             f"Texture/material: {texture_line}" if texture_line else "",
-            f"Page type adaptation: {style_obj.get('page_type_adaptation', '封面/章节页可强化情绪，内容/数据页优先可读')}",
+            f"Page type adaptation: {page_type_adaptation}",
             f"Reference usage: {style_obj.get('reference_usage', 'style text only unless template/page references are present')}",
             f"Visual rhythm: {visual_rhythm}",
         ] if line and not line.endswith(": ")

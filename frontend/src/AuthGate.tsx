@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import App from "./App";
 import {
   API_BASE,
+  CLIENT_PROVIDER_SETTINGS_ENABLED,
   DEFAULT_PROVIDER_SETTINGS,
   clearStoredAuth,
   getProviderSettings,
@@ -13,28 +14,15 @@ import {
   type ProviderSettings,
 } from "./api/client";
 
-const LOCAL_ADMIN_AUTH: MvpAuth = { testerId: "local-admin", displayName: "本地管理员" };
-const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
-
-function isLocalHost() {
-  return LOCAL_HOSTS.has(window.location.hostname);
-}
-
-const LOCAL_DEBUG_MODE = isLocalHost();
-const SERVER_MANAGED_PROVIDERS = import.meta.env.PROD || LOCAL_DEBUG_MODE;
-
-function isLocalAdminUrl() {
-  if (!isLocalHost()) return false;
-  const params = new URLSearchParams(window.location.search);
-  return LOCAL_DEBUG_MODE || params.get("local_admin") === "1" || params.get("admin") === "1";
-}
+const SERVER_MANAGED_PROVIDERS = !CLIENT_PROVIDER_SETTINGS_ENABLED;
 
 function getInitialAuth(): MvpAuth | null {
-  if (isLocalAdminUrl()) {
-    saveStoredAuth(LOCAL_ADMIN_AUTH);
-    return LOCAL_ADMIN_AUTH;
+  const stored = getStoredAuth();
+  if (stored?.testerId === "local-admin") {
+    clearStoredAuth();
+    return null;
   }
-  return getStoredAuth();
+  return stored;
 }
 
 function providerName(baseUrl: string, fallback: string) {

@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
@@ -17,6 +18,7 @@ from app.services.image_generation import (
     reset_image_call_events,
     save_slide_image,
 )
+from app.services.image_task_audit import append_image_generation_log, image_generation_log_path
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
 from app.services.logo_overlay_layout import resolve_logo_overlay_box
 from app.services.logo_policy import is_logo_confirmed, should_show_logo, should_use_logo_as_scene_asset
@@ -30,6 +32,38 @@ logger = logging.getLogger(__name__)
 redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
 _MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千万0-9]+)")
+
+
+def _prompt_audit(prompt: str | None) -> Dict:
+    text = prompt or ""
+    import hashlib
+
+    return {
+        "prompt_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None,
+        "prompt_length": len(text),
+        "prompt": text,
+    }
+
+
+def _reference_audit(refs: Optional[List[Dict]]) -> List[Dict]:
+    summary = []
+    for index, ref in enumerate(refs or [], start=1):
+        img = ref.get("image")
+        summary.append({
+            "index": index,
+            "role": ref.get("role"),
+            "label": ref.get("label"),
+            "process_mode": ref.get("process_mode"),
+            "asset_route_mode": ref.get("asset_route_mode"),
+            "asset_name": ref.get("asset_name"),
+            "asset_kind": ref.get("asset_kind"),
+            "file_path": ref.get("file_path") or getattr(img, "info", {}).get("pptgod_reference_source_path"),
+            "image_size": list(getattr(img, "size", []) or []),
+            "image_mode": getattr(img, "mode", None),
+            "source_mtime_ns": getattr(img, "info", {}).get("pptgod_reference_source_mtime_ns"),
+            "source_size_bytes": getattr(img, "info", {}).get("pptgod_reference_source_size"),
+        })
+    return summary
 
 
 def _existing_path(path: str | None, output_dir: str | None = None) -> str | None:
@@ -602,14 +636,24 @@ def _generate_one_slide(
     project_id: str,
     output_dir: str,
     preloaded_ref_data: Optional[List[Dict]] = None,
+    run_id: str | None = None,
 ) -> Dict:
     """
     在线程池中执行单页生成（纯 IO/计算，不涉及数据库操作）。
     返回 dict: {slide, image_path?, error?}
     """
     if not slide.prompt_text:
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "slide_skipped",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            reason="missing_prompt",
+        )
         return {"slide": slide, "error": "缺少 prompt"}
 
+    slide_started_at = time.time()
     reset_image_call_events()
     try:
         ref_data = list(preloaded_ref_data) if preloaded_ref_data else []
@@ -644,6 +688,20 @@ def _generate_one_slide(
 
         if use_product_refinement:
             prompt = _background_pass_prompt(prompt, product_refs)
+
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "slide_started",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            slide_type=slide.type,
+            reference_count=len(ref_images),
+            references=_reference_audit(first_pass_ref_data),
+            seed_reference_count=seed_count,
+            product_refinement=use_product_refinement,
+            **_prompt_audit(prompt),
+        )
 
         img = generate_slide_image(
             prompt=prompt,
@@ -691,18 +749,60 @@ def _generate_one_slide(
         logger.info(f"Pipeline: 第 {slide.page_num} 页生成完成"
                     + (f" (使用 {seed_count} 张同家族种子参考)" if seed_count else "")
                     + (f" (产品二次生成 {len(product_refs)} 张参考)" if use_product_refinement else ""))
+        events = get_image_call_events()
+        for event in events:
+            append_image_generation_log(
+                project_id,
+                run_id,
+                "image_api_event",
+                page_num=slide.page_num,
+                slide_id=slide.id,
+                **event,
+            )
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "slide_finished",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            status="completed",
+            image_path=image_path,
+            elapsed_seconds=round(time.time() - slide_started_at, 3),
+            api_event_count=len(events),
+        )
         return {
             "slide": slide,
             "image_path": image_path,
             "error": None,
-            "image_generation_events": get_image_call_events(),
+            "image_generation_events": events,
         }
     except Exception as e:
         logger.error(f"Pipeline: 第 {slide.page_num} 页生成失败: {e}")
+        events = get_image_call_events()
+        for event in events:
+            append_image_generation_log(
+                project_id,
+                run_id,
+                "image_api_event",
+                page_num=slide.page_num,
+                slide_id=slide.id,
+                **event,
+            )
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "slide_finished",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            status="failed",
+            error=str(e)[:1000],
+            elapsed_seconds=round(time.time() - slide_started_at, 3),
+            api_event_count=len(events),
+        )
         return {
             "slide": slide,
             "error": str(e)[:500],
-            "image_generation_events": get_image_call_events(),
+            "image_generation_events": events,
         }
 
 
@@ -750,6 +850,20 @@ def run_generation_pipeline(
         target_slides = [s for s in slides if s.page_num in page_nums]
         mode_desc = "打样模式" if prototype else "指定页面生成"
         logger.info(f"Pipeline: {mode_desc}，只生成 {len(target_slides)} 页")
+
+    log_path = image_generation_log_path(project_id, run_id)
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "pipeline_started",
+        project_title=project.title,
+        prototype=prototype,
+        requested_page_nums=page_nums,
+        target_page_nums=[s.page_num for s in target_slides],
+        total_target=len(target_slides),
+        log_path=log_path,
+    )
+    logger.info("Pipeline: image generation audit log: %s", log_path)
 
     mark_run_running(db, run_id, stage="batch_generation", message="正在生成图片...")
     db.commit()
@@ -904,7 +1018,7 @@ def run_generation_pipeline(
             max_workers = min(len(seed_pages), 3)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_slide = {
-                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id)): slide
+                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
                     for slide in seed_pages
                 }
                 for future in as_completed(future_to_slide):
@@ -930,7 +1044,7 @@ def run_generation_pipeline(
             max_workers = min(len(non_seed_pages), 3)
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_slide = {
-                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id)): slide
+                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
                     for slide in non_seed_pages
                 }
                 for future in as_completed(future_to_slide):
@@ -1085,6 +1199,22 @@ def run_generation_pipeline(
         error_msg=assembly_error or (failure_summary if target_failed > 0 else None),
     )
     db.commit()
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "pipeline_finished",
+        run_status=run_status,
+        project_status=project.status,
+        target_completed=target_completed,
+        target_failed=target_failed,
+        total_target=total_target,
+        completed_count=completed_count,
+        failed_count=failed_count,
+        generating_count=generating_count,
+        assembly_error=assembly_error,
+        failure_summary=failure_summary if target_failed > 0 else None,
+        log_path=log_path,
+    )
     logger.info(f"Pipeline: 项目状态流转 -> {project.status} (generating={generating_count}, completed={completed_count}, failed={failed_count})")
 
     if not all_completed_images:

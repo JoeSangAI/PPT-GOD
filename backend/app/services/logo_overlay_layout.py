@@ -42,7 +42,7 @@ def _logo_size(
     slide_type: str,
     scale: str,
 ) -> tuple[int, int]:
-    is_large = scale == "large" or slide_type in {"cover", "ending"}
+    is_large = scale == "large" or slide_type == "cover"
     size_key = "large" if is_large else "small"
     max_width = int(canvas_width * LOGO_WIDTH_RATIOS[size_key])
     max_height = int(canvas_height * LOGO_HEIGHT_RATIOS[size_key])
@@ -90,29 +90,44 @@ def _region_activity(img: Image.Image, box: tuple[int, int, int, int]) -> float:
     if crop.width <= 0 or crop.height <= 0:
         return 1.0
 
-    edge_mean = ImageStat.Stat(crop.filter(ImageFilter.FIND_EDGES)).mean[0] / 255
-    histogram = crop.histogram()
+    edges = crop.filter(ImageFilter.FIND_EDGES)
+    edge_mean = ImageStat.Stat(edges).mean[0] / 255
+    contrast_weights = _contrast_weights(crop)
     total = max(1, crop.width * crop.height)
-    bright_ratio = sum(histogram[165:]) / total
-    very_bright_ratio = sum(histogram[215:]) / total
-    bright = crop.point(lambda v: 1 if v > 95 else 0)
+    contrast_mean = sum(contrast_weights) / total if contrast_weights else 0
+    strong_ratio = sum(1 for weight in contrast_weights if weight > 0.16) / total if contrast_weights else 0
     rows = []
     cols = [0] * crop.width
-    pixels = list(bright.getdata())
+    pixels = [1 if weight > 0.16 else 0 for weight in contrast_weights]
     for y in range(crop.height):
         row = pixels[y * crop.width: (y + 1) * crop.width]
         rows.append(sum(row) / max(crop.width, 1))
         for x, value in enumerate(row):
             cols[x] += value
-    max_row_bright = max(rows or [0])
-    max_col_bright = max((value / max(crop.height, 1) for value in cols), default=0)
+    max_row_ink = max(rows or [0])
+    max_col_ink = max((value / max(crop.height, 1) for value in cols), default=0)
     return (
-        edge_mean * 0.40
-        + bright_ratio * 0.22
-        + very_bright_ratio * 0.08
-        + max_row_bright * 0.22
-        + max_col_bright * 0.08
+        edge_mean * 0.28
+        + contrast_mean * 0.34
+        + strong_ratio * 0.18
+        + max_row_ink * 0.14
+        + max_col_ink * 0.06
     )
+
+
+def _contrast_weights(gray: Image.Image) -> list[float]:
+    pixels = list(gray.getdata())
+    if not pixels:
+        return []
+    ordered = sorted(pixels)
+    p25 = ordered[int(len(ordered) * 0.25)]
+    p75 = ordered[int(len(ordered) * 0.75)]
+    median = ordered[int(len(ordered) * 0.50)]
+    light_canvas = median >= 150 or p75 >= 185
+    threshold = max(12, int((p75 - p25) * 0.08))
+    if light_canvas:
+        return [min(1.0, max(0.0, p75 - v - threshold) / 120) for v in pixels]
+    return [min(1.0, max(0.0, v - p25 - threshold) / 120) for v in pixels]
 
 
 def _dominant_content_box(img: Image.Image) -> tuple[float, float, float, float, float] | None:
@@ -125,8 +140,10 @@ def _dominant_content_box(img: Image.Image) -> tuple[float, float, float, float,
     small_w = 160
     small_h = max(1, int(small_w * img.height / max(img.width, 1)))
     gray = img.resize((small_w, small_h), Image.Resampling.BILINEAR).convert("L")
-    values = list(gray.getdata())
-    weights = [max(0, v - 135) / 120 for v in values]
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    contrast_weights = _contrast_weights(gray)
+    edge_weights = [min(1.0, edge / 80) * 0.28 for edge in edges.getdata()]
+    weights = [min(1.0, contrast + edge) for contrast, edge in zip(contrast_weights, edge_weights)]
 
     x_min = int(small_w * 0.08)
     x_max = int(small_w * 0.94)
@@ -174,13 +191,13 @@ def _salient_content_bbox(img: Image.Image) -> tuple[float, float, float, float]
     small_h = max(1, int(small_w * img.height / max(img.width, 1)))
     gray = img.resize((small_w, small_h), Image.Resampling.BILINEAR).convert("L")
     edges = gray.filter(ImageFilter.FIND_EDGES)
-    pixels = list(gray.getdata())
+    contrast_weights = _contrast_weights(gray)
     edge_pixels = list(edges.getdata())
     points: list[tuple[int, int]] = []
     for y in range(int(small_h * 0.08), int(small_h * 0.90)):
         for x in range(int(small_w * 0.10), int(small_w * 0.92)):
             idx = y * small_w + x
-            if pixels[idx] > 72 or edge_pixels[idx] > 24:
+            if contrast_weights[idx] > 0.16 or edge_pixels[idx] > 28:
                 points.append((x, y))
     if len(points) < max(24, int(small_w * small_h * 0.0025)):
         return None
@@ -288,7 +305,8 @@ def _smart_title_block_box(
             if str(slide_type or "").lower() == "ending" and 0.25 <= (cand_top / max(canvas_height, 1)) <= 0.84
             else 0.0
         )
-        score = activity * 4.6 + overlap * 2.4 + preference + title_distance * 0.55 + vertical_distance + middle_band_penalty
+        overlap_weight = 8.0 if str(slide_type or "").lower() == "ending" else 3.4
+        score = activity * 4.6 + overlap * overlap_weight + preference + title_distance * 0.55 + vertical_distance + middle_band_penalty
         logo_box = LogoBox(cand_left, cand_top, logo_width, logo_height, f"smart:{name}")
         if best is None or score < best[0]:
             best = (score, logo_box)

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Project, ProjectRun, Slide
 from app.services.artifact_versions import ARTIFACT_META_KEY, artifact_meta, dependency_signature
+from app.services.image_task_audit import append_image_generation_log
 
 
 ACTIVE_RUN_STATUSES = {"queued", "running"}
@@ -165,6 +166,17 @@ def create_project_run(
     )
     db.add(run)
     db.flush()
+    if kind in IMAGE_RUN_KINDS:
+        append_image_generation_log(
+            project_id,
+            run.id,
+            "run_created",
+            kind=kind,
+            stage=stage,
+            target_page_nums=pages,
+            total_count=run.total_count,
+            message=message,
+        )
     return run
 
 
@@ -174,6 +186,16 @@ def set_run_task(db: Session, run_id: str | None, task_id: str | None) -> Projec
         run.task_id = task_id
         run.status = "queued"
         db.flush()
+        if run.kind in IMAGE_RUN_KINDS:
+            append_image_generation_log(
+                run.project_id,
+                run.id,
+                "task_queued",
+                kind=run.kind,
+                task_id=task_id,
+                target_page_nums=run.target_page_nums,
+                total_count=run.total_count,
+            )
     return run
 
 
@@ -258,6 +280,19 @@ def finish_run(
         run.error_msg = error_msg
         run.finished_at = utc_now()
         db.flush()
+        if run.kind in IMAGE_RUN_KINDS:
+            append_image_generation_log(
+                run.project_id,
+                run.id,
+                "run_finished",
+                kind=run.kind,
+                status=status,
+                message=message,
+                completed_count=run.completed_count,
+                failed_count=run.failed_count,
+                total_count=run.total_count,
+                error_msg=error_msg,
+            )
     return run
 
 
@@ -307,16 +342,11 @@ def active_page_nums_for_run(run: ProjectRun | None, slides: list[Slide] | None)
     if not run or run.kind not in IMAGE_RUN_KINDS or not slides:
         return []
     target_pages = target_pages_for_run(run, slides)
-    active = sorted(
+    return sorted(
         int(s.page_num)
         for s in slides
         if s.page_num in target_pages and s.status == "generating"
     )
-    try:
-        visible_limit = max(1, min(4, int(settings.IMAGE_API_MAX_CONCURRENCY or 2)))
-    except (TypeError, ValueError):
-        visible_limit = 2
-    return active[:visible_limit]
 
 
 def serialize_run(run: ProjectRun | None, slides: list[Slide] | None = None) -> dict | None:

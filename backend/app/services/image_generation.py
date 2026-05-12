@@ -12,6 +12,7 @@ import uuid
 from typing import List, Optional
 
 import httpx
+import redis
 import requests
 from openai import (
     APIConnectionError,
@@ -28,8 +29,11 @@ logger = logging.getLogger(__name__)
 
 _image_client = None
 _image_client_lock = threading.Lock()
+_image_redis_client = None
+_image_redis_lock = threading.Lock()
 _run_state_lock = threading.Lock()
 _image_call_events = threading.local()
+_image_queue_wait = threading.local()
 _image_api_semaphore = threading.BoundedSemaphore(
     max(1, int(settings.IMAGE_API_MAX_CONCURRENCY or 1))
 )
@@ -42,6 +46,10 @@ _reference_upload_inflight: dict[str, threading.Event] = {}
 
 class ReferenceUploadTimeoutError(RuntimeError):
     """Raised when an image-edit request is interrupted and should not be retried."""
+
+
+class ProviderGatewayCutoffError(RuntimeError):
+    """Raised when the upstream/proxy cuts off a long-running image request."""
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,202 @@ def _response_request_id(resp) -> str | None:
     return None
 
 
+def _exception_debug_summary(exc: Exception) -> str:
+    parts = [exc.__class__.__name__]
+    message = str(exc)
+    if message:
+        parts.append(message)
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen and len(parts) < 8:
+        seen.add(id(cause))
+        cause_message = str(cause)
+        parts.append(
+            f"caused_by={cause.__class__.__name__}: {cause_message}"
+            if cause_message
+            else f"caused_by={cause.__class__.__name__}"
+        )
+        cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+    return " | ".join(parts)[:1000]
+
+
+def _configured_image_api_limit() -> int:
+    try:
+        return max(1, min(4, int(settings.IMAGE_API_MAX_CONCURRENCY or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _gateway_cutoff_seconds() -> int:
+    try:
+        return max(30, int(settings.IMAGE_PROVIDER_GATEWAY_CUTOFF_SECONDS or 120))
+    except (TypeError, ValueError):
+        return 120
+
+
+def _gateway_cutoff_max_attempts() -> int:
+    try:
+        return max(1, min(3, int(settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _image_quality() -> str:
+    quality = str(settings.IMAGE_GPT_QUALITY or "high").strip().lower()
+    return quality if quality in {"low", "medium", "high", "auto"} else "high"
+
+
+def _get_image_redis_client():
+    global _image_redis_client
+    if _image_redis_client is not None:
+        return _image_redis_client
+    with _image_redis_lock:
+        if _image_redis_client is None:
+            try:
+                _image_redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
+                _image_redis_client.ping()
+            except Exception as exc:
+                logger.warning("ImageGen: Redis image queue unavailable, using local limiter only: %s", exc)
+                _image_redis_client = False
+    return _image_redis_client or None
+
+
+def _image_lock_ttl_seconds() -> int:
+    try:
+        task_limit = int(settings.CELERY_TASK_TIME_LIMIT or 2100)
+    except (TypeError, ValueError):
+        task_limit = 2100
+    return max(300, task_limit + 300)
+
+
+def _release_redis_slot(client, key: str, token: str) -> None:
+    try:
+        client.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            key,
+            token,
+        )
+    except Exception as exc:
+        logger.warning("ImageGen: failed to release Redis image slot %s: %s", key, exc)
+
+
+def _start_redis_slot_renewer(client, key: str, token: str, ttl_seconds: int):
+    stop = threading.Event()
+    interval = max(10, min(60, ttl_seconds // 3))
+
+    def renew() -> None:
+        while not stop.wait(interval):
+            try:
+                client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    "return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                    1,
+                    key,
+                    token,
+                    ttl_seconds,
+                )
+            except Exception as exc:
+                logger.warning("ImageGen: failed to renew Redis image slot %s: %s", key, exc)
+
+    thread = threading.Thread(target=renew, name="pptgod-image-slot-renewer", daemon=True)
+    thread.start()
+    return stop
+
+
+def _acquire_redis_image_slot():
+    client = _get_image_redis_client()
+    if client is None:
+        return None
+
+    limit = _configured_image_api_limit()
+    ttl = _image_lock_ttl_seconds()
+    token = str(uuid.uuid4())
+    logged_wait = False
+    started = time.time()
+
+    while True:
+        for index in range(limit):
+            key = f"pptgod:image_api:slot:{index}"
+            try:
+                if client.set(key, token, nx=True, ex=ttl):
+                    if logged_wait:
+                        logger.info("ImageGen: acquired image API slot after %.1fs", time.time() - started)
+                    return client, key, token, _start_redis_slot_renewer(client, key, token, ttl)
+            except Exception as exc:
+                logger.warning("ImageGen: Redis image queue failed, using local limiter only: %s", exc)
+                return None
+        waited = time.time() - started
+        if waited >= 30 and not logged_wait:
+            logger.info("ImageGen: waiting for image API slot (%.1fs)", waited)
+            logged_wait = True
+        time.sleep(1.0)
+
+
+class _ImageApiSlot:
+    def __enter__(self):
+        self.started = time.time()
+        self.redis_slot = None
+        self.local_slot = _image_api_semaphore
+        self.local_slot.acquire()
+        try:
+            self.redis_slot = _acquire_redis_image_slot()
+            _image_queue_wait.seconds = time.time() - self.started
+            return self
+        except Exception:
+            self.local_slot.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.redis_slot:
+                client, key, token, stop = self.redis_slot
+                stop.set()
+                _release_redis_slot(client, key, token)
+        finally:
+            _image_queue_wait.seconds = None
+            self.local_slot.release()
+
+
+def _image_api_slot() -> _ImageApiSlot:
+    return _ImageApiSlot()
+
+
+def _current_image_queue_wait_seconds() -> float | None:
+    value = getattr(_image_queue_wait, "seconds", None)
+    if value is None:
+        return None
+    return round(float(value), 3)
+
+
+def _is_connection_like_error(exc: Exception) -> bool:
+    if isinstance(exc, (APIConnectionError, APITimeoutError, requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    text = _exception_debug_summary(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection error",
+            "connection aborted",
+            "connection reset",
+            "timed out",
+            "timeout",
+            "read operation timed out",
+            "remote end closed",
+        )
+    )
+
+
+def _is_gateway_idle_cutoff(exc: Exception, duration_seconds: float) -> bool:
+    timeout = _gateway_cutoff_seconds()
+    return (
+        _is_connection_like_error(exc)
+        and duration_seconds >= max(30, timeout - 10)
+        and duration_seconds <= timeout + 45
+    )
+
+
 def _record_image_call_event(**event) -> None:
     events = getattr(_image_call_events, "events", None)
     if events is None:
@@ -152,6 +356,7 @@ def _cache_key(
 ) -> str:
     h = hashlib.sha256()
     h.update(get_deer_image_model().encode("utf-8"))
+    h.update(_image_quality().encode("utf-8"))
     h.update(resolution.encode("utf-8"))
     h.update(aspect_ratio.encode("utf-8"))
     h.update(prompt.encode("utf-8"))
@@ -171,7 +376,7 @@ def _is_api_retryable(exc: Exception) -> bool:
     只在同一接口、同一 Idempotency-Key 下重试瞬时失败。
     不切换模型，不改成无参考图生成，也不返回占位图。
     """
-    if isinstance(exc, ReferenceUploadTimeoutError):
+    if isinstance(exc, (ReferenceUploadTimeoutError, ProviderGatewayCutoffError)):
         return False
     if isinstance(exc, (APIConnectionError, APITimeoutError)):
         return True
@@ -486,11 +691,12 @@ def _call_gpt_image_2_generate(
     started_at = time.time()
     resp = None
     try:
+        quality = _image_quality()
         resp = client.images.generate(
             model=get_deer_image_model(),
             prompt=prompt,
             size=size,
-            quality="high",
+            quality=quality,
             n=1,
             extra_headers=headers or None,
         )
@@ -501,31 +707,41 @@ def _call_gpt_image_2_generate(
             img_bytes = _download_image_bytes(image_data.url)
         else:
             raise ValueError("DeerAPI returned no image content")
+        duration_seconds = time.time() - started_at
         _record_image_call_event(
             endpoint="/v1/images/generations",
             model=get_deer_image_model(),
             status="succeeded",
             size=size,
+            quality=quality,
             reference_count=0,
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             idempotency_key=idempotency_key,
             request_id=_response_request_id(resp),
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
         )
         return Image.open(io.BytesIO(img_bytes))
     except Exception as exc:
+        duration_seconds = time.time() - started_at
+        gateway_cutoff = _is_gateway_idle_cutoff(exc, duration_seconds)
+        setattr(exc, "pptgod_duration_seconds", duration_seconds)
+        setattr(exc, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/generations",
             model=get_deer_image_model(),
-            status="failed",
+            status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
+            quality=_image_quality(),
             reference_count=0,
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             idempotency_key=idempotency_key,
             request_id=getattr(exc, "request_id", None) or _response_request_id(resp),
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
             error_type=exc.__class__.__name__,
             error=str(exc)[:500],
+            error_debug=_exception_debug_summary(exc),
         )
         raise
 
@@ -571,59 +787,77 @@ def _call_gpt_image_2_edit(
             ),
         )
     except requests.exceptions.ConnectTimeout as e:
+        duration_seconds = time.time() - started_at
+        gateway_cutoff = _is_gateway_idle_cutoff(e, duration_seconds)
+        setattr(e, "pptgod_duration_seconds", duration_seconds)
+        setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
             model=get_deer_image_model(),
-            status="failed",
+            status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
             error_type=e.__class__.__name__,
             error=str(e)[:500],
+            error_debug=_exception_debug_summary(e),
         )
         raise ReferenceUploadTimeoutError(
             "图片接口连接超时：请求未稳定送达，已停止自动重试，避免重复消耗生图额度"
         ) from e
     except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+        duration_seconds = time.time() - started_at
+        gateway_cutoff = _is_gateway_idle_cutoff(e, duration_seconds)
+        setattr(e, "pptgod_duration_seconds", duration_seconds)
+        setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
             model=get_deer_image_model(),
-            status="interrupted",
+            status="gateway_timeout" if gateway_cutoff else "interrupted",
             size=size,
             reference_count=len(reference_images),
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
             error_type=e.__class__.__name__,
             error=str(e)[:500],
+            error_debug=_exception_debug_summary(e),
         )
         raise ReferenceUploadTimeoutError(
             "图片接口响应中断：本次请求可能已进入生成并产生费用，已停止自动重试。请稍后重试失败页，避免重复扣费。"
         ) from e
     except requests.exceptions.RequestException as e:
+        duration_seconds = time.time() - started_at
+        gateway_cutoff = _is_gateway_idle_cutoff(e, duration_seconds)
+        setattr(e, "pptgod_duration_seconds", duration_seconds)
+        setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
             model=get_deer_image_model(),
-            status="failed",
+            status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=_response_request_id(getattr(e, "response", None)),
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
             error_type=e.__class__.__name__,
             error=str(e)[:500],
+            error_debug=_exception_debug_summary(e),
         )
         raise
     try:
@@ -636,37 +870,45 @@ def _call_gpt_image_2_edit(
             img_bytes = _download_image_bytes(image_data["url"])
         else:
             raise ValueError("DeerAPI returned no image content")
+        duration_seconds = time.time() - started_at
         _record_image_call_event(
             endpoint="/v1/images/edits",
             model=get_deer_image_model(),
             status="succeeded",
             size=size,
             reference_count=len(reference_images),
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=_response_request_id(resp),
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
         )
         return Image.open(io.BytesIO(img_bytes))
     except Exception as exc:
+        duration_seconds = time.time() - started_at
+        gateway_cutoff = _is_gateway_idle_cutoff(exc, duration_seconds)
+        setattr(exc, "pptgod_duration_seconds", duration_seconds)
+        setattr(exc, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
             model=get_deer_image_model(),
-            status="failed",
+            status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
+            queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=getattr(exc, "request_id", None) or _response_request_id(resp),
             started_at=_utc_iso(started_at),
-            duration_seconds=round(time.time() - started_at, 3),
+            duration_seconds=round(duration_seconds, 3),
             error_type=exc.__class__.__name__,
             error=str(exc)[:500],
+            error_debug=_exception_debug_summary(exc),
         )
         raise
 
@@ -758,7 +1000,7 @@ def _generate_real_slide_image(
             return img
         except Exception as e:
             req_id = getattr(e, "request_id", None)
-            err_detail = str(e)
+            err_detail = _exception_debug_summary(e)
             if req_id:
                 err_detail = f"{err_detail} [request_id={req_id}]"
             logger.warning(
@@ -767,6 +1009,15 @@ def _generate_real_slide_image(
             if attempt == len(api_backoff) - 1:
                 logger.error(f"ImageGen: all retries exhausted: {err_detail}")
                 raise
+            if getattr(e, "pptgod_gateway_idle_cutoff", False) and attempt >= _gateway_cutoff_max_attempts() - 1:
+                timeout = _gateway_cutoff_seconds()
+                logger.error(
+                    "ImageGen: upstream gateway cut off image request around %ss; stopping retries to avoid repeated long failures",
+                    timeout,
+                )
+                raise ProviderGatewayCutoffError(
+                    f"图片接口超过约 {timeout} 秒仍未返回，被上游连接窗口截断；已停止重复重试。请稍后重试失败页。"
+                ) from e
             if not _is_api_retryable(e):
                 logger.error(f"ImageGen: non-retryable error, aborting: {err_detail}")
                 raise
@@ -793,7 +1044,7 @@ def generate_slide_image(
             return Image.open(path).copy()
 
         _reserve_real_image_call()
-        with _image_api_semaphore:
+        with _image_api_slot():
             img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
         os.makedirs(settings.IMAGE_GEN_CACHE_DIR, exist_ok=True)
         img.save(path, "PNG")
@@ -804,7 +1055,7 @@ def generate_slide_image(
         raise ValueError("IMAGE_GEN_MODE must be one of: real, mock, cached")
 
     _reserve_real_image_call()
-    with _image_api_semaphore:
+    with _image_api_slot():
         return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
 
 

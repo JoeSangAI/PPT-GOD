@@ -129,7 +129,7 @@ def _logo_geometry(
 
     placement = normalize_logo_placement(placement)
     margin = Inches(0.28)
-    is_large = scale == "large" or slide_type in {"cover", "ending"}
+    is_large = scale == "large" or slide_type == "cover"
     size_key = "large" if is_large else "small"
     max_width = int(prs.slide_width * LOGO_WIDTH_RATIOS[size_key])
     max_height = int(prs.slide_height * LOGO_HEIGHT_RATIOS[size_key])

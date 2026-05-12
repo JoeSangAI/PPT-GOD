@@ -198,15 +198,66 @@ def _compact_visual_evidence(page_intent: Dict, reference_images: Optional[List[
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
+    visual_evidence = _rewrite_stale_dark_language_for_light_style(visual_evidence, "")
     return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
 
 
-def _compact_layout_intent(page_intent: Dict, reference_images: Optional[List[Dict]] = None) -> str:
+def _style_text_requests_light(style_text: str | None) -> bool:
+    text = re.sub(r"\s+", "", str(style_text or "")).lower()
+    return bool(
+        text
+        and (
+            "base_tone=light" in text
+            or "白色/米白" in text
+            or "浅色明亮基底" in text
+            or "浅底为主" in text
+            or "以白色为主" in text
+        )
+    )
+
+
+def _rewrite_stale_dark_language_for_light_style(text: str, style_text: str | None) -> str:
+    if not _style_text_requests_light(style_text):
+        return text
+    rewritten = str(text or "")
+    replacements = [
+        ("保持深色基底统一", "保持浅色基底统一"),
+        ("延续深色基底统一", "延续浅色基底统一"),
+        ("深色视觉基底", "浅色明亮视觉基底"),
+        ("深色视觉基调", "浅色明亮视觉基调"),
+        ("深色基底", "浅色基底"),
+        ("深色背景", "白色/米白浅色背景"),
+        ("黑紫背景", "明亮柔紫浅色背景"),
+        ("黑紫", "明亮柔紫"),
+        ("深邃暗色", "明亮浅色"),
+        ("高对比暗色卡片", "淡紫/米白浅色卡片"),
+        ("暗色卡片", "浅色卡片"),
+        ("暗色内容区", "浅色内容区"),
+        ("深色系语言", "浅色系语言"),
+        ("深色系风格", "浅色系风格"),
+    ]
+    for old, new in replacements:
+        rewritten = rewritten.replace(old, new)
+    if rewritten != text:
+        rewritten = rewritten.rstrip("。；; ") + "；当前确认风格要求整页以白色/米白/淡紫浅底为主，深色只能用于文字、细线或局部强调。"
+    return rewritten
+
+
+def _compact_visual_evidence_with_style(page_intent: Dict, reference_images: Optional[List[Dict]], style_text: str | None) -> str:
+    visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
+    if _has_product_ref(reference_images):
+        visual_evidence = _sanitize_product_reference_text(visual_evidence)
+    visual_evidence = _rewrite_stale_dark_language_for_light_style(visual_evidence, style_text)
+    return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
+
+
+def _compact_layout_intent(page_intent: Dict, reference_images: Optional[List[Dict]] = None, style_text: str | None = None) -> str:
     layout = page_intent.get("layout") or page_intent.get("type", "content")
     visual_desc = " ".join(str(page_intent.get("visual_description", "")).split())
     visual_desc = _remove_negative_clauses(visual_desc)
     if _has_product_ref(reference_images):
         visual_desc = _sanitize_product_reference_text(visual_desc)
+    visual_desc = _rewrite_stale_dark_language_for_light_style(visual_desc, style_text)
     if len(visual_desc) > 260:
         visual_desc = visual_desc[:260].rstrip() + "..."
     if visual_desc:
@@ -301,7 +352,8 @@ def _brand_mark_safety_instruction(page_intent: Dict) -> str:
     if logo_reservation:
         return (
             "Brand marks: do not draw, invent, or stylize any logo, wordmark, brand icon, "
-            "or placeholder mark; keep the reserved logo area clean for exact overlay."
+            "or placeholder mark. Leave only low-detail negative space at the logo position; "
+            "do not draw an outline, frame, box, badge, label, or container for it."
         )
     return "Brand marks: do not draw or invent logos, wordmarks, brand icons, or placeholder marks."
 
@@ -411,6 +463,12 @@ def generate_prompt_for_page(
 
     text_directives = []
     is_punchline_page = _is_punchline_page(page_intent)
+    page_type = str((page_intent or {}).get("type") or "").strip().lower()
+    section_title = str((content_text or {}).get("section_title") or "").strip()
+    if page_type == "section" and section_title:
+        label = _escape(_strip_markdown(section_title))
+        if label:
+            text_directives.append(f'Chapter label: "{label}"')
     if content_text.get("headline"):
         h = _escape(_strip_markdown(content_text["headline"]))
         text_directives.append(f'Headline: "{h}"')
@@ -452,12 +510,12 @@ def generate_prompt_for_page(
         # asset identity; long product descriptions are intentionally omitted.
         text_block = "\n".join(text_directives)
         style_block = _compact_style_pack(style_text)
-        visual_evidence = _compact_visual_evidence(page_intent, reference_images)
-        layout_intent = _compact_layout_intent(page_intent, reference_images)
+        visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text)
+        layout_intent = _compact_layout_intent(page_intent, reference_images, style_text)
         refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
-        logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
+        logo_section = f"\n\nLogo Placement Note:\n{logo_reservation}" if logo_reservation else ""
         overlay_reservation = overlay_reservation_instruction(
             page_intent,
             valid_asset_ids=_valid_overlay_asset_ids(page_intent),
@@ -488,12 +546,12 @@ def generate_prompt_for_page(
         )
     else:
         style_block = _compact_style_pack(style_text)
-        visual_evidence = _compact_visual_evidence(page_intent, reference_images)
-        layout_intent = _compact_layout_intent(page_intent, reference_images)
+        visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text)
+        layout_intent = _compact_layout_intent(page_intent, reference_images, style_text)
         refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
         refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
         logo_reservation = logo_reservation_instruction(page_intent)
-        logo_section = f"\n\nLogo Overlay Reservation:\n{logo_reservation}" if logo_reservation else ""
+        logo_section = f"\n\nLogo Placement Note:\n{logo_reservation}" if logo_reservation else ""
         overlay_reservation = overlay_reservation_instruction(
             page_intent,
             valid_asset_ids=_valid_overlay_asset_ids(page_intent),
@@ -548,6 +606,10 @@ def generate_prompts_for_all_pages(
             progress_callback(f"📝 第 {idx + 1} / {total} 页 Prompt 生成中...")
         content_item = content_item_by_page.get(page_num, {})
         content_text = content_item.get("text_content", {}) or {}
+        page_type = str(intent.get("type") or content_item.get("type") or "").strip().lower()
+        section_title = str(content_item.get("section_title") or "").strip()
+        if page_type == "section" and section_title:
+            content_text = {**content_text, "section_title": section_title}
         # 注入页面级参考图上下文（修复参考图丢失）
         if content_item.get("reference_context"):
             content_text = {**content_text, "reference_context": content_item["reference_context"]}

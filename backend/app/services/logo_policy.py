@@ -2,8 +2,8 @@ from typing import Any, Mapping
 
 
 DEFAULT_LOGO_ANCHOR = "top-right"
-LOGO_WIDTH_RATIOS = {"small": 0.052, "large": 0.18}
-LOGO_HEIGHT_RATIOS = {"small": 0.068, "large": 0.18}
+LOGO_WIDTH_RATIOS = {"small": 0.085, "large": 0.18}
+LOGO_HEIGHT_RATIOS = {"small": 0.085, "large": 0.18}
 LOGO_ANCHORS = {"top-left", "top-right", "bottom-left", "bottom-right"}
 LOGO_PLACEMENTS = LOGO_ANCHORS | {"center", "lower-center", "title-block-center"}
 LOGO_REVIEW_CONFIRMED_STATUSES = {"auto_confirmed", "user_confirmed"}
@@ -137,7 +137,7 @@ def logo_prompt_instruction(page: Any) -> str:
     policy = logo_policy_for_page(page)
     if not policy["show_logo"]:
         return ""
-    scale = "about 5% of slide width" if policy["scale"] == "small" else "modest brand signature size"
+    scale = "about 8-9% of slide width" if policy["scale"] == "small" else "modest brand signature size"
     placement = ANCHOR_LABELS[normalize_logo_placement(policy.get("placement"))]
     return (
         "Use the exact uploaded logo or co-brand lockup as a quiet brand signature in the "
@@ -156,10 +156,11 @@ def logo_reservation_instruction(page: Any, anchor: str | None = None) -> str:
         return ""
     placement_key = normalize_logo_placement(anchor or policy.get("placement"))
     placement = ANCHOR_LABELS[placement_key]
-    size = "small" if policy["scale"] == "small" else "modest"
+    size = "readable small" if policy["scale"] == "small" else "modest"
     return (
-        f"Keep the {placement} clean for a {size} logo/lockup overlay: no required text, "
-        "no key subject, and no dense detail in that area."
+        f"Leave the {placement} visually quiet for a {size} logo/lockup overlay: no required text, "
+        "no key subject, and no dense detail in that area. Do not draw any logo placeholder, "
+        "box, border, rounded rectangle, dashed frame, label, badge, or decorative logo container."
     )
 
 

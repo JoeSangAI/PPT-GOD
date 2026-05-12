@@ -38,7 +38,20 @@ from app.utils.reference_image import (
 _running_tasks: dict = {}
 _running_tasks_lock = asyncio.Lock()
 from app.core.config import settings
-from app.services.content_plan import generate_content_plan, infer_page_count_from_single_ppt
+from app.services.content_plan import (
+    LONG_DECK_CHUNK_SIZE,
+    LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT,
+    LOW_CONTENT_DRAFT_STATUSES,
+    build_document_driven_long_deck_draft,
+    build_long_deck_skeleton,
+    generate_content_plan,
+    generate_long_deck_outline_chunk,
+    infer_page_count_from_single_ppt,
+    infer_page_count_from_topic,
+    resolve_content_plan_page_target,
+    should_generate_incremental_long_deck,
+    _fallback_deck_blueprint,
+)
 from app.services.logo_policy import (
     DEFAULT_LOGO_ANCHOR,
     LOGO_ANCHORS,
@@ -691,8 +704,13 @@ def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dic
         intent["logo_policy"] = policy
         return intent
     page_type = str(intent.get("type") or "").lower()
-    if page_type not in {"cover", "ending"}:
+    if page_type == "ending":
         policy["placement"] = logo_anchor_from_ref(logo_ref)
+        policy["scale"] = "small"
+        policy.pop("resolved_overlay_box", None)
+    elif page_type != "cover":
+        policy["placement"] = logo_anchor_from_ref(logo_ref)
+        policy.pop("resolved_overlay_box", None)
     intent["logo_policy"] = policy
     return intent
 
@@ -1511,6 +1529,282 @@ def _content_plan_attachment_context(db: Session, project_id: str, attachment_id
     return "\n\n".join(parts).strip()
 
 
+def _upsert_content_plan_pages(
+    db: Session,
+    project_id: str,
+    pages: list[dict],
+    *,
+    replace_all: bool = False,
+) -> None:
+    if replace_all:
+        pptx_refs = db.query(ReferenceImage).filter(
+            ReferenceImage.project_id == project_id,
+            ReferenceImage.role == "content_ref",
+        ).all()
+        for ref in pptx_refs:
+            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+            if isinstance(analysis.get("pptx_source_page_num"), int):
+                ref.slide_id = None
+        db.flush()
+        db.query(Slide).filter(Slide.project_id == project_id).delete()
+        db.flush()
+
+    existing = {
+        slide.page_num: slide
+        for slide in db.query(Slide).filter(Slide.project_id == project_id).all()
+    }
+    for item in pages:
+        page_num = int(item.get("page_num") or 0)
+        if page_num <= 0:
+            continue
+        item = copy.deepcopy(item)
+        item["page_num"] = page_num
+        slide = existing.get(page_num)
+        if slide:
+            slide.type = item.get("type", slide.type or "content")
+            slide.content_json = item
+        else:
+            slide = Slide(
+                project_id=project_id,
+                page_num=page_num,
+                type=item.get("type", "content"),
+                content_json=item,
+            )
+            db.add(slide)
+            existing[page_num] = slide
+
+
+def _mark_skeleton_pages_need_review(pages: list[dict], reason: str) -> list[dict]:
+    marked: list[dict] = []
+    for page in pages:
+        item = copy.deepcopy(page)
+        item["generation_status"] = "needs_review"
+        item["generation_warning"] = reason[:240]
+        notes = str(item.get("speaker_notes") or "").strip()
+        review_note = f"本页仍是可编辑骨架：{reason[:120]}"
+        item["speaker_notes"] = f"{notes}\n\n{review_note}".strip() if notes else review_note
+        marked.append(item)
+    return marked
+
+
+def _finalize_incremental_content_plan_project(
+    db: Session,
+    project_id: str,
+    topic: str,
+    outline: list[dict],
+) -> Project | None:
+    pending_pptx_assets = _pending_pptx_asset_extractions(project_id)
+    if pending_pptx_assets:
+        pending_pptx_assets = _soft_wait_for_pptx_asset_extractions(project_id, timeout_seconds=4.0)
+        if pending_pptx_assets:
+            logger.info(
+                "[ContentPlan BG] %s PPTX asset extraction task(s) still running; continuing without hard gate",
+                pending_pptx_assets,
+            )
+    _link_pending_pptx_page_refs(project_id, db)
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if project:
+        project.status = "planning"
+        project.content_plan_confirmed = False
+        project.style_proposal = None
+        project.selected_style = None
+        if _should_autoname_project(project):
+            derived_title = _derive_project_title(topic, outline)
+            if derived_title:
+                project.title = derived_title
+        project.has_unread_notification = True
+        project.unread_notification_message = "内容规划已生成"
+    return project
+
+
+def _generate_long_content_plan_incrementally(
+    db: Session,
+    *,
+    project_id: str,
+    topic: str,
+    page_count: int,
+    documents: str,
+    run_id: str | None,
+) -> list[dict]:
+    target_count, min_pages, max_pages = resolve_content_plan_page_target(topic, page_count, documents)
+    fallback_blueprint = _fallback_deck_blueprint(target_count, min_pages, max_pages)
+    skeleton = build_document_driven_long_deck_draft(
+        topic=topic,
+        documents=documents,
+        target_count=target_count,
+        min_pages=min_pages,
+        max_pages=max_pages,
+        deck_blueprint=fallback_blueprint,
+    )
+
+    update_run_progress(
+        db,
+        run_id,
+        stage="skeleton",
+        message=f"已生成 {target_count} 页内容草稿，正在检查页面完整性...",
+        total_count=target_count,
+        completed_count=0,
+    )
+    _upsert_content_plan_pages(db, project_id, skeleton, replace_all=True)
+    _finalize_incremental_content_plan_project(db, project_id, topic, skeleton)
+    db.commit()
+    _update_progress(project_id, {
+        "stage": "skeleton",
+        "message": f"已生成 {target_count} 页内容草稿，正在检查页面完整性...",
+        "current_page": 0,
+        "total_pages": target_count,
+    }, run_id)
+
+    deck_blueprint = fallback_blueprint
+
+    outline_by_page = {int(page["page_num"]): copy.deepcopy(page) for page in skeleton}
+    if LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT <= 0:
+        update_run_progress(
+            db,
+            run_id,
+            stage="complete",
+            message=f"已生成 {target_count} 页内容规划，请检查标题、页数和顺序。",
+            total_count=target_count,
+            completed_count=target_count,
+        )
+        db.commit()
+        _update_progress(project_id, {
+            "stage": "complete",
+            "message": f"已生成 {target_count} 页内容规划，请检查标题、页数和顺序。",
+            "current_page": target_count,
+            "total_pages": target_count,
+        }, run_id)
+        return [outline_by_page[idx] for idx in range(1, target_count + 1)]
+
+    enriched_count = 0
+    failed_count = 0
+    consecutive_failures = 0
+
+    for start_page in range(1, target_count + 1, LONG_DECK_CHUNK_SIZE):
+        if start_page > LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT:
+            enriched_count = target_count
+            break
+        end_page = min(target_count, start_page + LONG_DECK_CHUNK_SIZE - 1)
+        db.expire_all()
+        if not is_run_active(db, run_id):
+            logger.info(f"[ContentPlan BG] Run {run_id} stopped during incremental content plan")
+            return [outline_by_page[idx] for idx in range(1, target_count + 1)]
+
+        message = f"正在补齐第 {start_page}-{end_page}/{target_count} 页内容..."
+        update_run_progress(
+            db,
+            run_id,
+            stage="generating",
+            message=message,
+            total_count=target_count,
+            completed_count=enriched_count,
+            failed_count=failed_count,
+        )
+        db.commit()
+        _update_progress(project_id, {
+            "stage": "generating",
+            "message": message,
+            "current_page": enriched_count,
+            "total_pages": target_count,
+        }, run_id)
+
+        skeleton_chunk = [outline_by_page[idx] for idx in range(start_page, end_page + 1)]
+        existing_outline = [outline_by_page[idx] for idx in range(1, start_page)]
+        try:
+            chunk = generate_long_deck_outline_chunk(
+                topic=topic,
+                documents=documents,
+                deck_blueprint=deck_blueprint,
+                existing_outline=existing_outline,
+                skeleton_chunk=skeleton_chunk,
+                target_count=target_count,
+                start_page=start_page,
+                end_page=end_page,
+            )
+            for page in chunk:
+                outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
+            _upsert_content_plan_pages(db, project_id, chunk)
+            enriched_count = end_page
+            consecutive_failures = 0
+        except Exception as e:
+            reason = str(e) or "模型响应超时"
+            logger.warning(
+                "[ContentPlan BG] Incremental chunk %s-%s failed for project=%s: %s",
+                start_page,
+                end_page,
+                project_id,
+                reason,
+            )
+            low_content_chunk = all(
+                str(page.get("generation_status") or "") in LOW_CONTENT_DRAFT_STATUSES
+                for page in skeleton_chunk
+            )
+            if low_content_chunk:
+                marked = _mark_skeleton_pages_need_review(skeleton_chunk, reason)
+                failed_count += len(marked)
+            else:
+                marked = []
+                for page in skeleton_chunk:
+                    item = copy.deepcopy(page)
+                    item["generation_warning"] = f"模型润色超时，当前保留基于上传材料生成的素材初稿：{reason[:160]}"
+                    marked.append(item)
+            for page in marked:
+                outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
+            _upsert_content_plan_pages(db, project_id, marked)
+            enriched_count = end_page
+            consecutive_failures += 1
+            if consecutive_failures >= 2:
+                remaining_start = end_page + 1
+                if remaining_start <= target_count:
+                    remaining = [
+                        outline_by_page[idx]
+                        for idx in range(remaining_start, target_count + 1)
+                    ]
+                    low_content_remaining = all(
+                        str(page.get("generation_status") or "") in LOW_CONTENT_DRAFT_STATUSES
+                        for page in remaining
+                    )
+                    if low_content_remaining:
+                        remaining_marked = _mark_skeleton_pages_need_review(
+                            remaining,
+                            "连续分段生成超时，已先保留完整可编辑骨架，避免任务回到 0 页。",
+                        )
+                        failed_count += len(remaining_marked)
+                    else:
+                        remaining_marked = []
+                        for page in remaining:
+                            item = copy.deepcopy(page)
+                            item["generation_warning"] = "连续分段生成超时，当前保留基于上传材料生成的素材初稿，可继续细化。"
+                            remaining_marked.append(item)
+                    for page in remaining_marked:
+                        outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
+                    _upsert_content_plan_pages(db, project_id, remaining_marked)
+                    enriched_count = target_count
+                db.commit()
+                break
+
+        outline = [outline_by_page[idx] for idx in range(1, target_count + 1)]
+        _finalize_incremental_content_plan_project(db, project_id, topic, outline)
+        update_run_progress(
+            db,
+            run_id,
+            stage="generating",
+            message=f"已处理到第 {enriched_count}/{target_count} 页...",
+            total_count=target_count,
+            completed_count=enriched_count,
+            failed_count=failed_count,
+        )
+        db.commit()
+        _update_progress(project_id, {
+            "stage": "generating",
+            "message": f"已处理到第 {enriched_count}/{target_count} 页...",
+            "current_page": enriched_count,
+            "total_pages": target_count,
+        }, run_id)
+
+    return [outline_by_page[idx] for idx in range(1, target_count + 1)]
+
+
 def _generate_content_plan_bg(
     project_id: str,
     topic: str,
@@ -1697,7 +1991,7 @@ def create_content_plan(
 
     # 优先使用用户传入的 topic，否则用项目标题
     topic = body.topic.strip() if body.topic else project.title
-    page_count = body.page_count
+    page_count = body.page_count or infer_page_count_from_topic(topic)
 
     try:
         run = create_project_run(
@@ -1951,6 +2245,11 @@ def create_prompts(
         for s in target_slides
         if s.visual_json
     ]
+    visual_intent_by_page = {
+        int(intent.get("page_num") or 0): intent
+        for intent in visual_plan
+        if isinstance(intent, dict)
+    }
 
     # style_ref 已被转成 style_text；Logo 按页面级 policy 融合，visual_asset 按页选择。
     ref_images_by_page = {
@@ -1977,8 +2276,9 @@ def create_prompts(
     for slide in target_slides:
         slide.prompt_text = prompt_by_page.get(slide.page_num)
         if slide.prompt_text:
+            visual_intent = visual_intent_by_page.get(slide.page_num, slide.visual_json)
             slide.visual_json = with_artifact_meta(
-                slide.visual_json,
+                visual_intent,
                 kind="visual_plan",
                 dependencies=artifact_deps,
                 prompt_dependencies=artifact_deps,
