@@ -12,7 +12,7 @@ from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
 from app.core.tester_auth import is_local_admin_request, require_tester_id, tester_id_from_header, verify_project_access
 from app.core.provider_credentials import store_current_provider_credentials
 from app.core.config import settings
-from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta
+from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta, with_stale_flags
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
@@ -148,11 +148,11 @@ def update_project_style(
         project.content_plan_confirmed = True
         project.status = "visual_ready"
         for slide in slides:
-            slide.visual_json = {}
-            slide.prompt_text = None
-            slide.image_path = None
+            had_outputs = bool(slide.visual_json or slide.prompt_text or slide.image_path)
+            slide.visual_json = with_stale_flags(slide.visual_json if isinstance(slide.visual_json, dict) else {}, content=True)
             slide.error_msg = None
-            slide.status = "pending"
+            if not had_outputs:
+                slide.status = "pending"
     db.commit()
     db.refresh(project)
     return project

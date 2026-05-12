@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
@@ -11,7 +12,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.models import Project, Slide
+from app.models.models import Project, Slide, SlideVersion
+from app.services.artifact_versions import with_stale_flags
 from app.services.image_generation import (
     generate_slide_image,
     get_image_call_events,
@@ -19,8 +21,8 @@ from app.services.image_generation import (
     save_slide_image,
 )
 from app.services.image_task_audit import append_image_generation_log, image_generation_log_path
-from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
-from app.services.logo_overlay_layout import resolve_logo_overlay_box
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
+from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.logo_policy import is_logo_confirmed, should_show_logo, should_use_logo_as_scene_asset
 from app.services.overlay_layers import exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
@@ -38,6 +40,7 @@ redis_client = redis.from_url(
 )
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
 _MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千万0-9]+)")
+MAX_VERSIONS_PER_SLIDE = 10
 
 
 def _prompt_audit(prompt: str | None) -> Dict:
@@ -70,6 +73,50 @@ def _reference_audit(refs: Optional[List[Dict]]) -> List[Dict]:
             "source_size_bytes": getattr(img, "info", {}).get("pptgod_reference_source_size"),
         })
     return summary
+
+
+def _archive_current_image(slide: Slide, db: Session) -> None:
+    if not slide.image_path or not os.path.exists(slide.image_path):
+        return
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    if visual.get("finetune_base_image_path"):
+        return
+
+    max_ver = (
+        db.query(SlideVersion)
+        .filter(SlideVersion.slide_id == slide.id)
+        .order_by(SlideVersion.version_number.desc())
+        .first()
+    )
+    next_ver = (max_ver.version_number + 1) if max_ver else 1
+    version_dir = os.path.join(settings.OUTPUT_DIR or "./outputs", slide.project_id, "versions")
+    os.makedirs(version_dir, exist_ok=True)
+    version_path = os.path.join(version_dir, f"slide_{slide.page_num:02d}_v{next_ver}.png")
+    shutil.copy2(slide.image_path, version_path)
+    db.add(
+        SlideVersion(
+            slide_id=slide.id,
+            project_id=slide.project_id,
+            image_path=version_path,
+            prompt_text=slide.prompt_text,
+            version_number=next_ver,
+        )
+    )
+
+    all_versions = (
+        db.query(SlideVersion)
+        .filter(SlideVersion.slide_id == slide.id)
+        .order_by(SlideVersion.version_number.asc())
+        .all()
+    )
+    if len(all_versions) > MAX_VERSIONS_PER_SLIDE:
+        for version in all_versions[:len(all_versions) - MAX_VERSIONS_PER_SLIDE]:
+            if version.image_path != slide.image_path and version.image_path != version_path and os.path.exists(version.image_path):
+                try:
+                    os.remove(version.image_path)
+                except OSError:
+                    pass
+            db.delete(version)
 
 
 def _existing_path(path: str | None, output_dir: str | None = None) -> str | None:
@@ -880,6 +927,7 @@ def run_generation_pipeline(
             slide.status = "failed"
             slide.error_msg = "缺少 prompt"
         else:
+            _archive_current_image(slide, db)
             slide.status = "generating"
             slide.error_msg = None
     db.commit()
@@ -916,6 +964,9 @@ def run_generation_pipeline(
             slide.image_path = result["image_path"]
             slide.status = "completed"
             slide.error_msg = None
+            if isinstance(slide.visual_json, dict):
+                slide.visual_json = with_stale_flags(slide.visual_json, image=False)
+                flag_modified(slide, "visual_json")
             if slide.visual_json and isinstance(slide.visual_json, dict) and slide.visual_json.get("finetune_base_image_path"):
                 slide.visual_json = {
                     k: v for k, v in slide.visual_json.items()
@@ -1099,6 +1150,7 @@ def run_generation_pipeline(
                     if logo_refs else None
                 )
                 logo_path_for_overlay = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) if logo_refs else None
+                logo_symbol_path_for_overlay = prepare_logo_symbol_image(logo_refs[0].file_path) if len(logo_refs) == 1 else None
                 if logo_path_for_overlay and logo_config:
                     slides_by_page = {s.page_num: s for s in slides}
                     for slide_data in all_completed_images:
@@ -1106,16 +1158,16 @@ def run_generation_pipeline(
                             continue
                         visual = dict(slide_data.get("visual_json") or {})
                         policy = dict(visual.get("logo_policy") or {})
-                        resolved_box = resolve_logo_overlay_box(
+                        render_policy = resolve_logo_render_policy(
                             _existing_path(slide_data.get("image_path"), output_dir),
                             logo_path_for_overlay,
+                            logo_symbol_path_for_overlay,
                             str(slide_data.get("type") or "content").lower(),
                             policy.get("placement") or logo_config.get("anchor") or "top-right",
                             policy.get("scale") or "small",
+                            policy,
                         )
-                        if not resolved_box:
-                            continue
-                        policy["resolved_overlay_box"] = resolved_box
+                        policy.update({k: v for k, v in render_policy.items() if v is not None})
                         visual["logo_policy"] = policy
                         slide_data["visual_json"] = visual
                         slide_model = slides_by_page.get(slide_data.get("page_num"))

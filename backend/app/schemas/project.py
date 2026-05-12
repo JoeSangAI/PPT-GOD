@@ -40,6 +40,7 @@ class ReferenceImageResponse(BaseModel):
     process_mode: str = "blend"
     url: str
     overlay_url: Optional[str] = None
+    symbol_overlay_url: Optional[str] = None
     asset_name: Optional[str] = None
     asset_kind: Optional[str] = None
     usage_note: Optional[str] = None

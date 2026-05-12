@@ -830,6 +830,7 @@ function getSlideImageUrl(imagePath: string, status?: string, cacheKey?: string 
 
 function shouldShowLogoOverlay(slide: any) {
   const policy = slide?.visual_json?.logo_policy;
+  if (String(policy?.render_variant || "").toLowerCase() === "omit") return false;
   if (policy && typeof policy.show_logo === "boolean") return policy.show_logo;
   const pageType = String(slide?.visual_json?.type || slide?.type || "content").toLowerCase();
   const layout = String(slide?.visual_json?.layout || "").toLowerCase();
@@ -1053,6 +1054,11 @@ function logoOverlayPosition(anchor?: string | null, resolvedBox?: any) {
   return pos;
 }
 
+function logoOverlaySrc(item: any, variant?: string) {
+  if (variant === "symbol" && item?.symbol_overlay_url) return item.symbol_overlay_url;
+  return item?.overlay_url || item?.url || "";
+}
+
 const OVERLAY_PRESET_BOXES: Record<string, { left: string; top: string; width: string; height: string }> = {
   "top-right-small": { left: "72%", top: "8%", width: "20%", height: "18%" },
   "bottom-right-small": { left: "72%", top: "72%", width: "20%", height: "18%" },
@@ -1144,7 +1150,7 @@ function SlideImageWithOverlays({
             <Fragment key={item.id || item.url || index}>
               {index > 0 && <span className="h-[1.8em] w-px bg-slate-500/45" />}
               <img
-                src={`${API_BASE}${item.overlay_url || item.url}`}
+                src={`${API_BASE}${logoOverlaySrc(item, policy.render_variant)}`}
                 alt=""
                 className="min-w-0 flex-1 object-contain"
                 style={{ maxHeight: resolvedLogoBox ? "100%" : largeLogo ? "136px" : "48px" }}
@@ -1280,6 +1286,29 @@ function App() {
   // image: 画面方案已更新 → 需确认并重新生成图片
   const [staleMap, setStaleMap] = useState<Record<string, { content?: boolean; visual?: boolean; image?: boolean }>>({});
 
+  const getSlideStaleFlags = (slide: Slide) => {
+    const stale = slide.visual_json?._artifact?.stale;
+    if (!stale || typeof stale !== "object") return {};
+    return {
+      content: Boolean(stale.content),
+      visual: Boolean(stale.visual),
+      image: Boolean(stale.image),
+    };
+  };
+
+  const hydrateSlideStaleMap = (items: Slide[]) => {
+    setStaleMap((prev) => {
+      const next = { ...prev };
+      items.forEach((slide) => {
+        const backendStale = getSlideStaleFlags(slide);
+        if (backendStale.content || backendStale.visual || backendStale.image) {
+          next[slide.id] = { ...next[slide.id], ...backendStale };
+        }
+      });
+      return next;
+    });
+  };
+
   const markSlideStale = (slideId: string, type: "content" | "visual" | "image") => {
     setStaleMap((prev) => ({
       ...prev,
@@ -1307,6 +1336,7 @@ function App() {
     }
     setSlidesLoadingProjectId(null);
     setStaleMap({});
+    if (nextProjectId && cachedSlides) hydrateSlideStaleMap(cachedSlides);
     setSelectedPages(new Set());
     setPrototypeSelectionTouched(false);
     setEditingSlide(null);
@@ -2015,6 +2045,7 @@ function App() {
       slidesCacheRef.current[projectId] = data;
       setSlidesProjectId(projectId);
       setSlides(data);
+      hydrateSlideStaleMap(data);
       // 视觉阶段的内容变动只影响相关页面，不撤销整套流程。
       if (currentAgentRoleRef.current === "visual" && contentPlanSnapshotRef.current.length > 0 && contentPlanConfirmedRef.current) {
         const changedSlides = data.filter((s: Slide) => {
@@ -2522,6 +2553,7 @@ function App() {
         setSlidesProjectId(null);
       }
       setStaleMap({});
+      if (cachedSlides) hydrateSlideStaleMap(cachedSlides);
       setStyleProposalsInChat([]);
       generationLoadingIdRef.current = null;
       loadSlides(selectedProject.id);
@@ -3167,6 +3199,7 @@ function App() {
               if (selectedProjectIdRef.current === projectId) {
                 setSlidesProjectId(projectId);
                 setSlides(freshSlides);
+                hydrateSlideStaleMap(freshSlides);
               }
               if (!hasSavedVisualPromptResult(freshSlides)) {
                 reject(new Error("后台任务已结束，但目标页面缺少画面描述或生图 Prompt。请重试生成生图方案。"));
@@ -3188,6 +3221,7 @@ function App() {
               if (selectedProjectIdRef.current === projectId) {
                 setSlidesProjectId(projectId);
                 setSlides(freshSlides);
+                hydrateSlideStaleMap(freshSlides);
               }
               if (hasSavedVisualPromptResult(freshSlides)) {
                 await loadProjects();
@@ -4923,6 +4957,7 @@ function App() {
           slidesCacheRef.current[selectedProject.id] = freshSlides;
           setSlidesProjectId(selectedProject.id);
           setSlides(freshSlides);
+          hydrateSlideStaleMap(freshSlides);
           if (editingSlide?.id === targetSlide.id) setEditingSlide(freshSlide);
         }
         if (freshSlide?.status === "failed") {
@@ -5944,6 +5979,16 @@ function App() {
           : getFullGenerationTargetSlides(pageNums);
         if (targetSlides.length === 0) {
           return reportBlockedAction("请先生成页面内容。", "not_ready", "info");
+        }
+        const pendingChangePages = targetSlides
+          .filter((slide) => {
+            const localStale = staleMap[slide.id] || {};
+            const backendStale = getSlideStaleFlags(slide);
+            return Boolean(localStale.content || localStale.visual || backendStale.content || backendStale.visual);
+          })
+          .map((slide) => slide.page_num);
+        if (pendingChangePages.length > 0) {
+          return reportBlockedAction(`第 ${pendingChangePages.join(", ")} 页还有未应用的修改，请先应用变更后再生成图片。`, "not_ready", "info");
         }
         const missingPromptPages = targetSlides
           .filter((slide) => !slideHasPrompt(slide))

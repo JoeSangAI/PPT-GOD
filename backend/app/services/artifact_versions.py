@@ -8,6 +8,7 @@ from typing import Any
 
 
 ARTIFACT_META_KEY = "_artifact"
+STALE_ARTIFACT_KEYS = ("content", "visual", "image")
 
 
 def stable_json(value: Any) -> str:
@@ -108,3 +109,36 @@ def artifact_meta(value: Any) -> dict:
     if isinstance(value, dict) and isinstance(value.get(ARTIFACT_META_KEY), dict):
         return value[ARTIFACT_META_KEY]
     return {}
+
+
+def artifact_stale(value: Any) -> dict[str, bool]:
+    stale = artifact_meta(value).get("stale")
+    if not isinstance(stale, dict):
+        return {}
+    return {key: bool(stale.get(key)) for key in STALE_ARTIFACT_KEYS if stale.get(key)}
+
+
+def with_stale_flags(value: dict | None, **flags: bool) -> dict:
+    result = copy.deepcopy(value) if isinstance(value, dict) else {}
+    meta = result.get(ARTIFACT_META_KEY) if isinstance(result.get(ARTIFACT_META_KEY), dict) else {}
+    stale = dict(meta.get("stale") or {}) if isinstance(meta.get("stale"), dict) else {}
+    for key, enabled in flags.items():
+        if key not in STALE_ARTIFACT_KEYS:
+            continue
+        if enabled:
+            stale[key] = True
+        else:
+            stale.pop(key, None)
+    if stale:
+        meta["stale"] = {key: True for key in STALE_ARTIFACT_KEYS if stale.get(key)}
+    else:
+        meta.pop("stale", None)
+    result[ARTIFACT_META_KEY] = meta
+    return result
+
+
+def has_stale_flags(value: Any, *keys: str) -> bool:
+    stale = artifact_stale(value)
+    if not keys:
+        return bool(stale)
+    return any(bool(stale.get(key)) for key in keys)

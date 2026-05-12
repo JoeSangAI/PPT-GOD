@@ -28,6 +28,184 @@ class LogoBox:
         }
 
 
+def _logo_tone_stats(logo_path: str) -> dict:
+    try:
+        with Image.open(logo_path) as source:
+            rgba = source.convert("RGBA")
+            rgba.thumbnail((360, 180))
+            visible = [
+                (0.299 * r + 0.587 * g + 0.114 * b, max(r, g, b) - min(r, g, b))
+                for r, g, b, a in rgba.getdata()
+                if a >= 220
+            ]
+    except Exception:
+        return {}
+    if not visible:
+        return {}
+    total = len(visible)
+    dark_share = sum(1 for lum, _chroma in visible if lum < 118) / total
+    light_share = sum(1 for lum, chroma in visible if lum > 210 and chroma < 32) / total
+    chroma_share = sum(1 for _lum, chroma in visible if chroma >= 38) / total
+    mean_luminance = sum(lum for lum, _chroma in visible) / total
+    return {
+        "dark_share": dark_share,
+        "light_share": light_share,
+        "chroma_share": chroma_share,
+        "mean_luminance": mean_luminance,
+    }
+
+
+def _background_box_stats(slide_image_path: str | None, box: Mapping[str, Any] | None) -> dict:
+    if not slide_image_path or not box or not os.path.exists(slide_image_path):
+        return {}
+    try:
+        with Image.open(slide_image_path) as source:
+            bg = source.convert("RGB")
+            left = _clamp(float(box.get("left", 0)) * bg.width, 0, bg.width - 1)
+            top = _clamp(float(box.get("top", 0)) * bg.height, 0, bg.height - 1)
+            right = _clamp(float(box.get("left", 0)) * bg.width + float(box.get("width", 0)) * bg.width, left + 1, bg.width)
+            bottom = _clamp(float(box.get("top", 0)) * bg.height + float(box.get("height", 0)) * bg.height, top + 1, bg.height)
+            pad_x = max(4, int((right - left) * 0.22))
+            pad_y = max(4, int((bottom - top) * 0.30))
+            region = bg.crop((
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(bg.width, right + pad_x),
+                min(bg.height, bottom + pad_y),
+            )).convert("L")
+            pixels = list(region.getdata())
+    except Exception:
+        return {}
+    if not pixels:
+        return {}
+    ordered = sorted(pixels)
+    p10 = ordered[int(len(ordered) * 0.10)]
+    p50 = ordered[int(len(ordered) * 0.50)]
+    p90 = ordered[int(len(ordered) * 0.90)]
+    return {
+        "median": p50,
+        "spread": p90 - p10,
+        "activity": _region_activity(region.convert("RGB"), (0, 0, region.width, region.height)),
+    }
+
+
+def _full_logo_is_readable(logo_stats: Mapping[str, Any], bg_stats: Mapping[str, Any]) -> bool:
+    if not logo_stats or not bg_stats:
+        return True
+    bg_median = float(bg_stats.get("median") or 0)
+    activity = float(bg_stats.get("activity") or 0)
+    has_dark = float(logo_stats.get("dark_share") or 0) >= 0.07
+    has_light = float(logo_stats.get("light_share") or 0) >= 0.07
+    if has_dark and bg_median < 150:
+        return False
+    if has_light and bg_median > 186:
+        return False
+    if activity > 0.34 and (has_dark or has_light):
+        return False
+    return True
+
+
+def _is_dark_visual_page(slide_type: str, bg_stats: Mapping[str, Any]) -> bool:
+    if bg_stats:
+        median = float(bg_stats.get("median") or 255)
+        if median < 128:
+            return True
+        if median > 186:
+            return False
+    slide_type_key = str(slide_type or "").lower()
+    if slide_type_key in {"cover", "section", "ending", "hero", "quote"}:
+        return True
+    return False
+
+
+def _resolved_box_from_policy(policy: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    box = policy.get("resolved_overlay_box")
+    if not isinstance(box, Mapping):
+        return None
+    required = ("left", "top", "width", "height")
+    try:
+        return {key: float(box[key]) for key in required} | {
+            "strategy": str(box.get("strategy") or "policy:resolved")
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_logo_render_policy(
+    slide_image_path: str | None,
+    full_logo_path: str,
+    symbol_logo_path: str | None,
+    slide_type: str,
+    placement: str | None,
+    scale: str = "small",
+    policy: Mapping[str, Any] | None = None,
+) -> dict:
+    """Choose full logo, symbol-only mark, or omit after the slide image exists."""
+    if not full_logo_path or not os.path.exists(full_logo_path):
+        return {"show_logo": False, "render_variant": "omit"}
+    policy = policy if isinstance(policy, Mapping) else {}
+    explicit_variant = str(policy.get("render_variant") or "").strip().lower()
+    full_box = _resolved_box_from_policy(policy) or resolve_logo_overlay_box(slide_image_path, full_logo_path, slide_type, placement, scale)
+    logo_stats = _logo_tone_stats(full_logo_path)
+    bg_stats = _background_box_stats(slide_image_path, full_box)
+    full_readable = _full_logo_is_readable(logo_stats, bg_stats)
+    has_symbol = bool(symbol_logo_path and os.path.exists(symbol_logo_path))
+    dark_visual = _is_dark_visual_page(slide_type, bg_stats)
+
+    if explicit_variant == "omit":
+        return {"show_logo": False, "render_variant": "omit"}
+    if explicit_variant == "symbol" and has_symbol:
+        symbol_scale = "small"
+        symbol_box = resolve_logo_overlay_box(slide_image_path, str(symbol_logo_path), slide_type, placement, symbol_scale)
+        return {
+            "show_logo": True,
+            "render_variant": "symbol",
+            "scale": symbol_scale,
+            "resolved_overlay_box": symbol_box,
+            "logo_contrast": "symbol_on_visual_page",
+        }
+    if explicit_variant == "full":
+        return {
+            "show_logo": True,
+            "render_variant": "full",
+            "resolved_overlay_box": full_box,
+            "logo_contrast": "readable" if full_readable else "full_forced",
+        }
+
+    if full_readable and not (dark_visual and has_symbol and float(logo_stats.get("dark_share") or 0) >= 0.07):
+        return {
+            "show_logo": True,
+            "render_variant": "full",
+            "resolved_overlay_box": full_box,
+            "logo_contrast": "readable",
+        }
+
+    if has_symbol:
+        symbol_scale = "small"
+        symbol_box = resolve_logo_overlay_box(slide_image_path, str(symbol_logo_path), slide_type, placement, symbol_scale)
+        return {
+            "show_logo": True,
+            "render_variant": "symbol",
+            "scale": symbol_scale,
+            "resolved_overlay_box": symbol_box,
+            "logo_contrast": "symbol_fallback",
+        }
+
+    if dark_visual:
+        return {
+            "show_logo": False,
+            "render_variant": "omit",
+            "logo_contrast": "omitted_unreadable_full_logo",
+        }
+
+    return {
+        "show_logo": True,
+        "render_variant": "full",
+        "resolved_overlay_box": full_box,
+        "logo_contrast": "contour_fallback",
+    }
+
+
 def _clamp(value: float, low: float, high: float) -> int:
     if high < low:
         return int(low)

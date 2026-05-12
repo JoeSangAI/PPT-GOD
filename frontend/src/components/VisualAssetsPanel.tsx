@@ -5,6 +5,7 @@ export interface ReferenceImage {
   role: "logo" | "style_ref" | "template" | "visual_asset" | "content_ref" | "chart_ref";
   url: string;
   overlay_url?: string | null;
+  symbol_overlay_url?: string | null;
   page_num?: number | null;
   process_mode?: "blend" | "crop" | "original";
   asset_name?: string | null;

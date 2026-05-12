@@ -18,8 +18,9 @@ from app.services.generation_pipeline import (
     _load_reference_images,
 )
 from app.services.image_generation import _cache_key
-from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
-from app.services.logo_overlay_layout import resolve_logo_overlay_box
+from app.services.artifact_versions import artifact_stale
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
+from app.services.logo_overlay_layout import resolve_logo_overlay_box, resolve_logo_render_policy
 from app.services.logo_policy import logo_policy_for_page
 from app.services.pptx_assembler import assemble_pptx
 from app.services import prompt_engine
@@ -39,7 +40,6 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 from pptx import Presentation
-from pptx.dml.color import RGBColor
 from pptx.util import Inches
 
 
@@ -297,6 +297,57 @@ def test_logo_overlay_preprocess_trims_white_background(tmp_path):
     assert overlay.size[0] < 50
     assert overlay.size[1] < 60
     assert overlay.getchannel("A").getextrema()[0] == 0
+
+
+def test_logo_overlay_adds_contour_halo_without_rectangular_patch(tmp_path):
+    logo_path = tmp_path / "mixed-logo.png"
+    img = Image.new("RGB", (180, 72), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((12, 14, 52, 54), radius=8, fill=(255, 205, 0))
+    draw.rectangle((70, 24, 160, 39), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    overlay_path = prepare_logo_overlay_image(str(logo_path))
+    overlay = Image.open(overlay_path).convert("RGBA")
+    alpha = overlay.getchannel("A")
+    light_halo_pixels = 0
+    for r, g, b, a in overlay.getdata():
+        if 0 < a < 230 and (r + g + b) / 3 > 225:
+            light_halo_pixels += 1
+
+    assert light_halo_pixels > 0
+    assert alpha.getpixel((0, 0)) == 0
+    assert alpha.getpixel((overlay.width - 1, overlay.height - 1)) == 0
+
+
+def test_logo_symbol_preprocess_extracts_left_brand_mark(tmp_path):
+    logo_path = tmp_path / "mixed-logo.png"
+    img = Image.new("RGB", (260, 80), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((14, 16, 62, 64), radius=9, fill=(255, 205, 0))
+    draw.rectangle((88, 28, 232, 42), fill=(18, 18, 18))
+    draw.rectangle((88, 48, 198, 57), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    full_path = prepare_logo_overlay_image(str(logo_path))
+    symbol_path = prepare_logo_symbol_image(str(logo_path))
+
+    assert symbol_path
+    full = Image.open(full_path)
+    symbol = Image.open(symbol_path)
+    assert symbol.width < full.width * 0.55
+    assert symbol.height >= full.height * 0.55
+
+
+def test_logo_symbol_preprocess_returns_none_for_wordmark_only(tmp_path):
+    logo_path = tmp_path / "wordmark.png"
+    img = Image.new("RGB", (260, 80), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((20, 26, 238, 42), fill=(18, 18, 18))
+    draw.rectangle((20, 49, 190, 58), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    assert prepare_logo_symbol_image(str(logo_path)) is None
 
 
 def test_logo_lockup_combines_multiple_marks(tmp_path):
@@ -723,14 +774,14 @@ def test_pptx_assembler_uses_resolved_logo_overlay_box(tmp_path):
     assert logo_shape.width == int(prs.slide_width * 0.18)
 
 
-def test_pptx_assembler_adds_dark_backplate_for_light_logo_on_light_slide(tmp_path):
+def test_pptx_assembler_uses_contour_safe_logo_without_rectangular_backplate(tmp_path):
     bg_path = tmp_path / "slide.png"
     logo_path = tmp_path / "logo.png"
     output_path = tmp_path / "out.pptx"
     Image.new("RGB", (1792, 1024), "white").save(bg_path)
     logo = Image.new("RGBA", (300, 120), (255, 255, 255, 0))
     draw = ImageDraw.Draw(logo)
-    draw.rectangle((20, 35, 280, 85), fill=(248, 248, 248, 255))
+    draw.rectangle((20, 35, 280, 85), fill=(18, 18, 18, 255))
     logo.save(logo_path)
 
     assemble_pptx(
@@ -746,10 +797,91 @@ def test_pptx_assembler_adds_dark_backplate_for_light_logo_on_light_slide(tmp_pa
 
     prs = Presentation(str(output_path))
     shapes = prs.slides[0].shapes
-    assert len(shapes) == 3
-    assert shapes[1].fill.fore_color.rgb == RGBColor(17, 24, 39)
-    logo_shape = shapes[2]
+    assert len(shapes) == 2
+    logo_shape = shapes[1]
     assert abs((logo_shape.left + logo_shape.width / 2) - prs.slide_width / 2) < Inches(0.05)
+
+
+def test_logo_render_policy_prefers_symbol_on_dark_cover(tmp_path):
+    bg_path = tmp_path / "dark-slide.png"
+    logo_path = tmp_path / "mixed-logo.png"
+    Image.new("RGB", (1792, 1024), (12, 12, 12)).save(bg_path)
+    img = Image.new("RGB", (260, 80), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((14, 16, 62, 64), radius=9, fill=(255, 205, 0))
+    draw.rectangle((88, 28, 232, 42), fill=(18, 18, 18))
+    draw.rectangle((88, 48, 198, 57), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    full_path = prepare_logo_overlay_image(str(logo_path))
+    symbol_path = prepare_logo_symbol_image(str(logo_path))
+    policy = resolve_logo_render_policy(
+        str(bg_path),
+        full_path,
+        symbol_path,
+        "cover",
+        "lower-center",
+        "large",
+        {"show_logo": True, "placement": "lower-center", "scale": "large"},
+    )
+
+    assert policy["show_logo"] is True
+    assert policy["render_variant"] == "symbol"
+    assert policy["scale"] == "small"
+    assert isinstance(policy["resolved_overlay_box"], dict)
+
+
+def test_logo_render_policy_uses_full_logo_on_light_quiet_page(tmp_path):
+    bg_path = tmp_path / "light-slide.png"
+    logo_path = tmp_path / "mixed-logo.png"
+    Image.new("RGB", (1792, 1024), (246, 244, 238)).save(bg_path)
+    img = Image.new("RGB", (260, 80), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((14, 16, 62, 64), radius=9, fill=(255, 205, 0))
+    draw.rectangle((88, 28, 232, 42), fill=(18, 18, 18))
+    draw.rectangle((88, 48, 198, 57), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    full_path = prepare_logo_overlay_image(str(logo_path))
+    symbol_path = prepare_logo_symbol_image(str(logo_path))
+    policy = resolve_logo_render_policy(
+        str(bg_path),
+        full_path,
+        symbol_path,
+        "content",
+        "top-right",
+        "small",
+        {"show_logo": True, "placement": "top-right", "scale": "small"},
+    )
+
+    assert policy["show_logo"] is True
+    assert policy["render_variant"] == "full"
+    assert policy["logo_contrast"] == "readable"
+
+
+def test_logo_render_policy_omits_unreadable_wordmark_on_dark_cover(tmp_path):
+    bg_path = tmp_path / "dark-slide.png"
+    logo_path = tmp_path / "wordmark.png"
+    Image.new("RGB", (1792, 1024), (12, 12, 12)).save(bg_path)
+    img = Image.new("RGB", (260, 80), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((20, 26, 238, 42), fill=(18, 18, 18))
+    draw.rectangle((20, 49, 190, 58), fill=(18, 18, 18))
+    img.save(logo_path)
+
+    full_path = prepare_logo_overlay_image(str(logo_path))
+    policy = resolve_logo_render_policy(
+        str(bg_path),
+        full_path,
+        prepare_logo_symbol_image(str(logo_path)),
+        "cover",
+        "lower-center",
+        "large",
+        {"show_logo": True, "placement": "lower-center", "scale": "large"},
+    )
+
+    assert policy["show_logo"] is False
+    assert policy["render_variant"] == "omit"
 
 
 def test_ending_logo_policy_defaults_to_small_corner_signature():
@@ -1897,7 +2029,8 @@ def test_content_edit_preserves_confirmed_workflow_and_existing_outputs():
     assert refreshed_project.selected_style == {"name": "Old"}
     assert refreshed_project.style_proposal == {"proposals": [{"name": "Old"}]}
     assert refreshed_slide.content_json["text_content"]["headline"] == "新标题"
-    assert refreshed_slide.visual_json == {"visual_description": "old visual"}
+    assert refreshed_slide.visual_json["visual_description"] == "old visual"
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
     assert refreshed_slide.prompt_text == "old prompt"
     assert refreshed_slide.image_path == "/tmp/old.png"
     assert refreshed_slide.status == "completed"
@@ -1941,14 +2074,15 @@ def test_style_reference_upload_after_confirmation_stays_in_visual_stage(tmp_pat
     refreshed_project = db.query(Project).filter(Project.id == project.id).first()
     refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
 
-    assert refreshed_project.status == "visual_ready"
+    assert refreshed_project.status == "prompt_ready"
     assert refreshed_project.content_plan_confirmed is True
-    assert refreshed_project.selected_style is None
-    assert refreshed_project.style_proposal is None
-    assert refreshed_slide.visual_json == {}
-    assert refreshed_slide.prompt_text is None
-    assert refreshed_slide.image_path is None
-    assert refreshed_slide.status == "pending"
+    assert refreshed_project.selected_style == {"name": "Old"}
+    assert refreshed_project.style_proposal == {"proposals": [{"name": "Old"}]}
+    assert refreshed_slide.visual_json["visual_description"] == "old visual"
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.image_path == "/tmp/old.png"
+    assert refreshed_slide.status == "completed"
 
 
 def test_visual_edit_invalidates_prompt_and_image_only():
@@ -1979,13 +2113,14 @@ def test_visual_edit_invalidates_prompt_and_image_only():
     refreshed_project = db.query(Project).filter(Project.id == project.id).first()
     refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
 
-    assert refreshed_project.status == "visual_ready"
+    assert refreshed_project.status == "completed"
     assert refreshed_project.content_plan_confirmed is True
     assert refreshed_project.selected_style == {"name": "Brand"}
     assert refreshed_slide.visual_json["visual_description"] == "new visual"
-    assert refreshed_slide.prompt_text is None
-    assert refreshed_slide.image_path is None
-    assert refreshed_slide.status == "visual_ready"
+    assert artifact_stale(refreshed_slide.visual_json) == {"visual": True}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.image_path == "/tmp/old.png"
+    assert refreshed_slide.status == "completed"
 
 
 def test_visual_asset_upload_defaults_crop_but_honors_explicit_blend(tmp_path, monkeypatch):
@@ -2045,8 +2180,9 @@ def test_visual_asset_upload_defaults_crop_but_honors_explicit_blend(tmp_path, m
     assert default_result["process_mode"] == "crop"
     assert explicit_result["process_mode"] == "blend"
     assert refreshed_project.selected_style == {"name": "Brand"}
-    assert refreshed_project.status == "visual_ready"
-    assert refreshed_slide.prompt_text is None
+    assert refreshed_project.status == "completed"
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
 
 
 def test_visual_asset_upload_returns_before_vlm_analysis_when_background_available(tmp_path, monkeypatch):
@@ -2859,9 +2995,10 @@ def test_delete_visual_asset_cleans_slide_selection_and_invalidates_outputs(tmp_
     assert refreshed_slide.visual_json["manual_visual_asset_ids"] == []
     assert refreshed_slide.visual_json["manual_visual_asset_usage"] == {}
     assert refreshed_slide.visual_json["overlay_layers"] == []
-    assert refreshed_slide.prompt_text is None
-    assert refreshed_slide.status == "visual_ready"
-    assert refreshed_project.status == "visual_ready"
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.status == "completed"
+    assert refreshed_project.status == "completed"
 
 
 def test_asset_pins_replace_reorder_and_survive_visual_merge(tmp_path):
@@ -2907,8 +3044,9 @@ def test_asset_pins_replace_reorder_and_survive_visual_merge(tmp_path):
     assert result["manual_visual_asset_ids"] == [assets[1].id, assets[0].id]
     assert slide.visual_json["visual_asset_ids"][:2] == [assets[1].id, assets[0].id]
     assert slide.visual_json["manual_visual_asset_usage"][assets[1].id] == "放在左侧"
-    assert slide.prompt_text is None
-    assert slide.status == "visual_ready"
+    assert artifact_stale(slide.visual_json) == {"visual": True}
+    assert slide.prompt_text == "old"
+    assert slide.status == "completed"
 
     merged = slides_api._merge_manual_pins_into_visual_json(
         {"visual_asset_ids": ["auto-1"], "visual_asset_usage": {"auto-1": "自动"}},
@@ -2956,8 +3094,9 @@ def test_overlay_layers_endpoint_and_visual_merge(tmp_path):
     assert result["overlay_layers"][0]["asset_id"] == asset.id
     assert result["overlay_layers"][0]["fit"] == "contain"
     assert slide.visual_json["overlay_layers"][0]["preset"] == "right-card"
-    assert slide.prompt_text is None
-    assert slide.status == "visual_ready"
+    assert artifact_stale(slide.visual_json) == {"visual": True}
+    assert slide.prompt_text == "old"
+    assert slide.status == "completed"
     db.refresh(asset)
     assert asset.process_mode == "original"
     assert asset.asset_analysis["exact_overlay"] is True

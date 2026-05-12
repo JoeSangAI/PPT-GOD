@@ -6,6 +6,7 @@ LOGO_WIDTH_RATIOS = {"small": 0.085, "large": 0.18}
 LOGO_HEIGHT_RATIOS = {"small": 0.085, "large": 0.18}
 LOGO_ANCHORS = {"top-left", "top-right", "bottom-left", "bottom-right"}
 LOGO_PLACEMENTS = LOGO_ANCHORS | {"center", "lower-center", "title-block-center"}
+LOGO_RENDER_VARIANTS = {"full", "symbol", "omit"}
 LOGO_REVIEW_CONFIRMED_STATUSES = {"auto_confirmed", "user_confirmed"}
 LOGO_REVIEW_NON_CONFIRMED_STATUSES = {"needs_review", "dismissed", "not_logo"}
 ANCHOR_LABELS = {
@@ -42,6 +43,8 @@ def should_show_logo(page: Any) -> bool:
     """Decide whether the uploaded logo should be attached/rendered on a page."""
     data = _as_dict(page)
     explicit = data.get("logo_policy")
+    if isinstance(explicit, Mapping) and str(explicit.get("render_variant") or "").strip().lower() == "omit":
+        return False
     if isinstance(explicit, Mapping) and "show_logo" in explicit:
         return bool(explicit.get("show_logo"))
 
@@ -121,11 +124,13 @@ def logo_policy_for_page(page: Any) -> dict:
     scale = str(explicit.get("scale")) if isinstance(explicit, Mapping) and explicit.get("scale") else (
         "large" if page_type == "cover" else "small"
     )
+    render_variant = str(explicit.get("render_variant") or "").strip().lower() if isinstance(explicit, Mapping) else ""
     return {
         "show_logo": show_logo,
         "placement": anchor,
         "scale": scale,
         "visibility": "unobtrusive" if show_logo else "omit",
+        **({"render_variant": render_variant} if render_variant in LOGO_RENDER_VARIANTS else {}),
     }
 
 

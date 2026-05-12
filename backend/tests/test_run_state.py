@@ -1,11 +1,12 @@
 from datetime import timedelta
 
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.models.base import Base
 from app.models.models import Project, Slide
-from app.services.artifact_versions import dependency_signature, with_artifact_meta
+from app.services.artifact_versions import artifact_stale, dependency_signature, with_artifact_meta
 from app.services.run_state import (
     apply_project_rollback,
     create_project_run,
@@ -279,3 +280,138 @@ def test_workflow_status_exposes_unified_progress_view_model():
     assert payload["progress"]["active_page_nums"] == [2, 3]
     assert payload["progress"]["running_count"] == 2
     assert payload["progress"]["can_cancel"] is True
+
+
+def test_content_dependent_invalidation_preserves_generated_outputs():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Preserve generated deck",
+        status="completed",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        content_json={"page_num": 1},
+        visual_json={"layout": "old"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.flush()
+
+    slides_api._invalidate_content_dependent_outputs(project)
+
+    assert project.status == "completed"
+    assert project.content_plan_confirmed is True
+    assert slide.prompt_text == "old prompt"
+    assert slide.image_path == "/tmp/old.png"
+    assert slide.visual_json["layout"] == "old"
+    assert artifact_stale(slide.visual_json) == {"content": True}
+
+
+def test_visual_invalidation_preserves_image_and_marks_prompt_stale():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Preserve image",
+        status="prototype_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        content_json={"page_num": 1},
+        visual_json={"layout": "old"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.flush()
+
+    slides_api._invalidate_visual_plan_dependent_outputs(project, [slide])
+
+    assert project.status == "prototype_ready"
+    assert slide.prompt_text == "old prompt"
+    assert slide.image_path == "/tmp/old.png"
+    assert slide.status == "completed"
+    assert artifact_stale(slide.visual_json) == {"visual": True}
+
+
+def test_start_generation_blocks_pages_with_unapplied_plan_changes():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Block stale generation",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(
+            project_id=project.id,
+            page_num=1,
+            status="completed",
+            content_json={"page_num": 1},
+            visual_json={"visual_description": "old view", "_artifact": {"stale": {"content": True}}},
+            prompt_text="old prompt",
+            image_path="/tmp/old.png",
+        )
+    )
+    db.commit()
+
+    try:
+        slides_api.start_generation(project.id, slides_api.PageNumsRequest(page_nums=[1]), db)
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert "未应用的内容或画面修改" in exc.detail
+    else:
+        raise AssertionError("expected stale page to block direct generation")
+
+
+def test_download_blocks_when_project_has_stale_artifacts():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Block stale download",
+        status="completed",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(
+            project_id=project.id,
+            page_num=1,
+            status="completed",
+            content_json={"page_num": 1},
+            visual_json={"visual_description": "old view", "_artifact": {"stale": {"image": True}}},
+            prompt_text="new prompt",
+            image_path="/tmp/old.png",
+        )
+    )
+    db.commit()
+
+    try:
+        slides_api.download_pptx(project.id, db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert "未应用的修改" in exc.detail
+    else:
+        raise AssertionError("expected stale artifacts to block deck download")

@@ -27,6 +27,14 @@ Recorded 2026-05-12 from user direction.
 - Do not add extra orchestration, queues, or recovery layers when a single source of truth or a synchronous state write solves the problem.
 - Use Occam's razor in workflow/state bugs: first remove duplicated state paths and hidden async handoffs before adding new fallback behavior.
 
+## Non-Blocking Workflow Principle
+
+Recorded 2026-05-12 from user direction.
+
+- Complex or uncertain processing should run in parallel or be cached ahead of the user-facing step whenever possible.
+- Do not block the normal frontend experience on optional analysis, visual polish, or best-effort asset inference.
+- If a refinement is not ready, use a stable local fallback and let the user continue instead of holding the workflow.
+
 ## Image Generation Architecture Constraint
 
 Recorded 2026-05-10 from user direction.

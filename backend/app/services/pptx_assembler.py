@@ -2,111 +2,18 @@ import logging
 import os
 from typing import Dict, List
 
-from PIL import Image, ImageStat
+from PIL import Image
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.dml.color import RGBColor
 from pptx.util import Inches
 
-from app.services.logo_assets import prepare_logo_lockup_image
-from app.services.logo_overlay_layout import logo_geometry_from_resolved_box, resolve_logo_overlay_box
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_symbol_image
+from app.services.logo_overlay_layout import logo_geometry_from_resolved_box, resolve_logo_overlay_box, resolve_logo_render_policy
 from app.services.logo_policy import LOGO_HEIGHT_RATIOS, LOGO_WIDTH_RATIOS, logo_policy_for_page, normalize_logo_placement, should_show_logo
 from app.services.overlay_layers import contained_picture_box, enabled_overlay_layers, overlay_box
 
 logger = logging.getLogger(__name__)
-
-
-def _visible_brightness(image_path: str) -> float | None:
-    try:
-        with Image.open(image_path) as source:
-            rgba = source.convert("RGBA")
-            rgba.thumbnail((360, 180))
-            samples = [
-                (r + g + b) / 3
-                for r, g, b, a in rgba.getdata()
-                if a >= 32
-            ]
-    except Exception:
-        return None
-    if not samples:
-        return None
-    return sum(samples) / len(samples)
-
-
-def _background_region_brightness(
-    prs: Presentation,
-    slide_image_path: str | None,
-    left: int,
-    top: int,
-    width: int,
-    height: int,
-) -> float | None:
-    if not slide_image_path or not os.path.exists(slide_image_path):
-        return None
-    try:
-        with Image.open(slide_image_path) as source:
-            bg = source.convert("RGB")
-            x0 = int(left / max(prs.slide_width, 1) * bg.width)
-            y0 = int(top / max(prs.slide_height, 1) * bg.height)
-            x1 = int((left + width) / max(prs.slide_width, 1) * bg.width)
-            y1 = int((top + height) / max(prs.slide_height, 1) * bg.height)
-            x0 = max(0, min(bg.width - 1, x0))
-            y0 = max(0, min(bg.height - 1, y0))
-            x1 = max(x0 + 1, min(bg.width, x1))
-            y1 = max(y0 + 1, min(bg.height, y1))
-            mean = ImageStat.Stat(bg.crop((x0, y0, x1, y1))).mean
-    except Exception:
-        return None
-    return sum(mean[:3]) / 3
-
-
-def _logo_backplate_color(
-    prs: Presentation,
-    slide_image_path: str | None,
-    logo_path: str,
-    left: int,
-    top: int,
-    width: int,
-    height: int,
-) -> RGBColor | None:
-    logo_brightness = _visible_brightness(logo_path)
-    background_brightness = _background_region_brightness(prs, slide_image_path, left, top, width, height)
-    if logo_brightness is None or background_brightness is None:
-        return None
-    if abs(logo_brightness - background_brightness) >= 58:
-        return None
-    if logo_brightness >= 155 and background_brightness >= 155:
-        return RGBColor(17, 24, 39)
-    if logo_brightness <= 105 and background_brightness <= 105:
-        return RGBColor(255, 255, 255)
-    if logo_brightness >= background_brightness:
-        return RGBColor(17, 24, 39)
-    return RGBColor(255, 255, 255)
-
-
-def _add_logo_contrast_backplate(
-    slide,
-    prs: Presentation,
-    slide_image_path: str | None,
-    logo_path: str,
-    left: int,
-    top: int,
-    width: int,
-    height: int,
-) -> None:
-    color = _logo_backplate_color(prs, slide_image_path, logo_path, left, top, width, height)
-    if color is None:
-        return
-    pad_x = max(Inches(0.08), int(width * 0.12))
-    pad_y = max(Inches(0.05), int(height * 0.28))
-    plate_left = max(0, left - pad_x)
-    plate_top = max(0, top - pad_y)
-    plate_width = min(prs.slide_width - plate_left, width + pad_x * 2)
-    plate_height = min(prs.slide_height - plate_top, height + pad_y * 2)
-    plate = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, plate_left, plate_top, plate_width, plate_height)
-    plate.fill.solid()
-    plate.fill.fore_color.rgb = color
-    plate.line.color.rgb = color
 
 
 def _logo_geometry(
@@ -188,6 +95,7 @@ def assemble_pptx(
         elif logo_config.get("file_path"):
             logo_paths.append(str(logo_config["file_path"]))
     logo_path_for_overlay = prepare_logo_lockup_image(logo_paths) if logo_paths else None
+    logo_symbol_path_for_overlay = prepare_logo_symbol_image(logo_paths[0]) if len(logo_paths) == 1 else None
 
     for slide_data in sorted_slides:
         slide = prs.slides.add_slide(blank_layout)
@@ -255,27 +163,32 @@ def assemble_pptx(
         ):
             raw_policy = (slide_data.get("visual_json") or {}).get("logo_policy") or {}
             policy = logo_policy_for_page(slide_data)
-            left, top, width, height = _logo_geometry(
-                prs,
+            render_policy = resolve_logo_render_policy(
+                img_path,
                 logo_path_for_overlay,
+                logo_symbol_path_for_overlay,
                 str(slide_data.get("type") or "content").lower(),
                 policy.get("placement") or logo_config.get("anchor") or "top-right",
                 policy.get("scale") or "small",
-                slide_image_path=img_path,
-                resolved_box=raw_policy.get("resolved_overlay_box"),
+                raw_policy,
             )
-            _add_logo_contrast_backplate(
-                slide,
+            if render_policy.get("show_logo") is False:
+                continue
+            if render_policy.get("render_variant") == "symbol" and logo_symbol_path_for_overlay:
+                logo_path_to_render = logo_symbol_path_for_overlay
+            else:
+                logo_path_to_render = logo_path_for_overlay
+            left, top, width, height = _logo_geometry(
                 prs,
-                img_path,
-                logo_path_for_overlay,
-                left,
-                top,
-                width,
-                height,
+                logo_path_to_render,
+                str(slide_data.get("type") or "content").lower(),
+                render_policy.get("placement") or policy.get("placement") or logo_config.get("anchor") or "top-right",
+                render_policy.get("scale") or policy.get("scale") or "small",
+                slide_image_path=img_path,
+                resolved_box=render_policy.get("resolved_overlay_box") or raw_policy.get("resolved_overlay_box"),
             )
             slide.shapes.add_picture(
-                logo_path_for_overlay,
+                logo_path_to_render,
                 left=left,
                 top=top,
                 width=width,

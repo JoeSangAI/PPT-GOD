@@ -63,8 +63,8 @@ from app.services.logo_policy import (
     should_show_logo,
     should_use_logo_as_scene_asset,
 )
-from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image
-from app.services.logo_overlay_layout import resolve_logo_overlay_box
+from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
+from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.overlay_layers import (
     exact_overlay_asset_ids,
     merge_overlay_layers_into_visual_json,
@@ -76,7 +76,7 @@ from app.services.prompt_engine import generate_prompt_for_page, generate_prompt
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 from app.services.visual_strategy import detect_logo_tone_from_image
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
-from app.services.artifact_versions import dependency_signature, with_artifact_meta
+from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
 from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import (
@@ -654,6 +654,7 @@ def _serialize_reference_image(
         "file_exists": os.path.exists(img.file_path),
         "url": _reference_upload_url(project_id, img.file_path),
         "overlay_url": _logo_overlay_url(img, project_id) if img.role == "logo" and is_logo_confirmed(img) else None,
+        "symbol_overlay_url": _logo_symbol_overlay_url(img, project_id) if img.role == "logo" and is_logo_confirmed(img) else None,
     }
 
 
@@ -717,6 +718,15 @@ def _logo_overlay_url(ref: ReferenceImage, project_id: str) -> str | None:
     if not overlay_path or not os.path.exists(overlay_path):
         return None
     return _reference_upload_url(project_id, overlay_path)
+
+
+def _logo_symbol_overlay_url(ref: ReferenceImage, project_id: str) -> str | None:
+    if ref.role != "logo" or not ref.file_path or not os.path.exists(ref.file_path):
+        return None
+    symbol_path = prepare_logo_symbol_image(ref.file_path)
+    if not symbol_path or not os.path.exists(symbol_path):
+        return None
+    return _reference_upload_url(project_id, symbol_path)
 
 
 def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dict | None:
@@ -799,7 +809,7 @@ def _with_resolved_logo_overlay_box(page_intent: dict | None, slide: Slide, proj
     if not isinstance(intent, dict) or not slide.image_path or not should_show_logo(intent):
         return intent
     policy = intent.get("logo_policy") if isinstance(intent.get("logo_policy"), dict) else {}
-    if isinstance(policy.get("resolved_overlay_box"), dict):
+    if isinstance(policy.get("resolved_overlay_box"), dict) and policy.get("render_variant"):
         return intent
     logo_refs = _project_logo_refs(project)
     if not logo_refs:
@@ -807,18 +817,19 @@ def _with_resolved_logo_overlay_box(page_intent: dict | None, slide: Slide, proj
     logo_path = prepare_logo_lockup_image([ref.file_path for ref in logo_refs])
     if not logo_path:
         return intent
-    resolved_box = resolve_logo_overlay_box(
+    symbol_path = prepare_logo_symbol_image(logo_refs[0].file_path) if len(logo_refs) == 1 else None
+    render_policy = resolve_logo_render_policy(
         _existing_output_path(slide.image_path),
         logo_path,
+        symbol_path,
         str(intent.get("type") or slide.type or "content").lower(),
         policy.get("placement") or logo_anchor_from_ref(logo_refs[0]),
         policy.get("scale") or "small",
+        policy,
     )
-    if not resolved_box:
-        return intent
     next_intent = copy.deepcopy(intent)
     next_policy = dict(policy)
-    next_policy["resolved_overlay_box"] = resolved_box
+    next_policy.update({k: v for k, v in render_policy.items() if v is not None})
     next_intent["logo_policy"] = next_policy
     return next_intent
 
@@ -1017,14 +1028,14 @@ def _invalidate_visual_asset_dependent_outputs(project: Project):
     """
     if project.selected_style:
         project.content_plan_confirmed = True
-    if project.status in {"prompt_ready", "prototype_ready", "completed", "failed"}:
-        project.status = "visual_ready"
     for slide in project.slides or []:
-        _clear_slide_generation_outputs(slide, clear_visual=False)
-        if slide.status in {"prompt_ready", "completed", "failed"}:
-            slide.status = "visual_ready"
+        _mark_slide_artifacts_stale(slide, content=True)
+        slide.error_msg = None
     if project.slides:
-        project.status = "visual_ready" if project.content_plan_confirmed else "planning"
+        if project.content_plan_confirmed and project.status in {"draft", "planning"}:
+            project.status = "visual_ready"
+        elif not project.content_plan_confirmed:
+            project.status = "planning"
 
 
 def _clear_slide_generation_outputs(slide: Slide, *, clear_visual: bool):
@@ -1035,26 +1046,51 @@ def _clear_slide_generation_outputs(slide: Slide, *, clear_visual: bool):
     slide.error_msg = None
 
 
+def _mark_slide_artifacts_stale(slide: Slide, **flags: bool):
+    slide.visual_json = with_stale_flags(slide.visual_json if isinstance(slide.visual_json, dict) else {}, **flags)
+
+
+def _project_has_stale_artifacts(slides: list[Slide]) -> bool:
+    return any(has_stale_flags(slide.visual_json) for slide in slides)
+
+
 def _invalidate_content_dependent_outputs(project: Project):
-    """Content edits require a fresh confirmation before visual work continues."""
-    apply_project_rollback(project, list(project.slides or []), "planning")
+    """Content changes make downstream page artifacts stale without deleting them."""
+    slides = list(project.slides or [])
+    if not slides:
+        project.status = "draft"
+        project.content_plan_confirmed = False
+        project.style_proposal = None
+        project.selected_style = None
+        return
+    for slide in slides:
+        _mark_slide_artifacts_stale(slide, content=True)
+        slide.error_msg = None
+    if project.content_plan_confirmed or project.selected_style:
+        project.content_plan_confirmed = True
+        if project.status in {"draft", "planning"}:
+            project.status = "visual_ready"
+    else:
+        project.status = "planning"
 
 
 def _invalidate_style_dependent_outputs(project: Project):
-    """Style-source changes keep confirmed content, but invalidate visual outputs."""
-    apply_project_rollback(project, list(project.slides or []), "visual_ready")
+    """Style-source changes keep confirmed content and current images as stale references."""
+    slides = list(project.slides or [])
+    if slides:
+        project.content_plan_confirmed = True
+    for slide in slides:
+        _mark_slide_artifacts_stale(slide, content=True)
+        slide.error_msg = None
+    if project.status in {"draft", "planning"} and slides:
+        project.status = "visual_ready"
 
 
 def _invalidate_visual_plan_dependent_outputs(project: Project, slides: list[Slide]):
     """Visual edits/page refs invalidate prompts and images, not confirmed content."""
-    if project.status in {"prompt_ready", "prototype_ready", "completed", "failed"}:
-        project.status = "visual_ready"
     for slide in slides:
-        slide.prompt_text = None
-        slide.image_path = None
+        _mark_slide_artifacts_stale(slide, visual=True)
         slide.error_msg = None
-        if slide.status in {"prompt_ready", "completed", "failed"}:
-            slide.status = "visual_ready"
 
 
 def _resolve_generation_page_nums(slides: list[Slide], requested_page_nums: list[int] | None, prototype: bool) -> list[int] | None:
@@ -2117,6 +2153,7 @@ def list_slides(project_id: str, db: Session = Depends(get_db)):
                     "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
                     "url": _reference_upload_url(project_id, ref.file_path),
                     "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" and is_logo_confirmed(ref) else None,
+                    "symbol_overlay_url": _logo_symbol_overlay_url(ref, project_id) if ref.role == "logo" and is_logo_confirmed(ref) else None,
                 }
                 for ref in sorted(refs_by_slide.get(s.id, []), key=_reference_image_sort_key)
             ],
@@ -2227,14 +2264,18 @@ def create_visual_plan(
         target_slides = [s for s in slides if s.page_num in body.page_nums]
 
     for slide in target_slides:
-        slide.visual_json = _merge_manual_pins_into_visual_json(
+        existing_visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+        next_visual = _merge_manual_pins_into_visual_json(
             with_artifact_meta(
                 visual_by_page.get(slide.page_num, {}),
                 kind="visual_plan",
                 dependencies=artifact_deps,
             ),
-            slide.visual_json,
+            existing_visual,
         )
+        if slide.prompt_text or slide.image_path or has_stale_flags(existing_visual, "content", "visual"):
+            next_visual = with_stale_flags(next_visual, content=False, visual=True)
+        slide.visual_json = next_visual
         if slide.status in ("pending", "planning"):
             slide.status = "visual_ready"
 
@@ -2344,6 +2385,7 @@ def create_prompts(
                 dependencies=artifact_deps,
                 prompt_dependencies=artifact_deps,
             )
+            slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
             slide.status = "prompt_ready"
 
     # 如果全部都有 prompt，项目状态推进
@@ -2537,14 +2579,18 @@ async def _do_generate_visual_and_prompts(
         visual_by_page = {v["page_num"]: v for v in visual_plan}
         artifact_deps = dependency_signature(project, slides)
         for slide in target_slides:
-            slide.visual_json = _merge_manual_pins_into_visual_json(
+            existing_visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+            next_visual = _merge_manual_pins_into_visual_json(
                 with_artifact_meta(
                     visual_by_page.get(slide.page_num, {}),
                     kind="visual_plan",
                     dependencies=artifact_deps,
                 ),
-                slide.visual_json,
+                existing_visual,
             )
+            if slide.prompt_text or slide.image_path or has_stale_flags(existing_visual, "content", "visual"):
+                next_visual = with_stale_flags(next_visual, content=False, visual=True)
+            slide.visual_json = next_visual
             if slide.status in ("pending", "planning"):
                 slide.status = "visual_ready"
         db.commit()
@@ -2630,6 +2676,7 @@ async def _do_generate_visual_and_prompts(
                     dependencies=artifact_deps,
                     prompt_dependencies=artifact_deps,
                 )
+                slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
                 slide.status = "prompt_ready"
 
         # 状态更新：优先按目标页判断（支持部分生成），再回退到全局判断
@@ -2769,6 +2816,16 @@ def start_generation(
 
     # 记录本次生成的目标页码，供前端进度显示用
     target_slides = [s for s in slides if s.page_num in page_nums] if page_nums else slides
+    stale_plan_pages = [
+        s.page_num
+        for s in target_slides
+        if has_stale_flags(s.visual_json, "content", "visual")
+    ]
+    if stale_plan_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
+        )
     missing_prompt_pages = [
         s.page_num
         for s in target_slides
@@ -2837,7 +2894,10 @@ def confirm_prototype(
         .all()
     )
 
-    pending_slides = [s for s in slides if s.status not in ("completed", "failed")]
+    pending_slides = [
+        s for s in slides
+        if s.status != "failed" and (s.status != "completed" or has_stale_flags(s.visual_json))
+    ]
     failed_slides = [s for s in slides if s.status == "failed"]
 
     # 如果有失败的，先重试；如果有未生成的，一起生成
@@ -2850,6 +2910,16 @@ def confirm_prototype(
         return {"message": "All slides already completed", "status": "completed"}
 
     target_slides = pending_slides + failed_slides
+    stale_plan_pages = [
+        s.page_num
+        for s in target_slides
+        if has_stale_flags(s.visual_json, "content", "visual")
+    ]
+    if stale_plan_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
+        )
     missing_prompt_slides = [
         s
         for s in target_slides
@@ -2997,7 +3067,7 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         project_id,
         pptx_filename,
     )
-    has_pptx = os.path.exists(pptx_path)
+    has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
 
     target_count, target_completed, target_failed = target_counts(active_run, slides)
     progress = generation_progress.get(project_id, {})
@@ -3050,7 +3120,7 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         project_id,
         pptx_filename,
     )
-    has_pptx = os.path.exists(pptx_path)
+    has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
 
     return serialize_workflow_status(
         project,
@@ -3116,6 +3186,9 @@ def download_pptx(project_id: str, prototype: bool = False, db: Session = Depend
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
+    if _project_has_stale_artifacts(slides):
+        raise HTTPException(status_code=409, detail="部分页面有未应用的修改，请先更新并重新生成相关页面后再下载。")
 
     filename = "prototype.pptx" if prototype else "presentation.pptx"
     pptx_path = os.path.join(
@@ -3341,6 +3414,7 @@ def upload_file(
         "logo_anchor": ref_image.logo_anchor,
         "url": _reference_upload_url(project_id, file_path),
         "overlay_url": _logo_overlay_url(ref_image, project_id) if role == "logo" and is_logo_confirmed(ref_image) else None,
+        "symbol_overlay_url": _logo_symbol_overlay_url(ref_image, project_id) if role == "logo" and is_logo_confirmed(ref_image) else None,
     }
 
 
@@ -3755,6 +3829,7 @@ def update_reference_image(
         "logo_anchor": ref.logo_anchor or (DEFAULT_LOGO_ANCHOR if ref.role == "logo" else None),
         "url": _reference_upload_url(project_id, ref.file_path),
         "overlay_url": _logo_overlay_url(ref, project_id) if ref.role == "logo" and is_logo_confirmed(ref) else None,
+        "symbol_overlay_url": _logo_symbol_overlay_url(ref, project_id) if ref.role == "logo" and is_logo_confirmed(ref) else None,
     }
 
 
@@ -3927,6 +4002,17 @@ def retry_failed_slides(
     if not failed_slides:
         raise HTTPException(status_code=400, detail="没有失败的页面需要重试")
 
+    stale_plan_pages = [
+        slide.page_num
+        for slide in failed_slides
+        if has_stale_flags(slide.visual_json, "content", "visual")
+    ]
+    if stale_plan_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
+        )
+
     # 过滤掉正在生成中的 slide，避免重复触发
     page_nums = []
     for slide in failed_slides:
@@ -4038,6 +4124,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
         dependencies=artifact_deps,
         prompt_dependencies=artifact_deps,
     )
+    slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
     db.commit()
     logger.info(f"RetrySlide: 已重新生成第 {slide.page_num} 页 prompt")
     return prompt
@@ -4268,6 +4355,9 @@ def retry_slide(
     if body.regenerate_prompt:
         _regenerate_slide_prompt(slide, project, db)
 
+    if has_stale_flags(slide.visual_json, "content", "visual"):
+        raise HTTPException(status_code=400, detail="该页面有未应用的内容或画面修改，请先更新画面方案。")
+
     if not slide.prompt_text:
         raise HTTPException(status_code=400, detail="Slide has no prompt. Generate prompts first.")
 
@@ -4333,6 +4423,7 @@ def update_slide_content(
         existing["speaker_notes"] = new_content["speaker_notes"]
 
     slide.content_json = existing
+    _mark_slide_artifacts_stale(slide, content=True)
     db.commit()
 
     return {
