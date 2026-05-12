@@ -18,6 +18,18 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     result_expires=3600,
+    broker_connection_timeout=settings.CELERY_BROKER_CONNECTION_TIMEOUT_SECONDS,
+    broker_transport_options={
+        "socket_connect_timeout": settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+        "retry_on_timeout": False,
+        "visibility_timeout": 3600,
+    },
+    result_backend_transport_options={
+        "socket_connect_timeout": settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+        "socket_timeout": settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+        "retry_on_timeout": False,
+    },
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     task_reject_on_worker_lost=True,

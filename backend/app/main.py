@@ -123,7 +123,7 @@ app.mount("/outputs", StaticFiles(directory=settings.OUTPUT_DIR), name="outputs"
 
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {"status": "ok"}
 
 

@@ -20,7 +20,13 @@ from app.services.style_proposal import generate_style_proposals
 
 logger = logging.getLogger(__name__)
 
-redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
+redis_client = redis.from_url(
+    settings.REDIS_URL or "redis://localhost:6379/0",
+    socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    retry_on_timeout=False,
+    health_check_interval=30,
+)
 
 
 def compute_style_asset_signature(project: Project | None) -> str:
@@ -116,8 +122,17 @@ def _cleanup_stale_generating_slides(project_id: str, page_nums: list):
 
 
 @celery_app.task
-def generate_slides_task(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None, credential_id: str = None):
+def generate_slides_task(
+    project_id: str,
+    page_nums: list = None,
+    prototype: bool = False,
+    run_id: str = None,
+    credential_id: str = None,
+    **legacy_kwargs,
+):
     """Celery task: 执行幻灯片生成流水线（页级别锁，允许不同页并发生成）。"""
+    if legacy_kwargs:
+        logger.info("Ignoring legacy generation task kwargs: %s", sorted(legacy_kwargs.keys()))
     credentials = load_task_provider_credentials(redis_client, credential_id)
     with provider_credentials_context(credentials):
         return _generate_slides_task_inner(project_id, page_nums, prototype, run_id)
@@ -240,8 +255,11 @@ def generate_style_proposals_task(
     run_id: str = None,
     credential_id: str = None,
     user_description: str | None = None,
+    **legacy_kwargs,
 ):
     """Celery task: 生成风格提案。"""
+    if legacy_kwargs:
+        logger.info("Ignoring legacy style proposal task kwargs: %s", sorted(legacy_kwargs.keys()))
     credentials = load_task_provider_credentials(redis_client, credential_id)
     with provider_credentials_context(credentials):
         return _generate_style_proposals_task_inner(self, project_id, run_id, user_description=user_description)

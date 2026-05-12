@@ -64,7 +64,8 @@ def _get_image_client() -> OpenAI:
     global _image_client
     credentials = get_provider_credentials()
     if credentials.deer_api_key != (settings.DEER_API_KEY or settings.MINIMAX_API_KEY) or credentials.deer_api_base != settings.DEER_API_BASE.rstrip("/"):
-        timeout = httpx.Timeout(1800.0, connect=30.0)
+        request_timeout = max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))
+        timeout = httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
         return OpenAI(
             api_key=credentials.deer_api_key,
             base_url=credentials.deer_api_base,
@@ -74,7 +75,8 @@ def _get_image_client() -> OpenAI:
     if _image_client is None:
         with _image_client_lock:
             if _image_client is None:
-                timeout = httpx.Timeout(1800.0, connect=30.0)
+                request_timeout = max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))
+                timeout = httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
                 _image_client = OpenAI(
                     api_key=settings.DEER_API_KEY or settings.MINIMAX_API_KEY,
                     base_url=settings.DEER_API_BASE,
@@ -167,7 +169,13 @@ def _get_image_redis_client():
     with _image_redis_lock:
         if _image_redis_client is None:
             try:
-                _image_redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
+                _image_redis_client = redis.from_url(
+                    settings.REDIS_URL or "redis://localhost:6379/0",
+                    socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+                    socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+                    retry_on_timeout=False,
+                    health_check_interval=30,
+                )
                 _image_redis_client.ping()
             except Exception as exc:
                 logger.warning("ImageGen: Redis image queue unavailable, using local limiter only: %s", exc)
@@ -431,7 +439,7 @@ def _download_image_bytes(url: str, max_attempts: int = 3) -> bytes:
     for attempt in range(max_attempts):
         try:
             logger.info(f"ImageGen: downloading URL (attempt {attempt + 1}/{max_attempts})")
-            resp = requests.get(url, timeout=300)
+            resp = requests.get(url, timeout=min(300, max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))))
             resp.raise_for_status()
             return resp.content
         except requests.exceptions.RequestException as e:

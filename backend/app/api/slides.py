@@ -100,13 +100,43 @@ from app.services.run_state import (
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["slides"])
+logger = logging.getLogger(__name__)
 
 
 def ensure_generation_worker_ready():
     if not ensure_celery_worker():
         raise HTTPException(status_code=503, detail="后台生成服务未启动，任务没有开始。请启动 worker 后重试。")
-logger = logging.getLogger(__name__)
 
+
+def _enqueue_generation_task(
+    db: Session,
+    project_id: str,
+    page_nums: Optional[List[int]],
+    *,
+    run,
+    prototype: bool = False,
+):
+    """Queue image generation and leave a recoverable run state if Redis/Celery fails."""
+    try:
+        credential_id = store_current_provider_credentials(redis_client)
+        task = generate_slides_task.delay(
+            project_id,
+            page_nums,
+            prototype=prototype,
+            run_id=run.id,
+            credential_id=credential_id,
+        )
+        set_run_task(db, run.id, task.id)
+        db.commit()
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+        return task
+    except Exception as exc:
+        logger.exception("Failed to enqueue generation task for project %s", project_id)
+        message = "后台生成队列暂时不可用。请确认 Docker/Redis 正常运行且磁盘空间充足，然后重试生成。"
+        finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
+        db.commit()
+        raise HTTPException(status_code=503, detail=message) from exc
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
@@ -2748,13 +2778,7 @@ def start_generation(
     }, run.id)
 
     # 使用 Celery 异步任务（Celery worker 内部有 Redis 锁兜底防重）
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_slides_task.delay(project_id, page_nums, prototype=body.prototype, run_id=run.id, credential_id=credential_id)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    # 保存 task_id 到 Redis，供 stop-generation 撤销用
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    task = _enqueue_generation_task(db, project_id, page_nums, run=run, prototype=body.prototype)
 
     return {
         "message": "Generation started",
@@ -2857,12 +2881,7 @@ def confirm_prototype(
     )
     db.commit()
 
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_slides_task.delay(project_id, target_page_nums, run_id=run.id, credential_id=credential_id)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    task = _enqueue_generation_task(db, project_id, target_page_nums, run=run)
 
     return {
         "message": "Full generation started",
@@ -3918,12 +3937,7 @@ def retry_failed_slides(
         "target_count": len(page_nums),
     }, run.id)
 
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_slides_task.delay(project_id, page_nums, run_id=run.id, credential_id=credential_id)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    task = _enqueue_generation_task(db, project_id, page_nums, run=run)
 
     return {
         "message": "Retry started",
@@ -4198,12 +4212,7 @@ def finetune_slide(
         "target_count": 1,
     }, run.id)
 
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id, credential_id=credential_id)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    task = _enqueue_generation_task(db, project_id, [slide.page_num], run=run)
 
     return {
         "message": "Finetune started",
@@ -4262,12 +4271,7 @@ def retry_slide(
         "target_count": 1,
     }, run.id)
 
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_slides_task.delay(project_id, [slide.page_num], run_id=run.id, credential_id=credential_id)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    _enqueue_generation_task(db, project_id, [slide.page_num], run=run)
 
     return {"message": "Retry started", "slide_id": slide_id, "page_num": slide.page_num, "run": serialize_run(run)}
 

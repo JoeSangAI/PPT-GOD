@@ -14,7 +14,7 @@ from app.core.provider_credentials import store_current_provider_credentials
 from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
-from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
+from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -248,12 +248,19 @@ def create_style_proposals(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    credential_id = store_current_provider_credentials(redis_client)
-    task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id, user_description=user_description)
-    set_run_task(db, run.id, task.id)
-    db.commit()
-    redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-    redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    try:
+        credential_id = store_current_provider_credentials(redis_client)
+        task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id, user_description=user_description)
+        set_run_task(db, run.id, task.id)
+        db.commit()
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    except Exception as exc:
+        logger.exception("Failed to enqueue style proposals task for project %s", project_id)
+        message = "后台队列暂时不可用。请确认 Docker/Redis 正常运行且磁盘空间充足，然后重试。"
+        finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
+        db.commit()
+        raise HTTPException(status_code=503, detail=message) from exc
     return {"status": "generating", "proposals": None, "run": serialize_run(run)}
 
 

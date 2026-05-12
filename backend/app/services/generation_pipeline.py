@@ -29,7 +29,13 @@ from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
 
-redis_client = redis.from_url(settings.REDIS_URL or "redis://localhost:6379/0")
+redis_client = redis.from_url(
+    settings.REDIS_URL or "redis://localhost:6379/0",
+    socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
+    retry_on_timeout=False,
+    health_check_interval=30,
+)
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
 _MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千万0-9]+)")
 

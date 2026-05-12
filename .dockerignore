@@ -1,13 +1,23 @@
 .git
 .DS_Store
+.playwright-cli
+.pytest_cache
 
 frontend/node_modules
 frontend/dist
+frontend/test-output
 
 backend/.env
+backend/venv
 backend/uploads
 backend/outputs
 backend/__pycache__
+backend/**/__pycache__
 backend/.pytest_cache
 
+backups
+output
+outputs
+
+*.py[cod]
 *.log
