@@ -177,7 +177,7 @@ def _get_image_redis_client():
                     settings.REDIS_URL or "redis://localhost:6379/0",
                     socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
                     socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
-                    retry_on_timeout=False,
+                    retry_on_timeout=True,
                     health_check_interval=30,
                 )
                 _image_redis_client.ping()
@@ -193,6 +193,13 @@ def _image_lock_ttl_seconds() -> int:
     except (TypeError, ValueError):
         task_limit = 2100
     return max(300, task_limit + 300)
+
+
+def _image_slot_wait_timeout_seconds() -> int:
+    try:
+        return max(30, int(settings.IMAGE_API_SLOT_WAIT_TIMEOUT_SECONDS or 600))
+    except (TypeError, ValueError):
+        return 600
 
 
 def _release_redis_slot(client, key: str, token: str) -> None:
@@ -238,6 +245,7 @@ def _acquire_redis_image_slot():
 
     limit = _configured_image_api_limit()
     ttl = _image_lock_ttl_seconds()
+    max_wait = _image_slot_wait_timeout_seconds()
     token = str(uuid.uuid4())
     logged_wait = False
     started = time.time()
@@ -254,6 +262,8 @@ def _acquire_redis_image_slot():
                 logger.warning("ImageGen: Redis image queue failed, using local limiter only: %s", exc)
                 return None
         waited = time.time() - started
+        if waited >= max_wait:
+            raise TimeoutError(f"Timed out waiting for image API slot after {max_wait}s")
         if waited >= 30 and not logged_wait:
             logger.info("ImageGen: waiting for image API slot (%.1fs)", waited)
             logged_wait = True
@@ -344,6 +354,16 @@ def _reserve_real_image_call() -> None:
                 f"MAX_REAL_IMAGES_PER_RUN={limit}"
             )
         _real_image_calls_this_run += 1
+
+
+def reset_run_image_counter() -> None:
+    global _real_image_calls_this_run
+    with _run_state_lock:
+        _real_image_calls_this_run = 0
+
+
+def clear_reference_upload_cache() -> None:
+    _clear_reference_upload_cache()
 
 
 def _make_mock_slide_image(prompt: str) -> Image.Image:
@@ -854,9 +874,7 @@ def _call_gpt_image_2_edit(
             error=str(e)[:500],
             error_debug=_exception_debug_summary(e),
         )
-        raise ReferenceUploadTimeoutError(
-            "图片接口连接超时：请求未稳定送达，已停止自动重试，避免重复消耗生图额度"
-        ) from e
+        raise
     except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
         duration_seconds = time.time() - started_at
         gateway_cutoff = _is_gateway_idle_cutoff(e, duration_seconds)
@@ -879,9 +897,7 @@ def _call_gpt_image_2_edit(
             error=str(e)[:500],
             error_debug=_exception_debug_summary(e),
         )
-        raise ReferenceUploadTimeoutError(
-            "图片接口响应中断：本次请求可能已进入生成并产生费用，已停止自动重试。请稍后重试失败页，避免重复扣费。"
-        ) from e
+        raise
     except requests.exceptions.RequestException as e:
         duration_seconds = time.time() - started_at
         gateway_cutoff = _is_gateway_idle_cutoff(e, duration_seconds)
@@ -1021,7 +1037,7 @@ def _generate_real_slide_image(
     else:
         size = "1024x1024"
     idempotency_key = str(uuid.uuid4())
-    api_backoff = [0, 5, 15]
+    api_backoff = [0, 10, 30, 60]
     aspect_ratio_retries = 0
     max_aspect_ratio_retries = max(0, int(settings.IMAGE_ASPECT_RATIO_MAX_RETRIES or 0))
     for attempt, delay in enumerate(api_backoff):

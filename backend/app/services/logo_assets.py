@@ -8,13 +8,13 @@ from PIL import Image, ImageChops, ImageFilter, ImageStat
 def _overlay_cache_path(source_path: str) -> str:
     directory = os.path.dirname(source_path)
     stem, _ = os.path.splitext(os.path.basename(source_path))
-    return os.path.join(directory, f"logo_overlay_safe_{stem}.png")
+    return os.path.join(directory, f"logo_overlay_clean_{stem}.png")
 
 
 def _symbol_cache_path(source_path: str) -> str:
     directory = os.path.dirname(source_path)
     stem, _ = os.path.splitext(os.path.basename(source_path))
-    return os.path.join(directory, f"logo_symbol_safe_{stem}.png")
+    return os.path.join(directory, f"logo_symbol_clean_{stem}.png")
 
 
 def _symbol_none_cache_path(source_path: str) -> str:
@@ -88,83 +88,13 @@ def _padded_bbox(mask: Image.Image, padding_ratio: float = 0.045) -> tuple[int, 
     )
 
 
-def _luminance(r: int, g: int, b: int) -> float:
-    return 0.299 * r + 0.587 * g + 0.114 * b
-
-
-def _tone_mask(img: Image.Image, mode: str) -> Image.Image:
-    rgba = img.convert("RGBA")
-    mask = Image.new("L", rgba.size, 0)
-    out = []
-    for r, g, b, a in rgba.getdata():
-        if a <= 96:
-            out.append(0)
-            continue
-        lum = _luminance(r, g, b)
-        if mode == "dark":
-            out.append(255 if lum < 118 else 0)
-        else:
-            out.append(255 if lum > 188 else 0)
-    mask.putdata(out)
-    return mask
-
-
-def _alpha_has_content(mask: Image.Image, min_pixels: int = 10) -> bool:
-    extrema = mask.getextrema()
-    if extrema[1] <= 0:
-        return False
-    return sum(1 for value in mask.getdata() if value > 0) >= min_pixels
-
-
-def _with_transparent_padding(img: Image.Image, padding: int) -> Image.Image:
-    if padding <= 0:
-        return img
-    canvas = Image.new("RGBA", (img.width + padding * 2, img.height + padding * 2), (255, 255, 255, 0))
-    canvas.alpha_composite(img, (padding, padding))
-    return canvas
-
-
-def _halo_layer(mask: Image.Image, color: tuple[int, int, int], strength: float, radius: int) -> Image.Image:
-    expanded = mask.filter(ImageFilter.MaxFilter(max(3, radius * 2 + 1)))
-    soft = expanded.filter(ImageFilter.GaussianBlur(max(1.0, radius * 0.75)))
-    alpha = soft.point(lambda value: int(min(180, value * strength)))
-    layer = Image.new("RGBA", mask.size, (*color, 0))
-    layer.putalpha(alpha)
-    return layer
-
-
-def _apply_contour_contrast_halo(img: Image.Image) -> Image.Image:
-    """
-    Give dark/light logo strokes their own transparent contrast edge.
-
-    This avoids the white-rectangle "sticker" effect while keeping black
-    wordmarks readable on dark generated slides and white marks readable on
-    light slides.
-    """
-    rgba = img.convert("RGBA")
-    visible = rgba.getchannel("A")
-    if visible.getextrema()[1] <= 16:
-        return rgba
-
-    padding = max(4, int(max(rgba.size) * 0.045))
-    rgba = _with_transparent_padding(rgba, padding)
-    dark_mask = _tone_mask(rgba, "dark")
-    light_mask = _tone_mask(rgba, "light")
-
-    base = Image.new("RGBA", rgba.size, (255, 255, 255, 0))
-    radius = max(2, int(max(rgba.size) * 0.018))
-    if _alpha_has_content(dark_mask):
-        base.alpha_composite(_halo_layer(dark_mask, (255, 252, 238), 0.68, radius))
-    if _alpha_has_content(light_mask):
-        base.alpha_composite(_halo_layer(light_mask, (15, 23, 42), 0.56, radius))
-    base.alpha_composite(rgba)
-    return base
-
-
 def _prepared_logo_crop(source_path: str) -> tuple[Image.Image, Image.Image] | None:
     img = Image.open(source_path).convert("RGBA")
     mask = _foreground_mask(img)
     bbox = _padded_bbox(mask)
+    # Shave sparse edge columns/rows to remove attached decorative lines
+    # (e.g. vertical separators next to wordmarks)
+    bbox = _shave_sparse_edges(mask, bbox, max_shave=8)
     cropped = img.crop(bbox)
     cropped_mask = mask.crop(bbox)
 
@@ -246,6 +176,120 @@ def _bbox_chroma_share(img: Image.Image, mask: Image.Image, bbox: tuple[int, int
     return chroma / max(total, 1)
 
 
+def _shave_sparse_edges(mask: Image.Image, bbox: tuple[int, int, int, int], max_shave: int = 8) -> tuple[int, int, int, int]:
+    """
+    Density-based edge trimming: shave columns/rows at the bbox edges
+    whose foreground density is anomalously low compared to the median.
+    Helps remove attached decorative lines (vertical or horizontal)
+    that sit at the edge of the logo crop.
+    """
+    left, top, right, bottom = bbox
+    crop_mask = mask.crop(bbox)
+    width, height = crop_mask.size
+    if width <= 10 or height <= 10:
+        return bbox
+
+    # Column density
+    col_density = []
+    for x in range(width):
+        col = crop_mask.crop((x, 0, x + 1, height))
+        non_zero = sum(1 for v in col.getdata() if v > 0)
+        col_density.append(non_zero / height)
+
+    sorted_density = sorted(col_density)
+    median_density = sorted_density[len(sorted_density) // 2]
+    effective_threshold = max(0.15, median_density * 0.25)
+
+    max_shave_x = min(max_shave, int(width * 0.15))
+    new_left = left
+    for x in range(max_shave_x):
+        d = col_density[x]
+        if 0 < d < effective_threshold:
+            new_left += 1
+        else:
+            break
+
+    new_right = right
+    for x in range(max_shave_x):
+        idx = width - 1 - x
+        d = col_density[idx]
+        if 0 < d < effective_threshold:
+            new_right -= 1
+        else:
+            break
+
+    # Row density
+    row_density = []
+    for y in range(height):
+        row = crop_mask.crop((0, y, width, y + 1))
+        non_zero = sum(1 for v in row.getdata() if v > 0)
+        row_density.append(non_zero / width)
+
+    sorted_row_density = sorted(row_density)
+    median_row_density = sorted_row_density[len(sorted_row_density) // 2]
+    row_threshold = max(0.15, median_row_density * 0.25)
+
+    max_shave_y = min(max_shave, int(height * 0.15))
+    new_top = top
+    for y in range(max_shave_y):
+        d = row_density[y]
+        if 0 < d < row_threshold:
+            new_top += 1
+        else:
+            break
+
+    new_bottom = bottom
+    for y in range(max_shave_y):
+        idx = height - 1 - y
+        d = row_density[idx]
+        if 0 < d < row_threshold:
+            new_bottom -= 1
+        else:
+            break
+
+    # Safety: don't over-trim
+    if new_right - new_left < max(8, width * 0.3):
+        new_left, new_right = left, right
+    if new_bottom - new_top < max(8, height * 0.3):
+        new_top, new_bottom = top, bottom
+
+    return (new_left, new_top, new_right, new_bottom)
+
+
+def _tighten_symbol_bbox(mask: Image.Image, bbox: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """
+    Shave off sparse edge columns/rows or attached decorative lines
+    (e.g. vertical separators) from a symbol bbox.
+
+    Uses erosion + re-connected-components to break thin connections,
+    then picks the largest surviving component as the true symbol.
+    """
+    left, top, right, bottom = bbox
+    crop_mask = mask.crop(bbox)
+    width, height = crop_mask.size
+    if width <= 6 or height <= 6:
+        return bbox
+
+    # Erode to break thin connections (e.g. a 1-px bridge to a separator line)
+    eroded = crop_mask.filter(ImageFilter.MinFilter(3))
+    components = _component_bboxes(eroded)
+
+    if len(components) >= 2:
+        # Erosion split the shape; keep the largest piece (the real symbol)
+        largest = max(components, key=lambda c: c[4])
+        lx, ly, lrx, lby, _ = largest
+        pad = max(2, int(max(lrx - lx, lby - ly) * 0.1))
+        return (
+            max(left, left + lx - pad),
+            max(top, top + ly - pad),
+            min(right, left + lrx + pad),
+            min(bottom, top + lby + pad),
+        )
+
+    # Fallback: density-based edge tightening for sparse tails
+    return _shave_sparse_edges(mask, bbox, max_shave=5)
+
+
 def _symbol_candidate_bbox(img: Image.Image, mask: Image.Image) -> tuple[int, int, int, int] | None:
     foreground_area = sum(1 for value in mask.getdata() if value > 0)
     if foreground_area <= 0:
@@ -262,15 +306,22 @@ def _symbol_candidate_bbox(img: Image.Image, mask: Image.Image) -> tuple[int, in
         width = max(1, right - left)
         height = max(1, bottom - top)
         ratio = width / height
-        if ratio < 0.28 or ratio > 2.5:
+        # Tightened aspect ratio filter to reject thin vertical/horizontal lines
+        if ratio < 0.35 or ratio > 2.0:
             continue
         if width >= img.width * 0.72:
             continue
         chroma_share = _bbox_chroma_share(img, mask, (left, top, right, bottom))
         area_share = area / max(foreground_area, 1)
+        # Skip tiny decorative lines even if they pass aspect ratio
+        if area_share < 0.05:
+            continue
         compactness = min(ratio, 1 / max(ratio, 0.01))
         left_bonus = 1.0 - min(1.0, left / max(img.width, 1))
-        score = area_share * 1.15 + chroma_share * 0.85 + compactness * 0.25 + left_bonus * 0.16
+        # Reduced left_bonus weight and increased compactness weight
+        # so that thin decorative lines near the left edge don't outscore
+        # the actual brand mark.
+        score = area_share * 1.15 + chroma_share * 0.85 + compactness * 0.45 + left_bonus * 0.06
         if best is None or score > best[0]:
             best = (score, (left, top, right, bottom), area_share, chroma_share)
 
@@ -280,7 +331,10 @@ def _symbol_candidate_bbox(img: Image.Image, mask: Image.Image) -> tuple[int, in
     if chroma_share < 0.12 and area_share < 0.16:
         return None
 
-    left, top, right, bottom = bbox
+    # Post-process: tighten bbox by dropping edge columns that are too sparse
+    # (helps remove attached vertical separator lines)
+    left, top, right, bottom = _tighten_symbol_bbox(mask, bbox)
+
     pad = max(2, int(max(right - left, bottom - top) * 0.18))
     return (
         max(0, left - pad),
@@ -312,7 +366,6 @@ def prepare_logo_overlay_image(source_path: str) -> str:
         if not prepared:
             return source_path
         cropped, _cropped_mask = prepared
-        cropped = _apply_contour_contrast_halo(cropped)
         cropped.save(output_path, "PNG")
         return output_path
     except Exception:
@@ -354,7 +407,6 @@ def prepare_logo_symbol_image(source_path: str) -> str | None:
         symbol_mask = cropped_mask.crop(bbox)
         if symbol.getchannel("A").getextrema()[0] >= 245:
             symbol.putalpha(symbol_mask.filter(ImageFilter.GaussianBlur(0.4)))
-        symbol = _apply_contour_contrast_halo(symbol)
         symbol.save(output_path, "PNG")
         return output_path
     except Exception:

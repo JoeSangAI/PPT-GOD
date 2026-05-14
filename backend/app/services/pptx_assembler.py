@@ -163,6 +163,9 @@ def assemble_pptx(
         ):
             raw_policy = (slide_data.get("visual_json") or {}).get("logo_policy") or {}
             policy = logo_policy_for_page(slide_data)
+            render_policy_input = {**raw_policy, **policy}
+            if "render_variant" not in policy:
+                render_policy_input.pop("render_variant", None)
             render_policy = resolve_logo_render_policy(
                 img_path,
                 logo_path_for_overlay,
@@ -170,14 +173,11 @@ def assemble_pptx(
                 str(slide_data.get("type") or "content").lower(),
                 policy.get("placement") or logo_config.get("anchor") or "top-right",
                 policy.get("scale") or "small",
-                raw_policy,
+                render_policy_input,
             )
             if render_policy.get("show_logo") is False:
                 continue
-            if render_policy.get("render_variant") == "symbol" and logo_symbol_path_for_overlay:
-                logo_path_to_render = logo_symbol_path_for_overlay
-            else:
-                logo_path_to_render = logo_path_for_overlay
+            logo_path_to_render = logo_path_for_overlay
             left, top, width, height = _logo_geometry(
                 prs,
                 logo_path_to_render,

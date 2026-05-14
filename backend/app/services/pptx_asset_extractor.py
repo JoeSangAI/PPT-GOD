@@ -62,6 +62,16 @@ class _ContentRefCandidate:
     asset: PptxImageAsset
 
 
+@dataclass
+class _XmlBlipTarget:
+    media_path: str
+    blob: bytes
+    left: int | None = None
+    top: int | None = None
+    width: int | None = None
+    height: int | None = None
+
+
 PARALLEL_PAGE_REF_MIN_COUNT = 4
 PARALLEL_PAGE_REF_MAX_COUNT = 8
 
@@ -236,6 +246,56 @@ def _is_cover_logo_candidate(
     return True
 
 
+def _norm_midpoint(occ: _ImageOccurrence) -> tuple[float, float]:
+    slide_w = max(1, occ.slide_width)
+    slide_h = max(1, occ.slide_height)
+    return (
+        (occ.left + occ.width / 2) / slide_w,
+        (occ.top + occ.height / 2) / slide_h,
+    )
+
+
+def _is_repeated_brand_mark_candidate(
+    occurrences: list[_ImageOccurrence],
+    dominant_share: float,
+    channel_std: float,
+    has_transparency: bool,
+) -> bool:
+    """Detect repeated small brand marks even when PPT stores them as shape fills."""
+    repeated_pages = {occ.page_num for occ in occurrences}
+    if len(repeated_pages) < 3:
+        return False
+    first = occurrences[0]
+    if first.area_ratio < 0.0012 or first.area_ratio > 0.035:
+        return False
+    aspect = first.width / max(1, first.height)
+    if aspect > 12 or aspect < 0.1:
+        return False
+    if _is_full_slide_background(first) or _is_ui_container_chrome(first):
+        return False
+    source_text = " ".join(first.slide_text.split())
+    if _text_has_any(source_text, IDENTITY_CODE_CONTEXT_TERMS) or _text_has_any(source_text, UI_CONTAINER_CONTEXT_TERMS):
+        return False
+
+    mids = [_norm_midpoint(occ) for occ in occurrences]
+    x_values = [x for x, _ in mids]
+    y_values = [y for _, y in mids]
+    stable_position = (max(x_values) - min(x_values) <= 0.08) and (max(y_values) - min(y_values) <= 0.08)
+    first_x, first_y = mids[0]
+    in_brand_zone = first_y <= 0.24 or first_y >= 0.76 or first_x <= 0.18 or first_x >= 0.82
+    if not stable_position or not in_brand_zone:
+        return False
+
+    # Small repeated marks in a stable corner/edge are more likely to be brand
+    # lockups than page evidence. The area threshold catches non-transparent
+    # yellow/white logo bitmaps stored as filled shapes.
+    if first.area_ratio <= 0.014:
+        return True
+    if has_transparency:
+        return True
+    return dominant_share >= 0.42 and channel_std <= 70
+
+
 def _text_has_any(text: str, terms: tuple[str, ...]) -> bool:
     lower = (text or "").lower()
     return any(term.lower() in lower for term in terms)
@@ -390,25 +450,55 @@ def _classify_asset(
         return "logo", "logo", None
     if len(repeated_pages) >= 4 and first.area_ratio <= 0.004:
         return "logo", "logo", None
+    if _is_repeated_brand_mark_candidate(occurrences, dominant_share, channel_std, has_transparency):
+        return "logo", "logo", None
     if _is_cover_logo_candidate(first, slide_count, dominant_share, channel_std, has_transparency):
         return "logo_candidate", "logo", None
     kind = _asset_kind_for_occ(first, has_transparency)
     return "useful", "content_ref", kind
 
 
-def _slide_xml_blip_targets(file_bytes: bytes) -> dict[int, list[tuple[str, bytes]]]:
+def _slide_xml_blip_targets(file_bytes: bytes) -> dict[int, list[_XmlBlipTarget]]:
     """Find images referenced by slide XML, including backgrounds/fill blips.
 
     python-pptx exposes ordinary picture shapes well, but background images and
     shape fills may only appear as a:blip relationships. This fallback keeps
     those visual sources in the asset library without adding a new dependency.
+    For shape-fill blips, keep the element geometry; otherwise small repeated
+    logos are indistinguishable from full-slide backgrounds.
     """
     ns = {
         "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
         "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
     }
-    result: dict[int, list[tuple[str, bytes]]] = {}
+    result: dict[int, list[_XmlBlipTarget]] = {}
+
+    def media_path_for_target(target: str) -> str:
+        media_path = os.path.normpath(os.path.join("ppt/slides", target)).replace("\\", "/")
+        if media_path.startswith("ppt/slides/../"):
+            media_path = "ppt/" + media_path[len("ppt/slides/../"):]
+        return media_path
+
+    def geometry_for_element(element: ET.Element) -> tuple[int, int, int, int] | None:
+        xfrm = element.find(".//a:xfrm", ns)
+        if xfrm is None:
+            return None
+        off = xfrm.find("a:off", ns)
+        ext = xfrm.find("a:ext", ns)
+        if off is None or ext is None:
+            return None
+        try:
+            return (
+                int(float(off.attrib.get("x", 0) or 0)),
+                int(float(off.attrib.get("y", 0) or 0)),
+                int(float(ext.attrib.get("cx", 0) or 0)),
+                int(float(ext.attrib.get("cy", 0) or 0)),
+            )
+        except (TypeError, ValueError):
+            return None
+
     try:
         with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
             slide_names = sorted(
@@ -426,17 +516,31 @@ def _slide_xml_blip_targets(file_bytes: bytes) -> dict[int, list[tuple[str, byte
                     for rel in rels_root.findall("rel:Relationship", ns)
                 }
                 slide_root = ET.fromstring(zf.read(slide_name))
-                for blip in slide_root.findall(".//a:blip", ns):
-                    rel_id = blip.attrib.get(f"{{{ns['r']}}}embed") or blip.attrib.get(f"{{{ns['r']}}}link")
-                    target = rel_targets.get(rel_id)
-                    if not target:
-                        continue
-                    media_path = os.path.normpath(os.path.join("ppt/slides", target)).replace("\\", "/")
-                    if media_path.startswith("ppt/slides/../"):
-                        media_path = "ppt/" + media_path[len("ppt/slides/../"):]
-                    if media_path not in zf.namelist():
-                        continue
-                    result.setdefault(page_num, []).append((media_path, zf.read(media_path)))
+                seen_targets: set[tuple[str, str, int | None, int | None, int | None, int | None]] = set()
+                for element_tag in ("p:sp", "p:pic", "p:bg"):
+                    for element in slide_root.findall(f".//{element_tag}", ns):
+                        geometry = geometry_for_element(element)
+                        for blip in element.findall(".//a:blip", ns):
+                            rel_id = blip.attrib.get(f"{{{ns['r']}}}embed") or blip.attrib.get(f"{{{ns['r']}}}link")
+                            target = rel_targets.get(rel_id)
+                            if not target:
+                                continue
+                            media_path = media_path_for_target(target)
+                            if media_path not in zf.namelist():
+                                continue
+                            left, top, width, height = geometry or (None, None, None, None)
+                            key = (rel_id or "", media_path, left, top, width, height)
+                            if key in seen_targets:
+                                continue
+                            seen_targets.add(key)
+                            result.setdefault(page_num, []).append(_XmlBlipTarget(
+                                media_path=media_path,
+                                blob=zf.read(media_path),
+                                left=left,
+                                top=top,
+                                width=width,
+                                height=height,
+                            ))
     except Exception:
         return result
     return result
@@ -493,6 +597,15 @@ def _parallel_page_ref_candidates(candidates: list[_ContentRefCandidate]) -> lis
         return []
     group.sort(key=_candidate_spatial_key)
     return group[:PARALLEL_PAGE_REF_MAX_COUNT]
+
+
+def _should_skip_content_ref_occurrence(occurrences: list[_ImageOccurrence], occ: _ImageOccurrence) -> bool:
+    repeated_pages = {item.page_num for item in occurrences}
+    if len(repeated_pages) >= 3 and _is_full_slide_background(occ):
+        return True
+    if len(repeated_pages) >= 3 and occ.area_ratio >= 0.18:
+        return True
+    return False
 
 
 def _keyword_tags(source_filename: str, occ: _ImageOccurrence, repeated_pages: list[int]) -> list[str]:
@@ -610,18 +723,23 @@ def extract_pptx_image_assets(
         for page_num, slide in enumerate(prs.slides, start=1)
     }
     for page_num, blips in xml_blips.items():
-        for _media_path, blob in blips:
+        for target in blips:
+            blob = target.blob
             digest = hashlib.sha1(blob).hexdigest()
             if digest in shape_digests_by_page.get(page_num, set()):
                 continue
+            left = 0 if target.left is None else target.left
+            top = 0 if target.top is None else target.top
+            width = int(prs.slide_width) if target.width is None else target.width
+            height = int(prs.slide_height) if target.height is None else target.height
             occurrence = _ImageOccurrence(
                 page_num=page_num,
                 blob=blob,
-                ext="png",
-                left=0,
-                top=0,
-                width=int(prs.slide_width),
-                height=int(prs.slide_height),
+                ext=(os.path.splitext(target.media_path)[1].lstrip(".") or "png").lower(),
+                left=int(left or 0),
+                top=int(top or 0),
+                width=int(width or 0),
+                height=int(height or 0),
                 slide_width=int(prs.slide_width),
                 slide_height=int(prs.slide_height),
                 slide_text=slide_text_by_page.get(page_num, ""),
@@ -687,7 +805,11 @@ def extract_pptx_image_assets(
                     asset_kind=None,
                     asset_name=f"{source_stem} extracted logo",
                     usage_note="从上传 PPT 中识别出的 Logo / 联合标识，作为全局品牌标识使用。",
-                    metadata=base_metadata,
+                    metadata={
+                        **base_metadata,
+                        "asset_scope": "project_logo",
+                        "library_role": "brand_logo",
+                    },
                 )
             )
             continue
@@ -718,6 +840,7 @@ def extract_pptx_image_assets(
                     metadata={
                         **base_metadata,
                         "classification": "library_asset",
+                        "asset_scope": "project_library",
                         "library_role": "core_global_asset",
                         "selection_tier": promotion.tier,
                         "importance_score": promotion.score,
@@ -728,6 +851,8 @@ def extract_pptx_image_assets(
             )
 
         for occ in occurrences:
+            if _should_skip_content_ref_occurrence(occurrences, occ):
+                continue
             content_ref_key = (digest, occ.page_num)
             if content_ref_key in seen_content_ref_candidates:
                 continue
@@ -758,6 +883,7 @@ def extract_pptx_image_assets(
                         usage_note="从上传 PPT 对应页提取的有用图片，优先作为本页参考图使用。",
                         metadata={
                             **metadata,
+                            "asset_scope": "page_reference",
                             "selection_tier": "page_ref",
                             "importance_score": round(priority, 2),
                             "selection_reason": promotion.reason,

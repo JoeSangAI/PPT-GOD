@@ -53,9 +53,30 @@ def test_provider_gateway_cutoff_is_not_retryable():
     assert image_generation._is_api_retryable(error) is False
 
 
-def test_default_image_generation_is_serial_high_quality_with_one_gateway_retry():
+def test_default_api_backoff_uses_four_attempts(monkeypatch):
+    calls = []
+    sleeps = []
+
+    monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_generate(_prompt, size="1792x1024", idempotency_key=None):
+        calls.append((size, idempotency_key))
+        raise image_generation.requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(image_generation, "_call_gpt_image_2_generate", fake_generate)
+
+    with pytest.raises(image_generation.requests.exceptions.ReadTimeout):
+        image_generation._generate_real_slide_image("prompt", reference_images=None)
+
+    assert len(calls) == 4
+    assert sleeps == [10, 30, 60]
+    assert len({call[1] for call in calls}) == 1
+
+
+def test_default_image_generation_is_serial_high_quality_without_gateway_retry():
     assert image_generation.settings.IMAGE_API_MAX_CONCURRENCY == 1
-    assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 2
+    assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 1
     assert image_generation._image_quality() == "high"
 
 
@@ -146,6 +167,21 @@ def test_image_api_slot_uses_redis_global_queue(monkeypatch):
 
     assert fake.set_calls
     assert fake.eval_calls
+
+
+def test_redis_image_slot_wait_has_timeout(monkeypatch):
+    class FullRedis:
+        def set(self, *_args, **_kwargs):
+            return False
+
+    times = iter([0.0, 31.0])
+    monkeypatch.setattr(image_generation, "_get_image_redis_client", lambda: FullRedis())
+    monkeypatch.setattr(image_generation, "_image_slot_wait_timeout_seconds", lambda: 30)
+    monkeypatch.setattr(image_generation.time, "time", lambda: next(times))
+    monkeypatch.setattr(image_generation.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(TimeoutError):
+        image_generation._acquire_redis_image_slot()
 
 
 def test_image_generation_audit_log_writes_jsonl(tmp_path, monkeypatch):
@@ -304,7 +340,7 @@ def test_reference_upload_encoding_is_single_flight_under_concurrency(monkeypatc
     assert len({result[1].getvalue() for result in results}) == 1
 
 
-def test_edit_read_timeout_records_interrupted_without_retry(monkeypatch):
+def test_edit_read_timeout_records_interrupted_and_reraises_retryable_error(monkeypatch):
     image_generation.reset_image_call_events()
     profile = image_generation._ReferenceUploadProfile(
         max_side=None,
@@ -329,7 +365,7 @@ def test_edit_read_timeout_records_interrupted_without_retry(monkeypatch):
 
     monkeypatch.setattr(image_generation.requests, "post", fake_post)
 
-    with pytest.raises(image_generation.ReferenceUploadTimeoutError):
+    with pytest.raises(image_generation.requests.exceptions.ReadTimeout):
         image_generation._call_gpt_image_2_edit(
             "prompt",
             [Image.new("RGB", (32, 18), "white")],
@@ -342,3 +378,27 @@ def test_edit_read_timeout_records_interrupted_without_retry(monkeypatch):
     assert event["upload_bytes"] == 1
     assert event["upload_prepare_seconds"] >= 0
     assert event["idempotency_key"] == "idem-test"
+
+
+def test_edit_read_timeout_retries_with_same_idempotency_key(monkeypatch):
+    calls = []
+    sleeps = []
+    reference = Image.new("RGB", (32, 18), "white")
+
+    monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_edit(_prompt, _reference_images, size="1792x1024", idempotency_key=None):
+        calls.append((size, idempotency_key))
+        if len(calls) == 1:
+            raise image_generation.requests.exceptions.ReadTimeout("read timed out")
+        return Image.new("RGB", (1792, 1024), "white")
+
+    monkeypatch.setattr(image_generation, "_call_gpt_image_2_edit", fake_edit)
+
+    img = image_generation._generate_real_slide_image("prompt", reference_images=[reference])
+
+    assert img.size == (1792, 1024)
+    assert len(calls) == 2
+    assert calls[0][1] == calls[1][1]
+    assert sleeps == [10]

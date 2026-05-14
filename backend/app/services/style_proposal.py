@@ -1558,18 +1558,96 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
     )
 
 
+def _template_source_labels(template: Dict) -> tuple[str, str, str]:
+    source_kind = str((template or {}).get("source_kind") or "").strip()
+    if source_kind == "finished_ppt":
+        return "沿用原稿风格", "沿用原稿", "这份成品 PPT"
+    return "沿用模板风格", "沿用模板", "这份模板"
+
+
+def _build_template_clone_fallback_proposal(summary: Dict, assets: Dict) -> Dict:
+    logo = assets.get("logo_analysis") or {}
+    template = assets.get("template_analysis") or {}
+    style_name, decision_label, source_label = _template_source_labels(template)
+    page_count = template.get("template_page_count")
+    page_text = f"已读取 {page_count} 类模板页，" if page_count else ""
+    # Use the template's own color analysis so palette is not empty
+    template_ref = template.get("reference_analysis") if isinstance(template, dict) else None
+    palette = _collect_clone_palette(template_ref or {}, logo)
+    visual_strategy = build_visual_strategy(
+        summary=summary,
+        palette=palette,
+        reference_analysis=template_ref or {},
+        logo_analysis=logo,
+    )
+    return {
+        "name": style_name,
+        "palette": palette,
+        "mood": "按模板统一、克制、可读",
+        "font": "沿用模板的标题/正文字体层级；缺失字体时使用高可读黑体。",
+        "description": (
+            f"{page_text}{source_label}是本次视觉方向的第一来源。"
+            "后续页面只学习它的版式、配色、字体节奏、Logo 位置和信息密度，不把旧正文混入新内容；"
+            "内容页和数据页在同一视觉语言内优先保证阅读效率。"
+        )[:520],
+        "source": "template_clone",
+        "clone_mode": "template_dna",
+        "reference_usage": "layout_color_typography_only",
+        "decision_label": decision_label,
+        "best_for": "你希望新 PPT 看起来就是沿着上传模板或原稿继续做，减少风格发散。",
+        "tradeoff": "探索性会变少；如果想换一个全新方向，需要在视觉对话里明确提出。",
+        "visual_focus": "复用模板的页面结构、配色关系、字体层级、Logo 位置和同类页面节奏。",
+        "page_type_adaptation": (
+            "页面类型适配规则：模板是默认风格来源。封面、目录、章节、正文、数据页分别借用对应模板页的结构；"
+            "没有对应模板页时，使用最接近的内容页节奏，不另起一套视觉语言。"
+        ),
+        "visual_strategy": visual_strategy,
+        "content_style_hint": (
+            "模板是本项目的第一视觉来源；后续画面方案和 Prompt 只学习版式、配色、字体层级和 Logo 位置。"
+        ),
+    }
+
+
 def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
     logo = assets.get("logo_analysis") or {}
     ref = assets.get("reference_analysis") or {}
     template = assets.get("template_analysis") or {}
     template_ref = template.get("reference_analysis") if isinstance(template, dict) else None
-    if template_ref and not (ref.get("description") or ref.get("dominant_palette")):
+    template_driven = False
+    # When a template is present, its colors should be the primary source.
+    # Merge template colors into ref so they survive even if the user also
+    # uploaded a style reference image.
+    if template_ref and template.get("has_template"):
+        # Start from template colors, then overlay any richer ref data
+        merged_ref = dict(template_ref)
+        for key in ("description", "mood", "texture", "composition_style", "font_suggestion", "ornaments"):
+            if ref.get(key):
+                merged_ref[key] = ref[key]
+        # Merge dominant palettes: template first, then ref extras
+        template_palette = list(template_ref.get("dominant_palette") or [])
+        ref_palette = list(ref.get("dominant_palette") or [])
+        merged_hexes = {p.get("hex") for p in template_palette if isinstance(p, dict)}
+        for p in ref_palette:
+            if isinstance(p, dict) and p.get("hex") and p.get("hex") not in merged_hexes:
+                template_palette.append(p)
+        if template_palette:
+            merged_ref["dominant_palette"] = template_palette
+        # Preserve template colors dict if ref lacks it
+        if template_ref.get("colors") and not ref.get("colors"):
+            merged_ref["colors"] = template_ref["colors"]
+        ref = merged_ref
+        template_driven = True
+    elif template_ref and not (ref.get("description") or ref.get("dominant_palette")):
         ref = template_ref
+        template_driven = True
 
     palette = _collect_clone_palette(ref, logo)
     palette_hex = [c["hex"] for c in palette]
     explicit_traditional_ref = _reference_explicitly_traditional(ref)
     style_name = (ref.get("style_name") or "").strip()
+    template_style_name, template_decision_label, template_source_label = _template_source_labels(template)
+    if template_driven:
+        style_name = template_style_name
     if not style_name:
         desc_for_name = " ".join(str(x) for x in [ref.get("description"), ref.get("mood"), ref.get("ornaments"), ref.get("texture")] if x)
         if explicit_traditional_ref and any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex):
@@ -1591,6 +1669,8 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
         style_name = "参考图复刻"
     if explicit_traditional_ref and any(_is_chromatic_brand_color(c) for c in palette_hex) and any(_is_warm_accent(c) for c in palette_hex) and style_name == "参考图复刻":
         style_name = "品牌主色典雅"
+    if template_driven:
+        style_name = template_style_name
 
     mood = ref.get("mood") or ("古朴、典雅、厚重" if explicit_traditional_ref else "现代、清晰、克制")
     font = ref.get("font_suggestion") or logo.get("font_style") or (
@@ -1624,10 +1704,16 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
 
     primary_name = _get_color_name(palette[0]['hex']) if palette else '品牌主色'
     accent_name = _get_color_name(palette[1]['hex']) if len(palette) > 1 else '强调色'
-    description = (
-        f"整体「{mood}」气质。{primary_name}定调品牌识别，{accent_name}做重点强调；"
-        f"封面/章节页可放大装饰，内容/数据页在同一视觉语言内提高留白与可读性。{clone_rules}"
-    )
+    if template_driven:
+        description = (
+            f"{template_source_label}是本次视觉方向的第一来源。整体「{mood}」气质，{primary_name}定调，{accent_name}做重点强调；"
+            "后续页面只学习模板的版式、配色、字体节奏、Logo 位置和信息密度，不把旧正文混入新内容。"
+        )
+    else:
+        description = (
+            f"整体「{mood}」气质。{primary_name}定调品牌识别，{accent_name}做重点强调；"
+            f"封面/章节页可放大装饰，内容/数据页在同一视觉语言内提高留白与可读性。{clone_rules}"
+        )
 
     return {
         "name": style_name,
@@ -1638,12 +1724,28 @@ def _build_reference_clone_proposal(summary: Dict, assets: Dict) -> Dict:
         "texture": texture,
         "ornaments": ornaments,
         "clone_rules": clone_rules,
-        "source": "asset_clone",
-        "clone_mode": "style_dna",
-        "reference_usage": "style_text_only",
+        "source": "template_clone" if template_driven else "asset_clone",
+        "clone_mode": "template_dna" if template_driven else "style_dna",
+        "reference_usage": "layout_color_typography_only" if template_driven else "style_text_only",
+        "decision_label": template_decision_label if template_driven else None,
+        "best_for": (
+            "你希望新 PPT 尽量贴近上传模板或原稿，只替换成新的内容。"
+            if template_driven else None
+        ),
+        "tradeoff": (
+            "探索性会变少；如果要跳出模板，需要明确提出新的风格要求。"
+            if template_driven else None
+        ),
+        "visual_focus": (
+            "复用模板的版式结构、配色关系、字体层级、Logo 位置和同类页面节奏。"
+            if template_driven else None
+        ),
         "page_type_adaptation": adaptation_rules,
         "visual_strategy": visual_strategy,
-        "content_style_hint": summary.get("style_direction_hint", ""),
+        "content_style_hint": (
+            "模板是本项目的第一视觉来源；后续画面方案和 Prompt 不另起风格。"
+            if template_driven else summary.get("style_direction_hint", "")
+        ),
     }
 
 
@@ -1854,8 +1956,6 @@ def _generate_asset_based_proposal(
     style_library: List[Dict],
 ) -> List[Dict]:
     """基于用户素材生成 1 套完整风格阐述。"""
-    client = get_llm_client()
-
     # 整理素材信息
     logo = assets.get("logo_analysis") or {}
     ref = assets.get("reference_analysis") or {}
@@ -1866,6 +1966,11 @@ def _generate_asset_based_proposal(
     if _has_clone_reference(ref, template) and not style_user_desc:
         logger.info("StyleProposal(AssetBased): using deterministic strict reference clone proposal")
         return [_build_reference_clone_proposal(summary, assets)]
+    if template.get("has_template") and not style_user_desc:
+        logger.info("StyleProposal(AssetBased): using deterministic template fallback proposal")
+        return [_build_template_clone_fallback_proposal(summary, assets)]
+
+    client = get_llm_client()
 
     asset_sections = []
     logo_palette = ", ".join(_logo_brand_colors(logo))

@@ -28,7 +28,9 @@ class Settings(BaseSettings):
     IMAGE_API_MAX_CONCURRENCY: int = 1
     IMAGE_GPT_QUALITY: str = "high"  # low | medium | high | auto
     IMAGE_PROVIDER_GATEWAY_CUTOFF_SECONDS: int = 120
-    IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS: int = 2
+    IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS: int = 1
+    IMAGE_API_SLOT_WAIT_TIMEOUT_SECONDS: int = 600
+    IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE: int = 8
     IMAGE_ASPECT_RATIO_TOLERANCE: float = 0.04
     IMAGE_ASPECT_RATIO_MAX_RETRIES: int = 1
     # 0 means keep source dimensions unless upload-size fallback is required.
@@ -50,6 +52,7 @@ class Settings(BaseSettings):
     RUN_HEARTBEAT_TIMEOUT_SECONDS: int = 300
     CELERY_TASK_SOFT_TIME_LIMIT: int = 1800
     CELERY_TASK_TIME_LIMIT: int = 2100
+    PPTX_ASSEMBLY_LOCK_TTL_SECONDS: int = 300
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175"
 
     OUTPUT_DIR: str = "./outputs"

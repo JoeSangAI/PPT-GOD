@@ -85,8 +85,7 @@ export type GateActionKey =
   | "confirm_prototype"
   | "start_generation"
   | "retry_failed"
-  | "download"
-  | "templates";
+  | "download";
 
 export interface GateContext {
   gate: WorkflowGate;
@@ -251,10 +250,10 @@ export function getGuidanceText(state: WorkflowState) {
       return "内容规划已完成，请检查并确认";
     case "visual_ready":
       if (state.hasSelectedStyle && !state.hasPrompt) return "视觉方向已确认，请先生成每页画面方案";
-      if (state.hasSelectedStyle) return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
+      if (state.hasSelectedStyle) return "请检查每页画面描述，可上传参考图，然后点击「生成样张」";
       return "生成视觉方向前，可先上传 Logo、风格参考、可复用素材或模板";
     case "prompt_ready":
-      return "请检查每页画面描述，可上传参考图，然后点击「打样确认」";
+      return "请检查每页画面描述，可上传参考图，然后点击「生成样张」";
     case "prototype":
       return "打样页正在生成中，请稍候";
     case "prototype_ready":
@@ -262,7 +261,7 @@ export function getGuidanceText(state: WorkflowState) {
     case "generating":
       return "正在批量生成所有页面";
     case "completed":
-      return "PPT 已生成完成，可点击「下载 PPTX」获取文件";
+      return "已生成，可从右上角导出";
     case "failed":
       return "部分页面生成失败，可点击「一键重试失败页」或单页重试";
     default:
@@ -298,9 +297,6 @@ export function getPrimaryActionKey(state: WorkflowState) {
 
 export function getSecondaryActionKeys(state: WorkflowState) {
   const actions: string[] = [];
-  if (state.projectStatus === "planning" && state.templatePageCount > 0) {
-    actions.push("templates");
-  }
   if (state.projectStatus === "prototype_ready") {
     actions.push("resample");
   }
@@ -368,7 +364,6 @@ function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateAc
     actions.push("switch_to_content");
     if (!state.contentPlanConfirmed) actions.push("generate_content_plan");
     if (state.projectStatus !== "draft" && !state.contentPlanConfirmed) actions.push("confirm_content", "switch_to_visual");
-    if (state.templatePageCount > 0) actions.push("templates");
   }
   if (gate === "visual") {
     actions.push("switch_to_visual", "generate_style_proposals");

@@ -9,6 +9,9 @@ from app.services.logo_policy import LOGO_HEIGHT_RATIOS, LOGO_WIDTH_RATIOS, norm
 
 logger = logging.getLogger(__name__)
 
+LOGO_OPTIONAL_RENDER_TYPES = {"section", "hero", "quote"}
+LARGE_SYMBOL_LOGO_HEIGHT_RATIO = 0.145
+
 
 @dataclass(frozen=True)
 class LogoBox:
@@ -140,7 +143,7 @@ def resolve_logo_render_policy(
     scale: str = "small",
     policy: Mapping[str, Any] | None = None,
 ) -> dict:
-    """Choose full logo, symbol-only mark, or omit after the slide image exists."""
+    """Choose whether to render the uploaded logo without modifying the mark."""
     if not full_logo_path or not os.path.exists(full_logo_path):
         return {"show_logo": False, "render_variant": "omit"}
     policy = policy if isinstance(policy, Mapping) else {}
@@ -149,21 +152,11 @@ def resolve_logo_render_policy(
     logo_stats = _logo_tone_stats(full_logo_path)
     bg_stats = _background_box_stats(slide_image_path, full_box)
     full_readable = _full_logo_is_readable(logo_stats, bg_stats)
-    has_symbol = bool(symbol_logo_path and os.path.exists(symbol_logo_path))
     dark_visual = _is_dark_visual_page(slide_type, bg_stats)
+    can_omit = str(slide_type or "").strip().lower() in LOGO_OPTIONAL_RENDER_TYPES
 
-    if explicit_variant == "omit":
+    if explicit_variant == "omit" and can_omit:
         return {"show_logo": False, "render_variant": "omit"}
-    if explicit_variant == "symbol" and has_symbol:
-        symbol_scale = "small"
-        symbol_box = resolve_logo_overlay_box(slide_image_path, str(symbol_logo_path), slide_type, placement, symbol_scale)
-        return {
-            "show_logo": True,
-            "render_variant": "symbol",
-            "scale": symbol_scale,
-            "resolved_overlay_box": symbol_box,
-            "logo_contrast": "symbol_on_visual_page",
-        }
     if explicit_variant == "full":
         return {
             "show_logo": True,
@@ -172,7 +165,7 @@ def resolve_logo_render_policy(
             "logo_contrast": "readable" if full_readable else "full_forced",
         }
 
-    if full_readable and not (dark_visual and has_symbol and float(logo_stats.get("dark_share") or 0) >= 0.07):
+    if full_readable:
         return {
             "show_logo": True,
             "render_variant": "full",
@@ -180,18 +173,7 @@ def resolve_logo_render_policy(
             "logo_contrast": "readable",
         }
 
-    if has_symbol:
-        symbol_scale = "small"
-        symbol_box = resolve_logo_overlay_box(slide_image_path, str(symbol_logo_path), slide_type, placement, symbol_scale)
-        return {
-            "show_logo": True,
-            "render_variant": "symbol",
-            "scale": symbol_scale,
-            "resolved_overlay_box": symbol_box,
-            "logo_contrast": "symbol_fallback",
-        }
-
-    if dark_visual:
+    if dark_visual and can_omit:
         return {
             "show_logo": False,
             "render_variant": "omit",
@@ -202,7 +184,7 @@ def resolve_logo_render_policy(
         "show_logo": True,
         "render_variant": "full",
         "resolved_overlay_box": full_box,
-        "logo_contrast": "contour_fallback",
+        "logo_contrast": "low_contrast_manual_review",
     }
 
 
@@ -225,6 +207,8 @@ def _logo_size(
     max_width = int(canvas_width * LOGO_WIDTH_RATIOS[size_key])
     max_height = int(canvas_height * LOGO_HEIGHT_RATIOS[size_key])
     ratio = logo_height / max(logo_width, 1)
+    if is_large and ratio >= 0.85:
+        max_height = min(max_height, int(canvas_height * LARGE_SYMBOL_LOGO_HEIGHT_RATIO))
     width = max(1, max_width)
     height = max(1, int(width * ratio))
     if height > max_height:
@@ -410,6 +394,32 @@ def _overlap_ratio(
     return overlap_area / a_area
 
 
+def _cover_alignment_box(
+    protected_content: tuple[float, float, float, float] | None,
+    content_box: tuple[float, float, float, float, float] | None,
+    canvas_width: int,
+    canvas_height: int,
+) -> tuple[float, float, float, float] | None:
+    if not protected_content or not content_box:
+        return None
+    p_left, p_top, p_right, p_bottom = protected_content
+    c_left, c_top, c_right, c_bottom, _confidence = content_box
+    protected_width = p_right - p_left
+    content_width = c_right - c_left
+    if protected_width < canvas_width * 0.46:
+        return None
+    if protected_width < content_width * 1.18:
+        return None
+    if p_top > c_bottom + canvas_height * 0.08:
+        return None
+    if p_bottom < c_top - canvas_height * 0.04:
+        return None
+    protected_cx = (p_left + p_right) / 2
+    if abs(protected_cx - canvas_width / 2) > canvas_width * 0.20:
+        return None
+    return protected_content
+
+
 def _clip_candidate(
     canvas_width: int,
     canvas_height: int,
@@ -435,11 +445,23 @@ def _smart_title_block_box(
     content_box = _dominant_content_box(img)
     canvas_width, canvas_height = img.size
     gap = max(18, int(canvas_height * 0.04))
+    protected_content = _salient_content_bbox(img)
 
     if content_box:
         left, top, right, bottom, confidence = content_box
         content_cx = (left + right) / 2
         content_width = right - left
+        alignment_box = (
+            _cover_alignment_box(protected_content, content_box, canvas_width, canvas_height)
+            if str(slide_type or "").lower() == "cover"
+            else None
+        )
+        if alignment_box:
+            left, alignment_top, right, alignment_bottom = alignment_box
+            content_cx = (left + right) / 2
+            content_width = max(content_width, right - left)
+            top = min(top, alignment_top)
+            bottom = max(bottom, alignment_bottom)
     else:
         content_cx = canvas_width / 2
         top = canvas_height * 0.28
@@ -450,12 +472,14 @@ def _smart_title_block_box(
     follow_penalty = 0.0 if confidence >= 0.08 else 0.22
     balanced = abs(content_cx - canvas_width / 2) < canvas_width * 0.10 or content_width > canvas_width * 0.52
     center_x = canvas_width / 2 if balanced else content_cx
-    protected_content = _salient_content_bbox(img)
+    slide_type_key = str(slide_type or "").lower()
+    above_title_preference = 0.02 if slide_type_key == "cover" else 0.08
+    lower_center_preference = 0.28 if slide_type_key == "cover" else 0.20
 
     raw_candidates: list[tuple[str, float, float, float]] = [
         ("below-title", center_x - logo_width / 2, bottom + gap * 0.65, 0.00 + follow_penalty),
-        ("above-title", center_x - logo_width / 2, top - logo_height - gap * 0.65, 0.08 + follow_penalty),
-        ("lower-center", canvas_width / 2 - logo_width / 2, canvas_height * 0.70, 0.20),
+        ("above-title", center_x - logo_width / 2, top - logo_height - gap * 0.65, above_title_preference + follow_penalty),
+        ("lower-center", canvas_width / 2 - logo_width / 2, canvas_height * 0.70, lower_center_preference),
         ("top-center", canvas_width / 2 - logo_width / 2, canvas_height * 0.08, 0.34),
         ("bottom-center", canvas_width / 2 - logo_width / 2, canvas_height * 0.86 - logo_height, 0.38),
         ("center", canvas_width / 2 - logo_width / 2, canvas_height / 2 - logo_height / 2, 0.58),
@@ -477,13 +501,15 @@ def _smart_title_block_box(
             protected_content,
         )
         title_distance = abs((cand_left + logo_width / 2) - center_x) / canvas_width
-        vertical_distance = 0 if name in {"below-title", "above-title"} else 0.08
+        vertical_distance = 0 if name in {"below-title", "above-title"} else (
+            0.22 if str(slide_type or "").lower() == "cover" else 0.08
+        )
         middle_band_penalty = (
             0.45
-            if str(slide_type or "").lower() == "ending" and 0.25 <= (cand_top / max(canvas_height, 1)) <= 0.84
+            if slide_type_key == "ending" and 0.25 <= (cand_top / max(canvas_height, 1)) <= 0.84
             else 0.0
         )
-        overlap_weight = 8.0 if str(slide_type or "").lower() == "ending" else 3.4
+        overlap_weight = 8.0 if slide_type_key == "ending" else 3.4
         score = activity * 4.6 + overlap * overlap_weight + preference + title_distance * 0.55 + vertical_distance + middle_band_penalty
         logo_box = LogoBox(cand_left, cand_top, logo_width, logo_height, f"smart:{name}")
         if best is None or score < best[0]:

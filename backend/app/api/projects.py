@@ -1,4 +1,6 @@
 import logging
+import os
+import re
 import time
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -7,9 +9,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.models.base import get_db
-from app.models.models import Project, Slide
+from app.models.models import Project, Slide, ReferenceImage
 from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse
-from app.core.tester_auth import is_local_admin_request, require_tester_id, tester_id_from_header, verify_project_access
+from app.core.tester_auth import is_local_admin_request, require_existing_tester, require_tester_id, tester_id_from_header, verify_project_access
 from app.core.provider_credentials import store_current_provider_credentials
 from app.core.config import settings
 from app.services.artifact_versions import content_signature, dependency_signature, selected_style_signature, with_artifact_meta, with_stale_flags
@@ -44,7 +46,8 @@ def create_project(
     if len(title) > 100:
         raise HTTPException(status_code=400, detail="项目标题不能超过100个字符")
 
-    project = Project(title=title, style_id=payload.style_id, tester_id=tester_id)
+    owner_tester_id = None if is_local_admin_request(tester_id) else require_existing_tester(db, tester_id).id
+    project = Project(title=title, style_id=payload.style_id, tester_id=owner_tester_id)
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -270,19 +273,86 @@ def create_style_proposals(
         task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id, user_description=user_description)
         set_run_task(db, run.id, task.id)
         db.commit()
-        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
     except Exception as exc:
         logger.exception("Failed to enqueue style proposals task for project %s", project_id)
         message = "后台队列暂时不可用。请确认 Docker/Redis 正常运行且磁盘空间充足，然后重试。"
         finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
         db.commit()
         raise HTTPException(status_code=503, detail=message) from exc
+    try:
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    except Exception as exc:
+        logger.warning("Redis 写入风格任务跟踪信息失败，不影响已分发任务: project=%s task=%s error=%s", project_id, task.id, exc)
     return {"status": "generating", "proposals": None, "run": serialize_run(run)}
 
 
 class TemplateRecommendationsRequest(BaseModel):
     recommendations: dict | None = None
+
+
+TEMPLATE_RECOMMENDATION_KEYS = {"cover", "toc", "section", "content", "data", "quote", "ending"}
+
+
+def _template_page_num(ref: ReferenceImage) -> int:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    try:
+        page_num = int(analysis.get("template_page_num") or 0)
+    except (TypeError, ValueError):
+        page_num = 0
+    if page_num > 0:
+        return page_num
+    match = re.search(r"page_(\d+)", os.path.basename(ref.file_path or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _template_recommendation_from_ref(ref: ReferenceImage) -> dict:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    layout_path = analysis.get("layout_file_path") or ref.file_path
+    return {
+        "page_num": _template_page_num(ref),
+        "file_path": layout_path,
+        "preview_file_path": analysis.get("preview_file_path") or ref.file_path,
+        "layout_file_path": layout_path,
+        "category": analysis.get("template_category") or "content",
+        "category_confidence": analysis.get("category_confidence") or 0.6,
+        "source_kind": analysis.get("source_kind") or "template",
+        "application_strength": analysis.get("template_application_strength") or "standard",
+        "logo_removed": bool(analysis.get("logo_removed")),
+    }
+
+
+def _hydrate_template_recommendations(project_id: str, recommendations: dict | None, db: Session) -> dict | None:
+    if recommendations is None:
+        return None
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.role == "template",
+    ).all()
+    by_page = {
+        _template_page_num(ref): ref
+        for ref in refs
+        if _template_page_num(ref) > 0
+    }
+    hydrated = {}
+    for key in TEMPLATE_RECOMMENDATION_KEYS:
+        value = recommendations.get(key) if isinstance(recommendations, dict) else None
+        if not value:
+            hydrated[key] = None
+            continue
+        try:
+            page_num = int(value.get("page_num") if isinstance(value, dict) else value)
+        except (TypeError, ValueError):
+            hydrated[key] = None
+            continue
+        ref = by_page.get(page_num)
+        hydrated_value = _template_recommendation_from_ref(ref) if ref else None
+        if hydrated_value and isinstance(value, dict):
+            strength = str(value.get("application_strength") or "").strip()
+            if strength in {"light", "standard", "strong"}:
+                hydrated_value["application_strength"] = strength
+        hydrated[key] = hydrated_value
+    return hydrated
 
 
 @router.patch("/{project_id}/template-recommendations", response_model=ProjectResponse)
@@ -296,7 +366,11 @@ def update_template_recommendations(
     project = db.query(Project).filter(Project.id == project_id).first()
     verify_project_access(project, tester_id)
     if payload.recommendations is not None:
-        project.selected_template_recommendations = payload.recommendations
+        project.selected_template_recommendations = _hydrate_template_recommendations(
+            project_id,
+            payload.recommendations,
+            db,
+        )
     db.commit()
     db.refresh(project)
     return project

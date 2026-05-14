@@ -93,6 +93,13 @@ def require_tester_id(x_pptgod_tester_id: Optional[str] = Header(default=None)) 
     return tester_id
 
 
+def require_existing_tester(db: Session, tester_id: str) -> TesterUser:
+    tester = db.query(TesterUser).filter(TesterUser.id == tester_id).first()
+    if not tester:
+        raise HTTPException(status_code=401, detail="登录状态已失效，请退出后重新进入 PPT God")
+    return tester
+
+
 def verify_project_access(project: Project | None, tester_id: str | None) -> Project:
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")

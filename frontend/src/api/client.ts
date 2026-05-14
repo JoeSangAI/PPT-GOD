@@ -135,6 +135,12 @@ export async function testerLogin(displayName: string, passcode: string = ""): P
   return { testerId: data.tester_id, displayName: data.display_name };
 }
 
+export async function fetchAuthMe(): Promise<MvpAuth> {
+  const res = await apiFetch(`${API_BASE}/auth/me`);
+  const data = await (await checkRes(res)).json();
+  return { testerId: data.tester_id, displayName: data.display_name || "测试用户" };
+}
+
 async function checkRes(res: Response) {
   if (!res.ok) {
     const text = await res.text().catch(() => "Unknown error");
@@ -611,6 +617,20 @@ export async function fetchTemplatePages(projectId: string) {
   return (await checkRes(res)).json();
 }
 
+export async function fetchTemplateStatus(projectId: string) {
+  const res = await apiFetch(`${API_BASE}/projects/${projectId}/template-status`);
+  return (await checkRes(res)).json();
+}
+
+export async function updateTemplateRecommendations(projectId: string, recommendations: any) {
+  const res = await apiFetch(`${API_BASE}/projects/${projectId}/template-recommendations`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ recommendations }),
+  });
+  return (await checkRes(res)).json();
+}
+
 export async function updateProjectStyle(projectId: string, selectedStyle: any) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/style`, {
     method: "PATCH",
@@ -654,15 +674,6 @@ export async function pollForStyleProposals(
     }
   }
   throw new Error("风格提案生成超时，请刷新页面后重试");
-}
-
-export async function updateTemplateRecommendations(projectId: string, recommendations: any) {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/template-recommendations`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recommendations }),
-  });
-  return (await checkRes(res)).json();
 }
 
 export async function rollbackProject(projectId: string, targetStage: string) {

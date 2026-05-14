@@ -1,11 +1,14 @@
 export type AgentRole = "content" | "visual" | "finetune";
 export type AgentRequestScope = "current_slide" | "selected_slides" | "deck";
 export type AgentRequestRisk = "safe" | "cost" | "destructive";
+export type AgentTargetArea = "whole" | "title" | "body" | "visual" | "materials" | "notes";
+export type AgentTargetConfidence = "explicit" | "inferred" | "needs_input";
 
 export interface InferAgentRequestContextInput {
   message: string;
   activeAgentRole: AgentRole;
   activeScope: AgentRequestScope;
+  targetAreaOverride?: AgentTargetArea | null;
   editingPageNum?: number | null;
   selectedPageNums?: number[];
   projectStatus?: string;
@@ -20,6 +23,9 @@ export interface AgentRequestContext {
   targetRole: AgentRole;
   scope: AgentRequestScope;
   risk: AgentRequestRisk;
+  targetArea: AgentTargetArea;
+  areaLabel: string;
+  confidence: AgentTargetConfidence;
   pageNums: number[];
   explicitScope: boolean;
   scopeLabel: string;
@@ -157,9 +163,61 @@ const CONTENT_RE = /(内容|文案|标题|正文|小标题|结构|逻辑|故事|
 const FINETUNE_RE = /(微调|修图|改图|这张图|当前图|成图|底图|最终图|图片里|图里|放大|缩小|擦除|局部|局部调整)/i;
 const COST_RE = /(出图|生图|生成图片|生成全部|批量生成|打样|重试失败|重新生成图片|确认生成|开始生成图片|全量生成)/i;
 const DESTRUCTIVE_RE = /(重新做|重做|重新规划|重构|覆盖|从头|按原文重新|重新生成内容|重新生成规划|变成\s*\d{1,3}\s*(?:[-到至~～]\s*\d{1,3})?\s*页|(?:做成|扩成|扩展成)\s*\d{1,3}\s*(?:[-到至~～]\s*\d{1,3})?\s*页|删除|删掉|移除|清空|替换整套)/i;
+const TITLE_AREA_RE = /(标题|主标题|副标题|小标题|headline|title|subtitle)/i;
+const BODY_AREA_RE = /(正文|段落|要点|项目符号|bullet|文案|内容|说明|文本|文字|数据|案例|结构|逻辑|改写|重写|扩写|删减)/i;
+const NOTES_AREA_RE = /(备注|讲稿|演讲稿|speaker\s*notes?|notes?)/i;
+const VISUAL_AREA_RE = /(画面|风格|背景|配色|颜色|色彩|版式|排版|图片|图像|视觉|质感|调性|商务|科技|高级|深色|浅色|杂志|极简|重画|出图|生图|打样|生成图片|画面方案|视觉描述|Prompt|prompt)/i;
+const MATERIALS_AREA_RE = /(Logo|logo|产品图|素材|参考图|模板|物料|品牌资产|上传|贴图)/i;
+
+const AREA_LABELS: Record<AgentTargetArea, string> = {
+  whole: "全页",
+  title: "标题",
+  body: "正文",
+  visual: "画面",
+  materials: "素材",
+  notes: "备注",
+};
 
 const isVisualStage = (status?: string) =>
   ["visual_ready", "prompt_ready", "prototype", "prototype_ready", "generating", "completed", "failed"].includes(status || "");
+
+const inferTargetArea = (
+  message: string,
+  targetRole: AgentRole,
+  override?: AgentTargetArea | null
+): { targetArea: AgentTargetArea; areaLabel: string; confidence: AgentTargetConfidence } => {
+  const explicitMaterials = hasAny(message, MATERIALS_AREA_RE);
+  const explicitVisual = hasAny(message, VISUAL_AREA_RE);
+  const explicitNotes = hasAny(message, NOTES_AREA_RE);
+  const explicitTitle = hasAny(message, TITLE_AREA_RE);
+  const explicitBody = hasAny(message, BODY_AREA_RE);
+
+  let targetArea: AgentTargetArea | null = null;
+  if (explicitMaterials) {
+    targetArea = "materials";
+  } else if (explicitVisual) {
+    targetArea = "visual";
+  } else if (explicitNotes) {
+    targetArea = "notes";
+  } else if (explicitTitle && !explicitBody) {
+    targetArea = "title";
+  } else if (explicitBody) {
+    targetArea = "body";
+  } else if (explicitTitle) {
+    targetArea = "title";
+  }
+
+  if (targetArea) {
+    return { targetArea, areaLabel: AREA_LABELS[targetArea], confidence: "explicit" };
+  }
+  if (override) {
+    return { targetArea: override, areaLabel: AREA_LABELS[override], confidence: "explicit" };
+  }
+  if (targetRole === "visual" || targetRole === "finetune") {
+    return { targetArea: "visual", areaLabel: AREA_LABELS.visual, confidence: "inferred" };
+  }
+  return { targetArea: "whole", areaLabel: AREA_LABELS.whole, confidence: "inferred" };
+};
 
 export function inferAgentRequestContext(input: InferAgentRequestContextInput): AgentRequestContext {
   const message = normalizeMessage(input.message);
@@ -170,6 +228,7 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
   const mentionsCurrent = hasAny(message, CURRENT_SCOPE_RE);
   const mentionsDeck = hasAny(message, DECK_SCOPE_RE);
   const mentionsSelected = hasAny(message, SELECTED_SCOPE_RE);
+  const needsSelectedPages = mentionsSelected && selectedPageNums.length === 0;
 
   let scope: AgentRequestScope = activeScope;
   let pageNums: number[] = [];
@@ -190,10 +249,20 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
     scope = selectedPageNums.length === 1 ? "current_slide" : "selected_slides";
     pageNums = selectedPageNums;
     explicitScope = true;
+  } else if (needsSelectedPages) {
+    scope = "selected_slides";
+    pageNums = [];
+    explicitScope = true;
   } else if (mentionsCurrent && input.editingPageNum) {
     scope = "current_slide";
     pageNums = [input.editingPageNum];
     explicitScope = true;
+  } else if (input.activeAgentRole === "finetune" && input.editingPageNum) {
+    scope = "current_slide";
+    pageNums = [input.editingPageNum];
+  } else if (selectedPageNums.length > 0) {
+    scope = selectedPageNums.length === 1 ? "current_slide" : "selected_slides";
+    pageNums = selectedPageNums;
   } else if (activeScope === "current_slide" && input.editingPageNum) {
     pageNums = [input.editingPageNum];
   } else if (activeScope === "selected_slides" && selectedPageNums.length > 0) {
@@ -234,11 +303,16 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
   }
 
   const risk: AgentRequestRisk = costIntent ? "cost" : destructiveIntent ? "destructive" : "safe";
+  const targetAreaContext = inferTargetArea(message, targetRole, input.targetAreaOverride);
+  const confidence: AgentTargetConfidence = needsSelectedPages ? "needs_input" : targetAreaContext.confidence;
 
   return {
     targetRole,
     scope,
     risk,
+    targetArea: targetAreaContext.targetArea,
+    areaLabel: targetAreaContext.areaLabel,
+    confidence,
     pageNums,
     explicitScope,
     scopeLabel: formatAgentScopeLabel(scope, pageNums),

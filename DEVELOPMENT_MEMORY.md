@@ -35,6 +35,16 @@ Recorded 2026-05-12 from user direction.
 - Do not block the normal frontend experience on optional analysis, visual polish, or best-effort asset inference.
 - If a refinement is not ready, use a stable local fallback and let the user continue instead of holding the workflow.
 
+## Agent Product Execution Priorities
+
+Recorded 2026-05-13 from user direction.
+
+- Prioritize quality over stability over speed. Speed optimizations are welcome only when they do not weaken output quality or system reliability.
+- Run independent work concurrently when possible, especially slow analysis, asset parsing, proposal generation, and background preparation, so the user waits less or does not notice the work.
+- Keep the pipeline simple. Use Occam's razor before adding orchestration, queues, fallback layers, or new state paths; prefer one clear source of truth and the smallest executable workflow that solves the user problem.
+- Be cautious about prompt growth. Do not use larger prompts as the default fix; prefer compact context, structured action schemas, deterministic executors, retrieval of only relevant facts, and prompt changes with clear risk control.
+- UI interactions must match user intuition. Surface actions in the user's mental model, make scope/cost/result visible, and avoid exposing implementation terms unless they help the user make a concrete decision.
+
 ## Image Generation Architecture Constraint
 
 Recorded 2026-05-10 from user direction.

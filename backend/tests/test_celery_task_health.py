@@ -8,6 +8,8 @@ from app.celery_app import celery_app
 from app.core.config import settings
 from app.models.base import Base
 from app.models.models import Project, Slide
+from app import tasks as image_tasks
+from app.services import generation_pipeline
 from app.services.run_state import create_project_run, utc_now
 
 
@@ -39,6 +41,186 @@ def test_generation_worker_check_targets_image_queue(monkeypatch):
     slides_api.ensure_generation_worker_ready()
 
     assert captured["queue"] == settings.CELERY_IMAGE_QUEUE
+
+
+def test_generation_page_chunks_are_bounded(monkeypatch):
+    monkeypatch.setattr(image_tasks.settings, "IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE", 3)
+
+    current, remaining = image_tasks._split_generation_pages([1, "2", 3, 4, 5])
+
+    assert current == [1, 2, 3]
+    assert remaining == [4, 5]
+
+
+def test_generation_task_queues_continuation_with_same_credential(monkeypatch):
+    db = make_session()
+    project = Project(title="Continuation run", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="prompt_ready", prompt_text="p2"),
+            Slide(project_id=project.id, page_num=3, status="prompt_ready", prompt_text="p3"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    db.commit()
+    project_id = project.id
+    run_id = run.id
+
+    captured = {}
+
+    class NextTask:
+        id = "next-task"
+
+    def fake_enqueue(_db, project_id, remaining_page_nums, *, prototype, run_id, credential_id):
+        captured.update(
+            project_id=project_id,
+            remaining_page_nums=remaining_page_nums,
+            prototype=prototype,
+            run_id=run_id,
+            credential_id=credential_id,
+        )
+        return NextTask()
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks.settings, "IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE", 2)
+    monkeypatch.setattr(image_tasks, "_acquire_page_locks", lambda _project_id, pages: pages)
+    monkeypatch.setattr(image_tasks, "_release_page_locks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "_cleanup_stale_generating_slides", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "run_generation_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "is_run_active", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(image_tasks, "_enqueue_generation_continuation", fake_enqueue)
+
+    result = image_tasks._generate_slides_task_inner(
+        project_id,
+        page_nums=[1, 2, 3],
+        run_id=run_id,
+        credential_id="credential-1",
+    )
+
+    assert result["status"] == "continued"
+    assert captured == {
+        "project_id": project_id,
+        "remaining_page_nums": [3],
+        "prototype": False,
+        "run_id": run_id,
+        "credential_id": "credential-1",
+    }
+
+
+def test_deferred_generation_chunk_keeps_run_active(monkeypatch):
+    db = make_session()
+    project = Project(title="Chunked run", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="prompt_ready", prompt_text="p2"),
+            Slide(project_id=project.id, page_num=3, status="prompt_ready", prompt_text="p3"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    db.commit()
+
+    def fake_generate_one_slide(slide, project_id, output_dir, ref_data, run_id=None):
+        return {"slide": slide, "image_path": f"/tmp/slide_{slide.page_num:02d}.png"}
+
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(generation_pipeline, "assemble_pptx", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not assemble")))
+
+    generation_pipeline.run_generation_pipeline(
+        project.id,
+        db,
+        page_nums=[1, 2],
+        run_id=run.id,
+        defer_finalization=True,
+    )
+
+    refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).one()
+    refreshed_slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+
+    assert refreshed_run.status == "running"
+    assert refreshed_run.total_count == 3
+    assert refreshed_run.completed_count == 2
+    assert [s.status for s in refreshed_slides] == ["completed", "completed", "prompt_ready"]
+
+
+def test_final_generation_chunk_finishes_shared_run(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Final chunk", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    existing_paths = []
+    for page_num in (1, 2):
+        image_path = tmp_path / f"slide_{page_num:02d}.png"
+        image_path.write_bytes(b"image")
+        existing_paths.append(str(image_path))
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="completed", prompt_text="p1", image_path=existing_paths[0]),
+            Slide(project_id=project.id, page_num=2, status="completed", prompt_text="p2", image_path=existing_paths[1]),
+            Slide(project_id=project.id, page_num=3, status="prompt_ready", prompt_text="p3"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    db.commit()
+
+    generated_path = tmp_path / "slide_03.png"
+    generated_path.write_bytes(b"image")
+    assembled = {}
+
+    def fake_generate_one_slide(slide, project_id, output_dir, ref_data, run_id=None):
+        return {"slide": slide, "image_path": str(generated_path)}
+
+    def fake_assemble_pptx(**kwargs):
+        assembled["count"] = len(kwargs["slide_images"])
+
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(generation_pipeline, "assemble_pptx", fake_assemble_pptx)
+    monkeypatch.setattr(generation_pipeline.redis_client, "set", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(generation_pipeline.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    generation_pipeline.run_generation_pipeline(project.id, db, page_nums=[3], run_id=run.id)
+
+    refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).one()
+    refreshed_project = db.query(Project).filter(Project.id == project.id).one()
+
+    assert refreshed_run.status == "succeeded"
+    assert refreshed_run.completed_count == 3
+    assert refreshed_project.status == "completed"
+    assert assembled["count"] == 3
 
 
 def test_missing_started_celery_task_marks_generation_recoverable(monkeypatch):

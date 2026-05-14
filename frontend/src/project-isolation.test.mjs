@@ -367,8 +367,8 @@ assert.match(
 );
 assert.match(
   source,
-  /disabled=\{isBusy \|\| chatLoading \|\| !canStartPrototypeGeneration\}/,
-  "the visual-stage sample button must use prototype readiness, not full-deck readiness"
+  /if \(actionKey === "start-prototype"\)[\s\S]*disabled: isBusy \|\| chatLoading \|\| !canStartPrototypeGeneration/,
+  "the process-bar sample action must use prototype readiness, not full-deck readiness"
 );
 assert.match(
   source,
@@ -394,6 +394,21 @@ assert.match(
   css,
   /pg-style-dock-decision/,
   "style proposal cards need a dedicated decision summary treatment"
+);
+assert.doesNotMatch(
+  source,
+  /TemplateRecommender|showTemplateRecommender|case "templates"/,
+  "template recommendations must not create a separate workflow branch"
+);
+assert.match(
+  source,
+  /hasTemplateSource[\s\S]*生成模板视觉方向[\s\S]*pg-template-source-strip/,
+  "uploaded templates must be integrated into the style proposal decision surface"
+);
+assert.match(
+  css,
+  /pg-template-source-strip[\s\S]*pg-style-swatch-group/,
+  "template source and palette swatches need explicit integrated UI treatment"
 );
 assert.match(
   source,
@@ -429,6 +444,61 @@ assert.match(
   source,
   /视觉阶段的内容变动只影响相关页面[\s\S]*setStaleMap[\s\S]*content: true[\s\S]*setContentPlanSnapshot\(data\)/,
   "visual-stage content edits must mark affected pages stale instead of reopening content confirmation"
+);
+assert.match(
+  source,
+  /const hydrateSlideStaleMap = \(items: Slide\[\]\) => \{[\s\S]*if \(backendStale\.content\) hydrated\.content = true;[\s\S]*if \(backendStale\.visual\) hydrated\.visual = true;[\s\S]*if \(backendStale\.image \|\| prevStale\.localImage\) hydrated\.image = true;[\s\S]*delete next\[slide\.id\];/,
+  "slide stale hydration must remove backend-cleared content/visual flags instead of preserving visual-prompt intermediate state"
+);
+assert.match(
+  source,
+  /className="pg-agent-command-bar"/,
+  "Agent composer guidance must be a compact command bar instead of a full task-card form"
+);
+assert.doesNotMatch(
+  source,
+  /className="pg-agent-command-sheet"[\s\S]{0,2600}<span>任务<\/span>[\s\S]{0,2600}<span>结果<\/span>/,
+  "Agent composer guidance must not expose internal task/result field rows in the narrow sidebar"
+);
+assert.match(
+  css,
+  /\.pg-agent-command-bar[\s\S]*\.pg-agent-scope-panel/,
+  "compact Agent command bar and its scope panel must have explicit styling"
+);
+assert.match(
+  source,
+  /target_area:\s*requestContext\.targetArea[\s\S]*area_label:\s*requestContext\.areaLabel[\s\S]*confidence:\s*requestContext\.confidence/,
+  "Agent page_context must carry the inferred page area so the backend can act on the same target the UI shows"
+);
+assert.match(
+  source,
+  /把选中页改得更商务，背景更克制/,
+  "Agent composer visual placeholder must use a concrete example"
+);
+assert.match(
+  source,
+  /把第 3 页标题改短，正文更像汇报口吻/,
+  "Agent composer content placeholder must use a concrete example"
+);
+assert.match(
+  source,
+  /保留文字，把画面换成更高级的办公室场景/,
+  "Agent composer placeholder must use concrete examples for visual, content, and single-page fine-tune states"
+);
+assert.doesNotMatch(
+  source,
+  /currentAgentRole === "finetune"[\s\S]{0,700}:\s*"输入指令\.\.\."/,
+  "Agent composer must not fall back to a generic input prompt in the main post-draft states"
+);
+assert.match(
+  source,
+  /先在画布中勾选页面，或改说具体页码/,
+  "Agent composer must block ambiguous 'these pages' commands when no pages are selected"
+);
+assert.match(
+  source,
+  /requestContext\.risk !== "safe"[\s\S]*会影响整套[\s\S]*会产生生图成本[\s\S]*会覆盖现有画面方案/,
+  "Agent composer must confirm cost/destructive requests with user-outcome consequences before sending"
 );
 
 const allowedDirectSetContexts = [

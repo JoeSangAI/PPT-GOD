@@ -19,6 +19,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_TRUSTED_HOST=mirrors.aliyun.com \
     PIP_DEFAULT_TIMEOUT=120
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libreoffice-impress \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

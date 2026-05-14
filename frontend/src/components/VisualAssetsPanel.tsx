@@ -179,17 +179,17 @@ export default function VisualAssetsPanel({
     handler?.();
   };
   const uploadChoices = [
-    { key: "logo", title: "品牌 Logo", detail: "作为角标或品牌标识", action: onUploadLogo },
-    { key: "asset", title: "可复用素材", detail: "产品、主视觉、人物、物料图", action: onUploadVisualAsset },
-    { key: "style", title: "风格参考", detail: "学习气质，不强制出现", action: onUploadStyleRef },
-    { key: "template", title: "版式模板", detail: "参考页面结构", action: onUploadTemplate },
+    { key: "logo", icon: "L", title: "Logo", detail: "品牌标识", action: onUploadLogo },
+    { key: "asset", icon: "+", title: "素材", detail: "产品/人物/物料", action: onUploadVisualAsset },
+    { key: "style", icon: "S", title: "风格", detail: "参考气质", action: onUploadStyleRef },
+    { key: "template", icon: "T", title: "模板", detail: "参考版式", action: onUploadTemplate },
   ];
 
   const AddChoiceGrid = ({ compact = false }: { compact?: boolean }) => (
     <div className={`pg-add-menu ${compact ? "is-compact" : ""}`} aria-label="添加项目素材">
       {uploadChoices.map((choice) => (
         <button key={choice.key} type="button" onClick={() => runUpload(choice.action)}>
-          <span className="pg-add-choice-icon" aria-hidden="true">+</span>
+          <span className="pg-add-choice-icon" aria-hidden="true">{choice.icon}</span>
           <b>{choice.title}</b>
           <span>{choice.detail}</span>
         </button>
@@ -396,37 +396,37 @@ export default function VisualAssetsPanel({
 
   return (
     <div className="pg-visual-assets-panel bg-gray-50 border-b border-gray-200 px-3 py-2">
-      <section className="pg-lite-section pg-project-assets-section">
-        <div className="pg-assets-lite-head">
-          <div>
-            <div className="pg-assets-onboarding-title">
-              项目素材 <span className="pg-assets-count-badge">{referenceImages.length}</span>
+      <section className="pg-assets-tray pg-project-assets-section">
+        <div className="pg-assets-tray-head">
+          <div className="pg-assets-tray-summary">
+            <div className="pg-assets-tray-title">
+              <span>已添加</span>
+              <b>{referenceImages.length}</b>
             </div>
-            <div className="pg-assets-onboarding-subtitle">
-              {showInVisualStage && referenceImages.length === 0
-                ? "生成视觉方向前，如果有 Logo、产品图、风格参考或模板，先放这里；没有也可以直接生成。"
-                : "跨页复用的图片和 Logo；只给某一页用的图，请在单页编辑里加「本页参考图」。"}
-            </div>
+            {referenceImages.length > 0 ? (
+              <div className="pg-assets-tray-chips">
+                <SummaryChip value={confirmedLogos.length} label=" Logo" />
+                <SummaryChip value={visualAssets.length} label=" 可复用" />
+                <SummaryChip value={styleRefs.length} label=" 风格" />
+                <SummaryChip value={template ? 1 : 0} label=" 模板" />
+                {missingAssetCount > 0 && <SummaryChip value={missingAssetCount} label=" 需重传" />}
+              </div>
+            ) : (
+              <span className="pg-assets-tray-hint">Logo、产品图、风格参考、模板都可以先放这里。</span>
+            )}
           </div>
-          <div className="pg-assets-lite-actions">
-            <button type="button" className="pg-asset-library-entry" onClick={() => setShowManager(true)}>
-              <span className="pg-asset-library-entry-icon" aria-hidden="true">+</span>
-              <span className="pg-asset-library-entry-copy">
-                <b>添加/管理素材</b>
-                <em>上传、编辑、删除</em>
-              </span>
+          <div className="pg-assets-tray-actions">
+            {uploadChoices.map((choice) => (
+              <button key={choice.key} type="button" className="pg-tray-upload-button" onClick={() => runUpload(choice.action)}>
+                <span className="pg-tray-upload-icon" aria-hidden="true">{choice.icon}</span>
+                <span>{choice.title}</span>
+              </button>
+            ))}
+            <button type="button" className="pg-assets-manage-button" onClick={() => setShowManager(true)}>
+              管理
             </button>
           </div>
         </div>
-        {referenceImages.length > 0 && (
-          <div className="pg-asset-summary-row">
-            <SummaryChip value={confirmedLogos.length} label=" Logo" />
-            <SummaryChip value={visualAssets.length} label=" 可复用" />
-            <SummaryChip value={styleRefs.length} label=" 风格参考" />
-            <SummaryChip value={template ? 1 : 0} label=" 模板" />
-            {missingAssetCount > 0 && <SummaryChip value={missingAssetCount} label=" 需重传" />}
-          </div>
-        )}
         {previewItems.length > 0 && (
           <div className="pg-lite-thumb-row pg-project-asset-preview-row">
             {previewItems.slice(0, 8).map(({ item, label }) => (
@@ -439,14 +439,9 @@ export default function VisualAssetsPanel({
           </div>
         )}
         {previewItems.length === 0 && (
-          <div className={`pg-project-asset-empty-state ${showInVisualStage ? "is-onboarding" : ""}`}>
-            <b>{showInVisualStage ? "先补充会影响视觉方向的素材" : "还没有项目素材"}</b>
-            <em>
-              {showInVisualStage
-                ? "有品牌 Logo、产品/主视觉、风格参考或版式模板就上传；没有也可以直接生成视觉方向。"
-                : "点击右上角「添加/管理素材」上传 Logo、产品图、风格参考或版式模板。"}
-            </em>
-            {showInVisualStage && <AddChoiceGrid compact />}
+          <div className="pg-project-asset-empty-state">
+            <b>{showInVisualStage ? "还没有项目素材" : "还没有项目素材"}</b>
+            <em>用上方按钮添加素材；没有素材也可以继续生成。</em>
           </div>
         )}
       </section>
@@ -575,7 +570,15 @@ export default function VisualAssetsPanel({
                       ? Object.entries(templateRecommendations).find(([, v]) => v && (v as any).page_num === page.page_num)
                       : null;
                     const recKey = recEntry ? recEntry[0] : null;
-                    const roleLabels: Record<string, string> = { cover: "封面", toc: "目录", content: "内容", ending: "封底" };
+                    const roleLabels: Record<string, string> = {
+                      cover: "封面",
+                      toc: "目录",
+                      section: "章节",
+                      content: "内容",
+                      data: "数据",
+                      quote: "强调",
+                      ending: "封底",
+                    };
                     return (
                       <button key={page.page_num} type="button" className="pg-template-page" onClick={() => onImageClick(getImageUrl(apiBase, page.url))}>
                         <img src={getImageUrl(apiBase, page.url)} alt={`模板第${page.page_num}页`} />

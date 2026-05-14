@@ -217,6 +217,64 @@ def test_user_style_description_overrides_reference_clone_shortcut(monkeypatch):
     assert "聊天要求优先级" in captured["prompt"]
 
 
+def test_template_only_style_proposal_is_deterministic(monkeypatch):
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+    monkeypatch.setattr(
+        style_proposal,
+        "get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("template default should not call LLM")),
+    )
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "年度经营复盘", "body": "增长、渠道、效率"}}],
+        assets={
+            "template_analysis": {
+                "has_template": True,
+                "source_kind": "template",
+                "template_page_count": 5,
+            }
+        },
+    )
+
+    assert len(proposals) == 1
+    assert proposals[0]["name"] == "沿用模板风格"
+    assert proposals[0]["decision_label"] == "沿用模板"
+    assert proposals[0]["source"] == "template_clone"
+    assert proposals[0]["clone_mode"] == "template_dna"
+    assert "旧正文" in proposals[0]["description"]
+
+
+def test_finished_ppt_template_reference_keeps_origin_label(monkeypatch):
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+    monkeypatch.setattr(
+        style_proposal,
+        "get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("template reference clone should not call LLM")),
+    )
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "content", "text_content": {"headline": "组织协同", "body": "方法、流程、案例"}}],
+        assets={
+            "template_analysis": {
+                "has_template": True,
+                "source_kind": "finished_ppt",
+                "reference_analysis": {
+                    "description": "黑底、黄色品牌块、左上 Logo，正文页大量留白。",
+                    "dominant_palette": [{"hex": "#000000", "share": 0.6}, {"hex": "#FFD000", "share": 0.2}],
+                    "mood": "强品牌、克制、发布会感",
+                    "font_suggestion": "粗黑标题配清晰黑体正文",
+                },
+            }
+        },
+    )
+
+    assert proposals[0]["name"] == "沿用原稿风格"
+    assert proposals[0]["decision_label"] == "沿用原稿"
+    assert proposals[0]["source"] == "template_clone"
+    assert proposals[0]["reference_usage"] == "layout_color_typography_only"
+    assert any(color["hex"] == "#FFD000" for color in proposals[0]["palette"])
+
+
 def test_explicit_deck_wide_dark_request_removes_light_content_policy():
     proposal = {
         "name": "墨韵金调",

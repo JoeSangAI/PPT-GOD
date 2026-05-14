@@ -39,6 +39,20 @@ export interface WorkflowStatus {
   progress?: WorkflowProgress | null;
   has_pptx?: boolean;
   pptx_path?: string | null;
+  quality_report?: {
+    status?: string;
+    signature?: string;
+    summary?: string;
+    message?: string;
+    issues?: Array<{
+      kind?: string;
+      severity?: string;
+      title?: string;
+      pages?: number[];
+      recommendation?: string;
+    }>;
+    agent_role?: "visual" | "content";
+  } | null;
   slides?: Array<{ id?: string; page_num: number; status: string; error_msg?: string | null }>;
 }
 

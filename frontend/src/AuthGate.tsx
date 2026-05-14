@@ -5,6 +5,7 @@ import {
   CLIENT_PROVIDER_SETTINGS_ENABLED,
   DEFAULT_PROVIDER_SETTINGS,
   clearStoredAuth,
+  fetchAuthMe,
   getProviderSettings,
   getStoredAuth,
   saveProviderSettings,
@@ -15,10 +16,11 @@ import {
 } from "./api/client";
 
 const SERVER_MANAGED_PROVIDERS = !CLIENT_PROVIDER_SETTINGS_ENABLED;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function getInitialAuth(): MvpAuth | null {
   const stored = getStoredAuth();
-  if (stored?.testerId === "local-admin") {
+  if (stored?.testerId === "local-admin" || (stored?.testerId && !UUID_PATTERN.test(stored.testerId))) {
     clearStoredAuth();
     return null;
   }
@@ -295,6 +297,32 @@ export default function AuthGate() {
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
   };
+
+  useEffect(() => {
+    if (!auth) return;
+    let cancelled = false;
+    fetchAuthMe()
+      .then((serverAuth) => {
+        if (cancelled) return;
+        const nextAuth = {
+          testerId: serverAuth.testerId,
+          displayName: serverAuth.displayName || auth.displayName,
+        };
+        if (nextAuth.testerId !== auth.testerId || nextAuth.displayName !== auth.displayName) {
+          saveStoredAuth(nextAuth);
+          setAuth(nextAuth);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        clearStoredAuth();
+        setAuth(null);
+        setError("登录状态已失效，请重新输入固定用户名。");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [auth]);
 
   const handleLoginSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();

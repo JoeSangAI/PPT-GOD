@@ -424,6 +424,7 @@ def serialize_workflow_status(
     latest_run: ProjectRun | None = None,
     has_pptx: bool = False,
     pptx_path: str | None = None,
+    quality_report: dict | None = None,
 ) -> dict:
     target_count, target_completed, target_failed = target_counts(active_run, slides)
     total_completed = sum(1 for s in slides if s.status == "completed")
@@ -446,6 +447,7 @@ def serialize_workflow_status(
         "progress": serialize_run_progress(active_run, slides),
         "has_pptx": has_pptx,
         "pptx_path": pptx_path if has_pptx else None,
+        "quality_report": quality_report,
         "slides": [
             {
                 "id": s.id,

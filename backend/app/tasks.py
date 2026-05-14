@@ -11,11 +11,12 @@ from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.generation_pipeline import run_generation_pipeline
+from app.services.image_generation import clear_reference_upload_cache
 from app.services.image_task_audit import append_image_generation_log
 from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.logo_policy import is_logo_confirmed
-from app.services.run_state import finish_run, is_run_active, mark_run_running, update_run_progress
+from app.services.run_state import finish_run, is_run_active, mark_run_running, set_run_task, update_run_progress
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION, generate_style_proposals
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ redis_client = redis.from_url(
     settings.REDIS_URL or "redis://localhost:6379/0",
     socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
     socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
-    retry_on_timeout=False,
+    retry_on_timeout=True,
     health_check_interval=30,
 )
 
@@ -81,6 +82,19 @@ def _resolve_target_pages(project_id: str, page_nums: list = None) -> list:
         db.close()
 
 
+def _image_task_page_chunk_size() -> int:
+    try:
+        return max(1, int(settings.IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE or 8))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _split_generation_pages(page_nums: list[int]) -> tuple[list[int], list[int]]:
+    chunk_size = _image_task_page_chunk_size()
+    normalized = [int(p) for p in page_nums]
+    return normalized[:chunk_size], normalized[chunk_size:]
+
+
 def _page_lock_ttl_seconds() -> int:
     try:
         return max(600, int(settings.CELERY_TASK_TIME_LIMIT or 2100) + 300)
@@ -104,7 +118,22 @@ def _acquire_page_locks(project_id: str, page_nums: list, ttl: int | None = None
 def _release_page_locks(project_id: str, page_nums: list):
     """Release per-page locks."""
     for pn in page_nums:
-        redis_client.delete(f"project:{project_id}:slide:{pn}:generating")
+        try:
+            redis_client.delete(f"project:{project_id}:slide:{pn}:generating")
+        except Exception as exc:
+            logger.warning("Failed to release page lock project=%s page=%s: %s", project_id, pn, exc)
+
+
+def _finish_run_for_credential_error(run_id: str | None, message: str, exc: Exception):
+    db = SessionLocal()
+    try:
+        finish_run(db, run_id, status="failed", message=message, error_msg=str(exc)[:500])
+        db.commit()
+    except Exception as cleanup_exc:
+        db.rollback()
+        logger.warning("Failed to mark run failed after credential error: %s", cleanup_exc)
+    finally:
+        db.close()
 
 
 def _cleanup_stale_generating_slides(project_id: str, page_nums: list):
@@ -129,6 +158,47 @@ def _cleanup_stale_generating_slides(project_id: str, page_nums: list):
         db.close()
 
 
+def _enqueue_generation_continuation(
+    db,
+    project_id: str,
+    remaining_page_nums: list[int],
+    *,
+    prototype: bool,
+    run_id: str | None,
+    credential_id: str | None,
+):
+    if not remaining_page_nums or not is_run_active(db, run_id):
+        return None
+    task = generate_slides_task.apply_async(
+        args=[project_id, remaining_page_nums],
+        kwargs={
+            "prototype": prototype,
+            "run_id": run_id,
+            "credential_id": credential_id,
+        },
+    )
+    set_run_task(db, run_id, task.id)
+    db.commit()
+    try:
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(datetime.now(timezone.utc).timestamp()), ex=3600)
+    except Exception as exc:
+        logger.warning(
+            "Failed to update continuation task tracking keys for project %s task %s: %s",
+            project_id,
+            task.id,
+            exc,
+        )
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "task_continuation_queued",
+        task_id=task.id,
+        remaining_page_nums=remaining_page_nums,
+    )
+    return task
+
+
 @celery_app.task
 def generate_slides_task(
     project_id: str,
@@ -141,12 +211,25 @@ def generate_slides_task(
     """Celery task: 执行幻灯片生成流水线（页级别锁，允许不同页并发生成）。"""
     if legacy_kwargs:
         logger.info("Ignoring legacy generation task kwargs: %s", sorted(legacy_kwargs.keys()))
-    credentials = load_task_provider_credentials(redis_client, credential_id)
+    try:
+        credentials = load_task_provider_credentials(redis_client, credential_id)
+    except RuntimeError as exc:
+        message = "任务凭据读取失败，请重新发起生成。"
+        logger.error("Generation task credential failure: project=%s run=%s error=%s", project_id, run_id, exc)
+        append_image_generation_log(project_id, run_id, "task_failed_before_start", reason="credential_error", error=str(exc))
+        _finish_run_for_credential_error(run_id, message, exc)
+        return {"project_id": project_id, "status": "failed", "error": message}
     with provider_credentials_context(credentials):
-        return _generate_slides_task_inner(project_id, page_nums, prototype, run_id)
+        return _generate_slides_task_inner(project_id, page_nums, prototype, run_id, credential_id=credential_id)
 
 
-def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototype: bool = False, run_id: str = None):
+def _generate_slides_task_inner(
+    project_id: str,
+    page_nums: list = None,
+    prototype: bool = False,
+    run_id: str = None,
+    credential_id: str = None,
+):
     """Celery task body with provider credentials installed in context."""
     append_image_generation_log(
         project_id,
@@ -167,8 +250,19 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
             db.close()
         return {"project_id": project_id, "status": "skipped", "reason": "no_pages"}
 
+    current_pages, remaining_pages = _split_generation_pages(target_pages)
+    if remaining_pages:
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "task_chunk_selected",
+            current_page_nums=current_pages,
+            remaining_page_nums=remaining_pages,
+            chunk_size=_image_task_page_chunk_size(),
+        )
+
     # 尝试获取每页的锁，只锁住没被其他任务占用的页
-    acquired_pages = _acquire_page_locks(project_id, target_pages)
+    acquired_pages = _acquire_page_locks(project_id, current_pages)
     if not acquired_pages:
         logger.info(f"All target pages for project {project_id} are already being generated")
         append_image_generation_log(
@@ -176,9 +270,9 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
             run_id,
             "task_skipped",
             reason="all_pages_locked",
-            target_page_nums=target_pages,
+            target_page_nums=current_pages,
         )
-        _cleanup_stale_generating_slides(project_id, target_pages)
+        _cleanup_stale_generating_slides(project_id, current_pages)
         db = SessionLocal()
         try:
             finish_run(db, run_id, status="stale", message="所有目标页面都已被其他任务锁定", error_msg="all_pages_locked")
@@ -187,7 +281,7 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
             db.close()
         return {"project_id": project_id, "status": "skipped", "reason": "all_pages_locked"}
 
-    skipped_pages = [p for p in target_pages if p not in acquired_pages]
+    skipped_pages = [p for p in current_pages if p not in acquired_pages]
     if skipped_pages:
         logger.info(f"Skipping locked pages: {skipped_pages}")
         append_image_generation_log(
@@ -200,14 +294,32 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
         _cleanup_stale_generating_slides(project_id, skipped_pages)
 
     db = SessionLocal()
+    continuation_enqueued = False
     try:
         logger.info(f"Celery task started: project={project_id}, pages={acquired_pages}, prototype={prototype}")
         mark_run_running(db, run_id, stage="batch_generation", message="图片生成任务已启动")
         db.commit()
-        run_generation_pipeline(project_id, db, page_nums=acquired_pages, prototype=prototype, run_id=run_id)
+        run_generation_pipeline(
+            project_id,
+            db,
+            page_nums=acquired_pages,
+            prototype=prototype,
+            run_id=run_id,
+            defer_finalization=bool(remaining_pages),
+        )
+        if remaining_pages and is_run_active(db, run_id):
+            next_task = _enqueue_generation_continuation(
+                db,
+                project_id,
+                remaining_pages,
+                prototype=prototype,
+                run_id=run_id,
+                credential_id=credential_id,
+            )
+            continuation_enqueued = bool(next_task)
         # 生成完成，设置未读通知提醒用户查看
         project = db.query(Project).filter(Project.id == project_id).first()
-        if project:
+        if project and not continuation_enqueued:
             project.has_unread_notification = True
             project.unread_notification_message = "打样完成" if prototype else "图片生成完成"
         db.commit()
@@ -219,9 +331,17 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
             status="completed",
             acquired_page_nums=acquired_pages,
             skipped_page_nums=skipped_pages,
+            remaining_page_nums=remaining_pages,
             prototype=prototype,
         )
-        return {"project_id": project_id, "status": "completed", "page_nums": acquired_pages, "prototype": prototype, "skipped_pages": skipped_pages}
+        return {
+            "project_id": project_id,
+            "status": "continued" if continuation_enqueued else "completed",
+            "page_nums": acquired_pages,
+            "remaining_page_nums": remaining_pages,
+            "prototype": prototype,
+            "skipped_pages": skipped_pages,
+        }
     except Exception as exc:
         logger.error(f"Celery task failed: {exc}")
         append_image_generation_log(
@@ -251,8 +371,13 @@ def _generate_slides_task_inner(project_id: str, page_nums: list = None, prototy
         return {"project_id": project_id, "status": "failed", "error": str(exc), "page_nums": acquired_pages, "prototype": prototype}
     finally:
         _release_page_locks(project_id, acquired_pages)
-        redis_client.delete(f"project:{project_id}:task_id")
-        redis_client.delete(f"project:{project_id}:task_started_at")
+        try:
+            if not continuation_enqueued:
+                redis_client.delete(f"project:{project_id}:task_id")
+                redis_client.delete(f"project:{project_id}:task_started_at")
+        except Exception as exc:
+            logger.warning("Failed to delete generation task tracking keys for project %s: %s", project_id, exc)
+        clear_reference_upload_cache()
         db.close()
 
 
@@ -268,7 +393,13 @@ def generate_style_proposals_task(
     """Celery task: 生成风格提案。"""
     if legacy_kwargs:
         logger.info("Ignoring legacy style proposal task kwargs: %s", sorted(legacy_kwargs.keys()))
-    credentials = load_task_provider_credentials(redis_client, credential_id)
+    try:
+        credentials = load_task_provider_credentials(redis_client, credential_id)
+    except RuntimeError as exc:
+        message = "任务凭据读取失败，请重新生成风格提案。"
+        logger.error("Style proposal task credential failure: project=%s run=%s error=%s", project_id, run_id, exc)
+        _finish_run_for_credential_error(run_id, message, exc)
+        return {"project_id": project_id, "status": "failed", "error": message}
     with provider_credentials_context(credentials):
         return _generate_style_proposals_task_inner(self, project_id, run_id, user_description=user_description)
 
@@ -356,14 +487,22 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                 template_ref = None
                 recommendations = project.selected_template_recommendations or {}
                 if isinstance(recommendations, dict):
-                    for key in ("cover", "content", "toc", "ending"):
+                    assets["template_analysis"]["template_page_count"] = sum(
+                        1 for value in recommendations.values() if isinstance(value, dict)
+                    )
+                    for key in ("cover", "content", "data", "section", "quote", "toc", "ending"):
                         rec = recommendations.get(key)
                         if isinstance(rec, dict) and rec.get("file_path"):
                             template_sample = rec["file_path"]
+                            assets["template_analysis"]["sample_category"] = key
+                            assets["template_analysis"]["source_kind"] = rec.get("source_kind") or "template"
+                            assets["template_analysis"]["application_strength"] = rec.get("application_strength") or "standard"
                             break
                 if template_refs:
                     template_ref = next((r for r in template_refs if r.file_path == template_sample), None) if template_sample else None
                     template_ref = template_ref or _first_existing_ref(template_refs) or template_refs[0]
+                    analysis = template_ref.asset_analysis if isinstance(template_ref.asset_analysis, dict) else {}
+                    assets["template_analysis"].setdefault("source_kind", analysis.get("source_kind") or "template")
                 if not template_sample and template_ref and _file_exists(template_ref.file_path):
                     template_sample = template_ref.file_path
                 cached = _cached_reference_analysis(template_ref) if template_ref else None

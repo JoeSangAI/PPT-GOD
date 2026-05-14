@@ -2,9 +2,11 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.core.tester_auth import get_or_create_tester, verify_project_access
+from app.api import projects as projects_api
+from app.core.tester_auth import get_or_create_tester, require_existing_tester, verify_project_access
 from app.models.base import Base
 from app.models.models import Project
+from app.schemas.project import ProjectCreate
 
 
 def make_session():
@@ -45,3 +47,28 @@ def test_project_access_is_scoped_by_tester_id():
     else:
         raise AssertionError("expected another tester to be rejected")
 
+
+def test_require_existing_tester_rejects_stale_id():
+    db = make_session()
+
+    try:
+        require_existing_tester(db, "stale-browser-id")
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert "登录状态已失效" in str(exc.detail)
+    else:
+        raise AssertionError("expected stale tester id to be rejected")
+
+
+def test_create_project_rejects_stale_tester_before_insert():
+    db = make_session()
+
+    try:
+        projects_api.create_project(ProjectCreate(title="旧缓存账号"), tester_id="stale-browser-id", db=db)
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert "登录状态已失效" in str(exc.detail)
+    else:
+        raise AssertionError("expected stale tester id to be rejected")
+
+    assert db.query(Project).count() == 0

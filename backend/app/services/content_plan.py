@@ -9,7 +9,12 @@ from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.services.document_parser import detect_ppt_sources
 from app.services.search_service import get_knowledge_augmenter
-from app.utils.text_cleaning import normalize_markdown_emphasis
+from app.utils.text_cleaning import (
+    is_markdown_thematic_break_line,
+    normalize_markdown_content,
+    normalize_markdown_emphasis,
+    remove_markdown_structural_noise,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -403,6 +408,230 @@ def _document_preservation_policy(documents: str, topic: str = "") -> str:
     return ""
 
 
+def _parse_ppt_source_pages(documents: str) -> list[dict]:
+    """Parse the lightweight PPT text markers emitted by document_parser."""
+    text = documents or ""
+    source_match = re.search(
+        r'---\s*PPT_SOURCE(?:\s+filename="([^"]*)")?\s+pages=(\d+)\s*---',
+        text,
+    )
+    if not source_match:
+        return []
+
+    filename = source_match.group(1) or ""
+    try:
+        expected_pages = int(source_match.group(2) or 0)
+    except ValueError:
+        expected_pages = 0
+
+    source_body = text[source_match.end():]
+    next_source = re.search(r'---\s*PPT_SOURCE(?:\s+filename="[^"]*")?\s+pages=\d+\s*---', source_body)
+    if next_source:
+        source_body = source_body[: next_source.start()]
+
+    page_headers = list(re.finditer(r"(?m)^---\s*第\s*(\d+)\s*页\s*---\s*$", source_body))
+    pages: list[dict] = []
+    for idx, match in enumerate(page_headers):
+        try:
+            page_num = int(match.group(1))
+        except ValueError:
+            continue
+        start = match.end()
+        end = page_headers[idx + 1].start() if idx + 1 < len(page_headers) else len(source_body)
+        raw = source_body[start:end].strip()
+        notes = ""
+        slide_text = raw
+        if "【备注】" in raw:
+            slide_text, notes = raw.split("【备注】", 1)
+        lines = [line.strip() for line in slide_text.splitlines() if line.strip()]
+        notes = notes.strip()
+        pages.append({
+            "page_num": page_num,
+            "source_document": filename,
+            "source_pages": expected_pages,
+            "lines": lines,
+            "notes": notes,
+            "raw_text": slide_text.strip(),
+        })
+
+    pages.sort(key=lambda page: int(page.get("page_num") or 0))
+    return pages
+
+
+def _ppt_page_type(page_num: int, total_pages: int, lines: list[str]) -> str:
+    if page_num == 1:
+        return "cover"
+    if total_pages > 1 and page_num == total_pages:
+        return "ending"
+    if len(lines) <= 2 and sum(len(line) for line in lines) <= 80:
+        return "section"
+    return "content"
+
+
+def _ppt_page_text_content(page_num: int, lines: list[str]) -> dict[str, str]:
+    if not lines:
+        return {
+            "headline": f"原 PPT 第{page_num}页",
+            "subhead": "",
+            "body": "",
+        }
+
+    if len(lines) == 1:
+        return {
+            "headline": lines[0],
+            "subhead": "",
+            "body": "",
+        }
+
+    if len(lines) == 2:
+        subtitle_like = (
+            page_num == 1
+            or len(lines[1]) > 18
+            or bool(re.search(r"(负责人|主讲|讲师|教授|博士|创始人|CEO|COO|CTO|/)", lines[1], flags=re.IGNORECASE))
+        )
+        return {
+            "headline": lines[0] if subtitle_like else "\n".join(lines),
+            "subhead": lines[1] if subtitle_like else "",
+            "body": "",
+        }
+
+    return {
+        "headline": lines[0],
+        "subhead": lines[1] if len(lines[1]) <= 48 else "",
+        "body": "\n".join(lines[2:] if len(lines[1]) <= 48 else lines[1:]),
+    }
+
+
+DIRECT_PPT_REPLICATE_FORBIDDEN_MARKERS = (
+    "PPT_SOURCE",
+    "PPTSOURCE",
+    "用户上传材料",
+)
+
+
+def validate_direct_ppt_replicate_outline(
+    outline: list[dict],
+    *,
+    expected_pages: int | None = None,
+    source_document: str = "",
+) -> dict:
+    """Quality gate for the deterministic PPT replicate path."""
+    expected = int(expected_pages or 0)
+    rendered_pages = []
+    missing_refs: list[int] = []
+    marker_pages: list[int] = []
+    for idx, page in enumerate(outline, start=1):
+        page_num = int(page.get("page_num") or idx)
+        text_content = page.get("text_content") if isinstance(page.get("text_content"), dict) else {}
+        rendered = "\n".join(
+            str(text_content.get(key) or "")
+            for key in ("headline", "subhead", "body")
+        )
+        if any(marker in rendered for marker in DIRECT_PPT_REPLICATE_FORBIDDEN_MARKERS):
+            marker_pages.append(page_num)
+        source_refs = page.get("source_refs") if isinstance(page.get("source_refs"), list) else []
+        has_source_ref = any(
+            isinstance(ref, dict)
+            and int(ref.get("source_page_num") or 0) == page_num
+            and (not source_document or str(ref.get("source_document") or "") == source_document)
+            for ref in source_refs
+        )
+        if not has_source_ref:
+            missing_refs.append(page_num)
+        rendered_pages.append(page_num)
+
+    duplicate_pages = sorted({page for page in rendered_pages if rendered_pages.count(page) > 1})
+    missing_pages = [
+        page_num
+        for page_num in range(1, expected + 1)
+        if expected and page_num not in rendered_pages
+    ]
+    checks = {
+        "page_count_match": expected <= 0 or len(outline) == expected,
+        "page_numbers_contiguous": rendered_pages == list(range(1, len(outline) + 1)),
+        "source_refs_complete": not missing_refs,
+        "marker_free": not marker_pages,
+    }
+    passed = all(checks.values()) and not duplicate_pages and not missing_pages
+    return {
+        "mode": "direct_ppt_replicate",
+        "status": "passed" if passed else "needs_review",
+        "checks": checks,
+        "expected_pages": expected or None,
+        "actual_pages": len(outline),
+        "missing_source_ref_pages": missing_refs,
+        "duplicate_pages": duplicate_pages,
+        "missing_pages": missing_pages,
+        "marker_pages": marker_pages,
+    }
+
+
+def build_direct_ppt_replicate_outline(documents: str, topic: str = "") -> list[dict]:
+    """Build a deterministic 1:1 content plan from a single uploaded PPT."""
+    sources = detect_ppt_sources(documents)
+    if len(sources) != 1 or _is_ppt_transform_request(topic):
+        return []
+
+    parsed_pages = _parse_ppt_source_pages(documents)
+    if not parsed_pages:
+        return []
+
+    source = sources[0]
+    filename = str(source.get("filename") or parsed_pages[0].get("source_document") or "").strip()
+    total_pages = int(source.get("pages") or len(parsed_pages) or 0)
+    outline: list[dict] = []
+    for idx, page in enumerate(parsed_pages, start=1):
+        page_num = int(page.get("page_num") or idx)
+        lines = [str(line).strip() for line in (page.get("lines") or []) if str(line).strip()]
+        text_content = _ppt_page_text_content(page_num, lines)
+        outline.append({
+            "page_num": page_num,
+            "type": _ppt_page_type(page_num, total_pages or len(parsed_pages), lines),
+            "section_title": "原 PPT 逐页复刻",
+            "text_content": text_content,
+            "speaker_notes": str(page.get("notes") or "").strip(),
+            "source_facts": {
+                "mode": "direct_ppt_replicate",
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_total_pages": total_pages or len(parsed_pages),
+                "source_line_count": len(lines),
+                "has_speaker_notes": bool(str(page.get("notes") or "").strip()),
+            },
+            "visual_suggestion": (
+                f"按原 PPT 第{page_num}页的版式、图片位置、背景和信息层级复刻；"
+                "内容规划阶段只做逐页承接，不改写成新叙事。"
+            ),
+            "source_refs": [{
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_type": "pptx_slide",
+                "reason": "direct_replicate",
+            }],
+            "generation_status": "pptx_direct",
+        })
+
+    outline.sort(key=lambda page: int(page.get("page_num") or 0))
+    for idx, page in enumerate(outline, start=1):
+        page["page_num"] = idx
+        if isinstance(page.get("source_facts"), dict):
+            page["source_facts"]["source_page_num"] = idx
+    outline = _normalize_content_markdown(outline)
+    quality = validate_direct_ppt_replicate_outline(
+        outline,
+        expected_pages=total_pages or len(outline),
+        source_document=filename,
+    )
+    for page in outline:
+        page["replicate_quality"] = {
+            "mode": quality["mode"],
+            "status": quality["status"],
+        }
+    if outline:
+        outline[0]["replicate_quality"] = quality
+    return outline
+
+
 def infer_page_count_from_single_ppt(documents: str, topic: str = "") -> int | None:
     sources = detect_ppt_sources(documents)
     if len(sources) != 1 or _is_ppt_transform_request(topic):
@@ -701,6 +930,8 @@ def _brief_title(topic: str) -> str:
 
 def _clean_markdown_inline(text: str) -> str:
     value = normalize_markdown_emphasis(str(text or ""))
+    if is_markdown_thematic_break_line(value):
+        return ""
     value = re.sub(r"`([^`]*)`", r"\1", value)
     value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
     value = re.sub(r"[*_~]+", "", value)
@@ -717,6 +948,8 @@ def _markdown_line_to_plain(line: str) -> str:
     text = line.strip()
     if not text:
         return ""
+    if is_markdown_thematic_break_line(text):
+        return ""
     text = re.sub(r"^>\s*", "", text)
     text = re.sub(r"^[-*+]\s+", "", text)
     text = re.sub(r"^\d+[.)、]\s+", "", text)
@@ -729,6 +962,165 @@ def _markdown_line_to_plain(line: str) -> str:
         if cells:
             return " / ".join(cells)
     return _clean_markdown_inline(text)
+
+
+PAGINATED_MARKDOWN_FIELD_RE = re.compile(
+    r"^-\s*(标题|内容|正文|表达意图|演讲备注|备注|视觉建议|画面建议)\s*[:：]\s*(.*)$",
+    flags=re.MULTILINE,
+)
+
+
+def _strip_module_prefix(title: str) -> str:
+    return re.sub(r"^\s*模块\s*[:：]\s*", "", title or "").strip()
+
+
+def _clean_paginated_markdown_field(lines: list[str]) -> str:
+    kept: list[str] = []
+    for raw in lines:
+        line = str(raw or "").rstrip()
+        if is_markdown_thematic_break_line(line):
+            continue
+        kept.append(line)
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    text = "\n".join(kept).strip()
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text)
+    if "无额外正文" in compact or compact in {"无正文", "标题即核心信息", "（无正文）"}:
+        return ""
+    return normalize_markdown_content(text)
+
+
+def _paginated_markdown_page_type(label: str, page_num: int) -> str:
+    text = re.sub(r"\s+", "", label or "")
+    if page_num == 1 or "封面" in text:
+        return "cover"
+    if any(marker in text for marker in ("行动引导", "收尾", "结束", "感谢", "封底")):
+        return "ending"
+    if any(marker in text for marker in ("过渡", "章节")):
+        return "section"
+    if "数据" in text:
+        return "data"
+    if any(marker in text for marker in ("金句", "使命")):
+        return "hero"
+    return "content"
+
+
+def parse_paginated_markdown_content_plan(documents: str) -> list[dict]:
+    """Parse a client-provided page-by-page Markdown draft into content plan pages."""
+    text = documents or ""
+    if not re.search(r"(?m)^###\s+", text) or not re.search(PAGINATED_MARKDOWN_FIELD_RE, text):
+        return []
+
+    pages: list[dict] = []
+    section_title = ""
+    current: dict | None = None
+    current_field = ""
+    in_code_fence = False
+    fence_marker = ""
+
+    def flush() -> None:
+        nonlocal current, current_field
+        if not current:
+            current_field = ""
+            return
+        headline = _clean_paginated_markdown_field(current.get("headline_lines") or [])
+        body = _clean_paginated_markdown_field(current.get("body_lines") or [])
+        notes = _clean_paginated_markdown_field(current.get("notes_lines") or [])
+        visual = _clean_paginated_markdown_field(current.get("visual_lines") or [])
+        label = str(current.get("label") or "").strip()
+        if headline or body:
+            page_num = len(pages) + 1
+            pages.append({
+                "page_num": page_num,
+                "type": _paginated_markdown_page_type(label, page_num),
+                "section_title": str(current.get("section_title") or "").strip(),
+                "text_content": {
+                    "headline": headline or label or f"第 {page_num} 页",
+                    "subhead": "",
+                    "body": body,
+                },
+                "speaker_notes": notes,
+                "visual_suggestion": visual or notes,
+                "source_refs": [ref for ref in [str(current.get("section_title") or "").strip(), label] if ref],
+                "generation_status": "source_paginated_markdown",
+                "source_facts": {
+                    "mode": "paginated_markdown",
+                    "source_section": str(current.get("section_title") or "").strip(),
+                    "source_page_label": label,
+                },
+            })
+        current = None
+        current_field = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        fence_match = re.match(r"^\s*(```+|~~~+)", line)
+        if fence_match:
+            marker = fence_match.group(1)[:3]
+            if not in_code_fence:
+                in_code_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_code_fence = False
+                fence_marker = ""
+            continue
+        if in_code_fence:
+            continue
+        if is_markdown_thematic_break_line(line):
+            continue
+
+        page_heading = re.match(r"^###\s+(.+?)\s*$", line)
+        if page_heading:
+            flush()
+            label = _clean_markdown_inline(page_heading.group(1))
+            current = {
+                "label": label,
+                "section_title": section_title,
+                "headline_lines": [],
+                "body_lines": [],
+                "notes_lines": [],
+                "visual_lines": [],
+            }
+            current_field = ""
+            continue
+
+        section_heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if section_heading:
+            flush()
+            title = _clean_markdown_inline(section_heading.group(1))
+            section_title = _strip_module_prefix(title) if title.startswith("模块") else ""
+            continue
+
+        if current is None:
+            continue
+
+        field_match = PAGINATED_MARKDOWN_FIELD_RE.match(line.strip())
+        if field_match:
+            label = field_match.group(1)
+            value = field_match.group(2)
+            if label == "标题":
+                current_field = "headline_lines"
+            elif label in {"内容", "正文"}:
+                current_field = "body_lines"
+            elif label in {"表达意图", "演讲备注", "备注"}:
+                current_field = "notes_lines"
+            else:
+                current_field = "visual_lines"
+            if value:
+                current.setdefault(current_field, []).append(value)
+            continue
+
+        if current_field:
+            current.setdefault(current_field, []).append(line)
+
+    flush()
+    if len(pages) < 2:
+        return []
+    return _normalize_content_markdown(pages)
 
 
 def extract_document_outline_units(documents: str) -> list[dict]:
@@ -1254,7 +1646,7 @@ def _generate_model_page_map(
             "current_page": 0,
             "total_pages": target_count,
         })
-    doc_text = (documents or "").strip()
+    doc_text = remove_markdown_structural_noise(documents or "")
     if len(doc_text) > PAGE_MAP_DOCUMENT_LIMIT:
         doc_text = _document_excerpt_for_extension(doc_text, limit=PAGE_MAP_DOCUMENT_LIMIT)
     preservation_policy = _document_preservation_policy(documents, topic)
@@ -1291,7 +1683,8 @@ def _generate_model_page_map(
 6. 相邻页面必须有明确的新信息、新问题、新活动或新叙事功能；不能出现连续两页同标题、同 bullet、同来源框架。
 7. 页间要有连续叙事：上一页为什么引出下一页要想清楚。
 8. 封面页可以没有 bullet；封底页只收束，不引入新论点。
-9. 输出格式必须固定为：
+9. 用户材料中的 Markdown 分隔线（如 ---、***、___）只代表结构，不能作为标题、bullet 或正文输出。
+10. 输出格式必须固定为：
 P1｜cover｜封面｜标题
 - bullet
 - bullet
@@ -1997,15 +2390,15 @@ def _normalize_content_markdown(outline: List[Dict]) -> List[Dict]:
             for key in ("headline", "subhead", "body"):
                 value = text_content.get(key)
                 if isinstance(value, str):
-                    text_content[key] = normalize_markdown_emphasis(value)
+                    text_content[key] = normalize_markdown_content(value)
                 elif isinstance(value, list):
                     text_content[key] = [
-                        normalize_markdown_emphasis(item) if isinstance(item, str) else item
+                        normalize_markdown_content(item) if isinstance(item, str) else item
                         for item in value
                     ]
         notes = page.get("speaker_notes")
         if isinstance(notes, str):
-            page["speaker_notes"] = normalize_markdown_emphasis(notes)
+            page["speaker_notes"] = normalize_markdown_content(notes)
         _normalize_punchline_page_content(page)
     return outline
 
@@ -2104,6 +2497,30 @@ def generate_content_plan(
                 "total_pages": len(exported_outline),
             })
         return exported_outline
+
+    paginated_markdown_outline = parse_paginated_markdown_content_plan(documents)
+    if paginated_markdown_outline and not requested_page_range and not strict_page_count and not _is_general_transform_request(topic):
+        logger.info("ContentPlan: detected paginated Markdown draft, reusing %s pages directly", len(paginated_markdown_outline))
+        if on_progress:
+            on_progress({
+                "stage": "saving",
+                "message": "已按上传分页稿整理，正在保存结果...",
+                "current_page": len(paginated_markdown_outline),
+                "total_pages": len(paginated_markdown_outline),
+            })
+        return paginated_markdown_outline
+
+    direct_ppt_outline = build_direct_ppt_replicate_outline(documents, topic)
+    if direct_ppt_outline and not requested_page_range and not strict_page_count:
+        logger.info("ContentPlan: detected single PPT direct replicate request, reusing %s source pages", len(direct_ppt_outline))
+        if on_progress:
+            on_progress({
+                "stage": "saving",
+                "message": "已按上传 PPT 逐页整理，正在保存结果...",
+                "current_page": len(direct_ppt_outline),
+                "total_pages": len(direct_ppt_outline),
+            })
+        return direct_ppt_outline
 
     doc_section = ""
     if has_docs:

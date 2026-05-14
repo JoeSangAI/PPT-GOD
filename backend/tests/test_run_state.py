@@ -1,6 +1,8 @@
 from datetime import timedelta
 
 from fastapi import HTTPException
+from PIL import Image
+from pptx import Presentation
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -383,19 +385,25 @@ def test_start_generation_blocks_pages_with_unapplied_plan_changes():
         raise AssertionError("expected stale page to block direct generation")
 
 
-def test_download_blocks_when_project_has_stale_artifacts():
+def test_download_exports_partial_deck_with_blank_pages(tmp_path, monkeypatch):
     from app.api import slides as slides_api
 
     db = make_session()
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
     project = Project(
-        title="Block stale download",
-        status="completed",
+        title="Partial export",
+        status="prototype_ready",
         content_plan_confirmed=True,
         selected_style={"name": "Brand"},
     )
     db.add(project)
     db.flush()
-    db.add(
+
+    generated_path = tmp_path / project.id / "slide_01.png"
+    generated_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (1792, 1024), "white").save(generated_path)
+
+    db.add_all([
         Slide(
             project_id=project.id,
             page_num=1,
@@ -403,15 +411,31 @@ def test_download_blocks_when_project_has_stale_artifacts():
             content_json={"page_num": 1},
             visual_json={"visual_description": "old view", "_artifact": {"stale": {"image": True}}},
             prompt_text="new prompt",
-            image_path="/tmp/old.png",
-        )
-    )
+            image_path=str(generated_path),
+        ),
+        Slide(
+            project_id=project.id,
+            page_num=2,
+            status="prompt_ready",
+            content_json={"page_num": 2},
+            visual_json={"visual_description": "planned"},
+            prompt_text="prompt",
+        ),
+        Slide(
+            project_id=project.id,
+            page_num=3,
+            status="prompt_ready",
+            content_json={"page_num": 3},
+            visual_json={"visual_description": "planned"},
+            prompt_text="prompt",
+        ),
+    ])
     db.commit()
 
-    try:
-        slides_api.download_pptx(project.id, db=db)
-    except HTTPException as exc:
-        assert exc.status_code == 409
-        assert "未应用的修改" in exc.detail
-    else:
-        raise AssertionError("expected stale artifacts to block deck download")
+    response = slides_api.download_pptx(project.id, db=db)
+    prs = Presentation(response.path)
+
+    assert len(prs.slides) == 3
+    assert len(prs.slides[0].shapes) >= 1
+    assert len(prs.slides[1].shapes) == 0
+    assert len(prs.slides[2].shapes) == 0

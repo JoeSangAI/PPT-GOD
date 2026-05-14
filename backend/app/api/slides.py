@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import io
 import json
 import logging
@@ -15,6 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image as PILImage
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.base import get_db, SessionLocal
 from app.models.models import Project, Slide, ReferenceImage, SlideVersion
@@ -27,7 +29,7 @@ from app.core.provider_credentials import (
     store_current_provider_credentials,
 )
 from app.utils.project_docs import load_project_documents
-from app.utils.text_cleaning import normalize_markdown_emphasis
+from app.utils.text_cleaning import normalize_markdown_content, normalize_markdown_emphasis
 from app.utils.reference_image import (
     default_visual_asset_process_mode,
     normalize_visual_asset_kind,
@@ -57,6 +59,7 @@ from app.services.logo_policy import (
     DEFAULT_LOGO_ANCHOR,
     LOGO_ANCHORS,
     logo_anchor_from_ref,
+    logo_policy_for_page,
     is_logo_confirmed,
     logo_review_status,
     normalize_logo_anchor,
@@ -73,8 +76,18 @@ from app.services.overlay_layers import (
 )
 from app.services.visual_plan import generate_visual_plan, _recall_visual_assets_for_page
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
+from app.services.pptx_assembler import assemble_pptx
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 from app.services.visual_strategy import detect_logo_tone_from_image
+from app.services.visual_block_renderer import (
+    blocks_to_markdown,
+    is_visual_block,
+    normalize_content_blocks,
+    normalize_route_mode,
+    render_visual_block,
+    route_to_asset_route_mode,
+    stable_block_hash,
+)
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
 from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
 from app.tasks import generate_slides_task, redis_client
@@ -98,6 +111,7 @@ from app.services.run_state import (
     update_run_progress,
     generation_progress,
 )
+from app.services.project_quality_report import build_project_quality_report
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["slides"])
@@ -129,15 +143,18 @@ def _enqueue_generation_task(
         )
         set_run_task(db, run.id, task.id)
         db.commit()
-        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
-        return task
     except Exception as exc:
         logger.exception("Failed to enqueue generation task for project %s", project_id)
         message = "后台生成队列暂时不可用。请确认 Docker/Redis 正常运行且磁盘空间充足，然后重试生成。"
         finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
         db.commit()
         raise HTTPException(status_code=503, detail=message) from exc
+    try:
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    except Exception as exc:
+        logger.warning("Redis 写入生成任务跟踪信息失败，不影响已分发任务: project=%s task=%s error=%s", project_id, task.id, exc)
+    return task
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
@@ -658,21 +675,56 @@ def _serialize_reference_image(
     }
 
 
-def _project_template_refs_for_prompt(project: Project) -> list[dict]:
-    """Template pages are global layout references; style_ref is handled as text style."""
-    refs = []
-    for img in project.reference_images or []:
-        if img.role != "template":
-            continue
-        if not img.file_path or not os.path.exists(img.file_path):
-            continue
-        refs.append({
-            "id": img.id,
-            "role": img.role,
-            "process_mode": img.process_mode,
-            "description": img.file_path,
-        })
-    return refs
+def _template_key_for_page_intent(page_intent: dict | None) -> str:
+    page_type = str((page_intent or {}).get("type") or "content").lower()
+    layout = str((page_intent or {}).get("layout") or "").lower()
+    if page_type == "cover":
+        return "cover"
+    if page_type == "toc" or layout == "toc":
+        return "toc"
+    if page_type == "section" or layout == "section":
+        return "section"
+    if page_type in {"data", "chart", "table"} or layout == "data":
+        return "data"
+    if page_type in {"hero", "quote"} or layout == "hero":
+        return "quote"
+    if page_type == "ending":
+        return "ending"
+    return "content"
+
+
+def _project_template_refs_for_prompt(project: Project, page_intent: dict | None = None) -> list[dict]:
+    """Return at most one template layout hint for the target page."""
+    raw_recommendations = getattr(project, "selected_template_recommendations", None)
+    recommendations = raw_recommendations if isinstance(raw_recommendations, dict) else {}
+    rec = recommendations.get(_template_key_for_page_intent(page_intent))
+    if not isinstance(rec, dict):
+        fallback = next(
+            (
+                img for img in (project.reference_images or [])
+                if img.role == "template" and img.file_path and os.path.exists(img.file_path)
+            ),
+            None,
+        )
+        if not fallback:
+            return []
+        return [{
+            "id": fallback.id,
+            "role": "template",
+            "process_mode": fallback.process_mode or "blend",
+            "description": "Template layout DNA only.",
+        }]
+    path = rec.get("layout_file_path") or rec.get("file_path")
+    if not path or not os.path.exists(path):
+        return []
+    return [{
+        "id": f"template-{rec.get('page_num') or _template_key_for_page_intent(page_intent)}",
+        "role": "template",
+        "process_mode": "blend",
+        "description": "Template layout DNA only.",
+        "category": rec.get("category"),
+        "application_strength": rec.get("application_strength") or "standard",
+    }]
 
 
 def _project_logo_refs(project: Project) -> list[ReferenceImage]:
@@ -752,7 +804,10 @@ def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dic
     elif page_type != "cover":
         policy["placement"] = logo_anchor_from_ref(logo_ref)
         policy.pop("resolved_overlay_box", None)
-    intent["logo_policy"] = policy
+    normalized_policy = logo_policy_for_page({**intent, "logo_policy": policy})
+    if "use_as_scene_asset" in policy:
+        normalized_policy["use_as_scene_asset"] = bool(policy.get("use_as_scene_asset"))
+    intent["logo_policy"] = normalized_policy
     return intent
 
 
@@ -809,8 +864,15 @@ def _with_resolved_logo_overlay_box(page_intent: dict | None, slide: Slide, proj
     if not isinstance(intent, dict) or not slide.image_path or not should_show_logo(intent):
         return intent
     policy = intent.get("logo_policy") if isinstance(intent.get("logo_policy"), dict) else {}
-    if isinstance(policy.get("resolved_overlay_box"), dict) and policy.get("render_variant"):
+    normalized_policy = logo_policy_for_page(intent)
+    if (
+        isinstance(policy.get("resolved_overlay_box"), dict)
+        and str(policy.get("render_variant") or "").strip().lower() not in {"", "omit"}
+    ):
         return intent
+    render_policy_input = {**policy, **normalized_policy}
+    if "render_variant" not in normalized_policy:
+        render_policy_input.pop("render_variant", None)
     logo_refs = _project_logo_refs(project)
     if not logo_refs:
         return intent
@@ -823,15 +885,33 @@ def _with_resolved_logo_overlay_box(page_intent: dict | None, slide: Slide, proj
         logo_path,
         symbol_path,
         str(intent.get("type") or slide.type or "content").lower(),
-        policy.get("placement") or logo_anchor_from_ref(logo_refs[0]),
-        policy.get("scale") or "small",
-        policy,
+        normalized_policy.get("placement") or logo_anchor_from_ref(logo_refs[0]),
+        normalized_policy.get("scale") or "small",
+        render_policy_input,
     )
     next_intent = copy.deepcopy(intent)
-    next_policy = dict(policy)
+    next_policy = dict(normalized_policy)
     next_policy.update({k: v for k, v in render_policy.items() if v is not None})
     next_intent["logo_policy"] = next_policy
     return next_intent
+
+
+def _repair_project_logo_policies(project: Project, slides: list[Slide]) -> bool:
+    """Normalize stale logo policies so old projects do not keep hiding required logos."""
+    if not _project_logo_refs(project):
+        return False
+    changed = False
+    for slide in slides:
+        current = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+        repaired = _with_resolved_logo_overlay_box(current, slide, project)
+        if not isinstance(repaired, dict):
+            continue
+        if repaired.get("logo_policy") == current.get("logo_policy"):
+            continue
+        slide.visual_json = repaired
+        flag_modified(slide, "visual_json")
+        changed = True
+    return changed
 
 
 def _visual_asset_summary(ref: ReferenceImage) -> str:
@@ -1016,7 +1096,37 @@ def _project_refs_for_prompt(
                 "usage_note": img.usage_note,
             })
     refs.extend(_project_logo_refs_for_prompt(project, page_intent))
-    refs.extend(_project_template_refs_for_prompt(project))
+    refs.extend(_project_template_refs_for_prompt(project, page_intent))
+    return refs
+
+
+def _slide_refs_for_prompt(slide: Slide, visual_json: dict | None = None) -> list[dict]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    overlay_asset_ids = exact_overlay_asset_ids(visual)
+    refs: list[dict] = []
+    for ref in sorted(slide.reference_images or [], key=_reference_image_sort_key):
+        if str(ref.id) in overlay_asset_ids:
+            continue
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+        is_content_block = analysis.get("source") == "content_block"
+        description = _format_pptx_reference_analysis(ref) or os.path.basename(ref.file_path or "")
+        if is_content_block:
+            description = (
+                f"Content block visual asset: {ref.asset_name or '画面素材'}. "
+                f"Type={analysis.get('content_block_kind') or analysis.get('visual_type') or 'diagram'}. "
+                "Keep the core nodes, arrows, table cells, and relationship structure from the rendered reference."
+            )
+        refs.append({
+            "id": ref.id,
+            "role": ref.role,
+            "description": description,
+            "process_mode": ref.process_mode or "blend",
+            "asset_name": ref.asset_name,
+            "asset_kind": ref.asset_kind,
+            "usage_note": ref.usage_note,
+            "asset_route_mode": analysis.get("asset_route_mode") if is_content_block else None,
+            "asset_analysis": analysis,
+        })
     return refs
 
 
@@ -1093,6 +1203,144 @@ def _invalidate_visual_plan_dependent_outputs(project: Project, slides: list[Sli
         slide.error_msg = None
 
 
+def _reassemble_generated_pptx_if_possible(project: Project) -> bool:
+    """
+    Logo review/anchor changes only affect the PPTX overlay layer once images exist.
+    Rebuild the export in place instead of sending users back through image generation.
+    """
+    if project.status not in {"prototype_ready", "completed"}:
+        return False
+    slides = sorted(project.slides or [], key=lambda slide: slide.page_num or 0)
+    if not slides:
+        return False
+
+    slide_images = []
+    for slide in slides:
+        image_path = _existing_output_path(slide.image_path)
+        if slide.status != "completed" or not image_path or not os.path.exists(image_path):
+            return False
+        visual_json = _with_resolved_logo_overlay_box(slide.visual_json, slide, project)
+        slide_images.append({
+            "page_num": slide.page_num,
+            "type": slide.type,
+            "image_path": image_path,
+            "speaker_notes": (slide.content_json or {}).get("speaker_notes") if isinstance(slide.content_json, dict) else "",
+            "visual_json": visual_json if isinstance(visual_json, dict) else {},
+        })
+
+    logo_refs = _project_logo_refs(project)
+    logo_config = (
+        {
+            "file_paths": [ref.file_path for ref in logo_refs],
+            "anchor": logo_anchor_from_ref(logo_refs[0]),
+        }
+        if logo_refs else None
+    )
+    overlay_assets = {
+        ref.id: {
+            "file_path": ref.file_path,
+            "asset_name": ref.asset_name,
+            "asset_kind": ref.asset_kind,
+        }
+        for ref in project.reference_images or []
+        if (
+            (
+                ref.role == "visual_asset" and not ref.slide_id
+            )
+            or (
+                ref.role in {"content_ref", "chart_ref"} and ref.slide_id
+            )
+        )
+        and ref.file_path
+        and os.path.exists(ref.file_path)
+    }
+    filename = "presentation.pptx" if project.status == "completed" else "prototype.pptx"
+    output_path = os.path.join(settings.OUTPUT_DIR or "./outputs", project.id, filename)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    assemble_pptx(
+        slide_images=slide_images,
+        output_path=output_path,
+        logo_config=logo_config,
+        overlay_assets=overlay_assets,
+    )
+    return True
+
+
+def _project_export_overlay_assets(project: Project) -> dict:
+    return {
+        ref.id: {
+            "file_path": ref.file_path,
+            "asset_name": ref.asset_name,
+            "asset_kind": ref.asset_kind,
+        }
+        for ref in project.reference_images or []
+        if (
+            (
+                ref.role == "visual_asset" and not ref.slide_id
+            )
+            or (
+                ref.role in {"content_ref", "chart_ref"} and ref.slide_id
+            )
+        )
+        and ref.file_path
+        and os.path.exists(ref.file_path)
+    }
+
+
+def _project_export_logo_config(project: Project) -> dict | None:
+    logo_refs = _project_logo_refs(project)
+    if not logo_refs:
+        return None
+    return {
+        "file_paths": [ref.file_path for ref in logo_refs],
+        "anchor": logo_anchor_from_ref(logo_refs[0]),
+    }
+
+
+def _assemble_partial_project_pptx(project: Project, slides: list[Slide], output_path: str) -> int:
+    """
+    Build an export with one PPTX page per current slide card.
+
+    Slides without a generated image are kept as blank pages so users can export
+    partial work without losing the planned deck structure.
+    """
+    if not slides:
+        return 0
+
+    slide_images = []
+    generated_count = 0
+    for slide in sorted(slides, key=lambda item: item.page_num or 0):
+        image_path = _existing_output_path(slide.image_path)
+        if image_path and os.path.exists(image_path):
+            generated_count += 1
+        else:
+            image_path = None
+        visual_json = (
+            _with_resolved_logo_overlay_box(slide.visual_json, slide, project)
+            if image_path
+            else (slide.visual_json if isinstance(slide.visual_json, dict) else {})
+        )
+        slide_images.append({
+            "page_num": slide.page_num,
+            "type": slide.type,
+            "image_path": image_path,
+            "speaker_notes": (slide.content_json or {}).get("speaker_notes") if isinstance(slide.content_json, dict) else "",
+            "visual_json": visual_json if isinstance(visual_json, dict) else {},
+        })
+
+    if generated_count == 0:
+        return 0
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    assemble_pptx(
+        slide_images=slide_images,
+        output_path=output_path,
+        logo_config=_project_export_logo_config(project),
+        overlay_assets=_project_export_overlay_assets(project),
+    )
+    return generated_count
+
+
 def _resolve_generation_page_nums(slides: list[Slide], requested_page_nums: list[int] | None, prototype: bool) -> list[int] | None:
     """Resolve generation targets. Prototype without explicit pages samples the first 3 slides."""
     if prototype and not requested_page_nums:
@@ -1110,14 +1358,137 @@ def _normalize_content_json_markdown(content_json: dict) -> dict:
         for key in ("headline", "subhead", "body"):
             value = text_content.get(key)
             if isinstance(value, str):
-                text_content[key] = normalize_markdown_emphasis(value)
+                text_content[key] = normalize_markdown_content(value)
             elif isinstance(value, list):
                 text_content[key] = [
-                    normalize_markdown_emphasis(item) if isinstance(item, str) else item
+                    normalize_markdown_content(item) if isinstance(item, str) else item
                     for item in value
                 ]
     if isinstance(content.get("speaker_notes"), str):
-        content["speaker_notes"] = normalize_markdown_emphasis(content["speaker_notes"])
+        content["speaker_notes"] = normalize_markdown_content(content["speaker_notes"])
+    content["content_blocks"] = normalize_content_blocks(content)
+    body_from_blocks = blocks_to_markdown(content["content_blocks"])
+    if body_from_blocks:
+        text_content = content.get("text_content")
+        if not isinstance(text_content, dict):
+            text_content = {}
+        text_content["body"] = normalize_markdown_content(body_from_blocks)
+        content["text_content"] = text_content
+    return content
+
+
+def _content_block_refs(db: Session, project_id: str, slide_id: str) -> list[ReferenceImage]:
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.slide_id == slide_id,
+        ReferenceImage.role == "chart_ref",
+    ).all()
+    return [
+        ref for ref in refs
+        if isinstance(ref.asset_analysis, dict)
+        and ref.asset_analysis.get("source") == "content_block"
+    ]
+
+
+def _content_block_asset_dir(project_id: str, slide_id: str) -> str:
+    base_dir = os.path.join(settings.UPLOAD_DIR, project_id, "content_blocks", slide_id)
+    if not os.path.isabs(base_dir):
+        base_dir = os.path.abspath(base_dir)
+    os.makedirs(base_dir, exist_ok=True)
+    return base_dir
+
+
+def _content_block_ref_payload(block: dict, file_path: str) -> dict:
+    route_mode = normalize_route_mode(block.get("route_mode"), block.get("kind"))
+    return {
+        "source": "content_block",
+        "analysis_type": "content_block",
+        "analysis_status": "completed",
+        "content_block_id": block.get("id"),
+        "content_block_kind": block.get("kind"),
+        "visual_type": block.get("visual_type") or block.get("kind"),
+        "source_hash": block.get("source_hash") or stable_block_hash(block),
+        "asset_route_mode": route_to_asset_route_mode(route_mode),
+        "rendered_file": os.path.basename(file_path),
+    }
+
+
+def _sync_content_block_assets(db: Session, project: Project, slide: Slide, content: dict) -> dict:
+    """Render visual content blocks into page-level chart refs and keep overlay state aligned."""
+    blocks = normalize_content_blocks(content)
+    content["content_blocks"] = blocks
+    text_content = content.get("text_content") if isinstance(content.get("text_content"), dict) else {}
+    content["text_content"] = {
+        **text_content,
+        "body": normalize_markdown_content(blocks_to_markdown(blocks)),
+    }
+
+    visual_blocks = [block for block in blocks if is_visual_block(block)]
+    visual_by_id = {str(block.get("id")): block for block in visual_blocks}
+    existing_refs = _content_block_refs(db, project.id, slide.id)
+    refs_by_block_id = {
+        str(ref.asset_analysis.get("content_block_id")): ref
+        for ref in existing_refs
+        if isinstance(ref.asset_analysis, dict) and ref.asset_analysis.get("content_block_id")
+    }
+
+    visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+    overlay_layers = normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+
+    for ref in existing_refs:
+        block_id = str((ref.asset_analysis or {}).get("content_block_id") or "")
+        if block_id and block_id not in visual_by_id:
+            overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != ref.id]
+            db.delete(ref)
+
+    output_dir = _content_block_asset_dir(project.id, slide.id)
+    for block in visual_blocks:
+        route_mode = normalize_route_mode(block.get("route_mode"), block.get("kind"))
+        block["route_mode"] = route_mode
+        block["source_hash"] = stable_block_hash(block)
+        file_path = render_visual_block(block, output_dir)
+        block_id = str(block.get("id"))
+        ref = refs_by_block_id.get(block_id)
+        payload = _content_block_ref_payload(block, file_path)
+        if ref is None:
+            ref = ReferenceImage(
+                project_id=project.id,
+                slide_id=slide.id,
+                file_path=file_path,
+                role="chart_ref",
+                process_mode=route_mode,
+                asset_name=str(block.get("title") or "画面素材"),
+                usage_note=f"由正文中的「{block.get('title') or '画面素材'}」生成",
+                asset_analysis=payload,
+            )
+            db.add(ref)
+            db.flush()
+        else:
+            ref.file_path = file_path
+            ref.process_mode = route_mode
+            ref.asset_name = str(block.get("title") or ref.asset_name or "画面素材")
+            ref.usage_note = f"由正文中的「{block.get('title') or '画面素材'}」生成"
+            ref.asset_analysis = {
+                **(ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}),
+                **payload,
+            }
+        block["rendered_asset_id"] = ref.id
+
+        overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != ref.id]
+        if route_mode == "original":
+            overlay_layers.append({
+                "id": f"ov_{ref.id}",
+                "asset_id": ref.id,
+                "enabled": True,
+                "preset": "center-card",
+                "fit": "contain",
+                "mode": "exact_card",
+                "usage_note": f"{ref.asset_name or '画面素材'}：原样保留",
+            })
+
+    visual["overlay_layers"] = normalize_overlay_layers(overlay_layers, valid_asset_ids=None, strict_assets=False)
+    slide.visual_json = visual
+    content["content_blocks"] = blocks
     return content
 
 
@@ -2119,6 +2490,8 @@ def list_slides(project_id: str, db: Session = Depends(get_db)):
         .order_by(Slide.page_num)
         .all()
     )
+    if _repair_project_logo_policies(project, slides):
+        db.commit()
     # 手动加载所有参考图，避免 joinedload 在 SQLAlchemy 2.0 下的兼容问题
     slide_ids = [s.id for s in slides]
     refs = db.query(ReferenceImage).filter(
@@ -2355,10 +2728,13 @@ def create_prompts(
 
     # style_ref 已被转成 style_text；Logo 按页面级 policy 融合，visual_asset 按页选择。
     ref_images_by_page = {
-        s.page_num: _project_refs_for_prompt(
-            project,
-            (s.visual_json or {}).get("visual_asset_ids") if isinstance(s.visual_json, dict) else [],
-            _with_prompt_asset_policies(s.visual_json, project, s) if isinstance(s.visual_json, dict) else None,
+        s.page_num: (
+            _project_refs_for_prompt(
+                project,
+                (s.visual_json or {}).get("visual_asset_ids") if isinstance(s.visual_json, dict) else [],
+                _with_prompt_asset_policies(s.visual_json, project, s) if isinstance(s.visual_json, dict) else None,
+            )
+            + _slide_refs_for_prompt(s, s.visual_json if isinstance(s.visual_json, dict) else None)
         )
         for s in target_slides
     }
@@ -2613,6 +2989,7 @@ async def _do_generate_visual_and_prompts(
         completed_count = 0
         semaphore = asyncio.Semaphore(5)
         progress_lock = asyncio.Lock()
+        slide_by_page_for_refs = {s.page_num: s for s in target_slides}
 
         async def _gen_one(intent: dict) -> dict:
             nonlocal completed_count
@@ -2620,12 +2997,14 @@ async def _do_generate_visual_and_prompts(
             try:
                 async with semaphore:
                     content_text = content_by_page.get(page_num, {})
+                    prompt_refs = _project_refs_for_prompt(project, intent.get("visual_asset_ids") or [], intent)
+                    prompt_refs.extend(_slide_refs_for_prompt(slide_by_page_for_refs.get(page_num), intent) if slide_by_page_for_refs.get(page_num) else [])
                     prompt = await asyncio.to_thread(
                         generate_prompt_for_page,
                         page_intent=intent,
                         content_text=content_text,
                         style_id=project.style_id or "default",
-                        reference_images=_project_refs_for_prompt(project, intent.get("visual_asset_ids") or [], intent) or None,
+                        reference_images=prompt_refs or None,
                         style_text_override=style_text_override,
                     )
                 async with progress_lock:
@@ -3058,7 +3437,8 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
     active_run = get_active_run(db, project_id)
     before_status = project.status
     reconcile_project_state(project, slides, active_run)
-    if project.status != before_status or db.dirty:
+    logo_policy_changed = _repair_project_logo_policies(project, slides)
+    if project.status != before_status or logo_policy_changed or db.dirty:
         db.commit()
 
     pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
@@ -3111,7 +3491,8 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
     latest_run = get_latest_run(db, project_id)
     before_status = project.status
     reconcile_project_state(project, slides, active_run)
-    if project.status != before_status or db.dirty:
+    logo_policy_changed = _repair_project_logo_policies(project, slides)
+    if project.status != before_status or logo_policy_changed or db.dirty:
         db.commit()
 
     pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
@@ -3121,6 +3502,11 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         pptx_filename,
     )
     has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
+    quality_report = (
+        build_project_quality_report(project, slides, has_pptx=has_pptx, pptx_path=pptx_path)
+        if not active_run
+        else None
+    )
 
     return serialize_workflow_status(
         project,
@@ -3129,6 +3515,7 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         latest_run=latest_run,
         has_pptx=has_pptx,
         pptx_path=pptx_path,
+        quality_report=quality_report,
     )
 
 
@@ -3182,22 +3569,21 @@ def get_generation_progress(project_id: str, db: Session = Depends(get_db)):
 
 @router.get("/{project_id}/download")
 def download_pptx(project_id: str, prototype: bool = False, db: Session = Depends(get_db)):
-    """下载生成的 PPTX 文件。支持 prototype 模式下载打样文件。"""
+    """下载生成的 PPTX 文件。未生成的页面会保留为空白页。"""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
-    if _project_has_stale_artifacts(slides):
-        raise HTTPException(status_code=409, detail="部分页面有未应用的修改，请先更新并重新生成相关页面后再下载。")
 
-    filename = "prototype.pptx" if prototype else "presentation.pptx"
+    filename = "prototype.pptx" if prototype else "partial_presentation.pptx"
     pptx_path = os.path.join(
         settings.OUTPUT_DIR or "./outputs",
         project_id,
         filename,
     )
-    if not os.path.exists(pptx_path):
-        raise HTTPException(status_code=404, detail="PPTX not found. Generate first.")
+    generated_count = _assemble_partial_project_pptx(project, slides, pptx_path)
+    if generated_count == 0:
+        raise HTTPException(status_code=404, detail="还没有生成过页面，暂时不能导出 PPTX。")
 
     display_name = f"{project.title}_prototype.pptx" if prototype else f"{project.title}.pptx"
     return FileResponse(
@@ -3662,9 +4048,12 @@ def delete_reference_image(
         # 数据库提交成功后再删物理文件，文件删失败不影响事务
         for t_ref in all_template_refs:
             try:
-                if os.path.exists(t_ref.file_path):
-                    os.remove(t_ref.file_path)
-                    logger.info(f"Deleted template file: {t_ref.file_path}")
+                analysis = t_ref.asset_analysis if isinstance(t_ref.asset_analysis, dict) else {}
+                paths = {t_ref.file_path, analysis.get("layout_file_path"), analysis.get("preview_file_path")}
+                for path in [p for p in paths if p]:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        logger.info(f"Deleted template file: {path}")
             except Exception as e:
                 logger.warning(f"Failed to delete template file {t_ref.file_path}: {e}")
         return {"message": "Deleted all template pages", "count": len(all_template_refs)}
@@ -3806,7 +4195,9 @@ def update_reference_image(
         raise HTTPException(status_code=400, detail="No supported fields to update")
 
     if changed_logo:
-        _invalidate_style_dependent_outputs(project)
+        reassembled = _reassemble_generated_pptx_if_possible(project)
+        if not reassembled:
+            _invalidate_style_dependent_outputs(project)
     if changed_visual_asset and ref.role == "visual_asset":
         _invalidate_visual_asset_dependent_outputs(project)
     elif ref.slide_id and ref.role != "finetune_ref":
@@ -4043,7 +4434,13 @@ def retry_failed_slides(
         "target_count": len(page_nums),
     }, run.id)
 
-    task = _enqueue_generation_task(db, project_id, page_nums, run=run)
+    task = _enqueue_generation_task(
+        db,
+        project_id,
+        page_nums,
+        run=run,
+        prototype=project.status == "prototype_ready",
+    )
 
     return {
         "message": "Retry started",
@@ -4088,18 +4485,8 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
         content_text = {"headline": "", "subhead": "", "body": ""}
 
     # 收集参考图描述：项目级可复用素材优先，页面级参考图随后补充。
-    overlay_asset_ids = exact_overlay_asset_ids(visual_json)
     reference_images = _project_refs_for_prompt(project, visual_json.get("visual_asset_ids") or [], page_intent)
-    if slide.reference_images:
-        for ref in sorted(slide.reference_images, key=_reference_image_sort_key):
-            if str(ref.id) in overlay_asset_ids:
-                continue
-            reference_images.append({
-                "id": ref.id,
-                "role": ref.role,
-                "description": _format_pptx_reference_analysis(ref) or os.path.basename(ref.file_path or ""),
-                "process_mode": ref.process_mode or "blend",
-            })
+    reference_images.extend(_slide_refs_for_prompt(slide, visual_json))
 
     # 获取项目级风格覆盖；没有确认风格时从内容推导紧凑 style pack。
     style_text_override = _style_text_from_selected_style(project.selected_style) or _derive_project_style_pack(
@@ -4381,7 +4768,13 @@ def retry_slide(
         "target_count": 1,
     }, run.id)
 
-    _enqueue_generation_task(db, project_id, [slide.page_num], run=run)
+    _enqueue_generation_task(
+        db,
+        project_id,
+        [slide.page_num],
+        run=run,
+        prototype=project.status == "prototype_ready",
+    )
 
     return {"message": "Retry started", "slide_id": slide_id, "page_num": slide.page_num, "run": serialize_run(run)}
 
@@ -4392,7 +4785,7 @@ def update_slide_content(
     body: UpdateContentRequest,
     db: Session = Depends(get_db),
 ):
-    """更新指定页码的 slide content_json。安全 merge：只更新 text_content 和 speaker_notes。"""
+    """更新指定页码的 slide content_json。安全 merge：只更新正文相关字段。"""
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -4421,7 +4814,10 @@ def update_slide_content(
         existing["text_content"] = existing_text
     if "speaker_notes" in new_content:
         existing["speaker_notes"] = new_content["speaker_notes"]
+    if "content_blocks" in new_content:
+        existing["content_blocks"] = new_content["content_blocks"]
 
+    existing = _sync_content_block_assets(db, project, slide, existing)
     slide.content_json = existing
     _mark_slide_artifacts_stale(slide, content=True)
     db.commit()
@@ -4571,7 +4967,7 @@ def create_slide(
                 updated["page_num"] = s.page_num
                 s.visual_json = updated
 
-    new_content = copy.deepcopy(body.content_json)
+    new_content = _normalize_content_json_markdown(copy.deepcopy(body.content_json))
     new_content.setdefault("page_num", insert_page_num)
     new_slide = Slide(
         project_id=project_id,
@@ -4580,6 +4976,8 @@ def create_slide(
         content_json=new_content,
     )
     db.add(new_slide)
+    db.flush()
+    new_slide.content_json = _sync_content_block_assets(db, project, new_slide, new_content)
     _invalidate_content_dependent_outputs(project)
     db.commit()
     db.refresh(new_slide)
@@ -4632,9 +5030,446 @@ def reorder_slides(
     return {"message": "Slides reordered", "new_order": body.page_nums}
 
 
+TEMPLATE_RECOMMENDATION_KEYS = ("cover", "toc", "section", "content", "data", "quote", "ending")
+
+
+def _file_sha1(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    sha1 = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            sha1.update(chunk)
+    return sha1.hexdigest()
+
+
+def _template_page_analysis(page: dict, source_filename: str, total_pages: int) -> dict:
+    return {
+        "analysis_type": "template_page",
+        "analysis_status": "completed",
+        "source_document": source_filename,
+        "template_page_num": page.get("page_num"),
+        "template_total_pages": total_pages,
+        "template_category": page.get("category") or "content",
+        "category_confidence": page.get("category_confidence") or 0.6,
+        "source_kind": page.get("source_kind") or "template",
+        "template_application_strength": "standard",
+        "preview_file_path": page.get("file_path"),
+        "layout_file_path": page.get("layout_file_path") or page.get("file_path"),
+        "text_density": page.get("text_density") or 0,
+        "logo_removed": bool(page.get("logo_removed")),
+    }
+
+
+def _template_recommendation_payload(page: dict | None) -> dict | None:
+    if not isinstance(page, dict):
+        return None
+    return {
+        "page_num": page.get("page_num"),
+        "file_path": page.get("layout_file_path") or page.get("file_path"),
+        "preview_file_path": page.get("file_path"),
+        "layout_file_path": page.get("layout_file_path") or page.get("file_path"),
+        "category": page.get("category") or "content",
+        "category_confidence": page.get("category_confidence") or 0.6,
+        "source_kind": page.get("source_kind") or "template",
+        "application_strength": "standard",
+        "logo_removed": bool(page.get("logo_removed")),
+    }
+
+
+def _template_page_num_from_ref(ref: ReferenceImage) -> int:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    try:
+        page_num = int(analysis.get("template_page_num") or 0)
+    except (TypeError, ValueError):
+        page_num = 0
+    if page_num > 0:
+        return page_num
+    match = re.search(r"page_(\d+)", os.path.basename(ref.file_path or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _template_page_payload_from_ref(project_id: str, ref: ReferenceImage, total: int | None = None) -> dict:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    page_num = _template_page_num_from_ref(ref)
+    layout_file_path = analysis.get("layout_file_path") or ref.file_path
+    layout_name = os.path.basename(layout_file_path) if layout_file_path else os.path.basename(ref.file_path)
+    preview_name = os.path.basename(ref.file_path)
+    return {
+        "id": ref.id,
+        "page_num": page_num,
+        "url": f"/uploads/{project_id}/templates/{preview_name}",
+        "layout_url": f"/uploads/{project_id}/templates/{layout_name}",
+        "category": analysis.get("template_category") or _infer_template_page_category_safe(page_num, total or 0),
+        "category_confidence": analysis.get("category_confidence") or 0.6,
+        "source_kind": analysis.get("source_kind") or "template",
+        "application_strength": analysis.get("template_application_strength") or "standard",
+        "logo_removed": bool(analysis.get("logo_removed")),
+        "file_exists": os.path.exists(ref.file_path),
+    }
+
+
+def _infer_template_page_category_safe(page_num: int, total: int) -> str:
+    from app.services.template_extractor import _infer_page_category
+
+    return _infer_page_category(page_num, total)
+
+
+def _logo_anchor_from_bounds(bounds: dict | None) -> str:
+    if not isinstance(bounds, dict):
+        return DEFAULT_LOGO_ANCHOR
+    try:
+        cx = float(bounds.get("left") or 0) + float(bounds.get("width") or 0) / 2
+        cy = float(bounds.get("top") or 0) + float(bounds.get("height") or 0) / 2
+    except (TypeError, ValueError):
+        return DEFAULT_LOGO_ANCHOR
+    horizontal = "left" if cx < 0.5 else "right"
+    vertical = "top" if cy < 0.5 else "bottom"
+    return f"{vertical}-{horizontal}"
+
+
+def _logo_regions_from_pptx_assets(assets: list) -> dict[int, list[dict]]:
+    regions_by_page: dict[int, list[dict]] = {}
+    for asset in assets:
+        if getattr(asset, "role", None) != "logo":
+            continue
+        metadata = getattr(asset, "metadata", {}) if isinstance(getattr(asset, "metadata", {}), dict) else {}
+        bounds = metadata.get("shape_bounds")
+        if not isinstance(bounds, dict) or not bounds:
+            continue
+        repeated = metadata.get("pptx_repeated_page_nums") or [getattr(asset, "source_page_num", None)]
+        for page_num in repeated:
+            try:
+                normalized_page = int(page_num)
+            except (TypeError, ValueError):
+                continue
+            regions_by_page.setdefault(normalized_page, []).append({
+                "bbox_norm": bounds,
+                "anchor": _logo_anchor_from_bounds(bounds),
+            })
+    return regions_by_page
+
+
+def _project_has_confirmed_manual_logo(project: Project, db: Session | None = None) -> bool:
+    refs = (
+        db.query(ReferenceImage).filter(ReferenceImage.project_id == project.id, ReferenceImage.role == "logo").all()
+        if db is not None
+        else (project.reference_images or [])
+    )
+    for ref in refs:
+        if ref.role != "logo" or ref.slide_id:
+            continue
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+        if analysis.get("source_document") or analysis.get("template_logo_source"):
+            continue
+        if is_logo_confirmed(ref):
+            return True
+    return False
+
+
+def _template_logo_analysis(asset, source_filename: str, *, needs_review: bool) -> dict:
+    metadata = getattr(asset, "metadata", {}) if not isinstance(asset, dict) else asset.get("metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    file_path = getattr(asset, "file_path", None) if not isinstance(asset, dict) else asset.get("file_path")
+    digest = metadata.get("pptx_image_sha1") or _file_sha1(file_path)
+    classification = (
+        getattr(asset, "classification", None)
+        if not isinstance(asset, dict)
+        else asset.get("classification")
+    ) or metadata.get("classification") or "logo"
+    return {
+        **metadata,
+        "analysis_status": "completed",
+        "analysis_type": "logo",
+        "source_document": source_filename,
+        "template_logo_source": "layout_template",
+        "classification": classification,
+        "pptx_image_sha1": digest,
+        "review_status": "needs_review" if needs_review else "auto_confirmed",
+        "needs_user_review": bool(needs_review),
+        "confidence_score": 0.62 if needs_review else 0.9,
+        "review_reason": (
+            "模板中识别出的 Logo 候选，已有项目 Logo，请确认是否替换或合并使用。"
+            if needs_review
+            else "从版式模板中识别出的 Logo，已作为项目级品牌标识使用。"
+        ),
+    }
+
+
+def _attach_template_logo_assets(project: Project, assets: list, source_filename: str, db: Session) -> int:
+    if not assets:
+        return 0
+    existing_logo_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.slide_id.is_(None),
+        ReferenceImage.role == "logo",
+    ).all()
+    existing_hashes = {
+        str((ref.asset_analysis or {}).get("pptx_image_sha1"))
+        for ref in existing_logo_refs
+        if isinstance(ref.asset_analysis, dict) and ref.asset_analysis.get("pptx_image_sha1")
+    }
+    has_manual_logo = _project_has_confirmed_manual_logo(project, db)
+    auto_confirmed_template_logo_attached = any(
+        is_logo_confirmed(ref)
+        and isinstance(ref.asset_analysis, dict)
+        and ref.asset_analysis.get("template_logo_source") == "layout_template"
+        for ref in existing_logo_refs
+    )
+    attached = 0
+    for asset in assets:
+        file_path = getattr(asset, "file_path", None) if not isinstance(asset, dict) else asset.get("file_path")
+        if not file_path or not os.path.exists(file_path):
+            continue
+        metadata = getattr(asset, "metadata", {}) if not isinstance(asset, dict) else asset.get("metadata", {})
+        metadata = metadata if isinstance(metadata, dict) else {}
+        digest = metadata.get("pptx_image_sha1") or _file_sha1(file_path)
+        if digest and digest in existing_hashes:
+            continue
+        needs_review = bool(has_manual_logo or auto_confirmed_template_logo_attached)
+        analysis = _template_logo_analysis(asset, source_filename, needs_review=needs_review)
+        if needs_review and not has_manual_logo:
+            analysis["review_reason"] = "同一模板中识别出的额外 Logo 候选，需用户确认后才会合并为项目 Logo。"
+        bounds = metadata.get("shape_bounds") if isinstance(metadata.get("shape_bounds"), dict) else None
+        logo_anchor = metadata.get("logo_anchor") or _logo_anchor_from_bounds(bounds)
+        db.add(ReferenceImage(
+            project_id=project.id,
+            slide_id=None,
+            file_path=file_path,
+            role="logo",
+            process_mode="original",
+            asset_name=(getattr(asset, "asset_name", None) if not isinstance(asset, dict) else asset.get("asset_name")),
+            usage_note=(getattr(asset, "usage_note", None) if not isinstance(asset, dict) else asset.get("usage_note")),
+            asset_analysis=analysis,
+            logo_anchor=normalize_logo_anchor(logo_anchor),
+        ))
+        if digest:
+            existing_hashes.add(str(digest))
+        if not needs_review:
+            auto_confirmed_template_logo_attached = True
+        attached += 1
+    return attached
+
+
+def _delete_old_template_logo_assets(project_id: str, db: Session) -> int:
+    old_logo_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.slide_id.is_(None),
+        ReferenceImage.role == "logo",
+    ).all()
+    deleted = 0
+    for ref in old_logo_refs:
+        analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+        if analysis.get("template_logo_source") != "layout_template":
+            continue
+        db.delete(ref)
+        deleted += 1
+    if deleted:
+        db.flush()
+    return deleted
+
+
+TEMPLATE_EXTRACTION_STATUS_FILE = "template_extract_status.json"
+
+
+def _template_status_path(project_id: str) -> str:
+    project_dir = os.path.join(settings.UPLOAD_DIR, project_id)
+    os.makedirs(project_dir, exist_ok=True)
+    return os.path.join(project_dir, TEMPLATE_EXTRACTION_STATUS_FILE)
+
+
+def _write_template_status(project_id: str, status: str, **payload) -> None:
+    data = {
+        "status": status,
+        "updated_at": time.time(),
+        **payload,
+    }
+    try:
+        with open(_template_status_path(project_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning("写入模板提取状态失败: project=%s error=%s", project_id, exc)
+
+
+def _read_template_status(project_id: str) -> dict:
+    path = _template_status_path(project_id)
+    if not os.path.exists(path):
+        return {"status": "not_found"}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"status": "unknown"}
+    except (OSError, json.JSONDecodeError):
+        return {"status": "unknown"}
+
+
+def _is_current_template_job(project_id: str, job_id: str | None) -> bool:
+    if not job_id:
+        return True
+    return _read_template_status(project_id).get("job_id") == job_id
+
+
+def _extract_template_into_project(
+    project: Project,
+    file_path: str,
+    safe_name: str,
+    ext: str,
+    db: Session,
+    *,
+    job_id: str | None = None,
+) -> dict:
+    pptx_logo_assets = []
+    logo_regions_by_page: dict[int, list[dict]] = {}
+    if ext == ".pptx":
+        try:
+            from app.services.pptx_asset_extractor import extract_pptx_image_assets
+
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            template_assets_dir = os.path.join(settings.UPLOAD_DIR, project.id, "template_assets")
+            os.makedirs(template_assets_dir, exist_ok=True)
+            extracted_assets = extract_pptx_image_assets(
+                file_bytes=file_bytes,
+                source_filename=safe_name,
+                output_dir=template_assets_dir,
+                max_assets_per_slide=1,
+                max_total_assets=24,
+            )
+            pptx_logo_assets = [asset for asset in extracted_assets if asset.role == "logo"]
+            logo_regions_by_page = _logo_regions_from_pptx_assets(pptx_logo_assets)
+        except Exception as exc:
+            logger.warning("模板 PPTX Logo 提取失败，继续提取模板页: project=%s file=%s error=%s", project.id, safe_name, exc)
+
+    from app.services.template_extractor import extract_template_package, promote_template_package
+
+    package = extract_template_package(
+        file_path,
+        project.id,
+        settings.UPLOAD_DIR,
+        logo_regions_by_page=logo_regions_by_page,
+        source_filename=safe_name,
+        finalize=False,
+    )
+
+    if not _is_current_template_job(project.id, job_id):
+        work_dir = package.get("work_dir") if isinstance(package, dict) else None
+        if work_dir and os.path.exists(work_dir):
+            shutil.rmtree(work_dir, ignore_errors=True)
+        db.rollback()
+        return {
+            "status": "stale",
+            "message": "Template extraction skipped because a newer upload exists",
+            "filename": safe_name,
+        }
+
+    package = promote_template_package(package)
+    pages = package["pages"]
+
+    old_template_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "template",
+    ).all()
+    for old_ref in old_template_refs:
+        db.delete(old_ref)
+
+    recommendations = package.get("recommendations") or {}
+    total_pages = len(pages)
+    for page in pages:
+        ref = ReferenceImage(
+            project_id=project.id,
+            file_path=page["file_path"],
+            role="template",
+            process_mode="blend",
+            asset_analysis=_template_page_analysis(page, safe_name, total_pages),
+        )
+        db.add(ref)
+
+    rendered_logo_assets = package.get("rendered_logo_candidates") or []
+    _delete_old_template_logo_assets(project.id, db)
+    attached_logo_count = _attach_template_logo_assets(
+        project,
+        [*pptx_logo_assets, *rendered_logo_assets],
+        safe_name,
+        db,
+    )
+
+    project.selected_template_recommendations = {
+        key: _template_recommendation_payload(recommendations.get(key))
+        for key in TEMPLATE_RECOMMENDATION_KEYS
+    }
+    _invalidate_style_dependent_outputs(project)
+    db.commit()
+
+    return {
+        "message": "Template extracted",
+        "filename": safe_name,
+        "total_pages": len(pages),
+        "status": "completed",
+        "document_kind": package.get("document_kind") or "template",
+        "extracted_logos": attached_logo_count,
+        "pages": [
+            {
+                "page_num": p["page_num"],
+                "url": p["url"],
+                "layout_url": p.get("layout_url"),
+                "category": p.get("category", "content"),
+                "category_confidence": p.get("category_confidence", 0.6),
+                "source_kind": p.get("source_kind", "template"),
+                "logo_removed": bool(p.get("logo_removed")),
+            }
+            for p in pages
+        ],
+        "recommendations": {
+            key: (
+                {
+                    "page_num": value["page_num"],
+                    "url": value["url"],
+                    "layout_url": value.get("layout_url"),
+                    "category": value.get("category", "content"),
+                    "category_confidence": value.get("category_confidence", 0.6),
+                    "source_kind": value.get("source_kind", "template"),
+                    "logo_removed": bool(value.get("logo_removed")),
+                }
+                if isinstance(value := recommendations.get(key), dict)
+                else None
+            )
+            for key in TEMPLATE_RECOMMENDATION_KEYS
+        },
+    }
+
+
+def _process_template_upload_bg(project_id: str, file_path: str, safe_name: str, ext: str, job_id: str) -> None:
+    _write_template_status(project_id, "running", filename=safe_name, job_id=job_id)
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            raise RuntimeError("Project not found")
+        result = _extract_template_into_project(project, file_path, safe_name, ext, db, job_id=job_id)
+        if result.get("status") == "stale":
+            return
+        _write_template_status(
+            project_id,
+            "completed",
+            filename=safe_name,
+            job_id=job_id,
+            total_pages=result.get("total_pages", 0),
+            document_kind=result.get("document_kind") or "template",
+            extracted_logos=result.get("extracted_logos", 0),
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.warning("模板提取后台任务失败: project=%s file=%s error=%s", project_id, safe_name, exc)
+        if _is_current_template_job(project_id, job_id):
+            _write_template_status(project_id, "failed", filename=safe_name, job_id=job_id, error=str(exc)[:500])
+    finally:
+        db.close()
+
+
 @router.post("/{project_id}/extract-template")
 def extract_template(
     project_id: str,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -4647,64 +5482,41 @@ def extract_template(
     safe_name = file.filename.replace("\\", "/").split("/")[-1]
     if ".." in safe_name or not safe_name or safe_name.startswith("."):
         raise HTTPException(status_code=400, detail="非法文件名")
+    ext = os.path.splitext(safe_name.lower())[1]
+    if ext not in {".ppt", ".pptx", ".pdf"}:
+        raise HTTPException(status_code=400, detail="版式模板仅支持 PPT、PPTX 或 PDF")
+
+    file_bytes = file.file.read()
+    if len(file_bytes) == 0:
+        raise HTTPException(status_code=400, detail="上传的文件为空")
 
     # 保存上传文件
     upload_dir = os.path.join(settings.UPLOAD_DIR, project_id)
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, f"template_{safe_name}")
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(file_bytes)
 
-    # 提取缩略图
-    from app.services.template_extractor import extract_template_images, recommend_template_pages
-    try:
-        pages = extract_template_images(file_path, project_id, settings.UPLOAD_DIR)
-    except Exception as e:
-        logger.error(f"模板提取失败: {e}")
-        raise HTTPException(status_code=500, detail=f"模板提取失败: {str(e)}")
-
-    old_template_refs = db.query(ReferenceImage).filter(
-        ReferenceImage.project_id == project_id,
-        ReferenceImage.role == "template",
-    ).all()
-    for old_ref in old_template_refs:
-        db.delete(old_ref)
-
-    # 获取 Content Plan 用于更智能的推荐
-    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
-    content_plan = [s.content_json for s in slides]
-    recommendations = recommend_template_pages(pages, content_plan)
-
-    # 保存为 reference_images (role = template)
-    for page in pages:
-        ref = ReferenceImage(
-            project_id=project_id,
-            file_path=page["file_path"],
-            role="template",
-        )
-        db.add(ref)
-
-    # 保存推荐映射到 project.selected_template_recommendations
-    # 格式: {cover: {page_num, file_path, category}, toc: {...}, content: {...}, ending: {...}}
-    project.selected_template_recommendations = {
-        k: ({"page_num": v["page_num"], "file_path": v["file_path"], "category": v.get("category", "content")} if v else None)
-        for k, v in recommendations.items()
-    }
-    _invalidate_style_dependent_outputs(project)
-    db.commit()
-
+    job_id = hashlib.sha1(f"{project_id}:{safe_name}:{len(file_bytes)}:{time.time()}".encode("utf-8")).hexdigest()[:16]
+    _write_template_status(project_id, "queued", filename=safe_name, job_id=job_id)
+    background_tasks.add_task(_process_template_upload_bg, project_id, file_path, safe_name, ext, job_id)
     return {
-        "message": "Template extracted",
-        "total_pages": len(pages),
-        "pages": [
-            {"page_num": p["page_num"], "url": p["url"], "category": p.get("category", "content")}
-            for p in pages
-        ],
-        "recommendations": {
-            k: ({"page_num": v["page_num"], "url": v["url"], "category": v.get("category", "content")} if v else None)
-            for k, v in recommendations.items()
-        },
+        "message": "Template extraction queued",
+        "status": "processing",
+        "filename": safe_name,
+        "job_id": job_id,
     }
+
+
+@router.get("/{project_id}/template-status")
+def get_template_status(
+    project_id: str,
+    db: Session = Depends(get_db),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _read_template_status(project_id)
 
 
 @router.get("/{project_id}/template-pages")
@@ -4721,17 +5533,13 @@ def list_template_pages(
         ReferenceImage.project_id == project_id,
         ReferenceImage.role == "template",
     ).all()
+    refs.sort(key=_template_page_num_from_ref)
 
     total = len(refs)
-    from app.services.template_extractor import _infer_page_category
 
     return [
-        {
-            "id": ref.id,
-            "url": f"/uploads/{project_id}/templates/{os.path.basename(ref.file_path)}",
-            "category": _infer_page_category(idx + 1, total),
-        }
-        for idx, ref in enumerate(refs)
+        _template_page_payload_from_ref(project_id, ref, total)
+        for ref in refs
     ]
 
 

@@ -15,18 +15,20 @@ from app.core.config import settings
 from app.models.models import Project, Slide, SlideVersion
 from app.services.artifact_versions import with_stale_flags
 from app.services.image_generation import (
+    clear_reference_upload_cache,
     generate_slide_image,
     get_image_call_events,
     reset_image_call_events,
+    reset_run_image_counter,
     save_slide_image,
 )
 from app.services.image_task_audit import append_image_generation_log, image_generation_log_path
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import resolve_logo_render_policy
-from app.services.logo_policy import is_logo_confirmed, should_show_logo, should_use_logo_as_scene_asset
+from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, should_show_logo, should_use_logo_as_scene_asset
 from app.services.overlay_layers import exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
-from app.services.run_state import cleanup_generation_progress, finish_run, is_run_active, mark_run_running, update_run_progress
+from app.services.run_state import cleanup_generation_progress, finish_run, get_run, is_run_active, mark_run_running, update_run_progress
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,7 @@ redis_client = redis.from_url(
     settings.REDIS_URL or "redis://localhost:6379/0",
     socket_connect_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
     socket_timeout=settings.REDIS_SOCKET_TIMEOUT_SECONDS,
-    retry_on_timeout=False,
+    retry_on_timeout=True,
     health_check_interval=30,
 )
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
@@ -497,7 +499,7 @@ def _load_reference_images(
         template_key = _map_slide_type_to_template_key(slide_type)
         tmpl = recommendations.get(template_key)
         if tmpl and isinstance(tmpl, dict) and tmpl.get("file_path"):
-            tmpl_path = tmpl["file_path"]
+            tmpl_path = tmpl.get("layout_file_path") or tmpl.get("file_path")
             if os.path.exists(tmpl_path) and len(refs) < MAX_REFERENCE_INPUTS:
                 try:
                     refs.append({
@@ -506,6 +508,8 @@ def _load_reference_images(
                         "role": "template",
                         "label": "Template Reference",
                         "file_path": tmpl_path,
+                        "template_key": template_key,
+                        "application_strength": tmpl.get("application_strength") or "standard",
                     })
                     logger.info(f"Slide {slide.page_num}: 加载模板参考图 {tmpl_path} (type={slide_type} -> key={template_key})")
                 except Exception as e:
@@ -542,9 +546,12 @@ def _map_slide_type_to_template_key(slide_type: str) -> str:
     mapping = {
         "cover": "cover",
         "toc": "toc",
-        "section": "toc",
-        "hero": "content",
-        "data": "content",
+        "section": "section",
+        "hero": "quote",
+        "quote": "quote",
+        "data": "data",
+        "chart": "data",
+        "table": "data",
         "ending": "ending",
     }
     return mapping.get(slide_type, "content")
@@ -721,6 +728,7 @@ def _generate_one_slide(
         seed_image_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref")
         seed_hint_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref_hint")
         seed_count = seed_image_count + seed_hint_count
+        template_ref_count = sum(1 for r in first_pass_ref_data if r.get("role") == "template")
         if seed_image_count > 0:
             seed_instruction = _seed_base_edit_instruction(slide, seed_image_count) or (
                 f"\n\nIMPORTANT — SAME-FAMILY LAYOUT REFERENCE: "
@@ -738,6 +746,13 @@ def _generate_one_slide(
                 "typography, palette, ornament language, grid system, and hierarchy closely so this slide feels like the same design system. "
                 "Do not change the requested slide text or visual evidence."
             )
+        elif template_ref_count > 0:
+            prompt = prompt + (
+                "\n\nIMPORTANT — TEMPLATE LAYOUT REFERENCE: Attached template reference images provide layout DNA only: "
+                "grid, spacing, hierarchy, typography rhythm, ornament language, and palette relationship. "
+                "Do not copy any template text, old body imagery, old product shots, or old logos. "
+                "Render this slide's own content and keep brand marks reserved for the uploaded project logo."
+            )
 
         if use_product_refinement:
             prompt = _background_pass_prompt(prompt, product_refs)
@@ -752,6 +767,7 @@ def _generate_one_slide(
             reference_count=len(ref_images),
             references=_reference_audit(first_pass_ref_data),
             seed_reference_count=seed_count,
+            template_reference_count=template_ref_count,
             product_refinement=use_product_refinement,
             **_prompt_audit(prompt),
         )
@@ -782,16 +798,33 @@ def _generate_one_slide(
                     f"Pipeline: 第 {slide.page_num} 页产品二次生成参考素材路径: "
                     + " | ".join(refinement_paths)
                 )
-            img = generate_slide_image(
-                prompt=_product_refinement_prompt(slide, product_refs),
-                reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
-                resolution="4K",
-                aspect_ratio="16:9",
-            )
-            logger.info(
-                f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
-                f"(base={base_path}, product_refs={len(product_refs)})"
-            )
+            try:
+                img = generate_slide_image(
+                    prompt=_product_refinement_prompt(slide, product_refs),
+                    reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
+                    resolution="4K",
+                    aspect_ratio="16:9",
+                )
+                logger.info(
+                    f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
+                    f"(base={base_path}, product_refs={len(product_refs)})"
+                )
+            except Exception as refine_error:
+                logger.warning(
+                    "Pipeline: 第 %s 页产品二次生成失败，回退使用 base image: %s",
+                    slide.page_num,
+                    refine_error,
+                )
+                append_image_generation_log(
+                    project_id,
+                    run_id,
+                    "product_refinement_fallback",
+                    page_num=slide.page_num,
+                    slide_id=slide.id,
+                    base_path=base_path,
+                    product_ref_count=len(product_refs),
+                    error=str(refine_error)[:1000],
+                )
 
         image_path = save_slide_image(
             img=img,
@@ -865,6 +898,7 @@ def run_generation_pipeline(
     page_nums: Optional[List[int]] = None,
     prototype: bool = False,
     run_id: str | None = None,
+    defer_finalization: bool = False,
 ):
     """
     执行生成流水线（支持单页并行，由 Celery 调用）。
@@ -872,6 +906,7 @@ def run_generation_pipeline(
     模块内限流，避免多页同时上传参考图导致写入超时。
     """
     logger.info(f"Pipeline: 开始生成项目 {project_id}, page_nums={page_nums}")
+    reset_run_image_counter()
 
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
@@ -904,6 +939,20 @@ def run_generation_pipeline(
         mode_desc = "打样模式" if prototype else "指定页面生成"
         logger.info(f"Pipeline: {mode_desc}，只生成 {len(target_slides)} 页")
 
+    run = get_run(db, run_id)
+    run_target_pages = set()
+    if run and run.target_page_nums:
+        run_target_pages = {int(p) for p in run.target_page_nums}
+    progress_slides = [s for s in slides if s.page_num in run_target_pages] if run_target_pages else target_slides
+    if not progress_slides:
+        progress_slides = target_slides
+
+    def progress_counts() -> tuple[int, int, int]:
+        total = len(progress_slides)
+        completed = sum(1 for s in progress_slides if s.status == "completed")
+        failed = sum(1 for s in progress_slides if s.status == "failed")
+        return total, completed, failed
+
     log_path = image_generation_log_path(project_id, run_id)
     append_image_generation_log(
         project_id,
@@ -931,8 +980,8 @@ def run_generation_pipeline(
             slide.status = "generating"
             slide.error_msg = None
     db.commit()
-    total_target = len(target_slides)
-    update_run_progress(db, run_id, total_count=total_target, completed_count=0, failed_count=0)
+    total_target, completed_now, failed_now = progress_counts()
+    update_run_progress(db, run_id, total_count=total_target, completed_count=completed_now, failed_count=failed_now)
     db.commit()
 
     output_dir = settings.OUTPUT_DIR or "./outputs"
@@ -990,8 +1039,7 @@ def run_generation_pipeline(
                 "visual_json": slide.visual_json or {},
             })
         db.commit()
-        completed_now = sum(1 for s in target_slides if s.status == "completed")
-        failed_now = sum(1 for s in target_slides if s.status == "failed")
+        total_target, completed_now, failed_now = progress_counts()
         update_run_progress(
             db,
             run_id,
@@ -1125,11 +1173,47 @@ def run_generation_pipeline(
             })
     all_completed_images.sort(key=lambda x: x["page_num"])
 
+    total_target, target_completed, target_failed = progress_counts()
+    unfinished_run_targets = [
+        s for s in progress_slides if s.status not in {"completed", "failed"}
+    ]
+    if defer_finalization or unfinished_run_targets:
+        update_run_progress(
+            db,
+            run_id,
+            completed_count=target_completed,
+            failed_count=target_failed,
+            total_count=total_target,
+            message=f"正在生成图片... {target_completed} / {total_target} 页完成"
+            + (f"，{target_failed} 页失败" if target_failed else ""),
+        )
+        db.commit()
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "pipeline_chunk_finished",
+            current_page_nums=[s.page_num for s in target_slides],
+            unfinished_page_nums=[s.page_num for s in unfinished_run_targets],
+            target_completed=target_completed,
+            target_failed=target_failed,
+            total_target=total_target,
+            log_path=log_path,
+        )
+        logger.info(
+            "Pipeline: chunk completed for run %s (%s/%s complete); deferring final writeback",
+            run_id,
+            target_completed,
+            total_target,
+        )
+        clear_reference_upload_cache()
+        return
+
     # 组装 PPTX（用 Redis 锁防止并发生成任务同时写文件）
     pptx_lock_key = f"project:{project_id}:pptx_assembly"
     assembly_error = None
     if all_completed_images:
-        pptx_acquired = redis_client.set(pptx_lock_key, "1", nx=True, ex=30)
+        pptx_lock_ttl = max(120, int(settings.PPTX_ASSEMBLY_LOCK_TTL_SECONDS or 300))
+        pptx_acquired = redis_client.set(pptx_lock_key, "1", nx=True, ex=pptx_lock_ttl)
         if pptx_acquired:
             try:
                 if prototype:
@@ -1157,7 +1241,11 @@ def run_generation_pipeline(
                         if not should_show_logo(slide_data):
                             continue
                         visual = dict(slide_data.get("visual_json") or {})
-                        policy = dict(visual.get("logo_policy") or {})
+                        raw_policy = dict(visual.get("logo_policy") or {})
+                        policy = logo_policy_for_page(slide_data)
+                        render_policy_input = {**raw_policy, **policy}
+                        if "render_variant" not in policy:
+                            render_policy_input.pop("render_variant", None)
                         render_policy = resolve_logo_render_policy(
                             _existing_path(slide_data.get("image_path"), output_dir),
                             logo_path_for_overlay,
@@ -1165,7 +1253,7 @@ def run_generation_pipeline(
                             str(slide_data.get("type") or "content").lower(),
                             policy.get("placement") or logo_config.get("anchor") or "top-right",
                             policy.get("scale") or "small",
-                            policy,
+                            render_policy_input,
                         )
                         policy.update({k: v for k, v in render_policy.items() if v is not None})
                         visual["logo_policy"] = policy
@@ -1207,7 +1295,10 @@ def run_generation_pipeline(
                 assembly_error = str(e)[:500]
                 db.commit()
             finally:
-                redis_client.delete(pptx_lock_key)
+                try:
+                    redis_client.delete(pptx_lock_key)
+                except Exception as exc:
+                    logger.warning("Pipeline: failed to release PPTX assembly lock: %s", exc)
         else:
             logger.info(f"Pipeline: 跳过 PPTX 组装，另一任务正在组装")
 
@@ -1216,8 +1307,7 @@ def run_generation_pipeline(
     generating_count = sum(1 for st in all_slide_statuses if st == "generating")
     completed_count = sum(1 for st in all_slide_statuses if st == "completed")
     failed_count = sum(1 for st in all_slide_statuses if st == "failed")
-    target_completed = sum(1 for s in target_slides if s.status == "completed")
-    target_failed = sum(1 for s in target_slides if s.status == "failed")
+    total_target, target_completed, target_failed = progress_counts()
     target_errors = [
         str(s.error_msg).strip()
         for s in target_slides
@@ -1280,3 +1370,4 @@ def run_generation_pipeline(
 
     # 清理内存中的 generation_progress，避免任务结束后端点仍返回旧数据
     cleanup_generation_progress(project_id)
+    clear_reference_upload_cache()

@@ -7,6 +7,8 @@ from app.services.content_plan import (
     content_plan_from_page_map,
     generate_content_plan,
     generate_content_page_map,
+    build_direct_ppt_replicate_outline,
+    validate_direct_ppt_replicate_outline,
     _document_preservation_mode,
     _document_preservation_policy,
     _enforce_requested_page_range,
@@ -18,6 +20,7 @@ from app.services.content_plan import (
     generate_long_deck_outline_chunk,
     _infer_document_driven_page_count,
     parse_page_map_markdown,
+    parse_paginated_markdown_content_plan,
     parse_exported_content_plan_markdown,
     resolve_content_plan_page_target,
     should_generate_incremental_long_deck,
@@ -185,6 +188,194 @@ P2｜content｜道｜为什么必须变
     assert outline[1]["type"] == "ending"
     assert "ChatGPT 达到 1 亿规模只用了 2 个月" in outline[1]["text_content"]["body"]
     assert "把速度和行为迁移连起来" in outline[1]["speaker_notes"]
+
+
+def test_page_map_parser_drops_markdown_separator_bullets():
+    markdown = """P1｜cover｜封面｜品牌增长课
+备注：封面。
+
+P2｜content｜正文｜核心判断
+- ---
+- 真正要保留的内容
+备注：解释判断。"""
+
+    outline = content_plan_from_page_map(parse_page_map_markdown(markdown))
+    body = outline[1]["text_content"]["body"]
+
+    assert "---" not in body
+    assert "真正要保留的内容" in body
+
+
+def test_paginated_markdown_draft_reuses_pages_without_separator_copy(monkeypatch):
+    documents = """--- 文档: 客户分页稿.md ---
+# 客户分页稿
+
+## 注意事项
+```
+### 页面类型
+- 标题：示例
+- 内容：示例
+- 表达意图：示例
+```
+
+---
+
+## 模块：封面与开场
+
+---
+
+### 封面
+- 标题：疯火轮 AI — 营销人的 AI 工作台
+- 内容：
+越用越懂你 · 边说边交付 · 团队一起用
+madfireai.com
+- 表达意图：品牌认知锚点
+
+---
+
+### 使命页
+- 标题：为营销人构建一个高效的AI工作环境
+- 内容：（无额外正文，标题即核心信息）
+- 表达意图：用一句有力的话传递产品分量
+
+---
+"""
+
+    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: (_ for _ in ()).throw(AssertionError("LLM should not be called")))
+    monkeypatch.setattr(content_plan_module.get_knowledge_augmenter(), "augment", lambda *_args, **_kwargs: "")
+
+    assert len(parse_paginated_markdown_content_plan(documents)) == 2
+
+    outline = generate_content_plan(topic="帮我做成 PPT", documents=documents)
+    rendered = "\n".join(
+        "\n".join(str(v) for v in page.get("text_content", {}).values())
+        for page in outline
+    )
+
+    assert len(outline) == 2
+    assert outline[0]["generation_status"] == "source_paginated_markdown"
+    assert outline[0]["type"] == "cover"
+    assert outline[0]["text_content"]["headline"] == "疯火轮 AI — 营销人的 AI 工作台"
+    assert "越用越懂你" in outline[0]["text_content"]["body"]
+    assert outline[1]["text_content"]["headline"] == "为营销人构建一个高效的AI工作环境"
+    assert outline[1]["text_content"]["body"] == ""
+    assert "---" not in rendered
+
+
+def test_single_uploaded_ppt_replicate_uses_source_pages_without_llm(monkeypatch):
+    documents = """--- 文档: 混沌-分众传媒AI落地实践-20250527.pptx ---
+--- PPT_SOURCE filename="混沌-分众传媒AI落地实践-20250527.pptx" pages=3 ---
+
+--- 第1页 ---
+分众传媒 AI 实践分享
+
+分众 KA 负责人/AI 创新业务负责人 桑卓豪
+【备注】
+开场备注
+
+--- 第2页 ---
+为什么今天
+分众要做AI？
+
+--- 第3页 ---
+目前已开发落地的
+AI 业务场景
+客户管理
+创意流程
+"""
+
+    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: (_ for _ in ()).throw(AssertionError("LLM should not be called")))
+
+    outline = generate_content_plan(
+        topic="【文件：混沌-分众传媒AI落地实践-20250527.pptx】 1:1 复刻这个 ppt",
+        documents=documents,
+    )
+
+    rendered = "\n".join(
+        "\n".join(str(v) for v in page.get("text_content", {}).values())
+        for page in outline
+    )
+    assert len(outline) == 3
+    assert [page["generation_status"] for page in outline] == ["pptx_direct"] * 3
+    assert outline[0]["text_content"]["headline"] == "分众传媒 AI 实践分享"
+    assert "分众 KA 负责人" in outline[0]["text_content"]["subhead"]
+    assert outline[0]["speaker_notes"] == "开场备注"
+    assert outline[1]["text_content"]["headline"] == "为什么今天\n分众要做AI？"
+    assert "客户管理" in outline[2]["text_content"]["body"]
+    assert "用户上传材料" not in rendered
+    assert outline[1]["source_refs"] == [{
+        "source_document": "混沌-分众传媒AI落地实践-20250527.pptx",
+        "source_page_num": 2,
+        "source_type": "pptx_slide",
+        "reason": "direct_replicate",
+    }]
+    assert outline[1]["source_facts"] == {
+        "mode": "direct_ppt_replicate",
+        "source_document": "混沌-分众传媒AI落地实践-20250527.pptx",
+        "source_page_num": 2,
+        "source_total_pages": 3,
+        "source_line_count": 2,
+        "has_speaker_notes": False,
+    }
+    assert outline[0]["replicate_quality"]["status"] == "passed"
+    assert outline[0]["replicate_quality"]["checks"]["marker_free"] is True
+
+
+def test_direct_ppt_outline_is_disabled_for_transform_requests():
+    documents = """--- PPT_SOURCE filename="source.pptx" pages=1 ---
+
+--- 第1页 ---
+原始第一页
+"""
+
+    assert build_direct_ppt_replicate_outline(documents, "请提取其中的客户管理部分做成 5 页") == []
+
+
+def test_direct_ppt_cover_two_lines_uses_second_line_as_subhead():
+    documents = """--- PPT_SOURCE filename="source.pptx" pages=2 ---
+
+--- 第1页 ---
+极简复刻封面
+这是一份没有图片素材的 PPT
+
+--- 第2页 ---
+为什么今天
+分众要做AI？
+"""
+
+    outline = build_direct_ppt_replicate_outline(documents, "1:1 复刻这个 ppt")
+
+    assert outline[0]["text_content"]["headline"] == "极简复刻封面"
+    assert outline[0]["text_content"]["subhead"] == "这是一份没有图片素材的 PPT"
+    assert outline[1]["text_content"]["headline"] == "为什么今天\n分众要做AI？"
+
+
+def test_direct_ppt_quality_gate_flags_marker_and_missing_source_ref():
+    outline = [
+        {
+            "page_num": 1,
+            "text_content": {"headline": "用户上传材料", "subhead": "", "body": ""},
+            "source_refs": [{"source_document": "source.pptx", "source_page_num": 1}],
+        },
+        {
+            "page_num": 2,
+            "text_content": {"headline": "真实第二页", "subhead": "", "body": ""},
+            "source_refs": [],
+        },
+    ]
+
+    quality = validate_direct_ppt_replicate_outline(
+        outline,
+        expected_pages=3,
+        source_document="source.pptx",
+    )
+
+    assert quality["status"] == "needs_review"
+    assert quality["checks"]["marker_free"] is False
+    assert quality["checks"]["source_refs_complete"] is False
+    assert quality["marker_pages"] == [1]
+    assert quality["missing_source_ref_pages"] == [2]
+    assert quality["missing_pages"] == [3]
 
 
 def test_generate_content_plan_uses_model_page_map_before_json(monkeypatch):

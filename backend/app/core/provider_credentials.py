@@ -4,10 +4,13 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 import json
+import logging
 import uuid
 from typing import Any, Mapping
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 MINIMAX_API_KEY_HEADER = "x-pptgod-minimax-api-key"
@@ -129,23 +132,33 @@ def store_current_provider_credentials(redis_client) -> str | None:
     if not credentials.has_request_override():
         return None
     credential_id = str(uuid.uuid4())
-    redis_client.set(
-        f"provider_credentials:{credential_id}",
-        credentials.to_json(),
-        ex=TASK_CREDENTIAL_TTL_SECONDS,
-    )
+    try:
+        redis_client.set(
+            f"provider_credentials:{credential_id}",
+            credentials.to_json(),
+            ex=TASK_CREDENTIAL_TTL_SECONDS,
+        )
+    except Exception as exc:
+        logger.error("Failed to store provider credentials for task: %s", exc)
+        raise RuntimeError("任务凭据保存失败，请确认 Redis 正常后重试。") from exc
     return credential_id
 
 
 def load_task_provider_credentials(redis_client, credential_id: str | None) -> ProviderCredentials | None:
     if not credential_id:
         return None
-    raw = redis_client.get(f"provider_credentials:{credential_id}")
+    try:
+        raw = redis_client.get(f"provider_credentials:{credential_id}")
+    except Exception as exc:
+        logger.error("Failed to load provider credentials %s: %s", credential_id, exc)
+        raise RuntimeError("任务凭据读取失败，请重新发起任务。") from exc
     if not raw:
-        return None
+        logger.error("Provider credentials %s are missing or expired", credential_id)
+        raise RuntimeError("任务凭据已过期或不存在，请重新发起任务。")
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
     try:
         return ProviderCredentials.from_mapping(json.loads(raw))
-    except Exception:
-        return None
+    except Exception as exc:
+        logger.error("Failed to decode provider credentials %s: %s", credential_id, exc)
+        raise RuntimeError("任务凭据格式异常，请重新发起任务。") from exc

@@ -46,6 +46,14 @@ assert.equal(content.mainStageMode, "deck_content");
 assert.ok(content.allowedActions.includes("confirm_content"));
 assert.ok(!content.allowedActions.includes("start_generation"));
 
+const contentWithTemplate = context({
+  projectStatus: "planning",
+  slides: [{ status: "pending" }],
+  contentPlanConfirmed: false,
+  templatePageCount: 6,
+});
+assert.ok(!contentWithTemplate.allowedActions.includes("templates"));
+
 const style = context({
   projectStatus: "visual_ready",
   slides: [{ status: "pending" }],
@@ -113,6 +121,9 @@ assert.deepEqual(
     targetRole: "content",
     scope: "current_slide",
     risk: "safe",
+    targetArea: "body",
+    areaLabel: "正文",
+    confidence: "explicit",
     pageNums: [3],
     explicitScope: true,
     scopeLabel: "第 3 页",
@@ -132,6 +143,9 @@ assert.deepEqual(
     targetRole: "visual",
     scope: "current_slide",
     risk: "safe",
+    targetArea: "visual",
+    areaLabel: "画面",
+    confidence: "explicit",
     pageNums: [3],
     explicitScope: true,
     scopeLabel: "第 3 页",
@@ -164,6 +178,9 @@ assert.deepEqual(
     targetRole: "visual",
     scope: "deck",
     risk: "cost",
+    targetArea: "visual",
+    areaLabel: "画面",
+    confidence: "explicit",
     pageNums: [],
     explicitScope: false,
     scopeLabel: "整套 PPT",
@@ -236,6 +253,85 @@ assert.deepEqual(
     contentPlanConfirmed: true,
   })).scopeLabel,
   "第 2, 4, 5 页"
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "把标题改短",
+    activeAgentRole: "content",
+    activeScope: "deck",
+    selectedPageNums: [2, 4, 5],
+    projectStatus: "planning",
+    contentPlanConfirmed: false,
+  })),
+  {
+    targetRole: "content",
+    scope: "selected_slides",
+    risk: "safe",
+    targetArea: "title",
+    areaLabel: "标题",
+    confidence: "explicit",
+    pageNums: [2, 4, 5],
+    explicitScope: false,
+    scopeLabel: "第 2, 4, 5 页",
+    routeReason: "content_intent",
+  }
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "这些页都换成更商务的版式",
+    activeAgentRole: "visual",
+    activeScope: "deck",
+    selectedPageNums: [],
+    projectStatus: "visual_ready",
+    contentPlanConfirmed: true,
+  })),
+  {
+    targetRole: "visual",
+    scope: "selected_slides",
+    risk: "safe",
+    targetArea: "visual",
+    areaLabel: "画面",
+    confidence: "needs_input",
+    pageNums: [],
+    explicitScope: true,
+    scopeLabel: "选中页",
+    routeReason: "visual_intent",
+  }
+);
+
+assert.equal(
+  inferAgentRequestContext({
+    message: "备注改得像演讲稿一点",
+    activeAgentRole: "content",
+    activeScope: "deck",
+    projectStatus: "planning",
+    contentPlanConfirmed: false,
+  }).targetArea,
+  "notes"
+);
+
+assert.equal(
+  inferAgentRequestContext({
+    message: "把产品图作为核心素材，参考模板的版式",
+    activeAgentRole: "visual",
+    activeScope: "deck",
+    projectStatus: "visual_ready",
+    contentPlanConfirmed: true,
+  }).targetArea,
+  "materials"
+);
+
+assert.equal(
+  inferAgentRequestContext({
+    message: "语气更克制",
+    activeAgentRole: "content",
+    activeScope: "deck",
+    projectStatus: "planning",
+    contentPlanConfirmed: false,
+  }).targetArea,
+  "whole"
 );
 
 assert.equal(

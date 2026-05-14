@@ -2,8 +2,14 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import type { CSSProperties, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, SyntheticEvent } from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-import TurndownService from "turndown";
-import { tables as gfmTables, strikethrough as gfmStrikethrough } from "turndown-plugin-gfm";
+import { Node as TiptapNode } from "@tiptap/core";
+import { EditorContent, NodeViewWrapper, ReactNodeViewRenderer, useEditor } from "@tiptap/react";
+import StarterKit from "@tiptap/starter-kit";
+import Underline from "@tiptap/extension-underline";
+import { Table } from "@tiptap/extension-table";
+import TableRow from "@tiptap/extension-table-row";
+import TableCell from "@tiptap/extension-table-cell";
+import TableHeader from "@tiptap/extension-table-header";
 import PptGodLogo from "./components/PptGodLogo";
 
 // 修复 marked 无法解析 **text标点**后接字符 的粗体（CommonMark 规范限制）
@@ -62,15 +68,13 @@ const renderMarkdown = (md: string, chatStyle = false): string => {
     ALLOWED_TAGS: [
       "p", "br", "strong", "em", "b", "i", "u", "ul", "ol", "li",
       "h1", "h2", "h3", "h4", "h5", "h6", "code", "pre", "span", "div",
-      "table", "thead", "tbody", "tr", "th", "td", "style"
+      "table", "thead", "tbody", "tr", "th", "td", "hr", "style"
     ],
     ALLOWED_ATTR: ["class", "style"],
   });
 };
 
 import { type StyleProposal } from "./components/StyleProposalSelector";
-import ChatStyleProposal from "./components/ChatStyleProposal";
-import TemplateRecommender from "./components/TemplateRecommender";
 import VisualAssetsPanel from "./components/VisualAssetsPanel";
 import ToastContainer, { type ToastItem } from "./components/Toast";
 import { useProjectWorkflow } from "./hooks/useProjectWorkflow";
@@ -92,6 +96,7 @@ import {
   type AgentRequestContext,
   type AgentRequestScope,
   type AgentRole,
+  type AgentTargetArea,
 } from "./agentRequestContext";
 
 import {
@@ -135,6 +140,7 @@ import {
   reorderSlides,
   extractTemplate,
   fetchTemplatePages,
+  fetchTemplateStatus,
   updateTemplateRecommendations,
   rollbackProject,
   finetuneSlide,
@@ -166,6 +172,38 @@ function clearProjectNotification(project: Project): Project {
 function normalizeProjectsForActiveSelection(projects: Project[], activeProjectId: string | null): Project[] {
   if (!activeProjectId) return projects;
   return projects.map((project) => (project.id === activeProjectId ? clearProjectNotification(project) : project));
+}
+
+function resolveAssetUrl(apiBase: string, url?: string | null) {
+  if (!url) return "";
+  if (/^(https?:|data:|blob:)/i.test(url)) return url;
+  return `${apiBase}${url.startsWith("/") ? url : `/${url}`}`;
+}
+
+type TemplateApplicationStrength = "light" | "standard" | "strong";
+
+const TEMPLATE_CONFIRM_TYPES = [
+  { key: "cover", label: "封面" },
+  { key: "toc", label: "目录" },
+  { key: "section", label: "章节" },
+  { key: "content", label: "内容" },
+  { key: "data", label: "数据" },
+  { key: "quote", label: "金句/强调" },
+  { key: "ending", label: "封底" },
+] as const;
+
+function buildDefaultTemplateSelection(pages: any[]) {
+  const firstPage = pages[0]?.page_num || 1;
+  const byCategory = new Map<string, number>();
+  pages.forEach((page) => {
+    const category = String(page?.category || "content");
+    if (!byCategory.has(category)) byCategory.set(category, Number(page.page_num) || firstPage);
+  });
+  const fallbackContent = byCategory.get("content") || firstPage;
+  return TEMPLATE_CONFIRM_TYPES.reduce<Record<string, number>>((acc, item) => {
+    acc[item.key] = byCategory.get(item.key) || (item.key === "quote" ? byCategory.get("hero") : undefined) || fallbackContent;
+    return acc;
+  }, {});
 }
 
 function projectStyleLabel(project: Project): string {
@@ -440,7 +478,7 @@ function buildRunCompletionFollowup({
     return {
       agentRole: "visual",
       content: "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先生成打样页预览；满意后再生成全部页面。",
-      nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
+      nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
     };
   }
   if (projectStatus === "prototype_ready") {
@@ -454,8 +492,7 @@ function buildRunCompletionFollowup({
     if (projectStatus === "completed") {
       return {
         agentRole: "visual",
-        content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。`,
-        nextAction: { type: "download", label: "下载 PPTX" },
+        content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。`,
       };
     }
     if (projectStatus === "failed") {
@@ -493,8 +530,8 @@ function buildRunCompletionFollowup({
   if (projectStatus === "prompt_ready" || (hasSelectedStyle && hasPrompt)) {
     return {
       agentRole: "visual",
-      content: "✅ 页面状态已更新。\n\n👉 下一步：检查每页画面方案，然后点击「打样确认」。",
-      nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
+      content: "✅ 页面状态已更新。\n\n👉 下一步：检查每页画面方案，然后点击「生成样张」。",
+      nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
     };
   }
   return {
@@ -798,7 +835,7 @@ function workflowProgressText(status: any) {
   if (activePages.length > 0 && isImageRunKind(progress.kind || status?.active_run?.kind)) {
     const activeText = activePages.length === 1
       ? `正在生成第 ${activePages[0]} 页`
-      : `正在并行生成第 ${formatPageNums(activePages)} 页`;
+      : `正在处理第 ${formatPageNums(activePages)} 页`;
     return total > 0 ? `${activeText}：${current} / ${total} ${unit}完成` : activeText;
   }
   return total > 0 ? `${message}：${current} / ${total} ${unit}完成` : message;
@@ -830,10 +867,16 @@ function getSlideImageUrl(imagePath: string, status?: string, cacheKey?: string 
 
 function shouldShowLogoOverlay(slide: any) {
   const policy = slide?.visual_json?.logo_policy;
-  if (String(policy?.render_variant || "").toLowerCase() === "omit") return false;
-  if (policy && typeof policy.show_logo === "boolean") return policy.show_logo;
   const pageType = String(slide?.visual_json?.type || slide?.type || "content").toLowerCase();
   const layout = String(slide?.visual_json?.layout || "").toLowerCase();
+  const optionalLogoPage =
+    pageType === "section" ||
+    pageType === "hero" ||
+    pageType === "quote" ||
+    layout === "hero" ||
+    layout === "content_hero";
+  if (String(policy?.render_variant || "").toLowerCase() === "omit") return optionalLogoPage ? false : true;
+  if (policy && typeof policy.show_logo === "boolean") return optionalLogoPage ? policy.show_logo : true;
   if (pageType === "cover" || pageType === "ending") return true;
   if (pageType === "hero" || pageType === "quote") return false;
   if (layout === "hero" || layout === "content_hero") return false;
@@ -862,6 +905,27 @@ function dedupeReferenceImages<T>(items?: T[]) {
     seen.add(key);
     return true;
   }) as T[];
+}
+
+function directReplicateSourceFacts(slide: any) {
+  const content = slide?.content_json || {};
+  const facts = content.source_facts || {};
+  if (facts.mode !== "direct_ppt_replicate" && content.generation_status !== "pptx_direct") return null;
+  const sourcePage = Number(facts.source_page_num || slide?.page_num || 0);
+  return {
+    sourcePage: Number.isFinite(sourcePage) && sourcePage > 0 ? sourcePage : slide?.page_num,
+    qualityStatus: content.replicate_quality?.status || "passed",
+  };
+}
+
+function isSourcePageReference(ref: any) {
+  const analysis = ref?.asset_analysis || {};
+  return analysis.classification === "source_slide_render" || analysis.analysis_type === "source_slide_preview";
+}
+
+function referenceThumbTitle(ref: any) {
+  if (isSourcePageReference(ref)) return "原稿页面 — 点击查看";
+  return "本页参考图 — 点击查看";
 }
 
 const HEX_COLOR_PATTERN = /#(?:[0-9a-fA-F]{3}){1,2}\b/g;
@@ -1054,8 +1118,7 @@ function logoOverlayPosition(anchor?: string | null, resolvedBox?: any) {
   return pos;
 }
 
-function logoOverlaySrc(item: any, variant?: string) {
-  if (variant === "symbol" && item?.symbol_overlay_url) return item.symbol_overlay_url;
+function logoOverlaySrc(item: any) {
   return item?.overlay_url || item?.url || "";
 }
 
@@ -1150,7 +1213,7 @@ function SlideImageWithOverlays({
             <Fragment key={item.id || item.url || index}>
               {index > 0 && <span className="h-[1.8em] w-px bg-slate-500/45" />}
               <img
-                src={`${API_BASE}${logoOverlaySrc(item, policy.render_variant)}`}
+                src={`${API_BASE}${logoOverlaySrc(item)}`}
                 alt=""
                 className="min-w-0 flex-1 object-contain"
                 style={{ maxHeight: resolvedLogoBox ? "100%" : largeLogo ? "136px" : "48px" }}
@@ -1240,8 +1303,9 @@ function App() {
     editingSlideRef.current = editingSlide;
   }, [editingSlide]);
 
-  // Agent 模式：page（单页） / global（全局）
-  const [agentMode, setAgentMode] = useState<"page" | "global">("global");
+  // Agent 指令作用范围，独立于打样页选择。
+  const [agentScope, setAgentScope] = useState<AgentRequestScope>("deck");
+  const [agentTargetAreaOverride, setAgentTargetAreaOverride] = useState<AgentTargetArea | null>(null);
 
   // 新建项目弹窗
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -1249,12 +1313,18 @@ function App() {
 
 
   const isBusy = operatingProjectId === selectedProject?.id || hasActiveRun;
+  const [deckSelectedPages, setDeckSelectedPages] = useState<Set<number>>(new Set());
   const [selectedPages, setSelectedPages] = useState<Set<number>>(new Set());
   const [prototypeSelectionTouched, setPrototypeSelectionTouched] = useState(false);
   const [showPrototypePreview, setShowPrototypePreview] = useState(true);
   const [referenceImages, setReferenceImages] = useState<any[]>([]);
   const [templatePages, setTemplatePages] = useState<any[]>([]);
-  const [showTemplateRecommender, setShowTemplateRecommender] = useState(false);
+  const [templateConfirmVisible, setTemplateConfirmVisible] = useState(false);
+  const [templateConfirmSaving, setTemplateConfirmSaving] = useState(false);
+  const [templateConfirmDismissedProjectId, setTemplateConfirmDismissedProjectId] = useState<string | null>(null);
+  const [templatePageSelection, setTemplatePageSelection] = useState<Record<string, number>>({});
+  const [templateApplicationStrength, setTemplateApplicationStrength] = useState<TemplateApplicationStrength>("standard");
+  const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
 
   // 主舞台折叠状态：默认折叠以节省空间
   const [styleBarExpanded, setStyleBarExpanded] = useState(false);
@@ -1284,7 +1354,7 @@ function App() {
   // content: 文字/参考图等上游信息变了 → 需更新画面方案（画面描述 + 提示词）
   // visual: 画面描述变了 → 需更新提示词
   // image: 画面方案已更新 → 需确认并重新生成图片
-  const [staleMap, setStaleMap] = useState<Record<string, { content?: boolean; visual?: boolean; image?: boolean }>>({});
+  const [staleMap, setStaleMap] = useState<Record<string, { content?: boolean; visual?: boolean; image?: boolean; localImage?: boolean }>>({});
 
   const getSlideStaleFlags = (slide: Slide) => {
     const stale = slide.visual_json?._artifact?.stale;
@@ -1300,9 +1370,17 @@ function App() {
     setStaleMap((prev) => {
       const next = { ...prev };
       items.forEach((slide) => {
+        const prevStale = next[slide.id] || {};
         const backendStale = getSlideStaleFlags(slide);
-        if (backendStale.content || backendStale.visual || backendStale.image) {
-          next[slide.id] = { ...next[slide.id], ...backendStale };
+        const hydrated: { content?: boolean; visual?: boolean; image?: boolean; localImage?: boolean } = {};
+        if (backendStale.content) hydrated.content = true;
+        if (backendStale.visual) hydrated.visual = true;
+        if (backendStale.image || prevStale.localImage) hydrated.image = true;
+        if (prevStale.localImage && !backendStale.image) hydrated.localImage = true;
+        if (hydrated.content || hydrated.visual || hydrated.image) {
+          next[slide.id] = hydrated;
+        } else {
+          delete next[slide.id];
         }
       });
       return next;
@@ -1312,7 +1390,7 @@ function App() {
   const markSlideStale = (slideId: string, type: "content" | "visual" | "image") => {
     setStaleMap((prev) => ({
       ...prev,
-      [slideId]: { ...prev[slideId], [type]: true },
+      [slideId]: { ...prev[slideId], [type]: true, ...(type === "image" ? { localImage: true } : {}) },
     }));
   };
 
@@ -1327,6 +1405,11 @@ function App() {
     generationLoadingIdRef.current = null;
     setReferenceImages([]);
     setTemplatePages([]);
+    setTemplateConfirmVisible(false);
+    setTemplateDrawerOpen(false);
+    setTemplateConfirmDismissedProjectId(null);
+    setTemplatePageSelection({});
+    setTemplateApplicationStrength("standard");
     if (nextProjectId && cachedSlides) {
       setSlides(cachedSlides);
       setSlidesProjectId(nextProjectId);
@@ -1337,13 +1420,17 @@ function App() {
     setSlidesLoadingProjectId(null);
     setStaleMap({});
     if (nextProjectId && cachedSlides) hydrateSlideStaleMap(cachedSlides);
+    setDeckSelectedPages(new Set());
     setSelectedPages(new Set());
     setPrototypeSelectionTouched(false);
     setEditingSlide(null);
-    setAgentMode("global");
+    setAgentScope("deck");
     setContentPlanSnapshot([]);
     setStyleProposalsInChat([]);
     setExpandedStyleProposalKey(null);
+    setAgentMaterialSheetOpen(false);
+    setAgentScopePickerOpen(false);
+    setProgressDetailsOpen(false);
     setChatInput("");
     setPendingAttachments([]);
     setPendingChatAttachments([]);
@@ -1356,6 +1443,12 @@ function App() {
       if (type) {
         const next = { ...prev[slideId] };
         delete next[type];
+        if (type === "image") delete next.localImage;
+        if (!next.content && !next.visual && !next.image) {
+          const withoutSlide = { ...prev };
+          delete withoutSlide[slideId];
+          return withoutSlide;
+        }
         return { ...prev, [slideId]: next };
       }
       const next = { ...prev };
@@ -1402,6 +1495,7 @@ function App() {
   const softLockWarnedRef = useRef(false);
   const generationLoadingIdRef = useRef<string | null>(null);
   const locallyHandledRunIdsRef = useRef<Set<string>>(new Set());
+  const postedQualityReportSignaturesRef = useRef<Set<string>>(new Set());
   const [contentPlanProgress, setContentPlanProgress] = useState<any>(null);
   const currentContentPlanProgress = contentPlanProgress?.project_id === selectedProject?.id ? contentPlanProgress : null;
   const [, setShowStylePanel] = useState(false);
@@ -1696,6 +1790,11 @@ function App() {
   const contentPlanConfirmedRef = useRef(contentPlanConfirmed);
   const [styleProposalsInChat, setStyleProposalsInChat] = useState<StyleProposal[]>([]);
   const [expandedStyleProposalKey, setExpandedStyleProposalKey] = useState<string | null>(null);
+  const [templateDrawerOpen, setTemplateDrawerOpen] = useState(false);
+  const [agentMaterialSheetOpen, setAgentMaterialSheetOpen] = useState(false);
+  const [agentScopePickerOpen, setAgentScopePickerOpen] = useState(false);
+  const [agentAreaPickerOpen, setAgentAreaPickerOpen] = useState(false);
+  const [progressDetailsOpen, setProgressDetailsOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void; onCancel: () => void } | null>(null);
 
@@ -1815,6 +1914,11 @@ function App() {
   }, [currentAgentRole]);
 
   useEffect(() => {
+    setAgentTargetAreaOverride(null);
+    setAgentAreaPickerOpen(false);
+  }, [selectedProject?.id, currentAgentRole]);
+
+  useEffect(() => {
     chatHistoryProjectIdRef.current = chatHistoryProjectId;
   }, [chatHistoryProjectId]);
 
@@ -1910,7 +2014,6 @@ function App() {
   const focusProjectLatestUpdate = (project: Project, notificationMessage?: string | null) => {
     setRightCollapsed(false);
     setEditingSlide(null);
-    setShowTemplateRecommender(false);
     setShowPrototypePreview(true);
     setCurrentAgentRole(getProjectEntryAgentRole(project, notificationMessage));
     chatAutoScrollRef.current = true;
@@ -2006,6 +2109,10 @@ function App() {
     setSelectedProject(optimisticProject);
     setShowPrototypePreview(true);
     setExpandedStyleProposalKey(null);
+    setTemplateDrawerOpen(false);
+    setAgentMaterialSheetOpen(false);
+    setAgentScopePickerOpen(false);
+    setProgressDetailsOpen(false);
 
     const isPlanConfirmed = !!optimisticProject.content_plan_confirmed;
     setContentPlanConfirmed(isPlanConfirmed);
@@ -2241,11 +2348,17 @@ function App() {
       const data = await fetchTemplatePages(projectId);
       if (loadingProjectIdRef.current !== projectId) return;
       const pages = (data || []).map((ref: any, idx: number) => ({
-        page_num: idx + 1,
-        url: `${API_BASE}${ref.url}`,
+        page_num: ref.page_num || idx + 1,
+        url: resolveAssetUrl(API_BASE, ref.url),
+        layout_url: ref.layout_url ? resolveAssetUrl(API_BASE, ref.layout_url) : undefined,
         category: ref.category || "content",
+        category_confidence: ref.category_confidence,
+        source_kind: ref.source_kind,
+        application_strength: ref.application_strength,
+        logo_removed: Boolean(ref.logo_removed),
       }));
       setTemplatePages(pages);
+      if (pages.length > 0) setTemplatePageSelection(buildDefaultTemplateSelection(pages));
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
         void recoverMissingProject(projectId);
@@ -2254,6 +2367,19 @@ function App() {
       showToast("加载模板页面失败：" + (err.message || "未知错误"), "error");
       if (loadingProjectIdRef.current === projectId) setTemplatePages([]);
     }
+  };
+
+  const waitForTemplateExtraction = async (projectId: string, jobId?: string | null) => {
+    for (let attempt = 0; attempt < 80; attempt++) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const status = await fetchTemplateStatus(projectId);
+      if (jobId && status?.job_id && status.job_id !== jobId) continue;
+      if (status?.status === "completed") return status;
+      if (status?.status === "failed") {
+        throw new Error(status.error || "模板提取失败，请重试");
+      }
+    }
+    throw new Error("模板提取还没有完成，请稍后刷新模板页面");
   };
 
   // 启动内容规划生成并轮询进度（复用于 Brief Studio 和 Agent regenerate_plan）
@@ -2544,6 +2670,15 @@ function App() {
       setContentPlanProgress(null);
       setReferenceImages([]);
       setTemplatePages([]);
+      setTemplateConfirmVisible(false);
+      setTemplateDrawerOpen(false);
+      setTemplateConfirmDismissedProjectId(null);
+      setTemplatePageSelection({});
+      setTemplateApplicationStrength("standard");
+      setDeckSelectedPages(new Set());
+      setAgentScope("deck");
+      setAgentScopePickerOpen(false);
+      setAgentMaterialSheetOpen(false);
       const cachedSlides = slidesCacheRef.current[selectedProject.id];
       if (cachedSlides) {
         setSlides(cachedSlides);
@@ -2865,7 +3000,7 @@ function App() {
           { role: "system", content: `批量生成完成，共 ${completedCount} 页` },
           {
             role: "agent",
-            content: "🎉 全量生成已完成！所有页面的图片都已生成。\n\n👉 下一步：点击上方「下载 PPTX」按钮获取最终演示文稿。如果需要调整某页，可以选中后重新生成。",
+            content: "🎉 全量生成已完成！所有页面的图片都已生成。\n\n👉 下一步：点击右上角「导出 PPTX」获取演示文稿。如果需要调整某页，可以选中后重新生成。",
             agentRole: "visual",
           },
         ]);
@@ -2889,6 +3024,40 @@ function App() {
     prevProjectStatusRef.current = { projectId: pid, status: currentStatus };
     prevActiveRunRef.current = { projectId: pid, runId: activeRunId, kind: activeRun?.kind || null };
   }, [selectedProject?.id, selectedProject?.status, activeRun?.id]);
+
+  // 最终态补充一份交付前检查，不阻塞生成完成提示和导出动作。
+  useEffect(() => {
+    const projectId = selectedProject?.id;
+    const report = currentProjectStatus?.quality_report;
+    const signature = String(report?.signature || "").trim();
+    const content = String(report?.message || "").trim();
+    if (!projectId || !signature || !content || currentProjectStatus?.active_run) return;
+
+    const scopedSignature = `${projectId}:${signature}`;
+    if (postedQualityReportSignaturesRef.current.has(scopedSignature)) return;
+    postedQualityReportSignaturesRef.current.add(scopedSignature);
+
+    const messageId = `quality-report-${signature}`;
+    updateProjectChatMessages(projectId, "visual", (prevMsgs) => {
+      if (prevMsgs.some((m) => m.id === messageId || (m.agentRole === "visual" && m.content === content))) {
+        return prevMsgs;
+      }
+      return [
+        ...prevMsgs,
+        {
+          id: messageId,
+          role: "agent",
+          content,
+          agentRole: "visual",
+        },
+      ];
+    });
+  }, [
+    selectedProject?.id,
+    currentProjectStatus?.active_run?.id,
+    currentProjectStatus?.quality_report?.signature,
+    currentProjectStatus?.quality_report?.message,
+  ]);
 
   // 实时更新批量生成进度到 Agent 窗口
   useEffect(() => {
@@ -3103,7 +3272,7 @@ function App() {
       ...prev,
       {
         role: "agent" as const,
-        content: `✅ 风格「${name}」已确认，正在生成每页画面描述和生图 Prompt。\n\n完成后会进入「打样确认」阶段。${pendingAssetsNote}`,
+        content: `✅ 风格「${name}」已确认，正在生成每页画面描述和生图 Prompt。\n\n完成后会进入样张检查阶段。${pendingAssetsNote}`,
         agentRole: "visual",
       },
     ]);
@@ -3259,9 +3428,9 @@ function App() {
         {
           role: "agent",
           content:
-            "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先「打样确认」生成关键种子页预览；满意后再「全量生成」所有页面。也可以直接全量生成。",
+            "✅ 画面设计已完成：每页画面描述和生图 Prompt 已生成。\n\n👉 下一步：先生成几页样张看效果；满意后再生成全部页面。也可以直接全量生成。",
           agentRole: "visual",
-          nextAction: { type: "start_prototype", label: "打样确认", confirm: true },
+          nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
         },
       ]);
     } catch (err: any) {
@@ -3301,7 +3470,7 @@ function App() {
       : useSelectedPages && selectedPages.size > 0
       ? Array.from(selectedPages)
       : undefined;
-    const pageDesc = pageNums ? `第 ${pageNums.join(", ")} 页` : (prototype ? "默认种子页" : "所有页面");
+    const pageDesc = pageNums ? `第 ${pageNums.join(", ")} 页` : (prototype ? "默认打样页" : "所有页面");
     const loadingId = `gen-${Date.now()}`;
     generationLoadingIdRef.current = loadingId;
     updateProjectChatMessages(projectId, "visual", (prev) => [
@@ -3328,7 +3497,7 @@ function App() {
       targetsClearForGeneration(pageNums);
       generationLoadingIdRef.current = null;
       const successMessage = finalStatus === "completed"
-        ? "✅ 全量生成已完成，页面已自动刷新。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。"
+        ? "✅ 全量生成已完成，页面已自动刷新。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。"
         : finalStatus === "prototype_ready"
         ? "✅ 打样图片已生成，页面已自动刷新。\n\n👉 下一步：检查打样页效果；满意后点击「确认打样，生成全部」，不满意可以重新打样或调整风格。"
         : "";
@@ -3340,9 +3509,7 @@ function App() {
             ? successMessage
             : `⚠️ 生成结束（状态：${finalStatus || "未知"}），页面已自动刷新，请检查是否有失败页。`,
           agentRole: "visual",
-          nextAction: finalStatus === "completed"
-            ? { type: "download", label: "下载 PPTX" }
-            : finalStatus === "prototype_ready"
+          nextAction: finalStatus === "prototype_ready"
             ? { type: "confirm_prototype", label: "确认打样，生成全部", confirm: true }
             : undefined,
         },
@@ -3357,7 +3524,7 @@ function App() {
         ...prev.filter((m) => m.id !== loadingId),
         {
           role: "agent",
-          content: "❌ 启动生成失败：" + (err.message || "未知错误") + "\n\n👉 解决方法：\n1. 检查网络连接\n2. 点击「打样确认」或「全量生成」按钮重试\n3. 如果多次失败，可以告诉我具体哪一页有问题",
+          content: "❌ 启动生成失败：" + (err.message || "未知错误") + "\n\n👉 解决方法：\n1. 检查网络连接\n2. 点击「生成样张」或「全量生成」按钮重试\n3. 如果多次失败，可以告诉我具体哪一页有问题",
           agentRole: "visual",
         },
       ]);
@@ -3444,10 +3611,9 @@ function App() {
         {
           role: "agent",
           content: finalStatus === "completed"
-            ? "✅ 全部页面生成完成。\n\n👉 下一步：点击上方「下载 PPTX」获取最终文件；需要调整时可选中页面重新生成。"
+            ? "✅ 全部页面生成完成。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。"
             : `⚠️ 生成结束（状态：${finalStatus}），部分页面可能未成功，请检查进度。`,
           agentRole: "visual",
-          nextAction: finalStatus === "completed" ? { type: "download", label: "下载 PPTX" } : undefined,
         },
       ]);
     } catch (err: any) {
@@ -3793,13 +3959,14 @@ function App() {
           : "prototype";
       if (selectedProjectIdRef.current === projectId) {
         setStaleMap({});
+        setDeckSelectedPages(new Set());
         setSelectedPages(new Set());
         setPrototypeSelectionTouched(false);
         setEditingSlide(null);
         setGalleryModal(null);
-        setShowTemplateRecommender(false);
         setStyleProposalsInChat([]);
         setExpandedStyleProposalKey(null);
+        setTemplateDrawerOpen(false);
         setGateRevisionMap((prev) => ({ ...prev, [projectId]: nextGateRevision }));
       }
 
@@ -3871,6 +4038,24 @@ function App() {
       return next;
     });
     setPrototypeSelectionTouched(true);
+  };
+
+  const toggleDeckPageSelection = (pageNum: number) => {
+    setDeckSelectedPages((prev) => {
+      const next = new Set(prev);
+      if (next.has(pageNum)) {
+        next.delete(pageNum);
+      } else {
+        next.add(pageNum);
+      }
+      if (next.size > 0) setAgentScope("selected_slides");
+      return next;
+    });
+  };
+
+  const clearDeckSelection = () => {
+    setDeckSelectedPages(new Set());
+    if (!editingSlide) setAgentScope("deck");
   };
 
   const selectAll = () => {
@@ -4039,12 +4224,12 @@ function App() {
 
   const handleEnterEdit = (slide: Slide) => {
     setEditingSlide(slide);
-    setAgentMode("page");
+    setAgentScope("current_slide");
   };
 
   const handleExitEdit = () => {
     setEditingSlide(null);
-    setAgentMode("global");
+    setAgentScope(deckSelectedPages.size > 0 ? "selected_slides" : "deck");
   };
 
   const handlePrevSlide = () => {
@@ -4773,7 +4958,7 @@ function App() {
         candidates.push(ref);
       }
     });
-    if (agentMode === "page" && editingSlide?.reference_images) {
+    if (agentScope === "current_slide" && editingSlide?.reference_images) {
       editingSlide.reference_images.forEach((ref: any) => {
         if (["content_ref", "chart_ref", "visual_asset"].includes(ref.role)) candidates.push(ref);
       });
@@ -4795,6 +4980,7 @@ function App() {
         message: userMsg,
         activeAgentRole: currentAgentRole,
         activeScope: activeAgentScope,
+        targetAreaOverride: agentTargetAreaOverride,
         editingPageNum: editingSlide?.page_num,
         selectedPageNums: selectedPageNumsForAgent,
         projectStatus: requestProject.status,
@@ -4804,6 +4990,30 @@ function App() {
         hasPrompt: slides.some(slideHasPrompt),
         hasGeneratedImage: slides.some((slide) => Boolean(slide.image_path)),
       });
+    if (!isRetry && requestContext.confidence === "needs_input") {
+      showToast("先在画布中勾选页面，或改说具体页码。", "info");
+      return;
+    }
+    if (!isRetry && requestContext.risk !== "safe") {
+      const impactParts: string[] = [];
+      if (requestContext.scope === "deck") {
+        impactParts.push(`会影响整套 ${slides.length || 0} 页`);
+      } else if (requestContext.scope === "selected_slides") {
+        const affectedCount = requestContext.pageNums.length || selectedPageNumsForAgent.length;
+        impactParts.push(affectedCount > 0 ? `会影响选中的 ${affectedCount} 页` : "会影响选中页");
+      } else {
+        const pageNum = requestContext.pageNums[0] || editingSlide?.page_num;
+        impactParts.push(pageNum ? `会影响第 ${pageNum} 页` : "会影响当前页");
+      }
+      if (requestContext.risk === "cost") {
+        impactParts.push("会产生生图成本");
+      }
+      if (requestContext.risk === "destructive") {
+        impactParts.push("会覆盖现有画面方案");
+      }
+      const ok = await showConfirm(`${impactParts.join("，")}。继续吗？`);
+      if (!ok) return;
+    }
     const requestAgentRole = (isRetry ? pendingChatRef.current?.agentRole : requestContext.targetRole) || requestContext.targetRole;
     if (!isRetry && requestAgentRole !== currentAgentRole) {
       currentAgentRoleRef.current = requestAgentRole;
@@ -5086,6 +5296,9 @@ function App() {
           mode: "page",
           scope: requestContext.scope,
           target_page_nums: [requestTargetSlide.page_num],
+          target_area: requestContext.targetArea,
+          area_label: requestContext.areaLabel,
+          confidence: requestContext.confidence,
           current_page: {
             page_num: requestTargetSlide.page_num,
             slide_id: requestTargetSlide.id,
@@ -5108,6 +5321,9 @@ function App() {
           mode: "global",
           scope: requestContext.scope,
           target_page_nums: requestContext.pageNums,
+          target_area: requestContext.targetArea,
+          area_label: requestContext.areaLabel,
+          confidence: requestContext.confidence,
           slides: scopedSlides.map(summarizeSlideForAgent),
         };
       }
@@ -6179,9 +6395,6 @@ function App() {
         case "retry_failed":
           await handleRetryAllFailed();
           return { ok: true };
-        case "templates":
-          setShowTemplateRecommender(true);
-          return { ok: true };
         case "download":
           window.location.href = getDownloadUrl(currentProject.id);
           return { ok: true };
@@ -6429,6 +6642,38 @@ function App() {
     styleProposalsInChat.length > 0
       ? styleProposalsInChat
       : (selectedProject?.style_proposal?.proposals || []);
+  const generatedSlideCount = slides.filter((slide) => Boolean(slide.image_path)).length;
+  const selectedTemplateRecommendations =
+    selectedProject?.selected_template_recommendations && typeof selectedProject.selected_template_recommendations === "object"
+      ? selectedProject.selected_template_recommendations
+      : null;
+  const selectedTemplateRecommendationCount = selectedTemplateRecommendations
+    ? Object.values(selectedTemplateRecommendations).filter(Boolean).length
+    : 0;
+  const hasTemplateSource = templatePages.length > 0 || selectedTemplateRecommendationCount > 0;
+  const selectedTemplateSourceKind = selectedTemplateRecommendations
+    ? (Object.values(selectedTemplateRecommendations).find((value: any) => value?.source_kind) as any)?.source_kind
+    : null;
+  const templateSourceKind =
+    templatePages.find((page: any) => page?.source_kind)?.source_kind ||
+    selectedTemplateSourceKind ||
+    (referenceImages.some((ref: any) => ref.role === "template" && ref?.asset_analysis?.document_kind === "finished_ppt")
+      ? "finished_ppt"
+      : "template");
+  const templateSourceCopy =
+    templateSourceKind === "finished_ppt"
+      ? "学习版式、配色和字体节奏，不把旧正文带进新内容。"
+      : "学习模板的版式、配色和字体节奏。";
+  const templateSourceMeta =
+    templatePages.length > 0
+      ? `${templatePages.length} 页已读取`
+      : selectedTemplateRecommendationCount > 0
+      ? `${selectedTemplateRecommendationCount} 类页面已匹配`
+      : "";
+  const showTemplateConfirmControls =
+    templatePages.length > 0 &&
+    (templateConfirmVisible ||
+      (selectedTemplateRecommendationCount === 0 && templateConfirmDismissedProjectId !== selectedProject?.id));
 
   // 处理 LLM 返回的转义字符（如 \\n -> 真正换行）
   const unescapeText = (text: string): string => {
@@ -6508,13 +6753,38 @@ function App() {
     selectedProject &&
     ((hasActiveRun && activeRun?.kind === "content_plan") ||
       (operatingProjectId === selectedProject.id && currentStatus === "draft" && currentAgentRole === "content"))
-    );
+  );
+  const handleConfirmTemplateRecommendations = async () => {
+    if (!selectedProject) return;
+    const fallbackSelection = buildDefaultTemplateSelection(templatePages);
+    const recommendations = TEMPLATE_CONFIRM_TYPES.reduce<Record<string, any>>((acc, item) => {
+      const pageNum = templatePageSelection[item.key] || fallbackSelection[item.key];
+      acc[item.key] = pageNum ? { page_num: pageNum, application_strength: templateApplicationStrength } : null;
+      return acc;
+    }, {});
+    setTemplateConfirmSaving(true);
+    try {
+      const updated = await updateTemplateRecommendations(selectedProject.id, recommendations);
+      const normalized = clearProjectNotification(updated);
+      setSelectedProject(normalized);
+      setProjects((prev) => prev.map((item) => (item.id === normalized.id ? normalized : item)));
+      setTemplateConfirmVisible(false);
+      setTemplateDrawerOpen(false);
+      setTemplateConfirmDismissedProjectId(normalized.id);
+      showToast("模板页推荐已确认", "success");
+      addSystemLog("用户确认了版式模板页映射");
+    } catch (err: any) {
+      showToast("保存模板推荐失败：" + (err.message || "未知错误"), "error");
+    } finally {
+      setTemplateConfirmSaving(false);
+    }
+  };
     const agentComposerValue = !isBriefStudioActive && chatInput.includes("[[PPTGOD_ATTACHMENT:") ? "" : chatInput;
-    const selectedPageNumsForAgent = useMemo(() => Array.from(selectedPages).sort((a, b) => a - b), [selectedPages]);
+    const selectedPageNumsForAgent = useMemo(() => Array.from(deckSelectedPages).sort((a, b) => a - b), [deckSelectedPages]);
     const activeAgentScope: AgentRequestScope =
-      agentMode === "page" && editingSlide
+      agentScope === "current_slide" && editingSlide
         ? "current_slide"
-        : selectedPageNumsForAgent.length > 1
+        : agentScope === "selected_slides" && selectedPageNumsForAgent.length > 0
         ? "selected_slides"
         : "deck";
     const composerRequestContext = useMemo(
@@ -6523,6 +6793,7 @@ function App() {
           message: agentComposerValue,
           activeAgentRole: currentAgentRole,
           activeScope: activeAgentScope,
+          targetAreaOverride: agentTargetAreaOverride,
           editingPageNum: editingSlide?.page_num,
           selectedPageNums: selectedPageNumsForAgent,
           projectStatus: currentStatus,
@@ -6535,6 +6806,7 @@ function App() {
       [
         activeAgentScope,
         agentComposerValue,
+        agentTargetAreaOverride,
         contentPlanConfirmed,
         currentAgentRole,
         currentStatus,
@@ -6545,7 +6817,7 @@ function App() {
       ]
     );
     const activeComposerDraftKey = useMemo(() => {
-    if (!selectedProject) return null;
+    if (!selectedProject?.id) return null;
     if (isBriefStudioActive) return getBriefDraftStorageKey(selectedProject.id);
     const targetSlideId = currentAgentRole === "finetune"
       ? finetuneTargetSlideId || editingSlide?.id || null
@@ -6597,7 +6869,7 @@ function App() {
   const displayStepIndex = workflowState.stepIndex;
   const activeAssetSlide =
     editingSlide ||
-    (selectedPages.size === 1 ? slides.find((slide) => selectedPages.has(slide.page_num)) || null : null);
+    (deckSelectedPages.size === 1 ? slides.find((slide) => deckSelectedPages.has(slide.page_num)) || null : null);
   const prototypePromptTargets = getPrototypeTargetSlides();
   const canStartPrototypeGeneration =
     prototypePromptTargets.length > 0 &&
@@ -6695,13 +6967,12 @@ function App() {
 
   const topPrimaryAction: UiAction | null = (() => {
     if (!selectedProject) return null;
-    if (["deck_visual", "deck_prototype", "deck_final"].includes(gateContext.mainStageMode)) return null;
     const actionKey = primaryActionKey;
     if (actionKey === "generate-style-proposals") {
       if (styleDockProposals.length > 0) return null;
       return {
         key: "generate-style-proposals",
-        label: isBusy ? "生成中..." : "生成视觉方向",
+        label: isBusy ? "生成中..." : hasTemplateSource ? "生成模板视觉方向" : "生成视觉方向",
         onClick: () => dispatchGateAction("generate_style_proposals"),
         variant: "primary",
         disabled: isBusy || chatLoading,
@@ -6727,15 +6998,19 @@ function App() {
           : "选择打样页",
         onClick: () => dispatchGateAction("start_prototype"),
         variant: "primary",
-        disabled: isBusy || !canStartPrototypeGeneration,
+        disabled: isBusy || chatLoading || !canStartPrototypeGeneration,
       };
     }
     if (actionKey === "download") {
+      return null;
+    }
+    if (actionKey === "confirm-prototype") {
       return {
-        key: "download",
-        label: "下载 PPTX",
-        href: getDownloadUrl(selectedProject.id),
+        key: "confirm-prototype",
+        label: "确认打样，生成全部",
+        onClick: () => dispatchGateAction("confirm_prototype"),
         variant: "primary",
+        disabled: isBusy || chatLoading,
       };
     }
     return null;
@@ -6743,18 +7018,9 @@ function App() {
 
   const topSecondaryActions: UiAction[] = (() => {
     if (!selectedProject) return [];
-    const stageDockOwnsActions = ["deck_visual", "deck_prototype"].includes(gateContext.mainStageMode);
     const actionKeys = secondaryActionKeys;
     const actions: UiAction[] = [];
-    if (actionKeys.includes("templates")) {
-      actions.push({
-        key: "templates",
-        label: "查看模板",
-        onClick: () => dispatchGateAction("templates"),
-        variant: "secondary",
-      });
-    }
-    if (!stageDockOwnsActions && actionKeys.includes("generate-all")) {
+    if (actionKeys.includes("generate-all")) {
       actions.push({
         key: "generate-all",
         label: "生成全部",
@@ -6763,7 +7029,7 @@ function App() {
         disabled: isBusy || !canStartFullGeneration,
       });
     }
-    if (!stageDockOwnsActions && actionKeys.includes("toggle-prototype-view")) {
+    if (actionKeys.includes("toggle-prototype-view")) {
       actions.push({
         key: "toggle-prototype-view",
         label: showPrototypePreview ? "返回全局预览" : "查看打样结果",
@@ -6772,7 +7038,7 @@ function App() {
         disabled: isBusy,
       });
     }
-    if (!stageDockOwnsActions && actionKeys.includes("resample")) {
+    if (actionKeys.includes("resample")) {
       actions.push({
         key: "resample",
         label: "重新打样",
@@ -6799,14 +7065,6 @@ function App() {
         onClick: () => dispatchGateAction("start_generation"),
         variant: "secondary",
         disabled: isBusy || !canStartFullGeneration,
-      });
-    }
-    if (slides.length > 0) {
-      actions.push({
-        key: "export-md",
-        label: "导出 MD",
-        href: getContentPlanMarkdownUrl(selectedProject.id),
-        variant: "link",
       });
     }
     return actions;
@@ -7009,17 +7267,10 @@ function App() {
 
     if (currentStatus === "completed") {
       return {
-        title: "下一步：下载 PPTX",
-        body: `${slides.filter((s) => s.image_path).length} / ${slides.length} 页已有画面。需要修改时，选中页面进入微调。`,
+        title: "下一步：导出或微调",
+        body: `${slides.filter((s) => s.image_path).length} / ${slides.length} 页已有画面。右上角可导出 PPTX，需要修改时选中页面进入微调。`,
         role: "visual",
         tone: "final",
-        primary: {
-          key: "download",
-          label: "下载 PPTX",
-          href: getDownloadUrl(selectedProject.id),
-          variant: "primary",
-          disabled: false,
-        },
       };
     }
 
@@ -7058,27 +7309,6 @@ function App() {
     return null;
   })();
 
-  const renderNudgeAction = (action: UiAction) => {
-    const className = `${actionClassName(action.variant)} justify-center text-center`;
-    if (action.href) {
-      return (
-        <a key={action.key} href={action.href} className={className}>
-          {action.label}
-        </a>
-      );
-    }
-    return (
-      <button
-        key={action.key}
-        onClick={action.onClick}
-        disabled={action.disabled}
-        className={className}
-      >
-        {action.label}
-      </button>
-    );
-  };
-
   // 卡片间隙插入触发区：竖条（桌面端）/ 横条（移动端），hover 时显示 +
   const InsertGap = ({ onClick, title }: { onClick: () => void; title: string }) => (
     <div
@@ -7106,12 +7336,218 @@ function App() {
           : activeRun?.kind === "prototype_generation"
           ? "打样生成进度"
           : "批量生成进度");
+  const deckSelectedPageNums = Array.from(deckSelectedPages).sort((a, b) => a - b);
+  const agentScopeText =
+    composerRequestContext.scope === "current_slide"
+      ? composerRequestContext.pageNums[0]
+        ? `第 ${composerRequestContext.pageNums[0]} 页`
+        : "当前页"
+      : composerRequestContext.scope === "selected_slides"
+      ? deckSelectedPageNums.length || composerRequestContext.pageNums.length
+        ? `选中的 ${deckSelectedPageNums.length || composerRequestContext.pageNums.length} 页`
+        : "选中页"
+      : `整套 ${slides.length || 0} 页`;
+  const agentAreaText =
+    composerRequestContext.targetArea === "whole"
+      ? composerRequestContext.targetRole === "content"
+        ? "内容"
+        : "画面"
+      : composerRequestContext.areaLabel;
+  const agentScopeHeadline =
+    currentAgentRole === "finetune"
+      ? editingSlide
+        ? `将微调第 ${editingSlide.page_num} 页画面`
+        : "先选择一页，再告诉我怎么改"
+      : composerRequestContext.confidence === "needs_input"
+      ? "先选页面，或直接说第几页"
+      : composerRequestContext.scope === "selected_slides" && composerRequestContext.targetArea === "body"
+      ? `将根据${agentScopeText}调整${agentAreaText}`
+      : composerRequestContext.targetArea === "title" || composerRequestContext.targetArea === "notes"
+      ? `将修改${agentScopeText}${agentAreaText}`
+      : composerRequestContext.scope === "current_slide"
+      ? `将调整${agentScopeText}${agentAreaText}`
+      : `将调整${agentScopeText}的${agentAreaText}`;
+  const agentSecondaryHint =
+    composerRequestContext.confidence === "needs_input"
+      ? "先在画布中勾选页面，或改说具体页码。"
+      : composerRequestContext.risk === "cost"
+      ? "发送前会确认生图成本。"
+      : composerRequestContext.risk === "destructive"
+      ? "发送前会确认影响范围。"
+      : "";
+  const agentScopeButtonLabel =
+    composerRequestContext.scope === "current_slide"
+      ? "当前页"
+      : composerRequestContext.scope === "selected_slides"
+      ? deckSelectedPageNums.length || composerRequestContext.pageNums.length
+        ? `选中 ${deckSelectedPageNums.length || composerRequestContext.pageNums.length} 页`
+        : "先选页"
+      : `整套 ${slides.length || 0} 页`;
+  const agentAreaButtonLabel =
+    composerRequestContext.targetArea === "whole" ? "全页" : composerRequestContext.areaLabel;
+  const agentAreaOptions: { value: AgentTargetArea; label: string; hint: string }[] = [
+    { value: "whole", label: "全页", hint: "不限定区域" },
+    { value: "title", label: "标题", hint: "标题、副标题" },
+    { value: "body", label: "正文", hint: "正文、要点" },
+    { value: "visual", label: "画面", hint: "背景、风格、版式" },
+    { value: "materials", label: "素材", hint: "Logo、产品图、参考图" },
+    { value: "notes", label: "备注", hint: "讲稿、备注" },
+  ];
+  const agentComposerPlaceholder =
+    currentAgentRole === "finetune" && !finetuneTargetSlideId
+      ? "请先在左侧点击一页..."
+      : currentStatus === "draft"
+      ? "输入 PPT 主题或粘贴文档内容..."
+      : currentAgentRole === "finetune"
+      ? "例如：保留文字，把画面换成更高级的办公室场景"
+      : currentAgentRole === "visual"
+      ? "例如：把选中页改得更商务，背景更克制"
+      : "例如：把第 3 页标题改短，正文更像汇报口吻";
+  const agentMaterialCount =
+    pendingAttachments.length +
+    pendingChatAttachments.length +
+    (currentAgentRole === "finetune" && finetuneTargetSlideId
+      ? (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length
+      : 0);
+  const selectedStyleInspectorProposal = expandedStyleProposalKey
+    ? styleDockProposals
+        .map((proposal, index) => ({ proposal, key: `${proposal.name}-${index}`, index }))
+        .find((item) => item.key === expandedStyleProposalKey) || null
+    : null;
+  const projectProgressItems = [
+    hasActiveRun
+      ? {
+          key: "active-run",
+          title: activeProgressLabel,
+          meta: activeProgress.status === "queued" ? activeProgressStatusText : `${activeProgress.current} / ${activeProgress.total || "?"} ${activeProgress.unit}完成`,
+          tone: "running",
+        }
+      : null,
+    currentContentPlanProgress?.stage && currentContentPlanProgress.stage !== "error"
+      ? {
+          key: "content-plan",
+          title: currentContentPlanProgress.message || "内容规划处理中",
+          meta: Number(currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages ?? 0) > 0
+            ? `${currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0} / ${currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages} ${currentContentPlanProgress.unit || "页"}`
+            : "后台运行",
+          tone: "running",
+        }
+      : null,
+    documents.some((doc: any) =>
+      ["queued", "running"].includes(String(doc.text_parse_status || "")) ||
+      ["queued", "running"].includes(String(doc.asset_extraction_status || ""))
+    )
+      ? { key: "documents", title: "资料解析", meta: "文件和素材正在后台入库", tone: "running" }
+      : null,
+    staleSlides.length > 0
+      ? { key: "stale", title: "待更新页面", meta: `${staleSlides.length} 页需要更新画面方案或图片`, tone: "warning" }
+      : null,
+    workflowState.hasFailedSlide
+      ? { key: "failed", title: "失败页", meta: `${slides.filter((s) => s.status === "failed").length} 页可重试`, tone: "danger" }
+      : null,
+  ].filter(Boolean) as Array<{ key: string; title: string; meta: string; tone: string }>;
+  const primaryProjectProgressItem = projectProgressItems[0] || null;
+  const hasStaleProgressItem = projectProgressItems.some((item) => item.key === "stale");
+  const hasFailedProgressItem = projectProgressItems.some((item) => item.key === "failed");
+  const workflowStatusTitle = primaryProjectProgressItem
+    ? primaryProjectProgressItem.title
+    : statusLabel[currentStatus] || workflowState.statusLabel;
+  const workflowStatusMeta = primaryProjectProgressItem
+    ? primaryProjectProgressItem.meta
+    : currentStatus === "completed" && slides.length > 0
+    ? `${generatedSlideCount} / ${slides.length} 页已生成`
+    : getGuidanceText() || workflowState.statusLabel;
   const shouldShowRunProgressEmptyState = Boolean(
     selectedProject &&
     slides.length === 0 &&
     !slidesAreLoading &&
     (hasActiveRun || currentStatus === "prototype" || currentStatus === "generating")
   );
+  const materialLogoCount = referenceImages.filter(isConfirmedLogoRef).length;
+  const materialAssetCount = referenceImages.filter((r: any) => r.role === "visual_asset").length;
+  const materialStyleRefCount = referenceImages.filter((r: any) => r.role === "style_ref").length;
+  const materialTemplateCount = referenceImages.filter((r: any) => r.role === "template").length;
+  const materialSummary = [
+    materialLogoCount > 0 ? `${materialLogoCount} 个 Logo` : "",
+    materialAssetCount > 0 ? `${materialAssetCount} 个素材` : "",
+    materialStyleRefCount > 0 ? `${materialStyleRefCount} 张风格` : "",
+    materialTemplateCount > 0 ? "模板" : "",
+  ].filter(Boolean).join(" · ") || "尚未添加";
+
+  const renderMaterialLibraryPanel = () => {
+    if (!selectedProject) return null;
+    return (
+      <aside className="pg-material-side-panel" aria-label="项目素材库">
+        <VisualAssetsPanel
+          referenceImages={referenceImages}
+          activeSlide={activeAssetSlide}
+          templateRecommendations={selectedProject.selected_template_recommendations}
+          templatePages={templatePages}
+          apiBase={API_BASE}
+          showInVisualStage={true}
+          onUploadLogo={() => logoInputRef.current?.click()}
+          onUploadStyleRef={() => styleRefInputRef.current?.click()}
+          onUploadTemplate={() => templateInputRef.current?.click()}
+          onUploadVisualAsset={() => visualAssetInputRef.current?.click()}
+          onUpdateVisualAsset={async (refId, data) => {
+            if (!selectedProject) return;
+            try {
+              const targetRef = referenceImages.find((r: any) => r.id === refId);
+              await updateReferenceImage(selectedProject.id, refId, data);
+              showToast(targetRef?.role === "logo" ? "Logo 设置已更新" : "可复用素材已更新");
+              await loadReferenceImages(selectedProject.id);
+              if (targetRef?.role === "visual_asset" || targetRef?.role === "logo" || data.review_status) {
+                slides.forEach((s) => markSlideStale(s.id, "content"));
+              }
+              addSystemLog(targetRef?.role === "logo" ? "用户更新了 Logo 角标设置" : "用户更新了可复用素材说明");
+            } catch (err: any) {
+              showToast("更新失败：" + (err.message || "未知错误"), "error");
+            }
+          }}
+          onDelete={async (refId) => {
+            if (!selectedProject) return;
+            try {
+              const deletedRef = referenceImages.find((r) => r.id === refId);
+              await deleteReferenceImage(selectedProject.id, refId);
+              showToast("已删除");
+              await loadReferenceImages(selectedProject.id);
+              if (deletedRef?.role === "visual_asset") {
+                const updated = await loadSlides(selectedProject.id);
+                if (editingSlide) {
+                  const fresh = updated.find((s: Slide) => s.id === editingSlide.id);
+                  if (fresh) setEditingSlide(fresh);
+                }
+              }
+              if (refId === referenceImages.find((r) => r.role === "template")?.id) {
+                setTemplatePages([]);
+              }
+              if (deletedRef && (deletedRef.role === "style_ref" || deletedRef.role === "logo" || deletedRef.role === "visual_asset")) {
+                slides.forEach((s) => markSlideStale(s.id, "content"));
+              }
+              if (deletedRef) {
+                const roleMap: Record<string, string> = { style_ref: "风格参考", logo: "品牌 Logo", template: "版式模板", visual_asset: "可复用素材" };
+                addSystemLog(`用户删除了项目${roleMap[deletedRef.role] || "素材"}`);
+              }
+              await loadProjects();
+            } catch (err: any) {
+              showToast("删除失败：" + (err.message || "未知错误"), "error");
+            }
+          }}
+          onPinAsset={handlePinAssetToSlide}
+          onUnpinAsset={handleUnpinAssetFromSlide}
+          onUpdateOverlayLayers={handleUpdateOverlayLayers}
+          onImageClick={(url) => {
+            const urls = referenceImages.map((r: any) => {
+              const assetUrl = r.overlay_url || r.url;
+              return String(assetUrl || "").startsWith("http") ? assetUrl : `${API_BASE}${assetUrl}`;
+            });
+            const index = urls.indexOf(url);
+            setGalleryModal({ urls, index: index >= 0 ? index : 0, title: "设计素材" });
+          }}
+        />
+      </aside>
+    );
+  };
 
   return (
     <div className="pg-app flex h-screen w-screen bg-gray-50 text-gray-900 overflow-hidden">
@@ -7256,57 +7692,38 @@ function App() {
 
       {/* 中栏：主预览区 */}
       <main className="pg-main flex-1 flex flex-col min-w-0">
-        <header className="pg-topbar h-12 border-b border-slate-200 bg-white flex items-center px-4 justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="font-semibold text-sm truncate max-w-[300px]" title={selectedProject?.title}>
-                {selectedProject ? selectedProject.title : "预览区"}
-              </span>
-              {selectedProject && (
-                <span className="text-xs px-2.5 py-0.5 rounded-full bg-slate-100 text-slate-600 font-medium">
-                  {statusLabel[currentStatus] || currentStatus}
-                </span>
-              )}
-            </div>
-            {/* 选页工具栏：内联到标题栏 */}
-            {selectedProject && shouldShowPrototypeSelection && (
-              <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-600">
-                <span className="text-slate-500">{isPrototypeRunActive ? "正在打样：" : "打样页："}</span>
-                {!isPrototypeRunActive && (
-                  <>
-                    <button onClick={selectAll} disabled={!canEditPrototypeSelection} className="text-blue-600 hover:underline font-medium disabled:text-slate-300 disabled:no-underline">全选</button>
-                    <button onClick={clearSelection} disabled={!canEditPrototypeSelection} className="text-slate-400 hover:underline disabled:text-slate-300 disabled:no-underline">默认种子页</button>
-                    <span className="text-slate-300">|</span>
-                  </>
-                )}
-                <span>{prototypeSelectionSummary}</span>
-                <span className="text-slate-400">
-                  {isPrototypeRunActive ? "生成中已锁定，完成后可重新打样。" : "勾选卡片可调整本次打样范围。"}
-                </span>
-              </div>
-            )}
-            {selectedProject && currentStatus === "prototype_ready" && (
-              <div className="text-xs text-slate-400 mt-0.5">
-                已生成样张，可先检查效果；需要重做时点击「重新打样」。
-              </div>
-            )}
+        <header className="pg-topbar pg-project-header">
+          <div className="pg-project-title" title={selectedProject?.title}>
+            {selectedProject ? selectedProject.title : "预览区"}
           </div>
-          <div className="flex items-center gap-2 flex-wrap justify-end">
-            {topSecondaryActions.map(renderTopAction)}
-            {topPrimaryAction && renderTopAction(topPrimaryAction)}
+          <div className="pg-project-exports">
+            {selectedProject && slides.length > 0 && (
+              <a href={getContentPlanMarkdownUrl(selectedProject.id)} className="pg-project-export-link">
+                导出 MD
+              </a>
+            )}
+            {selectedProject && generatedSlideCount > 0 ? (
+              <a href={getDownloadUrl(selectedProject.id)} className="pg-project-export-link">
+                导出 PPTX
+              </a>
+            ) : selectedProject ? (
+              <span className="pg-project-export-link is-disabled" aria-disabled="true">
+                导出 PPTX
+              </span>
+            ) : null}
           </div>
         </header>
 
-        {/* 项目进程时间线 */}
+        {/* 项目进程管理 */}
         {selectedProject && (
-          <div className="pg-workflow px-6 py-3 bg-gradient-to-r from-slate-50 via-white to-slate-50 border-b border-slate-200">
-            <div className="flex items-center">
+          <div className="pg-workflow">
+            <div className="pg-workflow-steps">
               {steps.map((step, idx) => {
                 const status = stepStatus(idx);
                 const canRollback = status === "done";
                 const isCurrentLoading = status === "current" && isLoadingStatus;
                 return (
-                  <div key={step.key} className="flex items-center">
+                  <div key={step.key} className="pg-workflow-step-wrap">
                     <button
                       onClick={() => { if (!canRollback) return; handleRollback(step.key as any); }}
                       disabled={!canRollback || isBusy}
@@ -7337,120 +7754,123 @@ function App() {
                       )}
                     </button>
                     {idx < steps.length - 1 && (
-                      <div className={`w-6 h-px mx-1.5 rounded-full ${idx < displayStepIndex ? "bg-emerald-400" : "bg-slate-200"}`} />
+                      <div className={`pg-workflow-connector ${idx < displayStepIndex ? "is-done" : ""}`} />
                     )}
                   </div>
                 );
               })}
             </div>
-            {/* 引导文案 */}
-            {getGuidanceText() && (
-              <div className="mt-2 text-sm text-slate-500 font-medium">
-                {getGuidanceText()}
+            <div className={`pg-workflow-status ${primaryProjectProgressItem ? `is-${primaryProjectProgressItem.tone}` : ""}`}>
+              <span className={`pg-progress-dot ${primaryProjectProgressItem ? `is-${primaryProjectProgressItem.tone}` : ""}`} />
+              <div>
+                <b>{workflowStatusTitle}</b>
+                <span>{workflowStatusMeta}</span>
+              </div>
+            </div>
+            <div className="pg-workflow-actions">
+              {selectedProject && deckSelectedPageNums.length > 0 && (
+                <button
+                  type="button"
+                  onClick={clearDeckSelection}
+                  className="pg-selection-pill"
+                  title="清除页面选择"
+                >
+                  已选 {deckSelectedPageNums.length} 页 · 清除
+                </button>
+              )}
+              {hasActiveRun ? (
+                <button type="button" className="pg-action pg-action-secondary" onClick={handleStopGeneration}>
+                  停止
+                </button>
+              ) : (
+                <>
+                  {hasStaleProgressItem && (
+                    <button type="button" className="pg-action pg-action-primary" onClick={() => handleUpdateStaleSlides()} disabled={isBusy || chatLoading}>
+                      更新画面方案
+                    </button>
+                  )}
+                  {hasFailedProgressItem && (
+                    <button type="button" className="pg-action pg-action-danger" onClick={() => dispatchGateAction("retry_failed")} disabled={isBusy || chatLoading}>
+                      重试失败页
+                    </button>
+                  )}
+                  {topSecondaryActions.map(renderTopAction)}
+                  {topPrimaryAction && renderTopAction(topPrimaryAction)}
+                </>
+              )}
+              {projectProgressItems.length > 1 && (
+                <button type="button" className="pg-action pg-action-secondary" onClick={() => setProgressDetailsOpen(true)}>
+                  查看详情
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 项目素材管理：中心工作台入口，详情进入停靠面板，避免遮挡编辑区 */}
+        {!isBriefStudioActive && selectedProject ? (
+          <>
+            <div className="pg-workbench-modulebar">
+              <button
+                type="button"
+                className="pg-assets-toggle pg-workbench-module-button"
+                onClick={() => setAssetsBarExpanded((open) => !open)}
+                aria-pressed={assetsBarExpanded}
+              >
+                <span className="pg-modulebar-label">素材库</span>
+                <span className={`pg-modulebar-summary ${referenceImages.length === 0 ? "is-muted" : ""}`}>
+                  {materialSummary}
+                </span>
+                <span className="ml-auto shrink-0 text-xs text-slate-400">
+                  {assetsBarExpanded ? "收起" : "展开"}
+                </span>
+              </button>
+            </div>
+          </>
+        ) : null}
+        {assetsBarExpanded && !isBriefStudioActive && selectedProject && renderMaterialLibraryPanel()}
+        {/* 视觉方案：紧凑条，可展开 */}
+        {selectedProject?.selected_style && (
+          currentStatus === "visual_ready" ||
+          currentStatus === "prompt_ready" ||
+          currentStatus === "generating" ||
+          currentStatus === "prototype_ready" ||
+          currentStatus === "completed"
+        ) && (
+          <div className="pg-style-bar">
+            <button
+              type="button"
+              className="pg-style-bar-toggle"
+              onClick={() => setStyleBarExpanded((v) => !v)}
+              aria-expanded={styleBarExpanded}
+            >
+              <span className="pg-style-bar-title">视觉方案：{selectedProject.selected_style.name}</span>
+              {selectedProject.selected_style.palette && (
+                <span className="pg-style-bar-swatches">
+                  {selectedProject.selected_style.palette.slice(0, 5).map((c: any, i: number) => {
+                    const color = typeof c === "string" ? c : c.hex;
+                    return <i key={i} style={{ backgroundColor: color }} title={typeof c === "string" ? c : c.name} />;
+                  })}
+                </span>
+              )}
+              <span className="pg-style-bar-description">
+                {stripHexCodes(selectedProject.selected_style.description || visualStrategyText(selectedProject.selected_style) || selectedProject.selected_style.mood || "")}
+              </span>
+              <span className="pg-style-bar-meta">{styleBarExpanded ? "收起" : "展开"}</span>
+            </button>
+            {styleBarExpanded && (
+              <div className="pg-style-bar-detail">
+                <span>氛围：{stripHexCodes(selectedProject.selected_style.mood) || "—"}</span>
+                <span>字体：{stripHexCodes(selectedProject.selected_style.font) || "—"}</span>
+                {visualStrategyText(selectedProject.selected_style) && (
+                  <span>整体基底：{visualStrategyText(selectedProject.selected_style)}</span>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* 项目素材条：可折叠，默认折叠 */}
-        {!isBriefStudioActive && (selectedProject && referenceImages.length > 0 || (selectedProject && currentAgentRole === "visual" && contentPlanConfirmed)) ? (
-          <div className="pg-assets-shell border-b border-gray-200">
-            {/* 始终显示的紧凑栏，点击 toggle */}
-            <div
-              className="pg-assets-toggle flex items-center gap-2 px-3 py-1.5 bg-gray-50 cursor-pointer hover:bg-gray-100 transition-colors"
-              onClick={() => setAssetsBarExpanded((v) => !v)}
-            >
-              <span className="min-w-0 truncate text-xs text-gray-600">
-                项目素材
-                {referenceImages.length > 0 && (
-                  <> · {referenceImages.filter(isConfirmedLogoRef).length > 0 && `${referenceImages.filter(isConfirmedLogoRef).length} 个品牌 Logo `}
-                    {referenceImages.filter((r) => r.role === "visual_asset").length > 0 && `${referenceImages.filter((r) => r.role === "visual_asset").length} 个可复用素材 `}
-                    {referenceImages.filter((r) => r.role === "style_ref").length > 0 && `${referenceImages.filter((r) => r.role === "style_ref").length} 张风格参考 `}
-                    {referenceImages.filter((r) => r.role === "template").length > 0 && "版式模板 "}</>
-                )}
-                {referenceImages.length === 0 && (
-                  <span className="text-gray-400"> · 尚未添加</span>
-                )}
-              </span>
-              <span className="ml-auto shrink-0 text-xs text-slate-400">
-                {assetsBarExpanded ? "收起 ▲" : "展开 ▼"}
-              </span>
-            </div>
-            {/* 展开态：完整面板 */}
-            {assetsBarExpanded && (
-              <div>
-                <VisualAssetsPanel
-                  referenceImages={referenceImages}
-                  activeSlide={activeAssetSlide}
-                  templateRecommendations={selectedProject?.selected_template_recommendations}
-                  templatePages={templatePages}
-                  apiBase={API_BASE}
-                  showInVisualStage={currentAgentRole === "visual" && contentPlanConfirmed}
-                  onUploadLogo={() => logoInputRef.current?.click()}
-                  onUploadStyleRef={() => styleRefInputRef.current?.click()}
-                  onUploadTemplate={() => templateInputRef.current?.click()}
-                  onUploadVisualAsset={() => visualAssetInputRef.current?.click()}
-                  onUpdateVisualAsset={async (refId, data) => {
-                    if (!selectedProject) return;
-                    try {
-                      const targetRef = referenceImages.find((r: any) => r.id === refId);
-                      await updateReferenceImage(selectedProject.id, refId, data);
-                      showToast(targetRef?.role === "logo" ? "Logo 设置已更新" : "可复用素材已更新");
-                      await loadReferenceImages(selectedProject.id);
-                      if (targetRef?.role === "visual_asset" || targetRef?.role === "logo" || data.review_status) {
-                        slides.forEach((s) => markSlideStale(s.id, "content"));
-                      }
-                      addSystemLog(targetRef?.role === "logo" ? "用户更新了 Logo 角标设置" : "用户更新了可复用素材说明");
-                    } catch (err: any) {
-                      showToast("更新失败：" + (err.message || "未知错误"), "error");
-                    }
-                  }}
-                  onDelete={async (refId) => {
-                    if (!selectedProject) return;
-                    try {
-                      const deletedRef = referenceImages.find((r) => r.id === refId);
-                      await deleteReferenceImage(selectedProject.id, refId);
-                      showToast("已删除");
-                      await loadReferenceImages(selectedProject.id);
-                      if (deletedRef?.role === "visual_asset") {
-                        const updated = await loadSlides(selectedProject.id);
-                        if (editingSlide) {
-                          const fresh = updated.find((s: Slide) => s.id === editingSlide.id);
-                          if (fresh) setEditingSlide(fresh);
-                        }
-                      }
-                      if (refId === referenceImages.find((r) => r.role === "template")?.id) {
-                        setTemplatePages([]);
-                      }
-                      if (deletedRef && (deletedRef.role === "style_ref" || deletedRef.role === "logo" || deletedRef.role === "visual_asset")) {
-                        slides.forEach((s) => markSlideStale(s.id, "content"));
-                      }
-                      if (deletedRef) {
-                        const roleMap: Record<string, string> = { style_ref: "风格参考", logo: "品牌 Logo", template: "版式模板", visual_asset: "可复用素材" };
-                        addSystemLog(`用户删除了项目${roleMap[deletedRef.role] || "素材"}`);
-                      }
-                      await loadProjects();
-                    } catch (err: any) {
-                      showToast("删除失败：" + (err.message || "未知错误"), "error");
-                    }
-                  }}
-                  onPinAsset={handlePinAssetToSlide}
-                  onUnpinAsset={handleUnpinAssetFromSlide}
-                  onUpdateOverlayLayers={handleUpdateOverlayLayers}
-                  onImageClick={(url) => {
-                    const urls = referenceImages.map((r: any) => {
-                      const assetUrl = r.overlay_url || r.url;
-                      return String(assetUrl || "").startsWith("http") ? assetUrl : `${API_BASE}${assetUrl}`;
-                    });
-                    const index = urls.indexOf(url);
-                    setGalleryModal({ urls, index: index >= 0 ? index : 0, title: "设计素材" });
-                  }}
-                />
-              </div>
-            )}
-          </div>
-        ) : null}
-
+        <div className="pg-workbench-body">
         <div className="pg-workspace flex-1 overflow-auto p-3">
           {!selectedProject ? (
             <div className="pg-empty-state flex items-center justify-center h-full text-gray-400">
@@ -7618,40 +8038,6 @@ function App() {
                 <div className="pg-flow-copy">上传材料或填写 Brief 后，先生成内容规划。</div>
               </div>
             </div>
-          ) : showTemplateRecommender && templatePages.length > 0 ? (
-            <div className="pg-screen-panel p-4">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-bold">模板页面推荐</h2>
-                <button
-                  onClick={() => setShowTemplateRecommender(false)}
-                  className="text-sm text-gray-500 hover:text-gray-700"
-                >
-                  关闭
-                </button>
-              </div>
-              <TemplateRecommender
-                pages={templatePages}
-                recommendations={{
-                  cover: templatePages[0] || null,
-                  toc: templatePages[1] || null,
-                  content: templatePages[Math.floor(templatePages.length / 2)] || null,
-                  ending: templatePages[templatePages.length - 1] || null,
-                }}
-                onConfirm={async (selected) => {
-                  if (!selectedProject) return;
-                  try {
-                    await updateTemplateRecommendations(selectedProject.id, selected);
-                    await loadProjects();
-                    const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
-                    const updated = fresh.find((p: Project) => p.id === selectedProject.id);
-                    if (updated) setSelectedProject(clearProjectNotification(updated));
-                    setShowTemplateRecommender(false);
-                  } catch (err: any) {
-                    showToast("保存模板选择失败：" + (err.message || "未知错误"), "error");
-                  }
-                }}
-              />
-            </div>
           ) : editingSlide ? (
             <SingleSlideEditor
               key={editingSlide.id}
@@ -7739,14 +8125,72 @@ function App() {
                   <div className="pg-stage-dock-head">
                     <div>
                       <div className="pg-stage-kicker">视觉方向</div>
-                      <h3>{styleDockProposals.length > 0 ? "选择视觉方向" : "生成视觉方向"}</h3>
-                      <p>
-                        {styleDockProposals.length > 0
-                          ? "查看每套方案的配色、字体和页面使用方式；素材补充统一在上方「项目素材」处理。"
-                          : "基于当前内容生成三套视觉方向；需要补充素材时，使用上方「项目素材」。"}
-                      </p>
+                      <h3>{styleDockProposals.length > 0 ? "选择视觉方向" : hasTemplateSource ? "生成模板视觉方向" : "生成视觉方向"}</h3>
                     </div>
                   </div>
+                  {hasTemplateSource && (
+                    <div className="pg-dock-section pg-dock-section--template">
+                      <div className="pg-dock-section__head">
+                        <span className="pg-dock-section__kicker">模板配置</span>
+                        <span className="pg-dock-section__title">版式映射</span>
+                        <span className="pg-dock-section__hint">{templatePages.length} 页</span>
+                      </div>
+                      <div className="pg-template-source-strip">
+                        <div className="pg-template-source-text">
+                          <b>{templateSourceCopy}</b>
+                          <p>{templateSourceMeta}</p>
+                        </div>
+                        <div className="pg-template-source-actions">
+                          {selectedTemplateRecommendationCount > 0 && (
+                            <span className="pg-template-confirmed-badge">模板已确认</span>
+                          )}
+                          {selectedTemplateRecommendationCount === 0 && (
+                            <>
+                              {(() => {
+                                const defaultSelection = buildDefaultTemplateSelection(templatePages);
+                                const summary = TEMPLATE_CONFIRM_TYPES
+                                  .filter((item) => defaultSelection[item.key])
+                                .slice(0, 4)
+                                .map((item) => `P${defaultSelection[item.key]}(${item.label})`)
+                                .join(" · ");
+                              return (
+                                <div className="pg-template-smart-summary">
+                                  <span>系统推荐：{summary}{templatePages.length > 4 ? " · 其他自动匹配" : ""}</span>
+                                </div>
+                              );
+                            })()}
+                            <button
+                              type="button"
+                              className="pg-template-confirm-primary"
+                              onClick={handleConfirmTemplateRecommendations}
+                              disabled={templateConfirmSaving || templatePages.length === 0}
+                            >
+                              {templateConfirmSaving ? "保存中..." : "确认使用模板"}
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          className="pg-template-adjust-btn"
+                          onClick={() => {
+                            setTemplateConfirmVisible(true);
+                            setTemplateDrawerOpen(true);
+                          }}
+                          disabled={templatePages.length === 0}
+                        >
+                          调整页面映射
+                        </button>
+                      </div>
+                      {showTemplateConfirmControls && (
+                        <div className="pg-template-confirm-block pg-template-confirm-nudge">
+                          <span>模板映射已移入右侧抽屉，调整时不会遮挡页面编辑。</span>
+                          <button type="button" onClick={() => setTemplateDrawerOpen(true)}>打开映射抽屉</button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="pg-dock-section pg-dock-section--proposals">
                   {styleDockProposals.length > 0 ? (
                     <div className="pg-style-dock-grid">
                       {styleDockProposals.map((proposal, index) => {
@@ -7763,13 +8207,16 @@ function App() {
                         const visualFocus = proposalDecisionField(proposal, "visual_focus");
                         const summary = stripHexCodes(proposal.description || proposal.mood || "基于当前内容和素材生成的视觉方向。");
                         return (
-                          <div key={proposalKey} className={`pg-style-dock-card ${isExpanded ? "is-expanded" : ""}`}>
+                          <div key={proposalKey} className={`pg-style-dock-card ${isExpanded ? "is-inspected" : ""}`}>
                             <div className="pg-style-dock-card-top">
                               <span>{proposalChoiceLabel(proposal, index)}</span>
-                              <div className="pg-style-swatches">
-                                {palette.slice(0, 5).map((c: any, i: number) => (
-                                  <i key={i} style={{ backgroundColor: proposalColorValue(c) }} title={proposalColorLabel(c, i)} />
-                                ))}
+                              <div className="pg-style-swatch-group">
+                                <em>配色</em>
+                                <div className="pg-style-swatches">
+                                  {palette.slice(0, 5).map((c: any, i: number) => (
+                                    <i key={i} style={{ backgroundColor: proposalColorValue(c) }} title={proposalColorLabel(c, i)} />
+                                  ))}
+                                </div>
                               </div>
                             </div>
                             <h4>{proposal.name}</h4>
@@ -7858,7 +8305,7 @@ function App() {
                                 onClick={() => setExpandedStyleProposalKey(isExpanded ? null : proposalKey)}
                                 disabled={isBusy || chatLoading}
                               >
-                                {isExpanded ? "收起说明" : "查看详情"}
+                                {isExpanded ? "关闭详情" : "查看详情"}
                               </button>
                               <button onClick={() => dispatchGateAction("confirm_style", { style: proposal })} disabled={isBusy || chatLoading}>
                                 确认并生成画面方案
@@ -7872,190 +8319,31 @@ function App() {
                     <div className="pg-style-dock-empty">
                       <div>
                         <b>还没有可选方案</b>
-                        <p>生成后会在这里显示三套方向。</p>
+                        <p>{hasTemplateSource ? "生成后会得到一套沿用模板的视觉方向。" : "生成后会在这里显示三套方向。"}</p>
                       </div>
-                      <button
-                        onClick={() => dispatchGateAction("generate_style_proposals")}
-                        disabled={isBusy || chatLoading}
-                        className="pg-action pg-action-primary bg-purple-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                      >
-                        生成视觉方向
-                      </button>
                     </div>
                   )}
                 </div>
+              </div>
               )}
 
               {gateContext.mainStageMode === "deck_visual" && (
                 <div className="pg-stage-dock pg-visual-dock">
-                  <div>
-                    <div className="pg-stage-kicker">画面方案</div>
-                    <h3>{slidesMissingPromptCount > 0 ? "先生成每页画面方案" : "检查每页画面方案，然后打样"}</h3>
-                    <p>
-                      {slidesMissingPromptCount > 0
-                        ? `还有 ${slidesMissingPromptCount} 页缺少画面方案或生图 Prompt。先补齐后再进入打样。`
-                        : `当前打样页：${prototypeSelectionSummary}。勾选或取消卡片前的小框，可调整本次需要打样的页面。`}
-                    </p>
-                  </div>
-                  <div className="pg-visual-dock-actions">
-                    {slidesMissingPromptCount > 0 ? (
-                      <button
-                        onClick={() => dispatchGateAction("generate_visual_prompts")}
-                        disabled={isBusy || chatLoading}
-                        className="pg-action pg-action-primary bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                      >
-                        生成画面方案
-                      </button>
-                    ) : (
-                      <>
+                  <div className="pg-stage-dock-head">
+                    <div>
+                      <div className="pg-stage-kicker">画面方案</div>
+                      <h3>{slidesMissingPromptCount > 0 ? "先生成每页画面方案" : "检查每页画面方案，然后打样"}</h3>
+                    </div>
+                    {slidesMissingPromptCount === 0 && (
+                      <div className="pg-visual-dock-actions">
                         <button onClick={selectAll} disabled={isBusy || chatLoading}>全选打样</button>
-                        <button onClick={clearSelection} disabled={isBusy || chatLoading}>默认种子页</button>
-                        <button
-                          onClick={() => dispatchGateAction("start_prototype")}
-                          disabled={isBusy || chatLoading || !canStartPrototypeGeneration}
-                          className="pg-action pg-action-primary bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                          title={!canStartPrototypeGeneration ? "请选择至少一页打样页" : undefined}
-                        >
-                          {prototypePromptTargets.length > 0 ? `打样 ${prototypePromptTargets.length} 页` : "选择打样页"}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {gateContext.mainStageMode === "deck_prototype" && (
-                <div className="pg-stage-dock pg-prototype-dock">
-                  <div>
-                    <div className="pg-stage-kicker">打样确认</div>
-                    <h3>{isPrototypeRunActive ? "正在生成打样页" : "先确认种子页，再批量生成"}</h3>
-                    <p>
-                      {isPrototypeRunActive
-                        ? `本次打样范围：${prototypeSelectionSummary}。生成中已锁定选页，完成后可重新打样或进入全量生成。`
-                        : `本次样张：${prototypeSelectionSummary}。检查风格、构图和文字可读性；满意后生成全部页面，不满意可重新打样。`}
-                    </p>
-                  </div>
-                  <div className="pg-prototype-strip">
-                    {slides.filter((s) => s.image_path).slice(0, 3).map((slide) => (
-                      <SlideImageWithOverlays
-                        key={slide.id}
-                        slide={slide}
-                        logo={projectLogo}
-                        referenceImages={referenceImages}
-                        src={getSlideImageUrl(slide.image_path!, slide.status, imageRefreshMap[slide.id])}
-                        alt={`Slide ${slide.page_num}`}
-                        className="pg-prototype-thumb"
-                        imgClassName="w-full h-full object-cover"
-                        onClick={() => {
-                          const gallerySlides = slides.filter((s) => s.image_path).sort((a, b) => a.page_num - b.page_num);
-                          const urls = gallerySlides.map((s) => getSlideImageUrl(s.image_path!, s.status, imageRefreshMap[s.id]));
-                          const url = getSlideImageUrl(slide.image_path!, slide.status, imageRefreshMap[slide.id]);
-                          setGalleryModal({ urls, index: Math.max(0, urls.indexOf(url)), title: "打样预览", slides: gallerySlides, logo: projectLogo });
-                        }}
-                      />
-                    ))}
-                  </div>
-                  <div className="pg-prototype-actions">
-                    <button onClick={() => dispatchGateAction("resample_prototype")} disabled={isBusy || chatLoading}>重新打样</button>
-                    <button
-                      onClick={() => dispatchGateAction("confirm_prototype")}
-                      disabled={isBusy || chatLoading}
-                      className="pg-action pg-action-primary bg-rose-600 text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                    >
-                      确认打样，生成全部
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {gateContext.mainStageMode === "deck_final" && (
-                <div className="pg-stage-decision pg-stage-decision-final">
-                  <div>
-                    <div className="pg-stage-decision-title">
-                      {currentStatus === "completed" ? "整套作品已生成" : "正在批量生成"}
-                    </div>
-                    <p>{slides.filter((s) => s.image_path).length} / {slides.length} 页已有画面。失败页可在卡片上单独重试。</p>
-                  </div>
-                  {currentStatus === "completed" && selectedProject && (
-                    <a href={getDownloadUrl(selectedProject.id)} className="pg-action pg-action-primary bg-slate-950 text-white px-4 py-2 rounded-lg text-sm font-medium">
-                      下载 PPTX
-                    </a>
-                  )}
-                </div>
-              )}
-
-              {/* 风格已选定：紧凑条，可展开 */}
-              {selectedProject?.selected_style && (
-                currentStatus === "visual_ready" ||
-                currentStatus === "prompt_ready" ||
-                currentStatus === "generating" ||
-                currentStatus === "prototype_ready" ||
-                currentStatus === "completed"
-              ) && (
-                <div className="pg-style-bar mb-2 bg-indigo-50 border border-indigo-200 rounded-lg overflow-hidden">
-                  {/* 紧凑栏（始终显示） */}
-                  <div
-                    className="pg-style-bar-toggle flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-indigo-100/50 transition-colors"
-                    onClick={() => setStyleBarExpanded((v) => !v)}
-                  >
-                    <span className="pg-style-bar-title text-xs font-medium text-indigo-800 truncate">
-                      风格：{selectedProject.selected_style.name}
-                    </span>
-                    {selectedProject.selected_style.palette && (
-                      <div className="flex gap-0.5 ml-1">
-                        {selectedProject.selected_style.palette.slice(0, 4).map((c: any, i: number) => {
-                          const color = typeof c === "string" ? c : c.hex;
-                          return (
-                            <div
-                              key={i}
-                              className="w-3 h-3 rounded-full border border-white"
-                              style={{ backgroundColor: color }}
-                            />
-                          );
-                        })}
+                        <button onClick={clearSelection} disabled={isBusy || chatLoading}>默认打样页</button>
                       </div>
                     )}
-                    <span className="pg-style-bar-meta ml-auto text-2xs text-indigo-400">
-                      {styleBarExpanded ? "收起" : "展开"}
-                    </span>
                   </div>
-                  {/* 展开详情 */}
-                  {styleBarExpanded && (
-                    <div className="pg-style-bar-detail px-3 pb-2 border-t border-indigo-100">
-                      {selectedProject.selected_style.palette && (
-                        <div className="flex items-center gap-2 py-1.5">
-                          <div className="flex gap-1">
-                            {selectedProject.selected_style.palette.slice(0, 5).map((c: any, i: number) => {
-                              const color = typeof c === "string" ? c : c.hex;
-                              return (
-                                <div
-                                  key={i}
-                                  className="w-4 h-4 rounded-full border border-white shadow-sm"
-                                  style={{ backgroundColor: color }}
-                                  title={typeof c === "string" ? c : c.name}
-                                />
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                      <div className="pg-style-bar-copy text-[11px] text-indigo-700">
-                        氛围：{selectedProject.selected_style.mood || "—"} · 字体：{selectedProject.selected_style.font || "—"}
-                      </div>
-                      {visualStrategyText(selectedProject.selected_style) && (
-                        <p className="pg-style-bar-copy text-[11px] text-indigo-700 mt-0.5 leading-relaxed">
-                          整体基底：{visualStrategyText(selectedProject.selected_style)}
-                        </p>
-                      )}
-                      {selectedProject.selected_style.description && (
-                        <p className="pg-style-bar-copy text-[11px] text-indigo-600 mt-0.5 leading-relaxed">
-                          {selectedProject.selected_style.description}
-                        </p>
-                      )}
-                    </div>
-                  )}
                 </div>
               )}
+
               <div className="pg-slide-grid flex flex-wrap w-full">
                 {/* 第一页之前：悬浮插入区 */}
                 {slides.length > 0 && !isBusy && !chatLoading && (
@@ -8075,7 +8363,9 @@ function App() {
                 const hasVisualDescription = Boolean(visual.visual_description && String(visual.visual_description).trim());
                 const hasPromptText = Boolean(slide.prompt_text && String(slide.prompt_text).trim());
                 const isPrototypePageChecked = visiblePrototypePageSet.has(slide.page_num);
+                const isDeckPageSelected = deckSelectedPages.has(slide.page_num);
                 const isLast = index === slides.length - 1;
+                const replicateSource = directReplicateSourceFacts(slide);
                 return (
                   <Fragment key={slide.id}>
                   <div
@@ -8132,16 +8422,29 @@ function App() {
                         handleEnterEdit(slide);
                       }
                     }}
-                    className={`pg-slide-card group relative bg-white rounded-lg border border-slate-200 p-3 shadow-sm flex flex-col cursor-pointer hover:shadow-lg hover:border-blue-400 transition-all h-[320px] overflow-hidden w-[calc((100%-4.5rem)/3)] min-w-[260px] flex-shrink-0 max-md:w-full ${
-                      isPrototypePageChecked && shouldShowPrototypeSelection
-                        ? "ring-2 ring-blue-400"
-                        : ""
-                    } ${finetuneTargetSlideId === slide.id && currentAgentRole === "finetune" ? "ring-2 ring-amber-400 border-amber-300" : ""} ${dragOverSlideId === slide.id ? "border-dashed border-blue-400 bg-blue-50" : ""} ${dragSlideId === slide.id ? "opacity-50" : ""}`}
-                  >
-                    <div className="flex items-center justify-between mb-1 shrink-0">
-                      <div className="flex items-center gap-1.5">
-                        {shouldShowPrototypeSelection && (
-                          <input
+	                    className={`pg-slide-card group relative bg-white rounded-lg border border-slate-200 p-3 shadow-sm flex flex-col cursor-pointer hover:shadow-lg hover:border-blue-400 transition-all h-[320px] overflow-hidden w-[calc((100%-4.5rem)/3)] min-w-[260px] flex-shrink-0 max-md:w-full ${
+	                      isPrototypePageChecked && shouldShowPrototypeSelection
+	                        ? "ring-2 ring-blue-400"
+	                        : ""
+	                    } ${isDeckPageSelected ? "pg-slide-card-selected" : ""} ${finetuneTargetSlideId === slide.id && currentAgentRole === "finetune" ? "ring-2 ring-amber-400 border-amber-300" : ""} ${dragOverSlideId === slide.id ? "border-dashed border-blue-400 bg-blue-50" : ""} ${dragSlideId === slide.id ? "opacity-50" : ""}`}
+	                  >
+	                    <div className="flex items-center justify-between mb-1 shrink-0">
+	                      <div className="flex items-center gap-1.5">
+	                        {!shouldShowPrototypeSelection && (
+	                          <input
+	                            type="checkbox"
+	                            checked={isDeckPageSelected}
+	                            title="选中后可让 Agent 作用于这些页面"
+	                            onClick={(e) => e.stopPropagation()}
+	                            onChange={(e) => {
+	                              e.stopPropagation();
+	                              toggleDeckPageSelection(slide.page_num);
+	                            }}
+	                            className="cursor-pointer"
+	                          />
+	                        )}
+	                        {shouldShowPrototypeSelection && (
+	                          <input
                             type="checkbox"
                             checked={isPrototypePageChecked}
                             disabled={!canEditPrototypeSelection}
@@ -8156,6 +8459,18 @@ function App() {
                           />
                         )}
                         <span className="text-xs text-slate-400 font-mono">P{slide.page_num}</span>
+                        {replicateSource && (
+                          <span
+                            className={`text-[10px] px-1.5 py-0.5 rounded-full leading-none ${
+                              replicateSource.qualityStatus === "passed"
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-100"
+                                : "bg-amber-50 text-amber-700 border border-amber-100"
+                            }`}
+                            title={replicateSource.qualityStatus === "passed" ? "已按原稿逐页承接" : "原稿承接需要检查"}
+                          >
+                            原稿 P{replicateSource.sourcePage}
+                          </span>
+                        )}
                         {statusText[slide.status] && <span className="text-sm">{statusText[slide.status]}</span>}
                       </div>
                       <div className="flex items-center gap-1">
@@ -8276,7 +8591,7 @@ function App() {
                                     src={`${API_BASE}${ref.url}`}
                                     alt="ref"
                                     className="w-7 h-7 rounded object-cover border cursor-pointer"
-                                    title="AI 参考图 — 点击查看大图"
+                                    title={referenceThumbTitle(ref)}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const allRefUrls = slides
@@ -8364,8 +8679,179 @@ function App() {
               })}
             </div>
           </>)}
+		        </div>
+          </div>
+		      </main>
+
+      {templateDrawerOpen && templatePages.length > 0 && (
+        <div className="pg-side-drawer-backdrop" role="presentation" onClick={() => setTemplateDrawerOpen(false)}>
+          <aside className="pg-side-drawer pg-template-drawer" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="pg-drawer-head">
+              <div>
+                <div className="pg-drawer-kicker">Template Mapping</div>
+                <h2>模板页面映射</h2>
+                <p>选择每类页面参考哪一张模板缩略图，不再使用长下拉遮挡编辑区。</p>
+              </div>
+              <button type="button" onClick={() => setTemplateDrawerOpen(false)}>关闭</button>
+            </div>
+            {(() => {
+              const fallbackSelection = buildDefaultTemplateSelection(templatePages);
+              const visibleTypes = showAdvancedMapping
+                ? TEMPLATE_CONFIRM_TYPES
+                : TEMPLATE_CONFIRM_TYPES.filter((item) => ["cover", "content", "ending"].includes(item.key));
+              return (
+                <>
+                  <div className="pg-template-drawer-grid">
+                    {visibleTypes.map((item) => {
+                      const selectedPageNum = templatePageSelection[item.key] || fallbackSelection[item.key];
+                      return (
+                        <section key={item.key} className="pg-template-picker-group">
+                          <div className="pg-template-picker-head">
+                            <span>{item.label}</span>
+                            <b>{selectedPageNum ? `P${selectedPageNum}` : "未选择"}</b>
+                          </div>
+                          <div className="pg-template-thumb-picker">
+                            {templatePages.map((page: any) => {
+                              const isSelected = Number(page.page_num) === Number(selectedPageNum);
+                              return (
+                                <button
+                                  key={`${item.key}-${page.page_num}`}
+                                  type="button"
+                                  className={isSelected ? "is-selected" : ""}
+                                  onClick={() => setTemplatePageSelection((prev) => ({ ...prev, [item.key]: Number(page.page_num) }))}
+                                  title={`使用模板 P${page.page_num}`}
+                                >
+                                  <img src={page.layout_url || page.url} alt={`模板第 ${page.page_num} 页`} />
+                                  <span>P{page.page_num}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </section>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    className="pg-template-advanced-toggle"
+                    onClick={() => setShowAdvancedMapping((value) => !value)}
+                  >
+                    {showAdvancedMapping ? "只看核心页面" : "显示更多页面类型"}
+                  </button>
+                  <div className="pg-template-strength-row pg-template-drawer-actions">
+                    <span>参考范围</span>
+                    <button type="button" className={templateApplicationStrength === "light" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("light")}>
+                      只学版式
+                    </button>
+                    <button type="button" className={templateApplicationStrength === "standard" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("standard")}>
+                      版式+配色
+                    </button>
+                    <button type="button" className={templateApplicationStrength === "strong" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("strong")}>
+                      完全沿用
+                    </button>
+                    <button type="button" className="pg-template-confirm-primary" onClick={handleConfirmTemplateRecommendations} disabled={templateConfirmSaving}>
+                      {templateConfirmSaving ? "保存中..." : "确认使用模板"}
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </aside>
         </div>
-      </main>
+      )}
+
+      {selectedStyleInspectorProposal && (
+        <div className="pg-side-drawer-backdrop" role="presentation" onClick={() => setExpandedStyleProposalKey(null)}>
+          <aside className="pg-side-drawer pg-style-inspector" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            {(() => {
+              const proposal = selectedStyleInspectorProposal.proposal;
+              const palette = Array.isArray(proposal.palette) ? proposal.palette : [];
+              const bestFor = proposalDecisionField(proposal, "best_for");
+              const tradeoff = proposalDecisionField(proposal, "tradeoff");
+              const visualFocus = proposalDecisionField(proposal, "visual_focus");
+              const pageTypeAdaptation = stripHexCodes((proposal as any).page_type_adaptation || "");
+              const contentStyleHint = stripHexCodes((proposal as any).content_style_hint || "");
+              return (
+                <>
+                  <div className="pg-drawer-head">
+                    <div>
+                      <div className="pg-drawer-kicker">Style Inspector</div>
+                      <h2>{proposal.name}</h2>
+                      <p>{stripHexCodes(proposal.description || proposal.mood || "基于当前内容和素材生成的视觉方向。")}</p>
+                    </div>
+                    <button type="button" onClick={() => setExpandedStyleProposalKey(null)}>关闭</button>
+                  </div>
+                  <div className="pg-style-inspector-grid">
+                    {bestFor && <div><b>适合</b><p>{bestFor}</p></div>}
+                    {tradeoff && <div><b>取舍</b><p>{tradeoff}</p></div>}
+                    {visualFocus && <div><b>视觉重点</b><p>{visualFocus}</p></div>}
+                    {visualStrategyText(proposal) && <div><b>整体基底</b><p>{visualStrategyText(proposal)}</p></div>}
+                    <div>
+                      <b>配色</b>
+                      <div className="pg-style-inspector-palette">
+                        {palette.slice(0, 6).map((color: any, colorIndex: number) => (
+                          <span key={`${proposalColorValue(color)}-${colorIndex}`}>
+                            <i style={{ backgroundColor: proposalColorValue(color) }} />
+                            <em>{proposalColorLabel(color, colorIndex)}</em>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    {stripHexCodes(proposal.mood) && <div><b>氛围</b><p>{stripHexCodes(proposal.mood)}</p></div>}
+                    {stripHexCodes(proposal.font) && <div><b>字体</b><p>{stripHexCodes(proposal.font)}</p></div>}
+                    {pageTypeAdaptation && <div><b>页面使用方式</b><p>{pageTypeAdaptation}</p></div>}
+                    {contentStyleHint && <div><b>内容适配</b><p>{contentStyleHint}</p></div>}
+                  </div>
+                  <div className="pg-drawer-footer">
+                    <button type="button" onClick={() => setExpandedStyleProposalKey(null)}>返回提案看板</button>
+                    <button type="button" className="pg-drawer-primary" onClick={() => dispatchGateAction("confirm_style", { style: proposal })} disabled={isBusy || chatLoading}>
+                      确认并生成画面方案
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </aside>
+        </div>
+      )}
+
+      {progressDetailsOpen && (
+        <div className="pg-side-drawer-backdrop" role="presentation" onClick={() => setProgressDetailsOpen(false)}>
+          <aside className="pg-side-drawer pg-progress-details" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <div className="pg-drawer-head">
+              <div>
+                <div className="pg-drawer-kicker">Progress</div>
+                <h2>进度详情</h2>
+                <p>查看正在处理、待更新和可重试的页面。</p>
+              </div>
+              <button type="button" onClick={() => setProgressDetailsOpen(false)}>关闭</button>
+            </div>
+            <div className="pg-progress-detail-list">
+              {projectProgressItems.length > 0 ? projectProgressItems.map((task) => (
+                <div key={task.key} className={`pg-progress-detail-card is-${task.tone}`}>
+                  <span className={`pg-progress-dot is-${task.tone}`} />
+                  <div>
+                    <b>{task.title}</b>
+                    <p>{task.meta}</p>
+                  </div>
+                  {task.key === "failed" && (
+                    <button type="button" onClick={() => dispatchGateAction("retry_failed")} disabled={isBusy || chatLoading}>
+                      重试失败页
+                    </button>
+                  )}
+                  {task.key === "stale" && (
+                    <button type="button" onClick={() => handleUpdateStaleSlides()} disabled={isBusy || chatLoading}>
+                      更新画面方案
+                    </button>
+                  )}
+                </div>
+              )) : (
+                <div className="pg-progress-detail-empty">当前没有需要处理的页面。</div>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
 
       {/* Agent 聊天面板 */}
       {!isBriefStudioActive && rightCollapsed && (
@@ -8569,17 +9055,11 @@ function App() {
                     ? "text-purple-800"
                     : "text-blue-800"
                 }`}>
-                  {currentStageNudge.title}
+                  {currentStageNudge.title.replace(/^下一步：/, "当前阶段：")}
                 </div>
                 <p className="mt-1 text-xs leading-relaxed text-slate-600">{currentStageNudge.body}</p>
               </div>
             </div>
-            {(currentStageNudge.primary || currentStageNudge.secondary) && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                {currentStageNudge.primary && renderNudgeAction(currentStageNudge.primary)}
-                {currentStageNudge.secondary && renderNudgeAction(currentStageNudge.secondary)}
-              </div>
-            )}
           </div>
         )}
         <div
@@ -8890,21 +9370,12 @@ function App() {
                         );
                       })()}
                     </div>
-                    {/* 视觉总监的风格提案卡片 - 每条消息携带自己的快照，互不干扰 */}
+                    {/* 视觉提案由中间主舞台统一管理，Agent 只保留轻量提示。 */}
                     {msg.role === "agent" && msg.agentRole === "visual" && msg.styleProposals && msg.styleProposals.length > 0 && isMessageFromCurrentGate(msg) && (
-                      <ChatStyleProposal
-                        proposals={msg.styleProposals}
-                        onSelect={(proposal) => dispatchGateAction("confirm_style", { style: proposal })}
-                        onAdjust={() => {
-                          if (!selectedProject) return;
-                          appendProjectChatMessage(selectedProject.id, "visual", {
-                            role: "agent",
-                            content: "👉 请告诉我你的调整方向（如「更商务一点」「配色再暖一些」「想要极简感」），我会基于你的反馈重新生成提案。",
-                            agentRole: "visual",
-                          });
-                        }}
-                        disabled={isBusy || chatLoading}
-                      />
+                      <div className="pg-agent-inline-notice">
+                        <b>已生成 {msg.styleProposals.length} 套视觉方向</b>
+                        <span>请在中间提案看板比较和确认，详情会在检查器里打开。</span>
+                      </div>
                     )}
                     {/* 消息操作按钮 */}
                     <div className={`flex gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
@@ -8976,79 +9447,6 @@ function App() {
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                     </svg>
                     <span>助手正在思考...</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-          {/* 批量生成进度（生图 / 生成提示词）：跟在最新消息之后 */}
-            {selectedProject && hasActiveRun && currentProjectStatus && activeRun?.kind !== "content_plan" && (
-              <div className="flex justify-start">
-                <div className="pg-progress-card bg-purple-50 border border-purple-200 rounded-lg text-sm text-purple-800 rounded-bl-none max-w-[80%] overflow-hidden w-72">
-                  <div className="px-3 py-2.5">
-                    <div className="font-medium mb-1">
-                      {activeProgressLabel}
-                    </div>
-                    <div className="w-full bg-purple-200 rounded-full h-2 mb-2">
-                      <div
-                        className="bg-purple-500 h-2 rounded-full transition-all"
-                        style={{
-                          width: `${activeProgress.percent}%`,
-                        }}
-                      />
-                    </div>
-                    <div>
-                      {activeProgress.status === "queued"
-                        ? activeProgressStatusText
-                        : `${activeProgress.current} / ${activeProgress.total} ${activeProgress.unit}完成${activeProgress.failed > 0 ? `，${activeProgress.failed} ${activeProgress.unit}失败` : ""}`}
-                    </div>
-                    {activeProgress.activePageNums.length > 0 && (
-                      <div className="mt-1 text-2xs text-purple-600">
-                        {activeProgress.activePageNums.length === 1
-                          ? `正在生成第 ${activeProgress.activePageNums[0]} 页`
-                          : `正在并行生成第 ${formatPageNums(activeProgress.activePageNums)} 页`}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
-          {/* 内容规划动态进度卡片：仅在项目处于生成中状态时显示，防止过时进度残留 */}
-          {selectedProject && currentAgentRole === "content" && activeRun?.kind === "content_plan" && currentContentPlanProgress && currentContentPlanProgress.stage && currentContentPlanProgress.stage !== "error" && (
-            <div className="flex justify-start">
-              <div className="pg-progress-card bg-blue-50 border border-blue-200 rounded-lg text-sm text-gray-700 rounded-bl-none max-w-[80%] overflow-hidden w-72">
-                <div className="px-3 py-2.5 flex items-center gap-2">
-                  <svg className="animate-spin h-4 w-4 text-blue-500 flex-shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                  </svg>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium text-blue-800 text-xs truncate">
-                      {currentContentPlanProgress.message || "生成中..."}
-                    </div>
-                      {Number(currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages ?? 0) > 0 && (
-                        <div className="mt-1.5">
-                          <div className="flex items-center justify-between text-2xs text-blue-600 mb-0.5">
-                            <span>进度</span>
-                            <span>
-                              {currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0} / {currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages} {currentContentPlanProgress.unit || "页"}
-                            </span>
-                          </div>
-                          <div className="h-1.5 bg-blue-100 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
-                              style={{
-                                width: `${Math.min(100, ((currentContentPlanProgress.current ?? currentContentPlanProgress.current_page ?? 0) / (currentContentPlanProgress.total ?? currentContentPlanProgress.total_pages)) * 100)}%`
-                              }}
-                            />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {currentContentPlanProgress.think && (
-                  <div className="px-3 py-2 bg-white/60 text-xs text-gray-500 whitespace-pre-wrap leading-relaxed max-h-32 overflow-auto border-t border-blue-100">
-                    {currentContentPlanProgress.think}
                   </div>
                 )}
               </div>
@@ -9184,15 +9582,30 @@ function App() {
               if (file && selectedProject) {
                 setUploadingTemplate(true);
                 try {
-                  await extractTemplate(selectedProject.id, file);
-                  showToast("版式模板已上传并提取");
+                  const initialResult = await extractTemplate(selectedProject.id, file);
+                  showToast("已收到版式模板，正在提取页面和 Logo");
+                  const result = initialResult?.status === "completed"
+                    ? initialResult
+                    : await waitForTemplateExtraction(selectedProject.id, initialResult?.job_id);
+                  const isFinishedPpt = result?.document_kind === "finished_ppt";
+                  const logoText = Number(result?.extracted_logos || 0) > 0 ? `，识别出 ${result.extracted_logos} 个 Logo` : "";
+                  showToast(isFinishedPpt ? `已学习这份成品 PPT 的版式${logoText}` : `版式模板已上传并提取${logoText}`);
                   await loadReferenceImages(selectedProject.id);
                   await loadTemplatePages(selectedProject.id);
                   await loadProjects();
+                  setAssetsBarExpanded(true);
+                  setTemplateConfirmDismissedProjectId(null);
+                  setTemplateConfirmVisible(true);
                   slides.forEach((s) => markSlideStale(s.id, "content"));
                   addSystemLog(`用户上传了版式模板「${file.name}」`);
                   if (currentAgentRole === "visual") {
-                    appendProjectChatMessage(selectedProject.id, "visual", { role: "user", content: `📑 已上传版式模板：${file.name}`, agentRole: "visual" });
+                    appendProjectChatMessage(selectedProject.id, "visual", {
+                      role: "user",
+                      content: isFinishedPpt
+                        ? `已上传成品 PPT 作为版式参考：${file.name}。我会只学习版式，不读取正文。`
+                        : `已上传版式模板：${file.name}`,
+                      agentRole: "visual",
+                    });
                   }
                 } catch (err: any) {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
@@ -9326,81 +9739,157 @@ function App() {
             </div>
             ) : (
             <div className="pg-composer-shell">
-              {currentAgentRole !== "finetune" && slides.length > 0 && (
-                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-slate-500">
-                  <span>作用范围：{composerRequestContext.scopeLabel}</span>
-                  <div className="flex items-center gap-1">
+              <div className="pg-agent-command-bar">
+                <div className="pg-agent-command-summary">
+                  <div className="pg-agent-command-copy">
+                    <b>{agentScopeHeadline}</b>
+                    {agentSecondaryHint && <span>{agentSecondaryHint}</span>}
+                  </div>
+                  <div className="pg-agent-command-actions">
+                    {currentAgentRole !== "finetune" && slides.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAgentScopePickerOpen((open) => !open);
+                          setAgentMaterialSheetOpen(false);
+                          setAgentAreaPickerOpen(false);
+                        }}
+                        className={`pg-agent-command-chip ${agentScopePickerOpen ? "is-active" : ""}`}
+                        aria-expanded={agentScopePickerOpen}
+                        title="调整本次修改范围"
+                      >
+                        {agentScopeButtonLabel}
+                      </button>
+                    )}
+                    {currentAgentRole !== "finetune" && slides.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAgentAreaPickerOpen((open) => !open);
+                          setAgentScopePickerOpen(false);
+                          setAgentMaterialSheetOpen(false);
+                        }}
+                        className={`pg-agent-command-chip ${agentAreaPickerOpen ? "is-active" : ""}`}
+                        aria-expanded={agentAreaPickerOpen}
+                        title="调整本次修改区域"
+                      >
+                        {agentAreaButtonLabel}
+                      </button>
+                    )}
                     <button
                       type="button"
-                      onClick={() => setAgentMode("page")}
-                      disabled={!editingSlide}
-                      className={`px-2 py-1 rounded-md border transition-colors ${
-                        composerRequestContext.scope === "current_slide"
-                          ? "bg-blue-600 border-blue-600 text-white"
-                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50 disabled:text-slate-300 disabled:hover:bg-white"
-                      }`}
-                      title={editingSlide ? `默认作用于第 ${editingSlide.page_num} 页` : "进入单页后可锁定当前页"}
+                      onClick={() => {
+                        setAgentMaterialSheetOpen((open) => !open);
+                        setAgentScopePickerOpen(false);
+                        setAgentAreaPickerOpen(false);
+                      }}
+                      disabled={!selectedProject || chatLoading || uploadingDoc}
+                      className={`pg-agent-command-chip ${agentMaterialSheetOpen ? "is-active" : ""}`}
+                      aria-expanded={agentMaterialSheetOpen}
+                      title="添加参考材料"
                     >
-                      当前页
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setAgentMode("global")}
-                      className={`px-2 py-1 rounded-md border transition-colors ${
-                        composerRequestContext.scope === "deck"
-                          ? "bg-blue-600 border-blue-600 text-white"
-                          : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
-                      }`}
-                      title="默认作用于整套 PPT"
-                    >
-                      整套 PPT
+                      {uploadingDoc ? "上传中" : agentMaterialCount > 0 ? `参考 ${agentMaterialCount}` : "加参考"}
                     </button>
                   </div>
-                  {composerRequestContext.explicitScope && (
-                    <span className="text-slate-400">已按指令识别</span>
-                  )}
-                  {composerRequestContext.risk === "cost" && (
-                    <span className="text-amber-600">会先确认生图成本</span>
-                  )}
-                  {composerRequestContext.risk === "destructive" && (
-                    <span className="text-amber-600">大范围改动会先确认</span>
-                  )}
                 </div>
-              )}
-              {currentAgentRole !== "finetune" && (
-                <div className="pg-composer-tools">
-                <button
-                  type="button"
-                  onClick={handlePickAgentAttachments}
-                  disabled={!selectedProject || chatLoading || uploadingDoc}
-                  className="pg-composer-attach"
-                  title="添加图片、PDF、PPT、Markdown 等材料"
-                  aria-label="添加材料"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M12 3v10" />
-                    <path d="m8 7 4-4 4 4" />
-                    <path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" />
-                  </svg>
-                  <span>{uploadingDoc ? "上传中..." : "添加材料"}</span>
-                </button>
-                <span className="pg-composer-tools-hint">支持图片、PDF、PPT、MD</span>
+                {currentAgentRole !== "finetune" && slides.length > 0 && agentAreaPickerOpen && (
+                  <div className="pg-agent-area-panel" role="group" aria-label="调整区域">
+                    {agentAreaOptions.map((item) => (
+                      <button
+                        key={item.value}
+                        type="button"
+                        onClick={() => {
+                          setAgentTargetAreaOverride(item.value);
+                          setAgentAreaPickerOpen(false);
+                        }}
+                        className={composerRequestContext.targetArea === item.value ? "is-active" : ""}
+                        title={item.hint}
+                      >
+                        <b>{item.label}</b>
+                        <span>{item.hint}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {currentAgentRole !== "finetune" && slides.length > 0 && agentScopePickerOpen && (
+                  <div className="pg-agent-scope-panel" role="group" aria-label="调整范围">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAgentScope("current_slide");
+                        setAgentScopePickerOpen(false);
+                      }}
+                      disabled={!editingSlide}
+                      className={composerRequestContext.scope === "current_slide" ? "is-active" : ""}
+                      title={editingSlide ? `只修改第 ${editingSlide.page_num} 页` : "进入单页后可用"}
+                    >
+                      <b>当前页</b>
+                      <span>{editingSlide ? `第 ${editingSlide.page_num} 页` : "进入单页可用"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAgentScope("selected_slides");
+                        setAgentScopePickerOpen(false);
+                      }}
+                      disabled={deckSelectedPageNums.length === 0}
+                      className={composerRequestContext.scope === "selected_slides" ? "is-active" : ""}
+                      title={deckSelectedPageNums.length > 0 ? `只修改选中的 ${deckSelectedPageNums.length} 页` : "先在中间选择页面"}
+                    >
+                      <b>选中页</b>
+                      <span>{deckSelectedPageNums.length > 0 ? `${deckSelectedPageNums.length} 页` : "先勾选页面"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAgentScope("deck");
+                        setAgentScopePickerOpen(false);
+                      }}
+                      className={composerRequestContext.scope === "deck" ? "is-active" : ""}
+                      title="修改整套 PPT"
+                    >
+                      <b>整套</b>
+                      <span>{slides.length || 0} 页</span>
+                    </button>
+                  </div>
+                )}
+                {agentMaterialSheetOpen && (
+                  <div className="pg-agent-material-sheet">
+                    <button type="button" onClick={() => { setAgentMaterialSheetOpen(false); handlePickAgentAttachments(); }}>
+                      <b>让 Agent 阅读</b><span>PDF、PPT、Markdown、图片</span>
+                    </button>
+                    <button type="button" onClick={() => { setAgentMaterialSheetOpen(false); styleRefInputRef.current?.click(); }}>
+                      <b>作为视觉参考</b><span>学习气质，不强制出现</span>
+                    </button>
+                    <button type="button" onClick={() => { setAgentMaterialSheetOpen(false); visualAssetInputRef.current?.click(); }}>
+                      <b>必须出现在画面</b><span>产品图、人物、物料</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAgentMaterialSheetOpen(false);
+                        const targetSlide = editingSlide || (deckSelectedPages.size === 1 ? slides.find((slide) => deckSelectedPages.has(slide.page_num)) : null);
+                        if (targetSlide) {
+                          handleUploadPageRef(targetSlide.id);
+                        } else {
+                          showToast("请先进入单页或只选中一页", "info");
+                        }
+                      }}
+                    >
+                      <b>作为本页素材</b><span>只绑定到当前页面</span>
+                    </button>
+                    <button type="button" onClick={() => { setAgentMaterialSheetOpen(false); templateInputRef.current?.click(); }}>
+                      <b>学习模板版式</b><span>PPT、PPTX 或 PDF</span>
+                    </button>
+                  </div>
+                )}
               </div>
-            )}
-          <div className="pg-composer-row flex gap-2">
+              <div className="pg-composer-row flex gap-2">
             <textarea
               ref={chatInputRef}
               className="pg-chat-input flex-1 border border-slate-300 rounded-lg resize-none px-3 py-2.5 text-sm focus:border-blue-400 focus:ring-1 focus:ring-blue-200 outline-none transition-colors"
               style={{ minHeight: 38, overflowY: "hidden" }}
-              placeholder={
-                currentAgentRole === "finetune" && !finetuneTargetSlideId
-                  ? "请先在左侧点击一页..."
-                  : currentStatus === "draft"
-                  ? "输入 PPT 主题或粘贴文档内容..."
-                  : currentAgentRole === "finetune"
-                  ? "告诉我怎么改，也可以添加参考图..."
-                  : "输入指令..."
-              }
+              placeholder={agentComposerPlaceholder}
               value={agentComposerValue}
               onChange={(e) => setChatInput(e.target.value)}
               onInput={autoResizeTextarea}
@@ -9619,10 +10108,387 @@ function App() {
   );
 }
 
+type ContentBlockKind = "markdown" | "table" | "flywheel" | "flow" | "matrix";
+type VisualRouteMode = "blend" | "crop" | "original";
+
+interface ContentBlock {
+  id: string;
+  kind: ContentBlockKind;
+  visual_type?: string;
+  title?: string;
+  markdown?: string;
+  source_spec?: any;
+  route_mode?: VisualRouteMode;
+  rendered_asset_id?: string;
+  source_hash?: string;
+}
+
+const assetRouteToBlockRoute = (route: "blend" | "double_blend" | "overlay"): VisualRouteMode => {
+  if (route === "overlay") return "original";
+  if (route === "double_blend") return "crop";
+  return "blend";
+};
+
+const VISUAL_BLOCK_LABELS: Record<string, string> = {
+  table: "表格",
+  flywheel: "飞轮",
+  flow: "流程图",
+  matrix: "对比矩阵",
+};
+
+const newBlockId = (kind: string) => `${kind}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+
+const defaultVisualBlock = (kind: Exclude<ContentBlockKind, "markdown">): ContentBlock => {
+  const title = VISUAL_BLOCK_LABELS[kind] || "画面素材";
+  const source_spec =
+    kind === "flywheel"
+      ? { center: "增长飞轮", nodes: ["获客", "激活", "留存", "推荐"] }
+      : kind === "flow"
+      ? { steps: ["输入", "处理", "输出"] }
+      : kind === "matrix"
+      ? { columns: ["维度", "方案 A", "方案 B"], rows: [["价值", "", ""], ["成本", "", ""]] }
+      : { columns: ["项目", "说明"], rows: [["要点", "说明"]] };
+  return {
+    id: newBlockId(kind),
+    kind,
+    visual_type: kind,
+    title,
+    source_spec,
+    route_mode: kind === "table" ? "blend" : "crop",
+  };
+};
+
+const splitVisualTextLines = (text: string) =>
+  text
+    .split(/\n|;|；/)
+    .map((line) => line.trim().replace(/^[-*•\d.、\s]+/, "").trim())
+    .filter(Boolean);
+
+const visualBlockFromText = (kind: Exclude<ContentBlockKind, "markdown">, text: string): ContentBlock => {
+  const lines = splitVisualTextLines(text);
+  const block = defaultVisualBlock(kind);
+  if (!lines.length) return block;
+  if (kind === "flywheel") {
+    return {
+      ...block,
+      title: lines[0] || block.title,
+      source_spec: { center: lines[0] || "增长飞轮", nodes: lines.slice(1, 7).length ? lines.slice(1, 7) : lines.slice(0, 6) },
+    };
+  }
+  if (kind === "flow") {
+    return {
+      ...block,
+      title: lines[0] || block.title,
+      source_spec: { steps: lines.slice(0, 8) },
+    };
+  }
+  const rows = lines.map((line) => line.split(/\||\t| {2,}/).map((cell) => cell.trim()).filter(Boolean));
+  return {
+    ...block,
+    title: lines[0] || block.title,
+    source_spec: {
+      columns: rows[0]?.length > 1 ? rows[0] : ["项目", "说明"],
+      rows: rows[0]?.length > 1 ? rows.slice(1) : lines.map((line) => [line, ""]),
+    },
+  };
+};
+
+const normalizeEditorContentBlocks = (content: any, fallbackBody: string): ContentBlock[] => {
+  const raw = Array.isArray(content?.content_blocks) ? content.content_blocks : null;
+  if (!raw) {
+    return [{ id: "body", kind: "markdown", markdown: fallbackBody || "" }];
+  }
+  const blocks = raw
+    .filter((block: any) => block && typeof block === "object")
+    .map((block: any, index: number) => {
+      const kind = String(block.kind || "markdown").toLowerCase() as ContentBlockKind;
+      const id = String(block.id || `block_${index + 1}`);
+      if (kind === "markdown") {
+        return { id, kind: "markdown", markdown: String(block.markdown ?? "") } as ContentBlock;
+      }
+      const normalizedKind: Exclude<ContentBlockKind, "markdown"> =
+        kind === "flywheel" || kind === "flow" || kind === "matrix" || kind === "table" ? kind : "table";
+      return {
+        ...defaultVisualBlock(normalizedKind),
+        ...block,
+        id,
+        kind: normalizedKind,
+        visual_type: block.visual_type || normalizedKind,
+        route_mode: (block.route_mode === "original" || block.route_mode === "crop" || block.route_mode === "blend")
+          ? block.route_mode
+          : defaultVisualBlock(normalizedKind).route_mode,
+      } as ContentBlock;
+    });
+  return blocks.length ? blocks : [{ id: "body", kind: "markdown", markdown: fallbackBody || "" }];
+};
+
+const visualBlockSummary = (block: ContentBlock): string => {
+  const title = block.title || VISUAL_BLOCK_LABELS[block.kind] || "画面素材";
+  const spec = block.source_spec || {};
+  if (block.kind === "flywheel") {
+    const nodes = Array.isArray(spec.nodes) ? spec.nodes.map((node: any) => typeof node === "string" ? node : node?.label).filter(Boolean) : [];
+    return `[画面素材：${title}]\n类型：飞轮图\n节点：${nodes.join(" → ")}`;
+  }
+  if (block.kind === "flow") {
+    const steps = Array.isArray(spec.steps) ? spec.steps.map((step: any) => typeof step === "string" ? step : step?.label).filter(Boolean) : [];
+    return `[画面素材：${title}]\n类型：流程图\n步骤：${steps.join(" → ")}`;
+  }
+  return `[画面素材：${title}]\n类型：${VISUAL_BLOCK_LABELS[block.kind] || "结构图"}`;
+};
+
+const contentBlocksToMarkdown = (blocks: ContentBlock[]): string => {
+  return blocks
+    .map((block) => block.kind === "markdown" ? (block.markdown || "").trim() : visualBlockSummary(block))
+    .filter(Boolean)
+    .join("\n\n");
+};
+
+const EDITOR_MARKDOWN_ALLOWED_TAGS = [
+  "p", "br", "strong", "em", "b", "i", "u", "s",
+  "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+  "code", "pre", "blockquote", "table", "thead", "tbody", "tr", "th", "td", "hr", "a",
+];
+
+const EDITOR_MARKDOWN_ALLOWED_ATTR = ["href", "title", "target", "rel", "colspan", "rowspan"];
+
+const markdownToEditorHtml = (markdown: string): string => {
+  const normalized = normalizeMarkdownEmphasis(markdown || "");
+  const html = (marked.parse(normalized, { async: false }) as string) || "";
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: EDITOR_MARKDOWN_ALLOWED_TAGS,
+    ALLOWED_ATTR: EDITOR_MARKDOWN_ALLOWED_ATTR,
+  });
+};
+
+const visualBlockToEditorHtml = (block: ContentBlock): string =>
+  `<div data-visual-block="true" data-block="${escapeHtml(JSON.stringify(block))}"></div>`;
+
+const inlineNodeText = (node: any): string => {
+  if (!node) return "";
+  if (node.type === "text") {
+    let text = String(node.text || "");
+    const marks = Array.isArray(node.marks) ? node.marks.map((mark: any) => mark.type) : [];
+    if (marks.includes("bold")) text = `**${text}**`;
+    if (marks.includes("italic")) text = `*${text}*`;
+    if (marks.includes("code")) text = `\`${text}\``;
+    return text;
+  }
+  return (node.content || []).map(inlineNodeText).join("");
+};
+
+const markdownFromTiptapNode = (node: any): string => {
+  if (!node) return "";
+  if (node.type === "paragraph") return (node.content || []).map(inlineNodeText).join("");
+  if (node.type === "heading") {
+    const level = Math.max(1, Math.min(4, Number(node.attrs?.level || 2)));
+    return `${"#".repeat(level)} ${(node.content || []).map(inlineNodeText).join("")}`;
+  }
+  if (node.type === "bulletList") {
+    return (node.content || []).map((item: any) => `- ${markdownFromTiptapNode(item).replace(/\n/g, "\n  ")}`).join("\n");
+  }
+  if (node.type === "orderedList") {
+    return (node.content || []).map((item: any, index: number) => `${index + 1}. ${markdownFromTiptapNode(item).replace(/\n/g, "\n   ")}`).join("\n");
+  }
+  if (node.type === "listItem") return (node.content || []).map(markdownFromTiptapNode).join("\n");
+  if (node.type === "blockquote") return (node.content || []).map(markdownFromTiptapNode).join("\n").split("\n").map((line: string) => `> ${line}`).join("\n");
+  if (node.type === "codeBlock") return "```\n" + ((node.content || []).map(inlineNodeText).join("") || "") + "\n```";
+  if (node.type === "horizontalRule") return "---";
+  if (node.type === "hardBreak") return "\n";
+  if (node.type === "table") {
+    const rows = (node.content || []).map((row: any) => (row.content || []).map((cell: any) => (cell.content || []).map(markdownFromTiptapNode).join(" ").trim()));
+    if (!rows.length) return "";
+    const widths = rows[0].map((_: string, i: number) => Math.max(...rows.map((row: string[]) => String(row[i] || "").length), 2));
+    const fmt = (row: string[]) => `| ${widths.map((w: number, i: number) => String(row[i] || "").padEnd(w, " ")).join(" | ")} |`;
+    return [fmt(rows[0]), `| ${widths.map((w: number) => "-".repeat(w)).join(" | ")} |`, ...rows.slice(1).map(fmt)].join("\n");
+  }
+  return (node.content || []).map(markdownFromTiptapNode).join("\n\n");
+};
+
+const tiptapDocFromBlocks = (blocks: ContentBlock[]): string => {
+  const html = blocks
+    .map((block) => block.kind === "markdown" ? markdownToEditorHtml(block.markdown || "") : visualBlockToEditorHtml(block))
+    .filter((part) => part.trim())
+    .join("");
+  return html || "<p></p>";
+};
+
+const tiptapDocToBlocks = (doc: any): ContentBlock[] => {
+  const blocks: ContentBlock[] = [];
+  let markdownBuffer: string[] = [];
+  const flushMarkdown = () => {
+    const markdown = markdownBuffer.join("\n\n").trim();
+    if (markdown || blocks.length === 0) {
+      blocks.push({ id: blocks.length === 0 ? "body" : newBlockId("body"), kind: "markdown", markdown });
+    }
+    markdownBuffer = [];
+  };
+  for (const node of doc?.content || []) {
+    if (node.type === "visualBlock") {
+      flushMarkdown();
+      try {
+        const parsed = JSON.parse(node.attrs?.block || "{}");
+        blocks.push({ ...defaultVisualBlock(parsed.kind || "table"), ...parsed });
+      } catch {
+        blocks.push(defaultVisualBlock("table"));
+      }
+    } else {
+      const md = markdownFromTiptapNode(node).trim();
+      if (md) markdownBuffer.push(md);
+    }
+  }
+  flushMarkdown();
+  return blocks;
+};
+
+const updateVisualBlockSpec = (block: ContentBlock, patch: any): ContentBlock => ({
+  ...block,
+  source_spec: {
+    ...(block.source_spec || {}),
+    ...patch,
+  },
+});
+
+function VisualBlockNodeView(props: any) {
+  const block: ContentBlock = useMemo(() => {
+    try {
+      const parsed = JSON.parse(props.node?.attrs?.block || "{}");
+      const kind = parsed.kind === "flywheel" || parsed.kind === "flow" || parsed.kind === "matrix" || parsed.kind === "table" ? parsed.kind : "table";
+      return { ...defaultVisualBlock(kind), ...parsed };
+    } catch {
+      return defaultVisualBlock("table");
+    }
+  }, [props.node?.attrs?.block]);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const updateBlock = (next: ContentBlock) => props.updateAttributes({ block: JSON.stringify(next) });
+  const spec = block.source_spec || {};
+  const listKey = block.kind === "flow" ? "steps" : "nodes";
+  const listValue = Array.isArray(spec[listKey])
+    ? spec[listKey].map((item: any) => typeof item === "string" ? item : item?.label || "").join("\n")
+    : "";
+  const tableText = Array.isArray(spec.rows)
+    ? [
+        Array.isArray(spec.columns) ? spec.columns.join(" | ") : "",
+        ...spec.rows.map((row: any) => Array.isArray(row) ? row.join(" | ") : String(row || "")),
+      ].filter(Boolean).join("\n")
+    : "";
+  return (
+    <NodeViewWrapper className="my-3" data-visual-block-id={block.id}>
+      <div className="rounded-lg border border-violet-200 bg-violet-50/60 p-3">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="text-[11px] font-semibold text-violet-700 bg-white border border-violet-200 rounded px-2 py-0.5">
+              {VISUAL_BLOCK_LABELS[block.kind] || "画面素材"}
+            </span>
+            <input
+              value={block.title || ""}
+              onChange={(e) => updateBlock({ ...block, title: e.target.value })}
+              className="min-w-0 flex-1 bg-transparent text-sm font-semibold text-slate-800 outline-none"
+              placeholder="素材标题"
+            />
+          </div>
+          <div className="flex items-center gap-1">
+            <button type="button" onClick={() => setAdvancedOpen((v) => !v)} className="text-[11px] text-slate-500 hover:text-slate-700 px-2 py-1 rounded hover:bg-white">
+              {advancedOpen ? "收起" : "编辑结构"}
+            </button>
+            <button type="button" onClick={() => props.deleteNode?.()} className="text-[11px] text-red-500 hover:text-red-600 px-2 py-1 rounded hover:bg-white">
+              删除
+            </button>
+          </div>
+        </div>
+        {block.kind === "flywheel" && (
+          <div className="grid grid-cols-1 gap-2">
+            <input
+              value={spec.center || ""}
+              onChange={(e) => updateBlock(updateVisualBlockSpec(block, { center: e.target.value }))}
+              className="text-xs rounded border border-violet-100 bg-white px-2 py-1.5 outline-none focus:ring-2 focus:ring-violet-200"
+              placeholder="中心词"
+            />
+            <textarea
+              value={listValue}
+              onChange={(e) => updateBlock(updateVisualBlockSpec(block, { nodes: e.target.value.split("\n").map((line) => line.trim()).filter(Boolean) }))}
+              className="text-xs rounded border border-violet-100 bg-white px-2 py-1.5 min-h-[82px] outline-none focus:ring-2 focus:ring-violet-200"
+              placeholder="每行一个节点"
+            />
+          </div>
+        )}
+        {block.kind === "flow" && (
+          <textarea
+            value={listValue}
+            onChange={(e) => updateBlock(updateVisualBlockSpec(block, { steps: e.target.value.split("\n").map((line) => line.trim()).filter(Boolean) }))}
+            className="w-full text-xs rounded border border-violet-100 bg-white px-2 py-1.5 min-h-[92px] outline-none focus:ring-2 focus:ring-violet-200"
+            placeholder="每行一个步骤"
+          />
+        )}
+        {(block.kind === "table" || block.kind === "matrix") && (
+          <textarea
+            value={tableText}
+            onChange={(e) => {
+              const rows = e.target.value.split("\n").map((line) => line.split("|").map((cell) => cell.trim())).filter((row) => row.some(Boolean));
+              updateBlock(updateVisualBlockSpec(block, { columns: rows[0] || [], rows: rows.slice(1) }));
+            }}
+            className="w-full text-xs rounded border border-violet-100 bg-white px-2 py-1.5 min-h-[110px] outline-none focus:ring-2 focus:ring-violet-200 font-mono"
+            placeholder="第一行是表头，使用 | 分隔列"
+          />
+        )}
+	        {advancedOpen && (
+	          <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-violet-100 pt-2">
+	            <label className="text-[11px] text-slate-500">默认素材方式</label>
+	            <div className="pg-mini-segmented" role="group" aria-label="默认素材方式">
+	              {([
+	                ["blend", "智能融合"],
+	                ["crop", "精修融合"],
+	                ["original", "精确粘贴"],
+	              ] as Array<[VisualRouteMode, string]>).map(([value, label]) => (
+	                <button
+	                  key={value}
+	                  type="button"
+	                  className={(block.route_mode || "crop") === value ? "is-active" : ""}
+	                  onClick={() => updateBlock({ ...block, route_mode: value })}
+	                >
+	                  {label}
+	                </button>
+	              ))}
+	            </div>
+	          </div>
+	        )}
+      </div>
+    </NodeViewWrapper>
+  );
+}
+
+const VisualBlockExtension = TiptapNode.create({
+  name: "visualBlock",
+  group: "block",
+  atom: true,
+  draggable: true,
+  addAttributes() {
+    return {
+      block: {
+        default: "{}",
+      },
+    };
+  },
+  parseHTML() {
+    return [{
+      tag: "div[data-visual-block]",
+      getAttrs: (element) => ({
+        block: element instanceof HTMLElement ? element.getAttribute("data-block") || "{}" : "{}",
+      }),
+    }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { ...HTMLAttributes, "data-visual-block": "true", "data-block": HTMLAttributes.block || "{}" }];
+  },
+  addNodeView() {
+    return ReactNodeViewRenderer(VisualBlockNodeView);
+  },
+});
+
 interface EditorState {
   headline: string;
   subhead: string;
   body: string;
+  contentBlocks: ContentBlock[];
 }
 
 interface SlideEditChangeSet {
@@ -9710,17 +10576,8 @@ function SingleSlideEditor({
     return "";
   };
   const [body, setBody] = useState<string>(normalizeBody(text.body));
+  const [contentBlocks, setContentBlocks] = useState<ContentBlock[]>(() => normalizeEditorContentBlocks(content, normalizeBody(text.body)));
   const [bodyEmpty, setBodyEmpty] = useState(!body || body.trim() === "");
-  const bodyEditorRef = useRef<HTMLDivElement>(null);
-  const turndownRef = useRef(
-    (() => {
-      const service = new TurndownService({ headingStyle: "atx", bulletListMarker: "-", codeBlockStyle: "fenced" });
-      // GFM 表格 + 删除线插件，确保 <table> 能反向转回 markdown 管道符语法，不被展平成纯文本
-      service.use(gfmTables);
-      service.use(gfmStrikethrough);
-      return service;
-    })()
-  );
   const [speakerNotes, setSpeakerNotes] = useState(unescapeText(content.speaker_notes || ""));
 
   // 视觉方案编辑状态
@@ -9732,10 +10589,63 @@ function SingleSlideEditor({
     headline: unescapeText(text.headline || ""),
     subhead: unescapeText(text.subhead || ""),
     body: normalizeBody(text.body),
+    contentBlocks: normalizeEditorContentBlocks(content, normalizeBody(text.body)),
   };
   const [history, setHistory] = useState<EditorState[]>([initialState]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const isUndoingRef = useRef(false);
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
+  const [insertMenuOpen, setInsertMenuOpen] = useState(false);
+  const [bodyEditMode, setBodyEditMode] = useState<"canvas" | "markdown">("canvas");
+  const [markdownModeEntryBody, setMarkdownModeEntryBody] = useState(body);
+  const [hasEditorSelection, setHasEditorSelection] = useState(false);
+
+  const editor = useEditor({
+    extensions: [
+      StarterKit,
+      Underline,
+      Table.configure({ resizable: true }),
+      TableRow,
+      TableHeader,
+      TableCell,
+      VisualBlockExtension,
+    ],
+    content: tiptapDocFromBlocks(contentBlocks),
+    editorProps: {
+      attributes: {
+        class: "pg-tiptap prose prose-sm max-w-none min-h-[220px] p-4 outline-none",
+      },
+      handleKeyDown: (_view, event) => {
+        if (event.key === "/" && !event.metaKey && !event.ctrlKey && !event.altKey) {
+          setSlashMenuOpen(true);
+          setInsertMenuOpen(false);
+          return false;
+        }
+        if (event.key === "Escape") {
+          setSlashMenuOpen(false);
+          setInsertMenuOpen(false);
+          return false;
+        }
+        if (event.key === "Enter" || event.key === " ") {
+          setSlashMenuOpen(false);
+          setInsertMenuOpen(false);
+        }
+        return false;
+      },
+    },
+    onSelectionUpdate: ({ editor: activeEditor }) => {
+      const { from, to } = activeEditor.state.selection;
+      setHasEditorSelection(from !== to);
+    },
+    onUpdate: ({ editor: activeEditor }) => {
+      if (isUndoingRef.current) return;
+      const nextBlocks = tiptapDocToBlocks(activeEditor.getJSON());
+      const nextBody = normalizeMarkdownEmphasis(contentBlocksToMarkdown(nextBlocks));
+      setContentBlocks(nextBlocks);
+      setBody(nextBody);
+      setBodyEmpty(!nextBody.trim());
+    },
+  }, [slide.id]);
 
   // Markdown 快捷键：Ctrl/Cmd + B/I/K
   const applyMarkdownShortcut = (
@@ -9796,16 +10706,28 @@ function SingleSlideEditor({
     }, 0);
   };
 
-  const getCurrentState = (): EditorState => {
-    let currentBody = body;
-    const bodyEl = bodyEditorRef.current;
-    if (bodyEl?.matches(":focus")) {
-      currentBody = normalizeMarkdownEmphasis(turndownRef.current.turndown(bodyEl.innerHTML));
+  const getCurrentBlocks = (): ContentBlock[] => {
+    if (bodyEditMode === "markdown") {
+      const normalizedBody = normalizeMarkdownEmphasis(body);
+      if (normalizedBody === markdownModeEntryBody) return contentBlocks;
+      return [{ id: "body", kind: "markdown", markdown: normalizedBody }];
     }
+    return editor ? tiptapDocToBlocks(editor.getJSON()) : contentBlocks;
+  };
+
+  const getCurrentBody = (blocks: ContentBlock[] = getCurrentBlocks()): string => {
+    if (bodyEditMode === "markdown") return normalizeMarkdownEmphasis(body);
+    return normalizeMarkdownEmphasis(contentBlocksToMarkdown(blocks));
+  };
+
+  const getCurrentState = (): EditorState => {
+    const currentBlocks = getCurrentBlocks();
+    const currentBody = getCurrentBody(currentBlocks);
     return {
       headline,
       subhead,
       body: currentBody,
+      contentBlocks: currentBlocks,
     };
   };
 
@@ -9818,7 +10740,8 @@ function SingleSlideEditor({
         top &&
         top.headline === state.headline &&
         top.subhead === state.subhead &&
-        top.body === state.body
+        top.body === state.body &&
+        JSON.stringify(top.contentBlocks) === JSON.stringify(state.contentBlocks)
       ) {
         return prev;
       }
@@ -9837,6 +10760,10 @@ function SingleSlideEditor({
     setHeadline(state.headline);
     setSubhead(state.subhead);
     setBody(state.body);
+    setContentBlocks(state.contentBlocks);
+    setBodyEditMode("canvas");
+    setMarkdownModeEntryBody(state.body);
+    editor?.commands.setContent(tiptapDocFromBlocks(state.contentBlocks), { emitUpdate: false });
     setTimeout(() => {
       isUndoingRef.current = false;
     }, 0);
@@ -9890,7 +10817,8 @@ function SingleSlideEditor({
       top &&
       top.headline === current.headline &&
       top.subhead === current.subhead &&
-      top.body === current.body
+      top.body === current.body &&
+      JSON.stringify(top.contentBlocks) === JSON.stringify(current.contentBlocks)
     ) {
       return;
     }
@@ -9902,6 +10830,7 @@ function SingleSlideEditor({
   const [pageActionLoading, setPageActionLoading] = useState<"plan" | "image" | null>(null);
   const [rerollingPlan, setRerollingPlan] = useState(false);
   const [assetRouteLoading, setAssetRouteLoading] = useState<string | null>(null);
+  const [materialsOpen, setMaterialsOpen] = useState(false);
 
   // 保存当前编辑内容（不退出）
   const handleSave = async (options?: { quiet?: boolean }): Promise<SaveResult> => {
@@ -9910,21 +10839,21 @@ function SingleSlideEditor({
     const originalHeadline = unescapeText(text.headline || "");
     const originalSubhead = unescapeText(text.subhead || "");
     const originalBody = normalizeBody(text.body);
+    const originalBlocks = normalizeEditorContentBlocks(content, originalBody);
     const originalSpeakerNotes = unescapeText(content.speaker_notes || "");
 
-    // 如果正文编辑器还在聚焦，先读取最新内容
-    let currentBody = body;
-    const bodyEl = bodyEditorRef.current;
-    if (bodyEl?.matches(":focus")) {
-      currentBody = normalizeMarkdownEmphasis(turndownRef.current.turndown(bodyEl.innerHTML));
-      setBody(currentBody);
-      setBodyEmpty(!currentBody || currentBody.trim() === "");
-    }
+    const currentBlocks = getCurrentBlocks();
+    const currentBody = getCurrentBody(currentBlocks);
+    setBody(currentBody);
+    setContentBlocks(currentBlocks);
+    setBodyEmpty(!currentBody || currentBody.trim() === "");
+    if (bodyEditMode === "markdown") setMarkdownModeEntryBody(currentBody);
 
     const hasContentChange =
       headline !== originalHeadline ||
       subhead !== originalSubhead ||
       currentBody !== originalBody ||
+      JSON.stringify(currentBlocks) !== JSON.stringify(originalBlocks) ||
       speakerNotes !== originalSpeakerNotes;
 
     const saveData = {
@@ -9932,6 +10861,7 @@ function SingleSlideEditor({
       type: slide.type,
       section_title: content.section_title || "",
       text_content: { headline, subhead, body: currentBody },
+      content_blocks: currentBlocks,
       speaker_notes: speakerNotes,
       visual_suggestion: content.visual_suggestion || "",
     };
@@ -10021,10 +10951,12 @@ function SingleSlideEditor({
     if (slide.content_json !== prevContentRef.current && !isUndoingRef.current) {
       prevContentRef.current = slide.content_json;
       const newText = slide.content_json?.text_content || {};
+      const nextBlocks = normalizeEditorContentBlocks(slide.content_json || {}, normalizeBody(newText.body));
       const newState: EditorState = {
         headline: unescapeText(newText.headline || ""),
         subhead: unescapeText(newText.subhead || ""),
         body: normalizeBody(newText.body),
+        contentBlocks: nextBlocks,
       };
       // 先 push 当前旧状态，再 push Agent 新状态，这样 undo/redo 链路完整
       setHistory((prev) => {
@@ -10043,6 +10975,10 @@ function SingleSlideEditor({
       setHeadline(newState.headline);
       setSubhead(newState.subhead);
       setBody(newState.body);
+      setContentBlocks(nextBlocks);
+      setBodyEditMode("canvas");
+      setMarkdownModeEntryBody(newState.body);
+      editor?.commands.setContent(tiptapDocFromBlocks(nextBlocks), { emitUpdate: false });
       setSpeakerNotes(unescapeText(slide.content_json?.speaker_notes || ""));
     }
     // 同步 visual_description
@@ -10052,64 +10988,130 @@ function SingleSlideEditor({
     }
   });
 
-  // 同步 body Markdown → contentEditable HTML（仅在非聚焦时，避免覆盖用户输入）
-  useEffect(() => {
-    const el = bodyEditorRef.current;
-    if (!el || el.matches(":focus")) return;
-    const normalizedBody = normalizeMarkdownEmphasis(body || "");
-    let html = (marked.parse(normalizedBody, { async: false }) as string) || "<p><br></p>";
-    html = fixMarkedBoldHtml(html);
-    // 给编辑器内表格附上样式，避免没有边框看起来像被展平
-    html = html.replace(/<table\b/g, '<table class="table-auto w-full text-sm border border-slate-300 my-2"');
-    html = html.replace(/<thead\b/g, '<thead class="bg-slate-100"');
-    html = html.replace(/<th\b/g, '<th class="border border-slate-300 px-2 py-1 text-left font-medium"');
-    html = html.replace(/<td\b/g, '<td class="border border-slate-300 px-2 py-1 align-top"');
-    const safeHtml = DOMPurify.sanitize(html, {
-      ALLOWED_TAGS: [
-        "p", "br", "strong", "em", "b", "i", "u",
-        "ul", "ol", "li",
-        "h1", "h2", "h3", "h4", "h5", "h6",
-        "code", "pre", "span", "div",
-        "table", "thead", "tbody", "tr", "th", "td",
-        "del", "s",
-      ],
-      ALLOWED_ATTR: ["class", "style"],
-    });
-    if (el.innerHTML !== safeHtml) {
-      el.innerHTML = safeHtml;
-    }
-  }, [body]);
-
   // body 变更时同步空状态
   useEffect(() => {
     setBodyEmpty(!body || body.trim() === "");
   }, [body]);
 
-  // 正文编辑器失焦：HTML → Markdown
-  const handleBodyBlur = () => {
-    const el = bodyEditorRef.current;
-    if (!el) return;
-    const html = el.innerHTML;
-    const md = normalizeMarkdownEmphasis(turndownRef.current.turndown(html));
-    setBody(md);
-    setBodyEmpty(!md || md.trim() === "");
+  const handleEditorBlur = () => {
+    if (!editor || bodyEditMode === "markdown") return;
+    const nextBlocks = tiptapDocToBlocks(editor.getJSON());
+    const nextBody = normalizeMarkdownEmphasis(contentBlocksToMarkdown(nextBlocks));
+    setContentBlocks(nextBlocks);
+    setBody(nextBody);
+    setBodyEmpty(!nextBody.trim());
     handleBlurPushHistory();
   };
 
-  // 正文输入时实时检测是否为空
-  const handleBodyInput = () => {
-    const el = bodyEditorRef.current;
-    if (!el) return;
-    const empty = el.innerText.trim() === "";
-    setBodyEmpty(empty);
+  const enterMarkdownMode = () => {
+    const nextBlocks = editor ? tiptapDocToBlocks(editor.getJSON()) : contentBlocks;
+    const nextBody = normalizeMarkdownEmphasis(contentBlocksToMarkdown(nextBlocks));
+    setContentBlocks(nextBlocks);
+    setBody(nextBody);
+    setBodyEmpty(!nextBody.trim());
+    setMarkdownModeEntryBody(nextBody);
+    setBodyEditMode("markdown");
+    setSlashMenuOpen(false);
+    setInsertMenuOpen(false);
   };
 
-  // 富文本工具栏命令
-  const execEditorCmd = (cmd: string, value?: string) => {
-    const el = bodyEditorRef.current;
-    if (!el) return;
-    el.focus();
-    document.execCommand(cmd, false, value);
+  const enterCanvasMode = () => {
+    const normalizedBody = normalizeMarkdownEmphasis(body);
+    let nextBlocks = contentBlocks;
+    if (normalizedBody !== markdownModeEntryBody) {
+      nextBlocks = [{ id: "body", kind: "markdown", markdown: normalizedBody }];
+      setContentBlocks(nextBlocks);
+      setBody(normalizedBody);
+      setBodyEmpty(!normalizedBody.trim());
+    }
+    editor?.commands.setContent(tiptapDocFromBlocks(nextBlocks), { emitUpdate: false });
+    setMarkdownModeEntryBody(normalizedBody);
+    setBodyEditMode("canvas");
+    setSlashMenuOpen(false);
+    setInsertMenuOpen(false);
+  };
+
+  const removeSlashTrigger = () => {
+    if (!editor) return undefined;
+    const { from } = editor.state.selection;
+    let chain = editor.chain().focus();
+    if (slashMenuOpen && from > 1 && editor.state.doc.textBetween(from - 1, from) === "/") {
+      chain = chain.deleteRange({ from: from - 1, to: from });
+    }
+    return chain;
+  };
+
+  const closeInsertMenus = () => {
+    setSlashMenuOpen(false);
+    setInsertMenuOpen(false);
+  };
+
+  const runTextBlockCommand = (command: "paragraph" | "heading2" | "heading3" | "bullet" | "ordered" | "quote") => {
+    if (!editor) return;
+    const chain = removeSlashTrigger();
+    if (!chain) return;
+    if (command === "heading2") chain.toggleHeading({ level: 2 }).run();
+    if (command === "heading3") chain.toggleHeading({ level: 3 }).run();
+    if (command === "bullet") chain.toggleBulletList().run();
+    if (command === "ordered") chain.toggleOrderedList().run();
+    if (command === "quote") chain.toggleBlockquote().run();
+    if (command === "paragraph") chain.setParagraph().run();
+    closeInsertMenus();
+  };
+
+  const indentListItem = () => {
+    editor?.chain().focus().sinkListItem("listItem").run();
+  };
+
+  const outdentListItem = () => {
+    editor?.chain().focus().liftListItem("listItem").run();
+  };
+
+  const topLevelInsertPosition = () => {
+    if (!editor) return null;
+    const { $from } = editor.state.selection;
+    for (let depth = $from.depth; depth > 0; depth -= 1) {
+      if ($from.node(depth - 1).type.name === "doc") return $from.after(depth);
+    }
+    return editor.state.selection.to;
+  };
+
+  const insertVisualBlock = (kind: Exclude<ContentBlockKind, "markdown">) => {
+    if (!editor) return;
+    const { from, to } = editor.state.selection;
+    const selectedText = editor.state.doc.textBetween(from, to, "\n").trim();
+    const block = selectedText ? visualBlockFromText(kind, selectedText) : defaultVisualBlock(kind);
+    const node = { type: "visualBlock", attrs: { block: JSON.stringify(block) } };
+    const slashTriggered = slashMenuOpen && from > 1 && editor.state.doc.textBetween(from - 1, from) === "/";
+    let chain = editor.chain().focus();
+    if (from !== to) {
+      chain = chain.deleteRange({ from, to });
+      chain.insertContent(node).run();
+    } else if (slashTriggered) {
+      chain = chain.deleteRange({ from: from - 1, to: from });
+      chain.insertContent(node).run();
+    } else {
+      const insertAt = topLevelInsertPosition();
+      if (insertAt !== null) editor.chain().focus().insertContentAt(insertAt, node).run();
+    }
+    closeInsertMenus();
+  };
+
+  const insertTableBlock = () => {
+    if (!editor) return;
+    const { from } = editor.state.selection;
+    const slashTriggered = slashMenuOpen && from > 1 && editor.state.doc.textBetween(from - 1, from) === "/";
+    let chain = editor.chain().focus();
+    if (slashTriggered) {
+      chain = chain.deleteRange({ from: from - 1, to: from });
+      chain.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run();
+    } else {
+      const insertAt = topLevelInsertPosition();
+      if (insertAt !== null) {
+        chain.setTextSelection(insertAt).insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run();
+      }
+    }
+    closeInsertMenus();
   };
 
   const projectAssetById = useMemo(() => {
@@ -10194,6 +11196,7 @@ function SingleSlideEditor({
     : `参考图 ${imageReferenceInputCount}/14 · 会稍慢`;
   const pageReferenceLabel = (ref: any) => {
     const analysis = ref?.asset_analysis || {};
+    if (analysis.source === "content_block") return "正文画面素材";
     const page = ref?.source_page_num || analysis.pptx_source_page_num;
     const groupIndex = analysis.asset_group_index;
     const groupSize = analysis.asset_group_size;
@@ -10202,6 +11205,24 @@ function SingleSlideEditor({
     }
     if (page) return `原 PPT 第 ${page} 页参考图`;
     return "本页上传素材";
+  };
+
+  const updateContentBlockRouteForRef = (ref: any, route: AssetRoute): ContentBlock[] | null => {
+    const blockId = String(ref?.asset_analysis?.content_block_id || "");
+    if (!blockId) return null;
+    const nextRoute = assetRouteToBlockRoute(route);
+    const currentBlocks = editor ? tiptapDocToBlocks(editor.getJSON()) : contentBlocks;
+    const matched = currentBlocks.some((block) => block.id === blockId || block.rendered_asset_id === ref.id);
+    if (!matched) return null;
+    const nextBlocks = currentBlocks.map((block) =>
+      block.id === blockId || block.rendered_asset_id === ref.id
+        ? { ...block, route_mode: nextRoute, rendered_asset_id: ref.id }
+        : block
+    );
+    setContentBlocks(nextBlocks);
+    setBody(normalizeMarkdownEmphasis(contentBlocksToMarkdown(nextBlocks)));
+    editor?.commands.setContent(tiptapDocFromBlocks(nextBlocks), { emitUpdate: false });
+    return nextBlocks;
   };
 
   const setPageReferenceRoute = async (ref: any, route: AssetRoute) => {
@@ -10229,10 +11250,23 @@ function SingleSlideEditor({
         }
         await updateReferenceImage(projectId, refId, { process_mode: routeProcessMode(route) });
       }
+      const nextBlocks = updateContentBlockRouteForRef(ref, route);
+      if (nextBlocks) {
+        const nextBody = normalizeMarkdownEmphasis(contentBlocksToMarkdown(nextBlocks));
+        await updateSlideContent(projectId, slide.page_num, {
+          page_num: slide.page_num,
+          type: slide.type,
+          section_title: slide.content_json?.section_title || "",
+          text_content: { headline, subhead, body: nextBody },
+          content_blocks: nextBlocks,
+          speaker_notes: speakerNotes,
+          visual_suggestion: slide.content_json?.visual_suggestion || "",
+        }, slide.id);
+      }
       markSlideStale?.(slide.id, "visual");
       await onSaved?.();
       onToast?.(`已切换为${routeLabel(route)}`, "success");
-      onSystemLog?.(`用户将第 ${slide.page_num} 页本页参考图切换为${routeLabel(route)}`);
+      onSystemLog?.(`用户将第 ${slide.page_num} 页本页画面素材切换为${routeLabel(route)}`);
     } catch (err: any) {
       try {
         await onSaved?.();
@@ -10296,6 +11330,8 @@ function SingleSlideEditor({
   const showContentStale = staleStatus?.content && hasVisualPlan && pastContentPlanning;
   const showVisualStale = staleStatus?.visual;
   const showImageStale = staleStatus?.image;
+  const materialCount = pageReferenceItems.length + blendProjectAssets.length + overlayProjectAssets.length;
+  const contentBlockMaterialCount = pageReferenceItems.filter((ref: any) => ref?.asset_analysis?.source === "content_block").length;
 
   return (
     <div className="pg-editor pg-single-slide-editor max-w-3xl mx-auto bg-white rounded border shadow-sm p-6">
@@ -10525,59 +11561,213 @@ function SingleSlideEditor({
         />
       </div>
 
-      {/* 正文（所见即所得） */}
+      {/* 正文 */}
       <div className="mb-6">
-        <label className="text-xs text-gray-500 mb-1 block font-medium">正文</label>
-        <div className="pg-rich-editor border border-gray-200 rounded focus-within:ring-2 focus-within:ring-blue-300 focus-within:border-transparent">
-          <div className="flex items-center gap-1 px-2 py-1 border-b border-gray-100 bg-gray-50 rounded-t">
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <label className="text-xs text-gray-500 block font-medium">正文</label>
+          <div className="pg-editor-mode-switch" role="group" aria-label="正文编辑模式">
             <button
               type="button"
-              onClick={() => execEditorCmd("bold")}
-              className="text-xs px-2 py-0.5 rounded hover:bg-gray-200 font-bold"
-              title="加粗 (Ctrl+B)"
+              className={bodyEditMode === "canvas" ? "is-active" : ""}
+              onClick={bodyEditMode === "canvas" ? undefined : enterCanvasMode}
             >
-              B
+              画布
             </button>
             <button
               type="button"
-              onClick={() => execEditorCmd("italic")}
-              className="text-xs px-2 py-0.5 rounded hover:bg-gray-200 italic"
-              title="斜体 (Ctrl+I)"
+              className={bodyEditMode === "markdown" ? "is-active" : ""}
+              onClick={bodyEditMode === "markdown" ? undefined : enterMarkdownMode}
             >
-              I
-            </button>
-            <button
-              type="button"
-              onClick={() => execEditorCmd("insertUnorderedList")}
-              className="text-xs px-2 py-0.5 rounded hover:bg-gray-200"
-              title="无序列表"
-            >
-              · 列表
-            </button>
-            <button
-              type="button"
-              onClick={() => execEditorCmd("insertOrderedList")}
-              className="text-xs px-2 py-0.5 rounded hover:bg-gray-200"
-              title="有序列表"
-            >
-              1. 列表
+              Markdown
             </button>
           </div>
-          <div className="relative">
-            {bodyEmpty && (
-              <div className="absolute top-3 left-3 text-gray-400 text-sm pointer-events-none select-none">
-                输入正文内容...
+        </div>
+        <div className={`pg-rich-editor border border-gray-200 rounded focus-within:ring-2 focus-within:ring-blue-300 focus-within:border-transparent ${bodyEditMode === "markdown" ? "pg-rich-editor-source" : ""}`}>
+          {bodyEditMode === "canvas" ? (
+            <>
+              <div className="pg-doc-toolbar flex flex-wrap items-center gap-1 px-2 py-1.5 border-b border-gray-100 bg-gray-50 rounded-t">
+                <button
+                  type="button"
+                  onClick={() => editor?.chain().focus().toggleBold().run()}
+                  className={`pg-tool-button font-bold ${editor?.isActive("bold") ? "is-active" : ""}`}
+                  title="加粗 (Ctrl+B)"
+                  aria-label="加粗"
+                >
+                  B
+                </button>
+                <button
+                  type="button"
+                  onClick={() => editor?.chain().focus().toggleItalic().run()}
+                  className={`pg-tool-button italic ${editor?.isActive("italic") ? "is-active" : ""}`}
+                  title="斜体 (Ctrl+I)"
+                  aria-label="斜体"
+                >
+                  I
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runTextBlockCommand("heading2")}
+                  className={`pg-tool-button ${editor?.isActive("heading", { level: 2 }) ? "is-active" : ""}`}
+                  title="二级标题"
+                  aria-label="二级标题"
+                >
+                  H2
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runTextBlockCommand("heading3")}
+                  className={`pg-tool-button ${editor?.isActive("heading", { level: 3 }) ? "is-active" : ""}`}
+                  title="三级标题"
+                  aria-label="三级标题"
+                >
+                  H3
+                </button>
+                <div className="pg-toolbar-divider" />
+                <button
+                  type="button"
+                  onClick={() => runTextBlockCommand("bullet")}
+                  className={`pg-tool-button ${editor?.isActive("bulletList") ? "is-active" : ""}`}
+                  title="项目列表"
+                  aria-label="项目列表"
+                >
+                  •
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runTextBlockCommand("ordered")}
+                  className={`pg-tool-button ${editor?.isActive("orderedList") ? "is-active" : ""}`}
+                  title="编号列表"
+                  aria-label="编号列表"
+                >
+                  1.
+                </button>
+                <button
+                  type="button"
+                  onClick={outdentListItem}
+                  className="pg-tool-button"
+                  title="减少缩进"
+                  aria-label="减少缩进"
+                >
+                  ←
+                </button>
+                <button
+                  type="button"
+                  onClick={indentListItem}
+                  className="pg-tool-button"
+                  title="增加缩进"
+                  aria-label="增加缩进"
+                >
+                  →
+                </button>
+                <div className="pg-toolbar-divider" />
+                <button type="button" onClick={insertTableBlock} className="pg-tool-button pg-tool-button-text" title="插入表格">
+                  表格
+                </button>
+                <button type="button" onClick={() => insertVisualBlock("flywheel")} className="pg-tool-button pg-tool-button-text pg-tool-button-accent" title="插入飞轮">
+                  飞轮
+                </button>
+                <button type="button" onClick={() => insertVisualBlock("flow")} className="pg-tool-button pg-tool-button-text pg-tool-button-accent" title="插入流程图">
+                  流程
+                </button>
+                <button type="button" onClick={() => insertVisualBlock("matrix")} className="pg-tool-button pg-tool-button-text pg-tool-button-accent" title="插入对比矩阵">
+                  矩阵
+                </button>
+                {hasEditorSelection && (
+                  <>
+                    <div className="pg-toolbar-divider" />
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => insertVisualBlock("flow")}
+                      className="pg-tool-button pg-tool-button-text pg-tool-button-convert"
+                      title="把选中文字转成流程图"
+                    >
+                      转流程
+                    </button>
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => insertVisualBlock("flywheel")}
+                      className="pg-tool-button pg-tool-button-text pg-tool-button-convert"
+                      title="把选中文字转成飞轮"
+                    >
+                      转飞轮
+                    </button>
+                  </>
+                )}
               </div>
-            )}
-            <div
-              ref={bodyEditorRef}
-              contentEditable
-              onInput={handleBodyInput}
-              onBlur={handleBodyBlur}
-              className="w-full text-sm p-3 min-h-[120px] prose prose-sm max-w-none outline-none"
-              suppressContentEditableWarning
+              <div className="pg-doc-canvas relative">
+                <button
+                  type="button"
+                  className="pg-block-plus"
+                  title="插入内容"
+                  aria-label="插入内容"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    editor?.chain().focus().run();
+                    setInsertMenuOpen((open) => !open);
+                    setSlashMenuOpen(false);
+                  }}
+                >
+                  +
+                </button>
+                {(slashMenuOpen || insertMenuOpen) && (
+                  <div className={`pg-insert-menu ${insertMenuOpen ? "is-from-plus" : ""}`}>
+                    <div className="pg-insert-menu-section">
+                      <div className="pg-insert-menu-title">文本</div>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => runTextBlockCommand("paragraph")}>
+                        <span>¶</span><b>正文</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => runTextBlockCommand("heading2")}>
+                        <span>H2</span><b>二级标题</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => runTextBlockCommand("bullet")}>
+                        <span>•</span><b>项目列表</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => runTextBlockCommand("ordered")}>
+                        <span>1.</span><b>编号列表</b>
+                      </button>
+                    </div>
+                    <div className="pg-insert-menu-section">
+                      <div className="pg-insert-menu-title">结构</div>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={insertTableBlock}>
+                        <span>▦</span><b>表格</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => insertVisualBlock("flywheel")}>
+                        <span>◎</span><b>飞轮</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => insertVisualBlock("flow")}>
+                        <span>→</span><b>流程图</b>
+                      </button>
+                      <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => insertVisualBlock("matrix")}>
+                        <span>⊞</span><b>对比矩阵</b>
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {bodyEmpty && (
+                  <div className="absolute top-4 left-4 text-gray-400 text-sm pointer-events-none select-none">
+                    输入正文，或按 / 插入结构...
+                  </div>
+                )}
+                <div onBlur={handleEditorBlur}>
+                  <EditorContent editor={editor} />
+                </div>
+              </div>
+            </>
+          ) : (
+            <textarea
+              value={body}
+              onChange={(e) => {
+                setBody(e.target.value);
+                setBodyEmpty(!e.target.value.trim());
+              }}
+              onKeyDown={(e) => applyMarkdownShortcut(e, setBody)}
+              onBlur={handleBlurPushHistory}
+              className="pg-markdown-source"
+              placeholder="用 Markdown 编辑正文..."
             />
-          </div>
+          )}
         </div>
       </div>
 
@@ -10593,10 +11783,14 @@ function SingleSlideEditor({
         />
       </div>
 
-      {/* 本页图片确认 */}
+      {/* 本页画面素材 */}
       <div className="mb-6">
-        <div className="flex items-center gap-1.5 mb-2">
-          <label className="text-xs text-gray-500 font-medium">本页图片确认</label>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="flex items-center gap-1.5">
+          <label className="text-xs text-gray-500 font-medium">本页画面素材</label>
+          <span className="text-[11px] text-slate-500 bg-slate-100 rounded-full px-2 py-0.5">
+            {materialCount} 个{contentBlockMaterialCount ? ` · ${contentBlockMaterialCount} 个来自正文` : ""}
+          </span>
           {imageReferenceInputCount >= 8 && (
             <span className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
               {imageReferenceBadgeText}
@@ -10605,12 +11799,21 @@ function SingleSlideEditor({
           <div className="relative group">
             <span className="text-xs text-gray-400 cursor-help">ⓘ</span>
             <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-1 hidden group-hover:block w-64 bg-gray-800 text-white text-[11px] rounded-lg px-3 py-2 shadow-lg z-50">
-              <p className="mb-1">这里列出本页会出现的图片素材。</p>
-              <p>你可以保留系统推荐，也可以改成更保真或原样保留。</p>
+              <p className="mb-1">这里列出本页会进入画面的素材。</p>
+              <p>图片、图表和正文生成的结构图都可以在这里选择融合或原样保留。</p>
               <div className="absolute left-1/2 -translate-x-1/2 top-full w-2 h-2 bg-gray-800 rotate-45" />
             </div>
           </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setMaterialsOpen((open) => !open)}
+            className="text-xs text-slate-600 border border-slate-200 rounded px-2.5 py-1 hover:bg-slate-50"
+          >
+            {materialsOpen ? "收起" : "展开"}
+          </button>
         </div>
+        {materialsOpen && (
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 mb-2">
           <div className="grid grid-cols-3 gap-2 text-[11px] mb-3">
             <div className="rounded bg-white border border-slate-200 p-2">
@@ -10648,7 +11851,7 @@ function SingleSlideEditor({
                           markSlideStale?.(slide.id, "visual");
                           onSaved?.();
                           onToast?.("已删除", "success");
-                          onSystemLog?.(`用户删除了第 ${slide.page_num} 页的本页参考图`);
+                          onSystemLog?.(`用户删除了第 ${slide.page_num} 页的本页画面素材`);
                         } catch (err: any) {
                           onToast?.("删除失败：" + (err.message || "未知错误"), "error");
                         }
@@ -10660,7 +11863,7 @@ function SingleSlideEditor({
                     </button>
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="text-xs font-semibold text-slate-700 truncate">{ref.asset_name || ref.asset_analysis?.subject || "本页参考图"}</div>
+                    <div className="text-xs font-semibold text-slate-700 truncate">{ref.asset_name || ref.asset_analysis?.subject || "本页画面素材"}</div>
                     <div className="text-[11px] text-slate-500 mt-0.5">{pageReferenceLabel(ref)} · {routeLabel(route)}</div>
                   </div>
                   <div className="flex gap-1">
@@ -10775,6 +11978,7 @@ function SingleSlideEditor({
             )}
           </div>
         </div>
+        )}
         <button
           onClick={() => {
             const input = document.createElement("input");
@@ -10788,13 +11992,13 @@ function SingleSlideEditor({
                 for (const file of files) {
                   await uploadFile(projectId, file, "content_ref", slide.id, "blend", {
                     asset_name: file.name.replace(/\.[^.]+$/, ""),
-                    usage_note: "用户从单页上传的本页参考图",
+                    usage_note: "用户上传的本页画面素材",
                   });
                 }
                 markSlideStale?.(slide.id, "visual");
                 await onSaved?.();
-                onToast?.(files.length > 1 ? `已加入 ${files.length} 张本页参考图` : "已加入本页参考图", "success");
-                onSystemLog?.(`用户为第 ${slide.page_num} 页上传了 ${files.length} 张本页参考图`);
+                onToast?.(files.length > 1 ? `已加入 ${files.length} 个本页画面素材` : "已加入本页画面素材", "success");
+                onSystemLog?.(`用户为第 ${slide.page_num} 页上传了 ${files.length} 个本页画面素材`);
               } catch (err: any) {
                 onToast?.("上传失败：" + (err.message || "未知错误"), "error");
               }
@@ -10803,7 +12007,7 @@ function SingleSlideEditor({
           }}
           className="text-xs bg-gray-100 text-gray-600 px-2 py-1 rounded hover:bg-gray-200"
         >
-          + 本页参考图
+          + 添加画面素材
         </button>
       </div>
 

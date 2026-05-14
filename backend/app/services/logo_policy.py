@@ -9,6 +9,8 @@ LOGO_PLACEMENTS = LOGO_ANCHORS | {"center", "lower-center", "title-block-center"
 LOGO_RENDER_VARIANTS = {"full", "symbol", "omit"}
 LOGO_REVIEW_CONFIRMED_STATUSES = {"auto_confirmed", "user_confirmed"}
 LOGO_REVIEW_NON_CONFIRMED_STATUSES = {"needs_review", "dismissed", "not_logo"}
+LOGO_OPTIONAL_PAGE_TYPES = {"section", "hero", "quote"}
+LOGO_OPTIONAL_LAYOUTS = {"hero", "content_hero"}
 ANCHOR_LABELS = {
     "top-left": "top-left safe corner",
     "top-right": "top-right safe corner",
@@ -42,14 +44,15 @@ def _as_dict(source: Any) -> dict:
 def should_show_logo(page: Any) -> bool:
     """Decide whether the uploaded logo should be attached/rendered on a page."""
     data = _as_dict(page)
-    explicit = data.get("logo_policy")
-    if isinstance(explicit, Mapping) and str(explicit.get("render_variant") or "").strip().lower() == "omit":
-        return False
-    if isinstance(explicit, Mapping) and "show_logo" in explicit:
-        return bool(explicit.get("show_logo"))
-
     page_type = str(data.get("type") or "").lower()
     layout = str(data.get("layout") or "").lower()
+    optional_page = page_type in LOGO_OPTIONAL_PAGE_TYPES or layout in LOGO_OPTIONAL_LAYOUTS
+
+    explicit = data.get("logo_policy")
+    if isinstance(explicit, Mapping) and str(explicit.get("render_variant") or "").strip().lower() == "omit":
+        return False if optional_page else True
+    if isinstance(explicit, Mapping) and "show_logo" in explicit:
+        return bool(explicit.get("show_logo")) if optional_page else True
 
     if page_type in {"cover", "ending"}:
         return True
@@ -125,6 +128,10 @@ def logo_policy_for_page(page: Any) -> dict:
         "large" if page_type == "cover" else "small"
     )
     render_variant = str(explicit.get("render_variant") or "").strip().lower() if isinstance(explicit, Mapping) else ""
+    if render_variant == "symbol":
+        render_variant = ""
+    if show_logo and render_variant == "omit":
+        render_variant = ""
     return {
         "show_logo": show_logo,
         "placement": anchor,

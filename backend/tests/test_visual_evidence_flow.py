@@ -1,4 +1,6 @@
 import io
+import zipfile
+from xml.etree import ElementTree as ET
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -22,6 +24,7 @@ from app.services.artifact_versions import artifact_stale
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import resolve_logo_overlay_box, resolve_logo_render_policy
 from app.services.logo_policy import logo_policy_for_page
+from app.services.project_quality_report import build_project_quality_report
 from app.services.pptx_assembler import assemble_pptx
 from app.services import prompt_engine
 from app.utils.text_cleaning import normalize_markdown_emphasis
@@ -40,6 +43,7 @@ from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches
 
 
@@ -199,6 +203,87 @@ def pptx_upload_with_many_pictures(name="many.pptx", count=5):
     return SimpleNamespace(filename=name, file=out, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 
 
+def pptx_upload_with_repeated_shape_fill_logos(tmp_path, name="shape-fill-logo.pptx", count=5):
+    img = Image.new("RGB", (133, 57), "black")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((5, 5, 42, 42), radius=8, fill=(255, 205, 0))
+    draw.rectangle((55, 15, 124, 27), fill=(245, 245, 245))
+    draw.rectangle((55, 34, 108, 44), fill=(245, 245, 245))
+    logo_bytes = io.BytesIO()
+    img.save(logo_bytes, "PNG")
+    logo_blob = logo_bytes.getvalue()
+
+    prs = Presentation()
+    for idx in range(count):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(0.6), Inches(0.6), Inches(6.5), Inches(0.6)).text = f"业务页面 {idx + 1}"
+        shape = slide.shapes.add_shape(
+            MSO_SHAPE.RECTANGLE,
+            Inches(8.35),
+            Inches(6.15),
+            Inches(0.75),
+            Inches(0.32),
+        )
+        shape.fill.solid()
+        shape.line.fill.background()
+
+    out = io.BytesIO()
+    prs.save(out)
+
+    ns = {
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+        "ct": "http://schemas.openxmlformats.org/package/2006/content-types",
+    }
+    for prefix, uri in ns.items():
+        if prefix not in {"rel", "ct"}:
+            ET.register_namespace(prefix, uri)
+
+    patched = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(out.getvalue()), "r") as zin, zipfile.ZipFile(patched, "w") as zout:
+        names = set(zin.namelist())
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                root = ET.fromstring(data)
+                has_png = any(child.attrib.get("Extension") == "png" for child in root)
+                if not has_png:
+                    ET.SubElement(root, f"{{{ns['ct']}}}Default", {"Extension": "png", "ContentType": "image/png"})
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            elif item.filename.startswith("ppt/slides/slide") and item.filename.endswith(".xml"):
+                slide_num = int(item.filename.rsplit("slide", 1)[1].split(".xml", 1)[0])
+                root = ET.fromstring(data)
+                shapes = root.findall(".//p:sp", ns)
+                target_shape = shapes[-1]
+                sp_pr = target_shape.find("p:spPr", ns)
+                for child in list(sp_pr):
+                    if child.tag in {f"{{{ns['a']}}}solidFill", f"{{{ns['a']}}}gradFill", f"{{{ns['a']}}}pattFill", f"{{{ns['a']}}}noFill"}:
+                        sp_pr.remove(child)
+                blip_fill = ET.Element(f"{{{ns['a']}}}blipFill")
+                ET.SubElement(blip_fill, f"{{{ns['a']}}}blip", {f"{{{ns['r']}}}embed": f"rIdLogo{slide_num}"})
+                stretch = ET.SubElement(blip_fill, f"{{{ns['a']}}}stretch")
+                ET.SubElement(stretch, f"{{{ns['a']}}}fillRect")
+                sp_pr.append(blip_fill)
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            elif item.filename.startswith("ppt/slides/_rels/slide") and item.filename.endswith(".xml.rels"):
+                slide_num = int(item.filename.rsplit("slide", 1)[1].split(".xml.rels", 1)[0])
+                root = ET.fromstring(data)
+                ET.SubElement(root, f"{{{ns['rel']}}}Relationship", {
+                    "Id": f"rIdLogo{slide_num}",
+                    "Type": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image",
+                    "Target": "../media/shapeFillLogo.png",
+                })
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            zout.writestr(item, data)
+        if "ppt/media/shapeFillLogo.png" not in names:
+            zout.writestr("ppt/media/shapeFillLogo.png", logo_blob)
+
+    patched.seek(0)
+    return SimpleNamespace(filename=name, file=patched, content_type="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+
 def pptx_upload_with_two_cover_logos(name="two-logos.pptx"):
     def logo_blob(color, accent):
         buf = io.BytesIO()
@@ -299,7 +384,7 @@ def test_logo_overlay_preprocess_trims_white_background(tmp_path):
     assert overlay.getchannel("A").getextrema()[0] == 0
 
 
-def test_logo_overlay_adds_contour_halo_without_rectangular_patch(tmp_path):
+def test_logo_overlay_keeps_clean_mark_without_auto_halo(tmp_path):
     logo_path = tmp_path / "mixed-logo.png"
     img = Image.new("RGB", (180, 72), "white")
     draw = ImageDraw.Draw(img)
@@ -310,12 +395,9 @@ def test_logo_overlay_adds_contour_halo_without_rectangular_patch(tmp_path):
     overlay_path = prepare_logo_overlay_image(str(logo_path))
     overlay = Image.open(overlay_path).convert("RGBA")
     alpha = overlay.getchannel("A")
-    light_halo_pixels = 0
-    for r, g, b, a in overlay.getdata():
-        if 0 < a < 230 and (r + g + b) / 3 > 225:
-            light_halo_pixels += 1
 
-    assert light_halo_pixels > 0
+    assert overlay.width < 170
+    assert overlay.height < 60
     assert alpha.getpixel((0, 0)) == 0
     assert alpha.getpixel((overlay.width - 1, overlay.height - 1)) == 0
 
@@ -694,6 +776,46 @@ def test_logo_overlay_layout_avoids_light_ending_title_text(tmp_path):
     assert overlap(logo_box, body_box) == 0
 
 
+def test_title_block_cover_logo_aligns_with_wide_title_not_densest_cluster(tmp_path):
+    bg_path = tmp_path / "wide-title-cover.png"
+    logo_path = tmp_path / "square-logo.png"
+
+    bg = Image.new("RGB", (1792, 1024), (5, 8, 26))
+    draw = ImageDraw.Draw(bg)
+    # Simulate a cover where the Chinese title characters are denser on the
+    # left, while the full title lockup spans across the page.
+    for x in (330, 430, 530, 650, 760):
+        draw.rectangle((x, 220, x + 70, 390), fill=(235, 228, 255))
+    for x in (1210, 1370):
+        draw.rectangle((x, 230, x + 95, 385), fill=(235, 228, 255))
+    draw.rectangle((340, 500, 1450, 585), fill=(225, 220, 245))
+    bg.save(bg_path)
+    Image.new("RGBA", (600, 640), (120, 60, 255, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "cover", "title-block-center", "large")
+
+    assert resolved is not None
+    assert resolved["strategy"] == "smart:above-title"
+    logo_center = resolved["left"] + resolved["width"] / 2
+    assert logo_center == pytest.approx(0.5, abs=0.07)
+
+
+def test_large_cover_square_logo_uses_optical_height_cap(tmp_path):
+    bg_path = tmp_path / "cover.png"
+    logo_path = tmp_path / "square-logo.png"
+
+    bg = Image.new("RGB", (1792, 1024), (5, 8, 26))
+    draw = ImageDraw.Draw(bg)
+    draw.rectangle((360, 250, 1430, 410), fill=(235, 228, 255))
+    bg.save(bg_path)
+    Image.new("RGBA", (600, 640), (120, 60, 255, 255)).save(logo_path)
+
+    resolved = resolve_logo_overlay_box(str(bg_path), str(logo_path), "cover", "title-block-center", "large")
+
+    assert resolved is not None
+    assert resolved["height"] <= 0.145
+
+
 def test_cover_center_logo_placement_is_physical_center(tmp_path):
     bg_path = tmp_path / "cover.png"
     logo_path = tmp_path / "logo.png"
@@ -774,7 +896,7 @@ def test_pptx_assembler_uses_resolved_logo_overlay_box(tmp_path):
     assert logo_shape.width == int(prs.slide_width * 0.18)
 
 
-def test_pptx_assembler_uses_contour_safe_logo_without_rectangular_backplate(tmp_path):
+def test_pptx_assembler_uses_clean_logo_without_rectangular_backplate(tmp_path):
     bg_path = tmp_path / "slide.png"
     logo_path = tmp_path / "logo.png"
     output_path = tmp_path / "out.pptx"
@@ -802,7 +924,7 @@ def test_pptx_assembler_uses_contour_safe_logo_without_rectangular_backplate(tmp
     assert abs((logo_shape.left + logo_shape.width / 2) - prs.slide_width / 2) < Inches(0.05)
 
 
-def test_logo_render_policy_prefers_symbol_on_dark_cover(tmp_path):
+def test_logo_render_policy_keeps_full_logo_on_required_dark_cover(tmp_path):
     bg_path = tmp_path / "dark-slide.png"
     logo_path = tmp_path / "mixed-logo.png"
     Image.new("RGB", (1792, 1024), (12, 12, 12)).save(bg_path)
@@ -826,8 +948,7 @@ def test_logo_render_policy_prefers_symbol_on_dark_cover(tmp_path):
     )
 
     assert policy["show_logo"] is True
-    assert policy["render_variant"] == "symbol"
-    assert policy["scale"] == "small"
+    assert policy["render_variant"] == "full"
     assert isinstance(policy["resolved_overlay_box"], dict)
 
 
@@ -859,7 +980,7 @@ def test_logo_render_policy_uses_full_logo_on_light_quiet_page(tmp_path):
     assert policy["logo_contrast"] == "readable"
 
 
-def test_logo_render_policy_omits_unreadable_wordmark_on_dark_cover(tmp_path):
+def test_logo_render_policy_keeps_required_pages_even_when_dark(tmp_path):
     bg_path = tmp_path / "dark-slide.png"
     logo_path = tmp_path / "wordmark.png"
     Image.new("RGB", (1792, 1024), (12, 12, 12)).save(bg_path)
@@ -880,8 +1001,155 @@ def test_logo_render_policy_omits_unreadable_wordmark_on_dark_cover(tmp_path):
         {"show_logo": True, "placement": "lower-center", "scale": "large"},
     )
 
+    assert policy["show_logo"] is True
+    assert policy["render_variant"] == "full"
+
+
+def test_logo_policy_ignores_stale_omit_on_required_content_page():
+    policy = logo_policy_for_page(
+        {
+            "type": "content",
+            "logo_policy": {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "render_variant": "omit",
+            },
+        }
+    )
+
+    assert policy["show_logo"] is True
+    assert policy["placement"] == "top-right"
+    assert policy["scale"] == "small"
+    assert "render_variant" not in policy
+
+
+def test_logo_policy_ignores_auto_symbol_variant():
+    policy = logo_policy_for_page(
+        {
+            "type": "content",
+            "logo_policy": {
+                "show_logo": True,
+                "placement": "top-right",
+                "scale": "small",
+                "render_variant": "symbol",
+            },
+        }
+    )
+
+    assert policy["show_logo"] is True
+    assert "render_variant" not in policy
+
+
+def test_logo_policy_allows_omit_on_section_page():
+    policy = logo_policy_for_page(
+        {
+            "type": "section",
+            "logo_policy": {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "render_variant": "omit",
+            },
+        }
+    )
+
     assert policy["show_logo"] is False
     assert policy["render_variant"] == "omit"
+
+
+def test_project_quality_report_flags_low_contrast_logo(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    slide_path = tmp_path / "slide.png"
+    pptx_path = tmp_path / "presentation.pptx"
+    Image.new("RGBA", (120, 60), (20, 20, 20, 255)).save(logo_path)
+    Image.new("RGB", (1792, 1024), (15, 15, 25)).save(slide_path)
+    pptx_path.write_bytes(b"pptx")
+    project = Project(id="p1", title="Deck", status="completed")
+    project.reference_images = [
+        ReferenceImage(
+            id="logo-1",
+            project_id="p1",
+            role="logo",
+            file_path=str(logo_path),
+            asset_analysis={"review_status": "user_confirmed"},
+        )
+    ]
+    slides = [
+        Slide(
+            id="s1",
+            project_id="p1",
+            page_num=1,
+            type="content",
+            status="completed",
+            image_path=str(slide_path),
+            content_json={"title": "增长策略", "bullets": ["统一品牌露出"]},
+            visual_json={
+                "type": "content",
+                "logo_policy": {
+                    "show_logo": True,
+                    "placement": "top-right",
+                    "scale": "small",
+                    "logo_contrast": "low_contrast_manual_review",
+                },
+            },
+        )
+    ]
+
+    report = build_project_quality_report(project, slides, has_pptx=True, pptx_path=str(pptx_path))
+
+    assert report
+    assert any(issue["kind"] == "logo_low_contrast" and issue["pages"] == [1] for issue in report["issues"])
+    assert "Logo 对比度可能偏弱" in report["message"]
+    assert "手动调整" in report["message"]
+
+
+def test_project_quality_report_ignores_optional_logo_omission(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    slide_path = tmp_path / "section.png"
+    pptx_path = tmp_path / "presentation.pptx"
+    Image.new("RGBA", (120, 60), (20, 20, 20, 255)).save(logo_path)
+    Image.new("RGB", (1792, 1024), (15, 15, 25)).save(slide_path)
+    pptx_path.write_bytes(b"pptx")
+    project = Project(id="p1", title="Deck", status="completed")
+    project.reference_images = [
+        ReferenceImage(
+            id="logo-1",
+            project_id="p1",
+            role="logo",
+            file_path=str(logo_path),
+            asset_analysis={"review_status": "user_confirmed"},
+        )
+    ]
+    slides = [
+        Slide(
+            id="s1",
+            project_id="p1",
+            page_num=1,
+            type="section",
+            status="completed",
+            image_path=str(slide_path),
+            content_json={"title": "章节页"},
+            visual_json={
+                "type": "section",
+                "logo_policy": {"show_logo": False, "render_variant": "omit"},
+            },
+        )
+    ]
+
+    report = build_project_quality_report(project, slides, has_pptx=True, pptx_path=str(pptx_path))
+
+    assert report
+    assert not any(issue["severity"] == "error" for issue in report["issues"])
+    assert not any(issue["kind"] == "required_logo_policy_missing" for issue in report["issues"])
+    assert "章节页和金句页允许不放" in report["message"]
+
+
+def test_project_quality_report_waits_until_final_stage(tmp_path):
+    project = Project(id="p1", title="Deck", status="prompt_ready")
+    slide = Slide(id="s1", project_id="p1", page_num=1, type="content", status="pending")
+
+    assert build_project_quality_report(project, [slide], has_pptx=False) is None
 
 
 def test_ending_logo_policy_defaults_to_small_corner_signature():
@@ -1112,7 +1380,7 @@ def test_visual_plan_prompt_allows_logo_policy_with_project_logo():
 
     assert "title-block-center" in prompt
     assert '"show_logo": true' in prompt
-    assert "不要要求底图为 Logo 绘制占位框、虚线框、圆角框、底板、徽章或任何容器" in prompt
+    assert "不要要求底图为 Logo 绘制占位框、虚线框、圆角框、底板、徽章、描边、外发光或任何容器" in prompt
 
 
 def test_default_visual_asset_usage_does_not_describe_product_appearance():
@@ -1188,6 +1456,79 @@ def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
     assert intent["logo_policy"]["show_logo"] is False
     assert intent["logo_policy"]["use_as_scene_asset"] is False
     assert "resolved_overlay_box" not in intent["logo_policy"]
+
+
+def test_project_logo_policy_restores_required_content_logo(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGBA", (120, 60), (80, 60, 120, 255)).save(logo_path)
+    logo = SimpleNamespace(
+        id="logo-1",
+        role="logo",
+        slide_id=None,
+        file_path=str(logo_path),
+        logo_anchor="top-right",
+        asset_analysis={},
+    )
+    project = SimpleNamespace(reference_images=[logo])
+
+    intent = slides_api._with_project_logo_policy(
+        {
+            "type": "content",
+            "logo_policy": {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "render_variant": "omit",
+            },
+        },
+        project,
+    )
+
+    assert intent["logo_policy"]["show_logo"] is True
+    assert "render_variant" not in intent["logo_policy"]
+
+
+def test_repair_project_logo_policies_updates_stale_required_content_logo(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    slide_path = tmp_path / "slide.png"
+    Image.new("RGBA", (120, 60), (80, 60, 120, 255)).save(logo_path)
+    Image.new("RGB", (1792, 1024), (12, 12, 24)).save(slide_path)
+    project = Project(id="p1", title="Deck", status="completed")
+    project.reference_images = [
+        ReferenceImage(
+            id="logo-1",
+            project_id="p1",
+            role="logo",
+            slide_id=None,
+            file_path=str(logo_path),
+            logo_anchor="top-right",
+            asset_analysis={"review_status": "user_confirmed"},
+        )
+    ]
+    slide = Slide(
+        id="s1",
+        project_id="p1",
+        page_num=3,
+        type="content",
+        status="completed",
+        image_path=str(slide_path),
+        visual_json={
+            "type": "content",
+            "logo_policy": {
+                "show_logo": False,
+                "placement": "top-right",
+                "scale": "small",
+                "render_variant": "omit",
+            },
+        },
+    )
+
+    changed = slides_api._repair_project_logo_policies(project, [slide])
+
+    assert changed is True
+    assert slide.visual_json["logo_policy"]["show_logo"] is True
+    assert slide.visual_json["logo_policy"]["render_variant"] == "full"
+    assert "resolved_overlay_box" in slide.visual_json["logo_policy"]
 
 
 def test_ending_logo_policy_uses_small_confirmed_corner_signature(tmp_path):
@@ -1525,6 +1866,44 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
     final_img = Image.open(result["image_path"])
     assert final_img.getpixel((0, 0)) == (0, 128, 0)
     assert (tmp_path / "project-1" / "slide_04_base.png").exists()
+
+
+def test_generate_one_slide_falls_back_to_base_when_refinement_fails(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+        calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
+        if len(calls) == 2:
+            raise RuntimeError("refinement API unavailable")
+        return Image.new("RGB", (16, 9), "blue")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    slide = Slide(
+        id="slide-refine-fallback",
+        page_num=5,
+        prompt_text="draft prompt",
+        content_json={"text_content": {"headline": "产品展示"}},
+        visual_json={},
+    )
+    ref_data = [
+        {
+            "id": "asset-1",
+            "role": "visual_asset",
+            "asset_kind": "product",
+            "asset_name": "产品图",
+            "file_path": "/tmp/uploads/product.png",
+            "image": Image.new("RGB", (8, 8), "white"),
+        }
+    ]
+
+    result = _generate_one_slide(slide, "project-refine-fallback", str(tmp_path), ref_data)
+
+    assert result["error"] is None
+    assert len(calls) == 2
+    assert (tmp_path / "project-refine-fallback" / "slide_05_base.png").exists()
+    final_img = Image.open(result["image_path"])
+    assert final_img.getpixel((0, 0)) == (0, 0, 255)
 
 
 def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeypatch):
@@ -1970,6 +2349,40 @@ def test_confirm_prototype_autofills_missing_prompts_before_full_generation(monk
     assert captured["page_nums"] == [2, 3]
     assert refreshed[1].prompt_text == "auto prompt"
     assert refreshed[1].status == "prompt_ready"
+
+
+def test_enqueue_generation_task_ignores_redis_tracking_failure(monkeypatch):
+    db = make_session()
+    project = Project(title="Redis tracking failure", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    run = slides_api.create_project_run(
+        db,
+        project.id,
+        kind="image_generation",
+        stage="batch_generation",
+        total_count=1,
+        message="queued",
+    )
+    db.commit()
+
+    monkeypatch.setattr(slides_api, "store_current_provider_credentials", lambda _redis: None)
+
+    def fake_delay(project_id, page_nums, **kwargs):
+        return SimpleNamespace(id="task-after-redis-failure")
+
+    def fail_tracking_set(*_args, **_kwargs):
+        raise RuntimeError("redis unavailable after dispatch")
+
+    monkeypatch.setattr(slides_api.generate_slides_task, "delay", fake_delay)
+    monkeypatch.setattr(slides_api.redis_client, "set", fail_tracking_set)
+
+    task = slides_api._enqueue_generation_task(db, project.id, [1], run=run)
+    refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).first()
+
+    assert task.id == "task-after-redis-failure"
+    assert refreshed_run.task_id == "task-after-redis-failure"
+    assert refreshed_run.status == "queued"
 
 
 def test_confirm_content_plan_advances_backend_stage():
@@ -2423,6 +2836,150 @@ def test_pptx_asset_extraction_is_idempotent_for_page_refs(tmp_path, monkeypatch
     assert second["page_refs"] == 0
     assert len(page_refs) == 1
     assert page_refs[0].slide_id == slide.id
+
+
+def test_pptx_shape_fill_repeated_logo_goes_to_logo_library(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PPT upload", status="planning")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pptx_upload_with_repeated_shape_fill_logos(tmp_path, "shape-fill-logo.pptx"),
+        db=db,
+    )
+    stats = documents_api._extract_pptx_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "shape-fill-logo.pptx"),
+        "shape-fill-logo.pptx",
+        db=db,
+    )
+
+    logos = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "logo",
+        ReferenceImage.slide_id.is_(None),
+    ).all()
+    page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+
+    assert stats["logos"] == 1
+    assert stats["page_refs"] == 0
+    assert len(logos) == 1
+    assert page_refs == []
+    assert logos[0].asset_analysis["classification"] == "logo"
+    assert logos[0].asset_analysis["asset_scope"] == "project_logo"
+    assert logos[0].asset_analysis["shape_bounds"]["width"] < 0.1
+    assert logos[0].process_mode == "original"
+
+
+def test_template_logo_candidates_only_auto_confirm_one_lockup(tmp_path):
+    db = make_session()
+    project = Project(title="Template logos", status="planning")
+    db.add(project)
+    db.commit()
+
+    paths = []
+    for index, color in enumerate(("black", "navy", "gold"), start=1):
+        path = tmp_path / f"template-logo-{index}.png"
+        Image.new("RGBA", (240, 80), color).save(path)
+        paths.append(path)
+
+    assets = [
+        SimpleNamespace(
+            file_path=str(path),
+            asset_name=f"候选 Logo {index}",
+            usage_note=None,
+            classification="logo",
+            metadata={
+                "pptx_image_sha1": f"candidate-{index}",
+                "shape_bounds": {"left": 0.86, "top": 0.03, "width": 0.1, "height": 0.04},
+            },
+        )
+        for index, path in enumerate(paths, start=1)
+    ]
+
+    attached = slides_api._attach_template_logo_assets(project, assets, "template.pptx", db)
+    db.commit()
+    logos = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "logo",
+        ReferenceImage.slide_id.is_(None),
+    ).order_by(ReferenceImage.asset_name).all()
+    db.refresh(project)
+
+    assert attached == 3
+    assert len(logos) == 3
+    assert [slides_api.logo_review_status(logo) for logo in logos].count("auto_confirmed") == 1
+    assert [logo.id for logo in slides_api._project_logo_refs(project)] == [logos[0].id]
+    assert "额外 Logo 候选" in logos[1].asset_analysis["review_reason"]
+
+
+def test_logo_review_after_generation_reassembles_without_clearing_images(tmp_path, monkeypatch):
+    db = make_session()
+    output_dir = tmp_path / "outputs"
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(output_dir))
+
+    project = Project(
+        id="generated-logo-review",
+        title="Generated logo review",
+        status="prototype_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "沿用模板"},
+    )
+    db.add(project)
+    image_paths = []
+    for page_num in (1, 2):
+        image_path = output_dir / project.id / f"slide_{page_num:02d}.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1792, 1024), (255, 255, 255)).save(image_path)
+        image_paths.append(str(image_path))
+        db.add(Slide(
+            project_id=project.id,
+            page_num=page_num,
+            type="content",
+            status="completed",
+            image_path=str(image_path),
+            content_json={"speaker_notes": f"notes {page_num}"},
+            visual_json={"logo_policy": {"show_logo": True, "placement": "top-right", "scale": "small"}},
+            prompt_text="prompt",
+        ))
+
+    for index, color in enumerate(((255, 203, 34, 255), (20, 24, 30, 255)), start=1):
+        path = tmp_path / f"logo-{index}.png"
+        Image.new("RGBA", (220, 80), color).save(path)
+        db.add(ReferenceImage(
+            id=f"logo-{index}",
+            project_id=project.id,
+            role="logo",
+            file_path=str(path),
+            process_mode="original",
+            asset_name=f"Logo {index}",
+            logo_anchor="top-right",
+            asset_analysis={"review_status": "auto_confirmed"},
+        ))
+    db.commit()
+
+    result = slides_api.update_reference_image(
+        project.id,
+        "logo-2",
+        {"review_status": "needs_review"},
+        db=db,
+    )
+    db.refresh(project)
+    slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+
+    assert result["review_status"] == "needs_review"
+    assert project.status == "prototype_ready"
+    assert [slide.status for slide in slides] == ["completed", "completed"]
+    assert [slide.image_path for slide in slides] == image_paths
+    assert all(artifact_stale(slide.visual_json) == {} for slide in slides)
+    assert (output_dir / project.id / "prototype.pptx").exists()
 
 
 def test_pptx_document_upload_queues_asset_extraction_with_background_tasks(tmp_path, monkeypatch):

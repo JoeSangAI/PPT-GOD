@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from app.services.logo_policy import logo_prompt_instruction, logo_reservation_instruction
 from app.services.overlay_layers import overlay_reservation_instruction
 from app.services.style_pack import derive_style_pack_from_content
-from app.utils.text_cleaning import normalize_markdown_emphasis
+from app.utils.text_cleaning import is_markdown_thematic_break_line, normalize_markdown_emphasis
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,8 @@ def _strip_markdown(text: str) -> str:
     in_table = False
     for line in lines:
         stripped = line.strip()
+        if is_markdown_thematic_break_line(stripped):
+            continue
         # 跳过 Markdown 表格分隔线（如 | --- | :---: |）
         if re.match(r'^\|?[\s:\-]+(?:\|[\s:\-]+)+\|?$', stripped):
             continue
@@ -52,7 +54,8 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r'^\s*>\s+', '', text, flags=re.MULTILINE)
     # 去除行首标题符号
     text = re.sub(r'^\s*#{1,6}\s+', '', text, flags=re.MULTILINE)
-    return text.strip()
+    cleaned_lines = [line for line in text.splitlines() if not is_markdown_thematic_break_line(line)]
+    return "\n".join(cleaned_lines).strip()
 
 
 def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 1100) -> str:
@@ -392,8 +395,11 @@ def _reference_descriptions_for_prompt(
                     + (f" Context: {detail}" if detail else "")
                 )
             elif role == "chart_ref":
+                detail = _compact_reference_text(desc, 180) if desc else ""
                 reference_descriptions.append(
-                    "Chart/data reference: follow this uploaded chart for the chart area."
+                    "Chart/data reference: follow this uploaded chart for the chart area. "
+                    "Preserve its core structure, node labels, arrows, and table relationships."
+                    + (f" Context: {detail}" if detail else "")
                 )
             elif role == "visual_asset":
                 asset_name = img.get("asset_name") or "visual asset"
@@ -426,6 +432,22 @@ def _reference_descriptions_for_prompt(
                     "Seed page: copy layout DNA only (grid, hierarchy, palette rhythm). "
                     "Do not copy seed text, body imagery, product shots, or logo unless this page has its own uploaded logo."
                 )
+            elif role == "template":
+                strength = str(img.get("application_strength") or "standard").lower()
+                if strength == "strong":
+                    reference_descriptions.append(
+                        "Template page: strictly follow the template's color palette, typography, and visual mood. "
+                        "Borrow layout structure and preserve the exact color scheme, material texture, and decoration language."
+                    )
+                elif strength == "standard":
+                    reference_descriptions.append(
+                        "Template page: borrow layout DNA and color palette; preserve the template's visual mood, typography, and material texture. "
+                        "Do not copy old text, old images, or old logos."
+                    )
+                else:  # light
+                    reference_descriptions.append(
+                        "Template page: borrow layout DNA only; do not copy old text, old images, or old logos."
+                    )
     return [line.strip() for line in reference_descriptions if line and line.strip()]
 
 

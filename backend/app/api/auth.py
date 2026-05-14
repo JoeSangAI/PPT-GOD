@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -30,7 +30,7 @@ def tester_login(payload: TesterLoginRequest, db: Session = Depends(get_db)):
 def auth_me(tester_id: str = Depends(require_tester_id), db: Session = Depends(get_db)):
     tester = db.query(TesterUser).filter(TesterUser.id == tester_id).first()
     if not tester:
-        return {"tester_id": tester_id, "display_name": "测试用户"}
+        raise HTTPException(status_code=401, detail="登录状态已失效，请重新输入固定用户名")
     return {
         "tester_id": tester.id,
         "display_name": tester.display_name,
