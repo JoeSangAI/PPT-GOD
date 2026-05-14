@@ -336,6 +336,39 @@ def test_explicit_brand_gold_request_inserts_visible_gold_accent():
     assert "关键数字" in combined
 
 
+def test_gold_accent_preserves_deck_wide_dark_contract():
+    proposal = {
+        "name": "禅灰极简",
+        "palette": [
+            {"name": "雾白", "hex": "#F4F4F0", "role": "内容页基底"},
+            {"name": "冷灰", "hex": "#D7DBE1", "role": "辅助线"},
+            {"name": "墨黑", "hex": "#090B10", "role": "封面背景"},
+            {"name": "炭灰", "hex": "#4B5563", "role": "正文文字"},
+        ],
+        "description": "正文页以浅色信息基底为主，少量深色封面。",
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "正文页也用黑色深色底，全页深色背景；另外加入一些分众的金色，就是 logo 的金色作为点缀。",
+    )
+
+    combined = " ".join(
+        str(normalized.get(key) or "")
+        for key in ("description", "page_type_adaptation", "content_style_hint")
+    )
+    palette_text = " ".join(
+        f"{color.get('name')} {color.get('hex')} {color.get('role')}"
+        for color in normalized["palette"][:4]
+    )
+    assert normalized["visual_strategy"]["base_tone"] == "dark"
+    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
+    assert "不得自动切换成白底" in normalized["page_type_adaptation"]
+    assert "分众金" in palette_text
+    assert "#9C6926" in palette_text
+    assert "正文页以浅色信息基底为主" not in combined
+
+
 def test_asset_based_generation_repairs_missing_gold_from_llm(monkeypatch):
     class _GoldCompletions:
         def create(self, **kwargs):

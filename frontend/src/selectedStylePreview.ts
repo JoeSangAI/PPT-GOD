@@ -66,6 +66,45 @@ function isLight(hex: string) {
   return hexBrightness(hex) >= 180;
 }
 
+function pageToneSignalText(style: any, palette: StylePreviewColor[]) {
+  const paletteText = palette.map((color) => `${color.name} ${color.role}`).join(" ");
+  return stripHexCodes(
+    [
+      style?.visual_strategy?.summary,
+      style?.visual_strategy?.content_treatment,
+      style?.page_type_adaptation,
+      style?.content_style_hint,
+      style?.visual_rhythm,
+      style?.description,
+      paletteText,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  ).replace(/\s+/g, "");
+}
+
+function hasDarkInformationPageContract(text: string) {
+  const informationPages = "(?:正文|内容|数据|表格|信息)(?:页|页面)?";
+  const darkBase = "(?:黑色?|深色?|暗色?|黑底|深底|深色底|深色基底|深色背景|深色系基底)";
+  const surface = "(?:底|基底|背景)";
+  return (
+    new RegExp(`${informationPages}.{0,28}${darkBase}.{0,8}${surface}?`, "i").test(text) ||
+    new RegExp(`${darkBase}.{0,8}${surface}?.{0,28}${informationPages}`, "i").test(text) ||
+    /(?:整套|全套|全页|所有页面|页面整体).{0,16}(?:黑色?|深色?|暗色?).{0,8}(?:底|基底|背景)/i.test(text)
+  );
+}
+
+function hasLightInformationPageContract(text: string) {
+  const informationPages = "(?:正文|内容|数据|表格|信息)(?:页|页面)?";
+  const lightBase = "(?:白色?|白底|浅色?|浅底|米白|明亮|淡色)";
+  const surface = "(?:底|基底|背景|内容区|卡片)";
+  return (
+    new RegExp(`${informationPages}.{0,28}${lightBase}.{0,8}${surface}?`, "i").test(text) ||
+    new RegExp(`${lightBase}.{0,8}${surface}.{0,28}${informationPages}`, "i").test(text) ||
+    /(?:整套|全套|全页|所有页面|页面整体).{0,16}(?:白色?|浅色?|米白|明亮).{0,8}(?:底|基底|背景)/i.test(text)
+  );
+}
+
 function normalizePalette(palette: any[] | undefined): StylePreviewColor[] {
   const normalized = (Array.isArray(palette) ? palette : []).map((color, index) => {
     if (typeof color === "string") {
@@ -88,16 +127,9 @@ function normalizePalette(palette: any[] | undefined): StylePreviewColor[] {
 function inferBaseTone(style: any, palette: StylePreviewColor[]): StylePreviewTone {
   const explicit = String(style?.visual_strategy?.base_tone || "").toLowerCase();
   if (explicit === "dark" || explicit === "light") return explicit;
-  const joined = stripHexCodes(
-    [
-      style?.visual_strategy?.summary,
-      style?.visual_strategy?.content_treatment,
-      style?.page_type_adaptation,
-      style?.description,
-    ]
-      .filter(Boolean)
-      .join(" ")
-  );
+  const joined = pageToneSignalText(style, palette);
+  if (hasDarkInformationPageContract(joined)) return "dark";
+  if (hasLightInformationPageContract(joined)) return "light";
   if (/深色|黑色|暗色|深蓝|深紫|dark/i.test(joined) && !/浅色|白色|米白|明亮|light/i.test(joined)) return "dark";
   if (/浅色|白色|米白|明亮|light/i.test(joined) && !/全页深色|深色基底|dark/i.test(joined)) return "light";
   const lightCount = palette.filter((color) => isLight(color.hex)).length;
@@ -107,15 +139,21 @@ function inferBaseTone(style: any, palette: StylePreviewColor[]): StylePreviewTo
   return "mixed";
 }
 
-function pickColor(palette: StylePreviewColor[], matcher: RegExp, fallbackIndex: number) {
-  return palette.find((color) => matcher.test(`${color.name} ${color.role}`)) || palette[fallbackIndex] || FALLBACK_PALETTE[fallbackIndex];
+function pickColor(palette: StylePreviewColor[], matcher: RegExp, fallbackIndex: number, tone?: "dark" | "light") {
+  const matchesTone = (color: StylePreviewColor) => (tone === "light" ? isLight(color.hex) : tone === "dark" ? !isLight(color.hex) : true);
+  return (
+    palette.find((color) => matcher.test(`${color.name} ${color.role}`) && matchesTone(color)) ||
+    palette.find((color) => matchesTone(color)) ||
+    palette[fallbackIndex] ||
+    FALLBACK_PALETTE[fallbackIndex]
+  );
 }
 
 function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColor[]): StylePagePreview[] {
   const primary = palette[0] || FALLBACK_PALETTE[0];
   const accent = palette[1] || FALLBACK_PALETTE[1];
-  const lightBase = pickColor(palette, /基底|背景|内容区|卡片|白|浅|米/i, 2);
-  const darkBase = pickColor(palette, /深|黑|暗|背景|基底/i, 3);
+  const lightBase = pickColor(palette, /白|浅|米|明亮|内容区|卡片|背景|基底/i, 2, "light");
+  const darkBase = pickColor(palette, /深|黑|暗|背景|基底/i, 3, "dark");
   const textColor = pickColor(palette, /正文|文字|标题|text/i, 3);
   const darkBackground = isLight(darkBase.hex) ? "#111827" : darkBase.hex;
   const lightBackground = isLight(lightBase.hex) ? lightBase.hex : "#F8FAFC";

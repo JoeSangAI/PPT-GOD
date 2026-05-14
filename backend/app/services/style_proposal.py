@@ -335,22 +335,26 @@ def _enforce_gold_accent_style(proposal: Dict, user_description: str) -> Dict:
         for index, item in enumerate(normalized.get("palette") or [])
     ]
     gold = _gold_accent_for_request(user_description)
+    use_requested_brand_gold = gold["name"] == "分众金"
+
+    def _apply_requested_gold(color: dict) -> dict:
+        if not _is_gold_like_color(color):
+            return color
+        if use_requested_brand_gold:
+            return {**color, **gold}
+        role = str(color.get("role") or "")
+        return {
+            **color,
+            "name": color.get("name") or gold["name"],
+            "role": (
+                color.get("role")
+                if "点缀" in role or "Logo" in role
+                else f"{role or '重点信息'} / Logo 呼应点缀"
+            ),
+        }
 
     if palette and any(_is_gold_like_color(color) for color in palette):
-        palette = [
-            {
-                **color,
-                "name": color.get("name") or gold["name"],
-                "role": (
-                    color.get("role")
-                    if "点缀" in str(color.get("role") or "") or "Logo" in str(color.get("role") or "")
-                    else f"{color.get('role') or '重点信息'} / Logo 呼应点缀"
-                ),
-            }
-            if _is_gold_like_color(color)
-            else color
-            for color in palette
-        ]
+        palette = [_apply_requested_gold(color) for color in palette]
     else:
         palette.insert(1 if palette else 0, gold)
     normalized["palette"] = palette[:5]

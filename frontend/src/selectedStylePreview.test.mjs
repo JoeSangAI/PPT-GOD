@@ -51,6 +51,23 @@ assert.equal(darkPreview.pages.find((page) => page.key === "data").tone, "dark")
 assert.match(darkPreview.rhythmText, /封面\/章节页/);
 assert.match(darkPreview.fontText, /思源黑体/);
 
+const darkInformationPagesPreview = buildSelectedStylePreview({
+  name: "禅灰极简（金色点缀）",
+  palette: [
+    { name: "曜石黑", hex: "#090B10", role: "整套页面背景/内容页深色基底" },
+    { name: "分众金", hex: "#C7A348", role: "Logo 呼应色/关键数字和装饰线点缀" },
+    { name: "雾白", hex: "#F4F4F0", role: "正文和图表文字" },
+    { name: "冷灰", hex: "#D7DBE1", role: "辅助线" },
+  ],
+  description: "按用户最新要求，分众金必须进入配色系统，但只做少量点缀。",
+  page_type_adaptation: "正文/内容/数据/表格页也必须保持黑色或深色底，不得自动切换成白底、米白底或浅色信息基底。",
+  content_style_hint: "用户明确要求内容页也以黑色/深色底为主。",
+});
+
+assert.equal(darkInformationPagesPreview.baseTone, "dark");
+assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "content").tone, "dark");
+assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "data").tone, "dark");
+
 const lightPreview = buildSelectedStylePreview({
   name: "柔紫暖白",
   palette: [
