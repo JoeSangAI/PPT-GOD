@@ -90,6 +90,7 @@ import {
   type GateActionKey,
   type WorkflowGate,
 } from "./workflow";
+import { buildSelectedStylePreview } from "./selectedStylePreview";
 import {
   inferAgentRequestContext,
   inferRequestedPageCount,
@@ -6642,6 +6643,9 @@ function App() {
     styleProposalsInChat.length > 0
       ? styleProposalsInChat
       : (selectedProject?.style_proposal?.proposals || []);
+  const selectedStylePreview = selectedProject?.selected_style
+    ? buildSelectedStylePreview(selectedProject.selected_style)
+    : null;
   const generatedSlideCount = slides.filter((slide) => Boolean(slide.image_path)).length;
   const selectedTemplateRecommendations =
     selectedProject?.selected_template_recommendations && typeof selectedProject.selected_template_recommendations === "object"
@@ -7858,13 +7862,47 @@ function App() {
               </span>
               <span className="pg-style-bar-meta">{styleBarExpanded ? "收起" : "展开"}</span>
             </button>
-            {styleBarExpanded && (
-              <div className="pg-style-bar-detail">
-                <span>氛围：{stripHexCodes(selectedProject.selected_style.mood) || "—"}</span>
-                <span>字体：{stripHexCodes(selectedProject.selected_style.font) || "—"}</span>
-                {visualStrategyText(selectedProject.selected_style) && (
-                  <span>整体基底：{visualStrategyText(selectedProject.selected_style)}</span>
-                )}
+            {styleBarExpanded && selectedStylePreview && (
+              <div className="pg-style-preview-band">
+                <p className="pg-style-preview-summary">{selectedStylePreview.summary}</p>
+                <div className="pg-style-page-previews" aria-label="视觉方案页面类型预览">
+                  {selectedStylePreview.pages.map((page) => (
+                    <div
+                      key={page.key}
+                      className={`pg-style-page-mini is-${page.tone} is-${page.intensity}`}
+                      style={{
+                        "--style-page-bg": page.background,
+                        "--style-page-accent": page.accent,
+                        "--style-page-text": page.text,
+                        "--style-page-surface": page.surface,
+                      } as CSSProperties}
+                    >
+                      <span className="pg-style-page-mini-label">{page.label}</span>
+                      <i className="pg-style-page-mini-glow" />
+                      <i className="pg-style-page-mini-title" />
+                      <i className="pg-style-page-mini-line line-1" />
+                      <i className="pg-style-page-mini-line line-2" />
+                      {page.key === "data" && (
+                        <span className="pg-style-page-mini-chart" aria-hidden="true">
+                          <i style={{ height: "42%" }} />
+                          <i style={{ height: "76%" }} />
+                          <i style={{ height: "55%" }} />
+                          <i style={{ height: "90%" }} />
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="pg-style-preview-notes">
+                  <div>
+                    <b>视觉节奏</b>
+                    <p>{selectedStylePreview.rhythmText}</p>
+                  </div>
+                  <div>
+                    <b>字体体系</b>
+                    <p>{selectedStylePreview.fontText}</p>
+                  </div>
+                </div>
               </div>
             )}
           </div>
