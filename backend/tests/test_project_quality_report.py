@@ -51,13 +51,21 @@ def test_project_quality_report_message_is_grouped_readable_markdown(tmp_path):
 
     assert report is not None
     message = report["message"]
-    assert message.startswith("**交付前检查**")
-    assert "- 页面生成：1 / 2 页" in message
-    assert "- PPTX：暂未确认可导出" in message
+    assert message.startswith("⚠️ **还不能交付最终稿**")
+    assert "目前只完成了 **1 / 2 页**，还有 **1 页**没有生成完成。" in message
+    assert "请先补齐剩余页面，完成后再导出最终 PPTX。" in message
+    assert "**下一步**" in message
+    assert "1. 点击「生成全部页面」或重试未完成页" in message
+    assert "2. 等页面全部完成后，点击「导出 PPTX」" in message
     assert "**需要处理**" in message
-    assert "1. **存在未完成页面**：第 2 页。请先补齐这些页面，再导出最终稿。" in message
-    assert "2. **未确认最终 PPTX 文件**：先刷新状态；如果仍不可导出，请重新生成或重试失败页。" in message
+    assert "🔴 **未完成页面**" in message
+    assert "第 2 页还未完成。请先补齐这些页面，再导出最终稿。" in message
+    assert "🔴 **PPTX 暂未确认可导出**" in message
+    assert "刷新状态后再试；如果仍不可导出，请重新生成或重试失败页。" in message
     assert "**建议复核**" in message
-    assert "1. **Logo 对比度可能偏弱**：第 1 页。建议在导出的 PPT 里手动调整位置或替换为更适合当前底色的版本。" in message
+    assert "🟡 **Logo 对比度偏弱**" in message
+    assert "第 1 页的 Logo 可能不够清晰。导出后建议顺手检查，必要时手动调整位置或替换 Logo。" in message
+    assert "**说明**" in message
+    assert "ℹ️ 章节页和金句页可以不放 Logo；内容页会保留品牌 Logo。" in message
     assert "\n>" not in message
     assert "- >" not in message

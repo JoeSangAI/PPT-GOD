@@ -9,6 +9,10 @@ const APP_URL = process.env.APP_URL || "http://127.0.0.1:4174";
 const API_BASE = process.env.VITE_API_BASE_URL || APP_URL;
 const APP_ORIGIN = new URL(APP_URL).origin;
 const API_ORIGIN = new URL(API_BASE, APP_URL).origin;
+const testerAuth = {
+  testerId: "22222222-2222-4222-8222-222222222222",
+  displayName: "Brief Submit Tester",
+};
 
 const project = {
   id: "brief-submit-project",
@@ -92,7 +96,10 @@ await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
   window.localStorage.setItem(
     "pptgod.mvpAuth",
-    JSON.stringify({ testerId: "brief-submit-tester", displayName: "Brief Submit Tester" }),
+    JSON.stringify({
+      testerId: "22222222-2222-4222-8222-222222222222",
+      displayName: "Brief Submit Tester",
+    }),
   );
 }, project.id);
 
@@ -104,6 +111,9 @@ await page.route("**/*", async (route) => {
   const mockableApiOrigin = url.origin === APP_ORIGIN || url.origin === API_ORIGIN;
   if (!mockableApiOrigin) return route.continue();
 
+  if (method === "GET" && pathName === "/auth/me") {
+    return route.fulfill({ json: { tester_id: testerAuth.testerId, display_name: testerAuth.displayName } });
+  }
   if (method === "GET" && pathName === "/projects") return route.fulfill({ json: [project] });
   if (method === "GET" && pathName === `/projects/${project.id}`) return route.fulfill({ json: project });
   if (method === "GET" && pathName === `/projects/${project.id}/slides`) return route.fulfill({ json: [] });

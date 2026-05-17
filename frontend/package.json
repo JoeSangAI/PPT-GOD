@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test:workflow": "node src/workflow.test.mjs",
     "test:isolation": "node src/project-isolation.test.mjs",
-    "test:low-cost": "npm run build && node test-low-cost-e2e.mjs"
+    "test:low-cost": "npm run build && node test-low-cost-e2e.mjs",
+    "test:visual-directive": "node test-visual-directive-e2e.mjs"
   },
   "dependencies": {
     "@tiptap/extension-table": "^3.23.2",

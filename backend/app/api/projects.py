@@ -18,6 +18,7 @@ from app.services.artifact_versions import content_signature, dependency_signatu
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
+from app.services.source_intent import normalize_intent_contract
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
 from celery.result import AsyncResult
 
@@ -108,6 +109,8 @@ def update_project(
         project.content_plan_confirmed = payload.content_plan_confirmed
         if payload.content_plan_confirmed and project.slides and project.status in {"draft", "planning"}:
             project.status = "visual_ready"
+    if payload.intent_contract is not None:
+        project.intent_contract = normalize_intent_contract(payload.intent_contract)
     db.commit()
     db.refresh(project)
     return project
@@ -238,8 +241,20 @@ def create_style_proposals(
         db.commit()
         db.refresh(project)
 
-    # 强制重新生成时先清空旧缓存
+    # 强制重新生成时先清空旧缓存（同时保留上一版 proposal 用于反对参考，避免 LLM 换汤不换药）
+    previous_proposal_snapshot: dict | None = None
     if force:
+        existing_proposals = (project.style_proposal or {}).get("proposals") if project.style_proposal else None
+        if existing_proposals:
+            for item in existing_proposals:
+                if isinstance(item, dict):
+                    previous_proposal_snapshot = {
+                        "name": item.get("name"),
+                        "palette": item.get("palette"),
+                        "mood": item.get("mood"),
+                        "description": item.get("description"),
+                    }
+                    break
         project.style_proposal = None
         db.commit()
         db.refresh(project)
@@ -270,7 +285,13 @@ def create_style_proposals(
 
     try:
         credential_id = store_current_provider_credentials(redis_client)
-        task = generate_style_proposals_task.delay(project_id, run.id, credential_id=credential_id, user_description=user_description)
+        task = generate_style_proposals_task.delay(
+            project_id,
+            run.id,
+            credential_id=credential_id,
+            user_description=user_description,
+            previous_proposal=previous_proposal_snapshot,
+        )
         set_run_task(db, run.id, task.id)
         db.commit()
     except Exception as exc:

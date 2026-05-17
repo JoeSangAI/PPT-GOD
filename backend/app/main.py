@@ -30,16 +30,22 @@ def _ensure_runtime_mvp_schema() -> None:
     if "projects" not in inspector.get_table_names():
         return
     project_columns = {col["name"] for col in inspector.get_columns("projects")}
-    if "tester_id" in project_columns:
+    missing_tester_id = "tester_id" not in project_columns
+    missing_intent_contract = "intent_contract" not in project_columns
+    if not missing_tester_id and not missing_intent_contract:
         return
     with engine.begin() as conn:
         dialect = engine.dialect.name
-        if dialect == "postgresql":
+        if missing_tester_id and dialect == "postgresql":
             conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS tester_id VARCHAR"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
-        else:
+        elif missing_tester_id:
             conn.execute(text("ALTER TABLE projects ADD COLUMN tester_id VARCHAR"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
+        if missing_intent_contract and dialect == "postgresql":
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS intent_contract JSON"))
+        elif missing_intent_contract:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN intent_contract JSON"))
 
 
 _ensure_runtime_mvp_schema()
@@ -49,8 +55,8 @@ if settings.IMAGE_GEN_MODE == "real":
     missing = []
     if not settings.MINIMAX_API_KEY:
         missing.append("MINIMAX_API_KEY")
-    if not settings.DEER_API_KEY:
-        missing.append("DEER_API_KEY")
+    if not settings.COMET_API_KEY:
+        missing.append("COMET_API_KEY")
     if missing:
         import warnings
         warnings.warn(

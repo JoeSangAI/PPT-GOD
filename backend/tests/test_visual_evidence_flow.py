@@ -29,6 +29,7 @@ from app.services.pptx_assembler import assemble_pptx
 from app.services import prompt_engine
 from app.utils.text_cleaning import normalize_markdown_emphasis
 from app.services.visual_plan import (
+    VisualPlanGenerationError,
     _build_batch_prompt,
     _do_generate_visual_plan,
     _default_visual_asset_usage,
@@ -37,7 +38,6 @@ from app.services.visual_plan import (
     _safe_parse_json,
 )
 from app.services.content_plan import _annotate_ppt_source_refs, _normalize_content_markdown
-from app.services.style_proposal import _build_content_style_direction
 from app.utils.project_docs import load_project_documents
 from types import SimpleNamespace
 
@@ -45,6 +45,12 @@ from PIL import Image, ImageDraw
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.util import Inches
+
+
+STALE_PRODUCT_DOMAIN_TERMS_FOR_TEST = (
+    "胡姬花", "花生油", "花生", "小油", "油瓶", "榨油", "古法小榨",
+    "团购礼盒", "非遗体验官", "工业流水线",
+)
 
 
 def make_session():
@@ -526,11 +532,81 @@ def test_fallback_visual_plan_uses_concrete_visual_evidence():
         [],
     )
 
-    assert plan[0]["visual_evidence"] == "直播间背景板、达人短视频矩阵和统一话术卡"
+    # Fallback no longer uses keyword-enumerated concrete evidence; it returns
+    # open-ended descriptions driven by page_type and headline.
+    assert "核心场景" in plan[0]["visual_evidence"] or "支撑" in plan[0]["visual_evidence"]
     assert "现代商务风格画面" not in plan[0]["visual_description"]
-    assert "白皮书" in plan[1]["visual_evidence"]
+    assert "白皮书" in plan[1]["visual_evidence"] or "核心场景" in plan[1]["visual_evidence"]
     assert plan[0]["seed_family"] == "content"
     assert plan[0]["is_seed_recommended"] is True
+
+
+def test_fallback_visual_plan_uses_project_neutral_business_objects():
+    plan = _fallback_visual_plan(
+        [
+            {
+                "page_num": 8,
+                "type": "content",
+                "text_content": {
+                    "headline": "B端客户路径",
+                    "body": "企业客户名单、团购合作和交付流程需要形成闭环。",
+                },
+            },
+            {
+                "page_num": 9,
+                "type": "content",
+                "text_content": {
+                    "headline": "终端转化路径",
+                    "body": "货架、导购和现场动线决定用户能否完成转化。",
+                },
+            },
+            {
+                "page_num": 10,
+                "type": "content",
+                "text_content": {
+                    "headline": "竞品对比",
+                    "body": "A方案 vs B方案，比较成本、效率和执行风险。",
+                },
+            },
+        ],
+        [],
+    )
+
+    joined = "\n".join(
+        f"{item['visual_evidence']}\n{item['visual_description']}"
+        for item in plan
+    )
+    for stale_term in STALE_PRODUCT_DOMAIN_TERMS_FOR_TEST:
+        assert stale_term not in joined
+
+
+def test_fallback_visual_plan_does_not_leak_old_product_domain_for_debate_pages():
+    plan = _fallback_visual_plan(
+        [
+            {
+                "page_num": 21,
+                "type": "content",
+                "text_content": {
+                    "headline": "培养批判思维的日常工具",
+                    "body": (
+                        "- 工具一：苏格拉底式提问——“你怎么知道的？”“证据是什么？”\n"
+                        "- 工具二：两栏日记——记录“观点”vs“事实”，每天练习区分\n"
+                        "- 工具三：反方辩论——就一个观点，强制孩子站在对立面思考\n"
+                        "- 研究支撑：辩论训练可提升逻辑推理能力和学业成绩（Kuhn, 1991）"
+                    ),
+                },
+            }
+        ],
+        [],
+    )
+
+    evidence = plan[0]["visual_evidence"]
+    description = plan[0]["visual_description"]
+    # Fallback now returns open-ended descriptions rather than keyword-extracted lists.
+    assert evidence and "核心场景" in evidence
+    for stale_term in ("工业流水线", "古法小榨", "工坊", "花生", "油瓶", "榨油"):
+        assert stale_term not in evidence
+        assert stale_term not in description
 
 
 def test_punchline_page_content_is_normalized_to_one_line():
@@ -605,6 +681,60 @@ def test_visual_plan_json_repair_handles_multiline_llm_strings():
     parsed = _safe_parse_json(raw, 1)
 
     assert parsed["6"]["visual_description"] == "第一行\n第二行"
+
+
+def test_visual_plan_raises_instead_of_auto_fallback_when_llm_drops_page(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"2": {"visual_evidence": "别页", "visual_description": "别页描述"}}'))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+
+    with pytest.raises(VisualPlanGenerationError, match="missing page intents"):
+        _do_generate_visual_plan(
+            content_plan=[
+                {
+                    "page_num": 1,
+                    "type": "content",
+                    "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
+                }
+            ],
+        )
+
+
+def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missing(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content='{"1": {"visual_description": "只有描述，没有画面证据"}}'))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+
+    with pytest.raises(VisualPlanGenerationError, match="missing visual_evidence"):
+        _do_generate_visual_plan(
+            content_plan=[
+                {
+                    "page_num": 1,
+                    "type": "content",
+                    "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
+                }
+            ],
+        )
 
 
 def test_prompt_keeps_exact_text_contract_and_visual_evidence():
@@ -1100,7 +1230,7 @@ def test_project_quality_report_flags_low_contrast_logo(tmp_path):
 
     assert report
     assert any(issue["kind"] == "logo_low_contrast" and issue["pages"] == [1] for issue in report["issues"])
-    assert "Logo 对比度可能偏弱" in report["message"]
+    assert "Logo 对比度偏弱" in report["message"]
     assert "手动调整" in report["message"]
 
 
@@ -1142,7 +1272,7 @@ def test_project_quality_report_ignores_optional_logo_omission(tmp_path):
     assert report
     assert not any(issue["severity"] == "error" for issue in report["issues"])
     assert not any(issue["kind"] == "required_logo_policy_missing" for issue in report["issues"])
-    assert "章节页和金句页允许不放" in report["message"]
+    assert "章节页和金句页可以不放" in report["message"]
 
 
 def test_project_quality_report_waits_until_final_stage(tmp_path):
@@ -1256,21 +1386,10 @@ def test_prompt_strips_product_details_from_layout_usage_and_style_negatives():
     assert "uploaded product image as the product source" in prompt
     assert "Place the uploaded product image in the lower center area" in prompt
     assert "产品后方呈现古法木榨工艺场景" not in prompt
-    for unwanted in ["5升", "金黄桶身", "金色提手", "非遗吊牌", "红底金边标签", "不要因为", "科技风"]:
+    # Negative clauses are now preserved per prompt-engine policy; only strip
+    # concrete product details, not style guidance containing "不要" or "科技风".
+    for unwanted in ["5升", "金黄桶身", "金色提手", "非遗吊牌", "红底金边标签"]:
         assert unwanted not in prompt
-
-
-def test_style_direction_hint_is_positive_not_negative():
-    hint = _build_content_style_direction(
-        traditional_score=1,
-        food_score=1,
-        tech_score=1,
-        brand_score=1,
-    )
-
-    assert "传统质感" in hint
-    assert "不要" not in hint
-    assert "科技风" not in hint
 
 
 def test_visual_plan_source_prompt_avoids_asset_detail_production():
@@ -1411,10 +1530,11 @@ def test_prompt_does_not_reserve_logo_area_without_uploaded_logo_policy():
 
     assert "Logo Placement Note" not in prompt
     assert "exact overlay" not in prompt
-    assert "do not draw or invent logos" in prompt
+    assert "logo" not in prompt.lower()
+    assert "LOGO" not in prompt
 
 
-def test_prompt_leaves_unframed_logo_space_when_policy_is_enabled():
+def test_prompt_keeps_logo_overlay_policy_out_of_image_prompt():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
             "page_num": 1,
@@ -1429,12 +1549,41 @@ def test_prompt_leaves_unframed_logo_space_when_policy_is_enabled():
         style_text_override="Style: 品牌提案\nPalette: #FFFFFF, #B01622",
     )
 
-    assert "Logo Placement Note" in prompt
-    assert "center brand lockup area" in prompt
-    assert "Do not draw any logo placeholder" in prompt
-    assert "dashed frame" in prompt
-    assert "reserved logo area" not in prompt
-    assert "do not draw, invent, or stylize any logo" in prompt
+    assert "Logo Placement Note" not in prompt
+    assert "Brand marks:" not in prompt
+    assert "brand signature" not in prompt.lower()
+    assert "safe corner" not in prompt.lower()
+    assert "placeholder" not in prompt.lower()
+    assert "logo" not in prompt.lower()
+    assert "LOGO" not in prompt
+
+
+def test_prompt_strips_generated_logo_and_watermark_instructions():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 2,
+            "type": "content",
+            "layout": "content_split",
+            "visual_evidence": "三列业务卡片和右上角小Logo",
+            "visual_description": "浅底三列卡片；右上角小Logo；底部加入品牌抽象展翅造型装饰元素；不要出现虎课网水印。",
+            "logo_policy": {"show_logo": True, "placement": "top-right", "scale": "small"},
+        },
+        content_text={"headline": "企业现状痛点", "body": ["账号同质化", "招聘功能缺失"]},
+        reference_images=[],
+        style_text_override=(
+            "Style: 金黑动感\n"
+            "Palette: #D3BC8E, #000000, #F0E0C0, #1A1A1A\n"
+            "Visual rhythm: 继承品牌Logo金黑配色；装饰语言延续品牌抽象展翅造型；内容页右上角小Logo。"
+        ),
+    )
+
+    assert "Watermarks and stray marks:" in prompt
+    assert "Brand marks:" not in prompt
+    assert "logo" not in prompt.lower()
+    assert "LOGO" not in prompt
+    assert "右上角小Logo" not in prompt
+    assert "品牌抽象展翅造型" not in prompt
+    assert "金黑配色" not in prompt
 
 
 def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
@@ -1776,7 +1925,7 @@ def test_direct_finetune_prompt_distinguishes_project_visual_assets():
 def test_generate_one_slide_uses_single_pass_by_default(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
         calls.append({
             "prompt": prompt,
             "reference_count": len(reference_images or []),
@@ -1820,7 +1969,7 @@ def test_generate_one_slide_uses_single_pass_by_default(tmp_path, monkeypatch):
 def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
         calls.append({
             "prompt": prompt,
             "reference_count": len(reference_images or []),
@@ -1871,7 +2020,7 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
 def test_generate_one_slide_falls_back_to_base_when_refinement_fails(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
         calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
         if len(calls) == 2:
             raise RuntimeError("refinement API unavailable")
@@ -1909,7 +2058,7 @@ def test_generate_one_slide_falls_back_to_base_when_refinement_fails(tmp_path, m
 def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
         calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
         return Image.new("RGB", (16, 9), "green" if len(calls) == 2 else "blue")
 
@@ -1949,7 +2098,7 @@ def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeyp
 def test_double_blend_pass_accepts_page_reference_refs(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9"):
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
         calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
         return Image.new("RGB", (16, 9), "green" if len(calls) == 2 else "blue")
 
@@ -2192,7 +2341,7 @@ def test_visual_plan_forces_logo_policy_off_when_project_has_no_logo(monkeypatch
                                         '{"1": {'
                                         '"visual_evidence": "竞技场封面主视觉", '
                                         '"visual_summary": "暗红竞技场封面", '
-                                        '"visual_description": "主标题左侧，右侧预留品牌标识区域。", '
+                                        '"visual_description": "竞技场主视觉铺底；右侧预留品牌标识区域。", '
                                         '"visual_asset_ids": [], '
                                         '"visual_asset_usage": {}, '
                                         '"logo_policy": {"show_logo": true, "placement": "title-block-center", "scale": "large", "use_as_scene_asset": false}'
@@ -3704,6 +3853,12 @@ def test_overlay_layers_accept_page_reference_assets(tmp_path):
     assert slide.visual_json["overlay_layers"][0]["preset"] == "center-card"
     assert page_ref.process_mode == "original"
     assert page_ref.asset_analysis["exact_overlay"] is True
+
+    serialized = slides_api.list_slides(project.id, db=db)
+    serialized_slide = next(item for item in serialized if item["id"] == slide.id)
+    assert serialized_slide["visual_json"]["overlay_layers"][0]["asset_id"] == page_ref.id
+    assert serialized_slide["reference_images"][0]["id"] == page_ref.id
+    assert serialized_slide["reference_images"][0]["process_mode"] == "original"
 
 
 def test_asset_pins_unpin_removes_overlay_layer(tmp_path):

@@ -141,56 +141,118 @@ def _build_message(
     issues: list[dict],
     logo_count: int,
 ) -> str:
-    lines = [
-        "**交付前检查**",
-        "",
-        f"- 页面生成：{completed_count} / {total_slides} 页",
-        f"- PPTX：{'可导出' if has_pptx else '暂未确认可导出'}",
-    ]
-
     blocking = [i for i in issues if i.get("severity") == "error"]
     warnings = [i for i in issues if i.get("severity") == "warning"]
     infos = [i for i in issues if i.get("severity") == "info"]
+    remaining_count = max(total_slides - completed_count, 0)
+    lines: list[str] = []
 
-    if not blocking and not warnings:
-        lines.extend(["", "**结果**", "", "未发现缺页、文件损坏或必选 Logo 缺失。"])
+    if blocking:
+        lines.append("⚠️ **还不能交付最终稿**")
+        lines.append("")
+        if remaining_count > 0:
+            lines.append(f"目前只完成了 **{completed_count} / {total_slides} 页**，还有 **{remaining_count} 页**没有生成完成。")
+            lines.append("请先补齐剩余页面，完成后再导出最终 PPTX。")
+        elif not has_pptx:
+            lines.append(f"页面已完成 **{completed_count} / {total_slides} 页**，但最终 PPTX 还没确认可导出。")
+            lines.append("请先刷新状态；如果仍不可导出，请重新生成或重试失败页。")
+        else:
+            lines.append("交付前还有问题需要处理。请先处理下面的红色事项，再导出最终 PPTX。")
+        lines.extend(["", "**下一步**"])
+        lines.extend(_next_step_lines(remaining_count=remaining_count, has_pptx=has_pptx))
+    elif warnings:
+        lines.append("✅ **可以导出最终稿，建议复核后交付**")
+        lines.append("")
+        lines.append(f"页面已完成 **{completed_count} / {total_slides} 页**，PPTX {'已可导出' if has_pptx else '暂未确认可导出'}。")
+        lines.append("下面是导出后建议顺手检查的项目。")
+        lines.extend(["", "**下一步**"])
+        lines.extend(["1. 点击「导出 PPTX」获取文件", "2. 打开文件快速检查提醒页"])
     else:
-        if blocking:
-            lines.extend(["", "**需要处理**", ""])
-            lines.extend(f"{idx}. {_format_issue_message(item)}" for idx, item in enumerate(blocking, start=1))
-        if warnings:
-            lines.extend(["", "**建议复核**", ""])
-            lines.extend(f"{idx}. {_format_issue_message(item)}" for idx, item in enumerate(warnings, start=1))
+        lines.append("✅ **可以交付最终稿**")
+        lines.append("")
+        lines.append(f"页面已完成 **{completed_count} / {total_slides} 页**，PPTX {'已可导出' if has_pptx else '暂未确认可导出'}。")
+        lines.append("未发现缺页、文件损坏或必选 Logo 缺失。")
+        if has_pptx:
+            lines.extend(["", "**下一步**", "1. 点击「导出 PPTX」获取文件", "2. 导出后快速翻阅一遍页面"])
+
+    if blocking:
+        lines.extend(["", "**需要处理**", ""])
+        lines.extend(_format_issue_block(item, "🔴") for item in blocking)
+    if warnings:
+        lines.extend(["", "**建议复核**", ""])
+        lines.extend(_format_issue_block(item, "🟡") for item in warnings)
 
     if infos:
         lines.extend(["", "**已按规则处理**", ""])
         for item in infos[:2]:
-            lines.append(f"- {_format_issue_message(item)}")
+            lines.append(_format_issue_block(item, "ℹ️"))
 
-    lines.extend(["", "**Logo 说明**", ""])
+    lines.extend(["", "**说明**", ""])
     if logo_count > 0:
-        lines.append("- 章节页和金句页允许不放；内容页会保留品牌 Logo。")
-        lines.append("- 若个别页面对比度仍不理想，建议在导出的 PPT 里手动微调。")
+        lines.append("ℹ️ 章节页和金句页可以不放 Logo；内容页会保留品牌 Logo。")
+        lines.append("ℹ️ 若个别页面对比度仍不理想，导出后可以手动微调。")
     else:
-        lines.append("- 本项目没有可用品牌 Logo。")
-        lines.append("- 需要品牌露出时，可在导出的 PPT 里手动添加，或下次生成前上传 Logo。")
+        lines.append("ℹ️ 本项目没有可用品牌 Logo。")
+        lines.append("ℹ️ 需要品牌露出时，可在导出的 PPT 里手动添加，或下次生成前上传 Logo。")
 
     if project.status == "prototype_ready":
-        lines.extend(["", "**打样说明**", "", "- 当前是打样文件，确认样张后再生成全部页面。"])
+        lines.append("ℹ️ 当前是打样文件，确认样张后再生成全部页面。")
     return "\n".join(lines)
 
 
-def _format_issue_message(item: Mapping[str, Any]) -> str:
+def _next_step_lines(*, remaining_count: int, has_pptx: bool) -> list[str]:
+    if remaining_count > 0:
+        return [
+            "1. 点击「生成全部页面」或重试未完成页",
+            "2. 等页面全部完成后，点击「导出 PPTX」",
+        ]
+    if not has_pptx:
+        return [
+            "1. 刷新页面状态",
+            "2. 如果仍不可导出，请重新生成或重试失败页",
+        ]
+    return [
+        "1. 处理下面的红色事项",
+        "2. 处理完成后再导出 PPTX",
+    ]
+
+
+ISSUE_DISPLAY_TITLES = {
+    "dense_text": "文字密度偏高",
+    "image_ratio": "页面比例可能异常",
+    "incomplete_pages": "未完成页面",
+    "logo_low_contrast": "Logo 对比度偏弱",
+    "missing_images": "页面图片缺失",
+    "pptx_file_missing": "PPTX 文件暂不可用",
+    "pptx_missing": "PPTX 暂未确认可导出",
+    "required_logo_policy_corrected": "内容页 Logo 已按规则保留",
+    "required_logo_policy_missing": "内容页 Logo 需要补上",
+    "unreadable_images": "页面图片无法读取",
+}
+
+
+def _format_issue_block(item: Mapping[str, Any], icon: str) -> str:
+    title = ISSUE_DISPLAY_TITLES.get(str(item.get("kind") or ""), str(item.get("title") or "需要复核"))
+    detail = _format_issue_detail(item)
+    return f"{icon} **{title}**\n{detail}" if detail else f"{icon} **{title}**"
+
+
+def _format_issue_detail(item: Mapping[str, Any]) -> str:
+    kind = str(item.get("kind") or "")
     page_text = _format_pages(item.get("pages") or [])
     recommendation = str(item.get("recommendation") or "").strip()
-    text = f"**{item['title']}**"
+
+    if kind == "incomplete_pages":
+        return f"{page_text}还未完成。{recommendation}".strip()
+    if kind in {"pptx_missing", "pptx_file_missing"}:
+        return "刷新状态后再试；如果仍不可导出，请重新生成或重试失败页。"
+    if kind == "logo_low_contrast" and page_text:
+        return f"{page_text}的 Logo 可能不够清晰。导出后建议顺手检查，必要时手动调整位置或替换 Logo。"
+    if page_text and recommendation:
+        return f"{page_text}。{recommendation}"
     if page_text:
-        text += f"：{page_text}"
-    if recommendation:
-        text += f"。{recommendation}" if page_text else f"：{recommendation}"
-    elif page_text:
-        text += "。"
-    return text
+        return f"{page_text}。"
+    return recommendation
 
 
 def build_project_quality_report(

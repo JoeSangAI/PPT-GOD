@@ -21,7 +21,7 @@ def test_prepare_reference_image_keeps_source_size_without_max_side():
 def test_build_reference_upload_files_falls_back_only_after_budget_check(monkeypatch):
     calls = []
 
-    def fake_reference_upload_file(ref, index, profile=None):
+    def fake_reference_upload_file(ref, index, profile=None, project_id=None):
         calls.append(profile.max_side)
         size_bytes = 10 * 1024 * 1024 if profile.max_side is None else 10 * 1024
         return f"ref_{index}.jpg", io.BytesIO(b"x"), "image/jpeg", size_bytes
@@ -74,10 +74,18 @@ def test_default_api_backoff_uses_four_attempts(monkeypatch):
     assert len({call[1] for call in calls}) == 1
 
 
-def test_default_image_generation_is_serial_high_quality_without_gateway_retry():
+def test_image_generation_defaults_are_serial_without_gateway_retry(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "IMAGE_GPT_QUALITY", "high")
+
     assert image_generation.settings.IMAGE_API_MAX_CONCURRENCY == 1
     assert image_generation.settings.IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS == 1
     assert image_generation._image_quality() == "high"
+
+
+def test_image_quality_accepts_medium_for_gateway_window(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "IMAGE_GPT_QUALITY", "medium")
+
+    assert image_generation._image_quality() == "medium"
 
 
 def test_aspect_ratio_gate_accepts_current_wide_output(monkeypatch):
@@ -388,7 +396,7 @@ def test_edit_read_timeout_retries_with_same_idempotency_key(monkeypatch):
     monkeypatch.setattr(image_generation, "get_deer_image_model", lambda: "gpt-image-2-all")
     monkeypatch.setattr(image_generation.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    def fake_edit(_prompt, _reference_images, size="1792x1024", idempotency_key=None):
+    def fake_edit(_prompt, _reference_images, size="1792x1024", idempotency_key=None, project_id=None):
         calls.append((size, idempotency_key))
         if len(calls) == 1:
             raise image_generation.requests.exceptions.ReadTimeout("read timed out")

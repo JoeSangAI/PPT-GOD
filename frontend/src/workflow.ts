@@ -30,6 +30,80 @@ export interface WorkflowRun {
   total_count?: number;
   completed_count?: number;
   failed_count?: number;
+  started_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ImageGenerationOutcomeInput {
+  prototype?: boolean;
+  projectStatus?: string | null;
+  run?: WorkflowRun | null;
+}
+
+export interface ImageGenerationOutcome {
+  kind: "success" | "partial" | "cancelled" | "failed" | "unknown";
+  isSuccess: boolean;
+  canConfirmPrototype: boolean;
+  completed: number;
+  total: number;
+  failed: number;
+  targetText: string;
+  message: string;
+}
+
+export interface WorkflowProgressViewInput {
+  active_run?: WorkflowRun | null;
+  progress?: {
+    run_id?: string;
+    kind?: string;
+    status?: string;
+    stage?: string;
+    label?: string;
+    message?: string | null;
+    current?: number;
+    total?: number;
+    failed?: number;
+    unit?: string;
+    percent?: number;
+    target_page_nums?: number[] | null;
+    active_page_nums?: number[];
+    running_count?: number;
+    current_page?: number;
+    total_pages?: number;
+    updated_at?: string | null;
+  } | null;
+  target_count?: number;
+  target_page_nums?: number[] | null;
+  total_slides?: number;
+  completed_slides?: number;
+  target_completed_slides?: number;
+  target_failed_slides?: number;
+}
+
+export interface WorkflowProgressMetric {
+  label: string;
+  value: string;
+}
+
+export interface WorkflowProgressStep {
+  label: string;
+  status: "done" | "current" | "pending";
+}
+
+export interface WorkflowProgressDisclosure {
+  headline: string;
+  summary: string;
+  detail: string;
+  metrics: WorkflowProgressMetric[];
+  steps: WorkflowProgressStep[];
+  percent: number;
+  current: number;
+  total: number;
+  failed: number;
+  unit: string;
+  activePageNums: number[];
+  targetPageNums: number[];
+  status?: string | null;
 }
 
 export interface WorkflowState {
@@ -53,6 +127,33 @@ export interface WorkflowState {
   contentPlanConfirmed: boolean;
   hasSelectedStyle: boolean;
   activeRun: WorkflowRun | null;
+}
+
+export interface SlideStaleFlags {
+  content?: boolean;
+  visual?: boolean;
+  image?: boolean;
+  localImage?: boolean;
+}
+
+export interface StaleSlideActionInput {
+  slide: {
+    id?: string;
+    page_num?: number;
+  };
+  stale?: SlideStaleFlags | null;
+}
+
+export interface StaleSlideActionPlan {
+  primaryActionKey: "update_visual_plan" | "regenerate_images" | null;
+  primaryLabel: string | null;
+  progressTitle: string | null;
+  progressMeta: string | null;
+  contentOrVisualCount: number;
+  imageOnlyCount: number;
+  pageNumsForVisualPlan: number[];
+  pageNumsForPrompt: number[];
+  imageOnlyPageNums: number[];
 }
 
 export type WorkflowGate =
@@ -116,6 +217,64 @@ export const STATUS_LABEL: Record<string, string> = {
   failed: "失败",
 };
 
+function uniqueSortedPageNums(items: StaleSlideActionInput[]) {
+  return Array.from(new Set(
+    items
+      .map((item) => Number(item.slide.page_num))
+      .filter(Number.isFinite)
+  )).sort((a, b) => a - b);
+}
+
+export function planStaleSlideAction(items: StaleSlideActionInput[]): StaleSlideActionPlan {
+  const staleItems = (items || []).filter((item) => {
+    const stale = item.stale || {};
+    return Boolean(stale.content || stale.visual || stale.image);
+  });
+  const needsVisualPlan = staleItems.filter((item) => Boolean(item.stale?.content));
+  const needsPrompt = staleItems.filter((item) => Boolean(item.stale?.content || item.stale?.visual));
+  const imageOnly = staleItems.filter((item) => Boolean(item.stale?.image && !item.stale?.content && !item.stale?.visual));
+
+  if (needsPrompt.length > 0) {
+    return {
+      primaryActionKey: "update_visual_plan",
+      primaryLabel: "更新画面方案",
+      progressTitle: "待更新画面方案",
+      progressMeta: `${needsPrompt.length} 页内容或画面描述变更，需要先更新画面方案`,
+      contentOrVisualCount: needsPrompt.length,
+      imageOnlyCount: imageOnly.length,
+      pageNumsForVisualPlan: uniqueSortedPageNums(needsVisualPlan),
+      pageNumsForPrompt: uniqueSortedPageNums(needsPrompt),
+      imageOnlyPageNums: uniqueSortedPageNums(imageOnly),
+    };
+  }
+
+  if (imageOnly.length > 0) {
+    return {
+      primaryActionKey: "regenerate_images",
+      primaryLabel: "重新生成图片",
+      progressTitle: "待重新生成图片",
+      progressMeta: `${imageOnly.length} 页图片已过期，确认后重新生成这些页面`,
+      contentOrVisualCount: 0,
+      imageOnlyCount: imageOnly.length,
+      pageNumsForVisualPlan: [],
+      pageNumsForPrompt: [],
+      imageOnlyPageNums: uniqueSortedPageNums(imageOnly),
+    };
+  }
+
+  return {
+    primaryActionKey: null,
+    primaryLabel: null,
+    progressTitle: null,
+    progressMeta: null,
+    contentOrVisualCount: 0,
+    imageOnlyCount: 0,
+    pageNumsForVisualPlan: [],
+    pageNumsForPrompt: [],
+    imageOnlyPageNums: [],
+  };
+}
+
 export function buildWorkflowState(input: WorkflowInput): WorkflowState {
   const slides = input.slides || [];
   const projectStatus = input.projectStatus || "draft";
@@ -141,7 +300,7 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     hasGeneratedImage,
     hasPrompt,
     viewLabel: projectStatus === "prototype_ready"
-      ? (input.showPrototypePreview ? "打样结果" : "全局预览")
+      ? (input.showPrototypePreview ? "样张结果" : "全局预览")
       : null,
     selectedPageCount: input.selectedPageCount || 0,
     staleSummary: input.staleSummary || { hasContentOrVisualStale: false, imageStaleCount: 0 },
@@ -170,6 +329,298 @@ export function buildGateContext(state: WorkflowState, revision = 0): GateContex
 
 export function isActiveRun(run?: WorkflowRun | null) {
   return Boolean(run && (run.status === "queued" || run.status === "running"));
+}
+
+const RUN_COPY: Record<string, {
+  headline: string;
+  running: string;
+  doneNoun: string;
+  detail: string;
+  steps: string[];
+}> = {
+  content_plan: {
+    headline: "内容规划进度",
+    running: "正在整理每页要讲什么",
+    doneNoun: "内容规划",
+    detail: "正在读取材料并整理每页要讲什么；完成后会进入内容规划页。",
+    steps: ["读取材料", "整理页面结构", "保存到画布"],
+  },
+  style_proposal: {
+    headline: "视觉方向进度",
+    running: "正在整理可选视觉方向",
+    doneNoun: "视觉方向",
+    detail: "正在根据内容和素材整理可选视觉方向；完成后会显示方案卡片。",
+    steps: ["读取内容与素材", "生成视觉方向", "保存方案"],
+  },
+  visual_prompts: {
+    headline: "画面方案进度",
+    running: "正在生成每页画面方案",
+    doneNoun: "画面方案",
+    detail: "正在把每页内容转换成可生成样张的画面方案；完成后每页会出现检查项。",
+    steps: ["读取内容与素材", "生成画面方案", "保存到页面"],
+  },
+  prototype_generation: {
+    headline: "样张进度",
+    running: "正在生成样张",
+    doneNoun: "样张页",
+    detail: "正在生成样张；完成后会直接出现在画布中。",
+    steps: ["准备页面", "生成图片", "写入画布"],
+  },
+  batch_generation: {
+    headline: "批量生成进度",
+    running: "正在生成图片",
+    doneNoun: "页面图片",
+    detail: "正在生成页面图片；完成后会直接出现在画布中。",
+    steps: ["准备页面", "生成图片", "写入画布"],
+  },
+  page_generation: {
+    headline: "单页生成进度",
+    running: "正在生成图片",
+    doneNoun: "页面图片",
+    detail: "正在生成选中页面；完成后会直接出现在画布中。",
+    steps: ["准备页面", "生成图片", "写入画布"],
+  },
+  retry_failed: {
+    headline: "失败页重试进度",
+    running: "正在重试失败页",
+    doneNoun: "页面图片",
+    detail: "正在重试失败页面；完成后会直接出现在画布中。",
+    steps: ["准备失败页", "重新生成图片", "写入画布"],
+  },
+  finetune: {
+    headline: "单页微调进度",
+    running: "正在微调当前页",
+    doneNoun: "页面图片",
+    detail: "正在根据你的修改生成当前页；完成后会替换到画布中。",
+    steps: ["读取修改要求", "生成新画面", "保存版本"],
+  },
+};
+
+function progressCopy(kind?: string | null) {
+  return RUN_COPY[String(kind || "")] || {
+    headline: "任务进度",
+    running: "任务正在处理",
+    doneNoun: "任务",
+    detail: "任务正在处理；页面会自动刷新进度。",
+    steps: ["等待开始", "处理中", "更新结果"],
+  };
+}
+
+function isImageProgressKind(kind?: string | null) {
+  return ["prototype_generation", "batch_generation", "page_generation", "retry_failed", "finetune"].includes(String(kind || ""));
+}
+
+function cleanWorkflowMessage(message?: string | null) {
+  return String(message || "")
+    .replace(/[🧠🚀⏳✅📝🎨]/gu, "")
+    .replace(/（?批次\s*\d+\s*\/\s*\d+）?/g, "")
+    .replace(/\d+\s*\/\s*\d+\s*页完成/g, "")
+    .replace(/\.\.\./g, "")
+    .replace(/……/g, "")
+    .replace(/\bprompt\b/gi, "画面方案")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function displayProgressMessage(kind: string, message: string, fallback: string) {
+  if (kind === "visual_prompts") {
+    if (!message || /视觉方案|画面方案|prompt|生图|撰写/i.test(message)) {
+      return fallback;
+    }
+  }
+  return message || fallback;
+}
+
+function numberFrom(value: unknown, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function secondsSinceIsoAt(value: string | null | undefined, nowMs: number) {
+  if (!value) return 0;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return 0;
+  return Math.max(0, Math.floor((nowMs - timestamp) / 1000));
+}
+
+export function formatWorkflowDuration(seconds: number) {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 10) return "刚刚";
+  if (s < 60) return `${s} 秒`;
+  const minutes = Math.floor(s / 60);
+  const rest = s % 60;
+  if (minutes < 60) return rest > 0 ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours} 小时 ${remainingMinutes} 分钟` : `${hours} 小时`;
+}
+
+export function formatWorkflowPageNumsForUser(pageNums?: number[] | null, limit = 6) {
+  const unique = Array.from(new Set((pageNums || []).map(Number).filter(Number.isFinite))).sort((a, b) => a - b);
+  if (unique.length === 0) return "";
+  const shown = unique.slice(0, limit).join("、");
+  return unique.length > limit ? `第 ${shown} 等 ${unique.length} 页` : `第 ${shown} 页`;
+}
+
+export function evaluateImageGenerationOutcome(input: ImageGenerationOutcomeInput): ImageGenerationOutcome {
+  const run = input.run || null;
+  const prototype = Boolean(input.prototype);
+  const projectStatus = String(input.projectStatus || "");
+  const status = String(run?.status || "");
+  const total = Math.max(0, Number(run?.total_count || 0));
+  const completed = total > 0
+    ? Math.min(total, Math.max(0, Number(run?.completed_count || 0)))
+    : Math.max(0, Number(run?.completed_count || 0));
+  const failed = total > 0
+    ? Math.min(total, Math.max(0, Number(run?.failed_count || 0)))
+    : Math.max(0, Number(run?.failed_count || 0));
+  const targetText = formatWorkflowPageNumsForUser(run?.target_page_nums || null);
+  const scopeText = targetText ? `（${targetText}）` : "";
+  const noun = prototype ? "样张生成" : "图片生成";
+  const base = { completed, total, failed, targetText };
+
+  if (status === "cancelled") {
+    const message = completed > 0
+      ? `已停止${noun}${scopeText}，本次只生成了 ${completed} / ${total || completed} 页，不算完整样张。请检查已生成页面，或重打样张。`
+      : `已停止${noun}${scopeText}，本次没有生成新样张。旧样张仍会保留在画布中，不能代表刚才的新视觉方案。`;
+    return {
+      ...base,
+      kind: "cancelled",
+      isSuccess: false,
+      canConfirmPrototype: false,
+      message,
+    };
+  }
+
+  if (["failed", "stale"].includes(status)) {
+    const reason = run?.message || "后台任务没有完成";
+    const hasPartialResult = completed > 0;
+    return {
+      ...base,
+      kind: hasPartialResult ? "partial" : "failed",
+      isSuccess: false,
+      canConfirmPrototype: false,
+      message: hasPartialResult
+        ? `${noun}${scopeText}只完成了 ${completed} / ${total || completed} 页，不能直接确认生成全部。原因：${reason}`
+        : `${noun}${scopeText}没有生成成功，画布里仍是旧结果或待生成页面。原因：${reason}`,
+    };
+  }
+
+  const expectedStatus = prototype ? "prototype_ready" : "completed";
+  const successByRun = status === "succeeded" && completed > 0 && (!total || completed >= total) && failed === 0;
+  const successByLegacyStatus = !run && projectStatus === expectedStatus;
+  if (successByRun || successByLegacyStatus) {
+    return {
+      ...base,
+      kind: "success",
+      isSuccess: true,
+      canConfirmPrototype: prototype,
+      message: prototype
+        ? `样张已生成${scopeText}，页面已刷新。请检查风格、构图和文字可读性；满意后再生成全部。`
+        : "全部页面生成完成，页面已刷新。可以导出 PPTX，需要调整时再选中页面微调。",
+    };
+  }
+
+  return {
+    ...base,
+    kind: "unknown",
+    isSuccess: false,
+    canConfirmPrototype: false,
+    message: `生成任务已结束，但当前状态是「${projectStatus || "未知"}」。请检查页面是否有失败或待生成项后再继续。`,
+  };
+}
+
+function buildStepStatuses(labels: string[], currentIndex: number): WorkflowProgressStep[] {
+  const safeCurrent = Math.max(0, Math.min(labels.length - 1, currentIndex));
+  return labels.map((label, index) => ({
+    label,
+    status: index < safeCurrent ? "done" : index === safeCurrent ? "current" : "pending",
+  }));
+}
+
+function progressStepIndex(kind: string, status: string | null, stage: string | null, current: number, total: number) {
+  if (status === "queued") return 0;
+  const normalizedStage = String(stage || "").toLowerCase();
+  if (/(saving|save|complete|final|assembling)/.test(normalizedStage)) return 2;
+  if (/(document|parse|analyz|asset|read)/.test(normalizedStage)) return 0;
+  if (total > 0 && current >= total) return 2;
+  if (kind === "content_plan" && current <= 0 && /(brief|ingest|document)/.test(normalizedStage)) return 0;
+  return 1;
+}
+
+export function buildWorkflowProgressDisclosure(
+  input?: WorkflowProgressViewInput | null,
+  nowMs = Date.now()
+): WorkflowProgressDisclosure | null {
+  const activeRun = input?.active_run || null;
+  const progress = input?.progress || null;
+  if (!activeRun && !progress) return null;
+
+  const kind = String(progress?.kind || activeRun?.kind || "");
+  const copy = progressCopy(kind);
+  const status = String(progress?.status || activeRun?.status || "");
+  const total = Math.max(0, numberFrom(progress?.total ?? progress?.total_pages ?? activeRun?.total_count ?? input?.target_count ?? input?.total_slides));
+  const rawCurrent = numberFrom(progress?.current ?? progress?.current_page ?? activeRun?.completed_count ?? input?.target_completed_slides ?? input?.completed_slides);
+  const current = Math.min(total || rawCurrent, Math.max(0, rawCurrent));
+  const failed = Math.max(0, numberFrom(progress?.failed ?? activeRun?.failed_count ?? input?.target_failed_slides));
+  const unit = progress?.unit || (kind === "style_proposal" ? "套" : "页");
+  const percent = total > 0 ? Math.min(100, (current / total) * 100) : 0;
+  const targetPageNums = Array.isArray(progress?.target_page_nums)
+    ? progress.target_page_nums.map(Number).filter(Number.isFinite)
+    : Array.isArray(activeRun?.target_page_nums)
+    ? activeRun.target_page_nums.map(Number).filter(Number.isFinite)
+    : Array.isArray(input?.target_page_nums)
+    ? input.target_page_nums.map(Number).filter(Number.isFinite)
+    : [];
+  const activePageNums = Array.isArray(progress?.active_page_nums)
+    ? progress.active_page_nums.map(Number).filter(Number.isFinite).sort((a, b) => a - b)
+    : [];
+  const message = displayProgressMessage(kind, cleanWorkflowMessage(progress?.message || activeRun?.message), copy.running);
+  const startedAt = activeRun?.started_at || null;
+  const updatedAt = progress?.updated_at || activeRun?.updated_at || null;
+  const elapsed = startedAt ? formatWorkflowDuration(secondsSinceIsoAt(startedAt, nowMs)) : "";
+  const recentDuration = updatedAt ? formatWorkflowDuration(secondsSinceIsoAt(updatedAt, nowMs)) : "";
+  const recent = recentDuration ? (recentDuration === "刚刚" ? "刚刚" : `${recentDuration}前`) : "";
+  const hasTotal = total > 0;
+  const progressValue = hasTotal ? `${current} / ${total} ${unit}` : current > 0 ? `${current} ${unit}` : "";
+  const targetText = formatWorkflowPageNumsForUser(targetPageNums);
+
+  const summary = status === "queued"
+    ? `${copy.headline.replace(/进度$/, "")}已排队，等待开始${elapsed ? `，已等待 ${elapsed}` : ""}`
+    : activePageNums.length > 0 && isImageProgressKind(kind)
+    ? `${activePageNums.length === 1 ? `正在生成第 ${activePageNums[0]} 页` : `正在处理${formatWorkflowPageNumsForUser(activePageNums)}`}：${progressValue || message}完成`
+    : hasTotal
+    ? `${message}：${progressValue}完成`
+    : message;
+
+  const detail = status === "queued"
+    ? "任务已提交，正在等待后台开始；页面会自动刷新进度。"
+    : activePageNums.length > 0 && isImageProgressKind(kind)
+    ? `${formatWorkflowPageNumsForUser(activePageNums)}正在生成；完成后会直接出现在画布中。`
+    : copy.detail;
+
+  const metrics: WorkflowProgressMetric[] = [];
+  if (progressValue) metrics.push({ label: "进度", value: progressValue });
+  if (failed > 0) metrics.push({ label: "失败", value: `${failed} ${unit}` });
+  if (targetText) metrics.push({ label: "处理范围", value: targetText });
+  if (elapsed) metrics.push({ label: status === "queued" ? "已等待" : "已运行", value: elapsed });
+  if (recent) metrics.push({ label: "最近更新", value: recent });
+
+  return {
+    headline: copy.headline,
+    summary,
+    detail,
+    metrics,
+    steps: buildStepStatuses(copy.steps, progressStepIndex(kind, status || null, progress?.stage || activeRun?.stage || null, current, total)),
+    percent,
+    current,
+    total,
+    failed,
+    unit,
+    activePageNums,
+    targetPageNums,
+    status,
+  };
 }
 
 function getStepIndex(
@@ -255,9 +706,9 @@ export function getGuidanceText(state: WorkflowState) {
     case "prompt_ready":
       return "请检查每页画面描述，可上传参考图，然后点击「生成样张」";
     case "prototype":
-      return "打样页正在生成中，请稍候";
+      return "样张正在生成中，请稍候";
     case "prototype_ready":
-      return "打样页已生成，请检查效果，满意后点击确认开始批量生成";
+      return "样张已生成，请检查效果；满意后生成全部页面";
     case "generating":
       return "正在批量生成所有页面";
     case "completed":
@@ -300,9 +751,7 @@ export function getSecondaryActionKeys(state: WorkflowState) {
   if (state.projectStatus === "prototype_ready") {
     actions.push("resample");
   }
-  if (state.hasFailedSlide) {
-    actions.push("retry-failed");
-  }
+  // retry-failed is handled exclusively by StatusCard (getStatusCard).
   // Page regeneration actions are intentionally not global header actions.
   // They belong on the affected page/card so the loading state stays local.
   if (state.projectStatus === "completed") {
@@ -385,4 +834,260 @@ function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateAc
   }
   if (state.hasFailedSlide) actions.push("retry_failed");
   return actions;
+}
+
+// ============================================================
+// StatusCard: 状态栏的唯一数据源
+// 原则:任何时刻只显示一张卡 + 一个主 CTA(异常态最多一个副 CTA)
+// 优先级:任务运行中 > 失败 > 过期 > 样张就绪 > 待操作
+// ============================================================
+
+export type StatusCardTone = "running" | "danger" | "warning" | "success" | "info";
+
+export type StatusActionKey =
+  | "stop"
+  | "retry-failed"
+  | "update-stale-visual"
+  | "regenerate-stale-images"
+  | "confirm-prototype"
+  | "resample-prototype"
+  | "start-prototype"
+  | "generate-style"
+  | "generate-visual-prompts"
+  | "confirm-content"
+  | "switch-to-visual"
+  | "start-generation"
+  | "download";
+
+export interface StatusCardAction {
+  key: StatusActionKey;
+  label: string;
+  variant: "primary" | "secondary" | "danger";
+  disabled?: boolean;
+  title?: string;
+}
+
+export interface StatusCardData {
+  tone: StatusCardTone;
+  title: string;
+  description?: string;
+  detail?: string;
+  progress?: { current: number; total: number; percent: number; unit: string };
+  primary?: StatusCardAction;
+  secondary?: StatusCardAction;
+}
+
+export interface StatusCardInput {
+  workflowState: WorkflowState;
+  staleActionPlan: StaleSlideActionPlan;
+  failedPageNums: number[];
+  visiblePrototypePageNums: number[];
+  resamplePageNums: number[];
+  prototypePromptTargetCount: number;
+  completedSlideCount: number;
+  totalSlideCount: number;
+  progressDisclosure?: WorkflowProgressDisclosure | null;
+  canStartPrototypeGeneration?: boolean;
+  canStartFullGeneration?: boolean;
+}
+
+export function getStatusCard(input: StatusCardInput): StatusCardData | null {
+  const {
+    workflowState: w,
+    staleActionPlan,
+    failedPageNums,
+    visiblePrototypePageNums,
+    resamplePageNums,
+    prototypePromptTargetCount,
+    completedSlideCount,
+    totalSlideCount,
+    progressDisclosure,
+    canStartPrototypeGeneration = true,
+  } = input;
+
+  // 优先级 1:任务正在运行
+  if (w.activeRun) {
+    const disc = progressDisclosure;
+    const total = disc?.total || 0;
+    const current = disc?.current || 0;
+    const unit = disc?.unit || "页";
+    return {
+      tone: "running",
+      title: disc?.headline || "任务进行中",
+      description: disc?.summary || "任务进行中,请稍候",
+      progress: total > 0 ? { current, total, percent: disc?.percent || 0, unit } : undefined,
+      primary: {
+        key: "stop",
+        label: "停止",
+        variant: "secondary",
+      },
+    };
+  }
+
+  // 优先级 2:有失败页(异常态独占)
+  if (w.hasFailedSlide && failedPageNums.length > 0) {
+    const pageText = formatWorkflowPageNumsForUser(failedPageNums);
+    return {
+      tone: "danger",
+      title: failedPageNums.length === 1
+        ? `第 ${failedPageNums[0]} 页生成失败`
+        : `${failedPageNums.length} 页生成失败`,
+      description: failedPageNums.length === 1
+        ? "点击重试可继续;反复失败请进入该页修改画面描述"
+        : `失败页:${pageText}。点击重试可继续;反复失败请进入对应页面修改`,
+      primary: {
+        key: "retry-failed",
+        label: "重试失败页",
+        variant: "danger",
+      },
+    };
+  }
+
+  // 优先级 3:有过期画面(异常态独占)
+  if (staleActionPlan.primaryActionKey === "update_visual_plan") {
+    return {
+      tone: "warning",
+      title: `${staleActionPlan.contentOrVisualCount} 页需要更新画面方案`,
+      description: "内容或画面描述变更,需要先更新画面方案再重新生成图片",
+      primary: {
+        key: "update-stale-visual",
+        label: "更新画面方案",
+        variant: "primary",
+      },
+    };
+  }
+  if (staleActionPlan.primaryActionKey === "regenerate_images") {
+    return {
+      tone: "warning",
+      title: `${staleActionPlan.imageOnlyCount} 页图片需要重新生成`,
+      description: "确认画面方案后,重新生成这些页面即可",
+      primary: {
+        key: "regenerate-stale-images",
+        label: "重新生成图片",
+        variant: "primary",
+      },
+    };
+  }
+
+  // 优先级 4:样张已生成,等待用户判断
+  if (w.projectStatus === "prototype_ready") {
+    const scopeText = formatWorkflowPageNumsForUser(visiblePrototypePageNums);
+    const totalSuffix = totalSlideCount > 0 && visiblePrototypePageNums.length < totalSlideCount
+      ? `(共 ${totalSlideCount} 页)`
+      : "";
+    return {
+      tone: "success",
+      title: scopeText
+        ? `样张已生成 · ${scopeText}${totalSuffix}`
+        : "样张已生成",
+      description: resamplePageNums.length > 0
+        ? `已勾选 ${resamplePageNums.length} 页重打;不勾选则全部满意,可生成全部`
+        : "满意 → 生成全部页面;不满意 → 在画布勾选页面后重打",
+      primary: {
+        key: "confirm-prototype",
+        label: "样张满意,生成全部",
+        variant: "primary",
+      },
+      secondary: resamplePageNums.length > 0
+        ? {
+            key: "resample-prototype",
+            label: `重打样张(${resamplePageNums.length} 页)`,
+            variant: "secondary",
+          }
+        : undefined,
+    };
+  }
+
+  // 优先级 5:批量完成
+  if (w.projectStatus === "completed") {
+    return {
+      tone: "success",
+      title: `已生成 ${completedSlideCount} / ${totalSlideCount} 页`,
+      description: "右上角可导出 PPTX;需要修改时选中页面进入微调",
+      primary: {
+        key: "download",
+        label: "导出 PPTX",
+        variant: "primary",
+      },
+    };
+  }
+
+  // 优先级 6:按 stage 引导(画面方案就绪 → 生成样张)
+  if ((w.projectStatus === "prompt_ready" || w.projectStatus === "failed") && w.hasPrompt) {
+    const scopeText = formatWorkflowPageNumsForUser(visiblePrototypePageNums);
+    return {
+      tone: "info",
+      title: scopeText
+        ? `样张范围:${scopeText}${totalSlideCount > 0 && visiblePrototypePageNums.length < totalSlideCount ? `(共 ${totalSlideCount} 页)` : ""}`
+        : "下一步:生成样张",
+      description: "勾选画布页面可改变范围,准备好后点击生成样张",
+      primary: {
+        key: "start-prototype",
+        label: prototypePromptTargetCount > 0
+          ? `生成样张(${prototypePromptTargetCount} 页)`
+          : "选择样张页",
+        variant: "primary",
+        disabled: !canStartPrototypeGeneration || prototypePromptTargetCount === 0,
+      },
+    };
+  }
+
+  // 视觉方向待生成
+  if (w.projectStatus === "visual_ready" && !w.hasSelectedStyle) {
+    return {
+      tone: "info",
+      title: "下一步:生成视觉方向",
+      description: "可先在「素材库」上传 Logo、风格参考或模板;没有素材也可直接生成",
+      primary: {
+        key: "generate-style",
+        label: w.isBusy ? "生成中..." : "生成视觉方向",
+        variant: "primary",
+        disabled: w.isBusy,
+      },
+    };
+  }
+
+  // 画面方案待生成
+  if (w.projectStatus === "visual_ready" && w.hasSelectedStyle && !w.hasPrompt) {
+    return {
+      tone: "info",
+      title: "下一步:生成画面方案",
+      description: "为每页生成画面方案和生图 Prompt,然后再生成样张",
+      primary: {
+        key: "generate-visual-prompts",
+        label: "生成画面方案",
+        variant: "primary",
+      },
+    };
+  }
+
+  // 内容规划阶段:待确认
+  if ((w.projectStatus === "planning" || w.projectStatus === "content_plan_ready") && !w.contentPlanConfirmed) {
+    return {
+      tone: "info",
+      title: "下一步:确认内容",
+      description: "检查页数、标题和顺序,确认进入视觉阶段",
+      primary: {
+        key: "confirm-content",
+        label: "确认内容,请视觉总监",
+        variant: "primary",
+      },
+    };
+  }
+
+  // 内容已确认:请视觉总监
+  if ((w.projectStatus === "planning" || w.projectStatus === "content_plan_ready") && w.contentPlanConfirmed) {
+    return {
+      tone: "info",
+      title: "下一步:进入视觉阶段",
+      description: "内容已确认,接下来由视觉总监生成整体方向",
+      primary: {
+        key: "switch-to-visual",
+        label: "请视觉总监介入",
+        variant: "primary",
+      },
+    };
+  }
+
+  return null;
 }

@@ -13,6 +13,12 @@ export interface InferAgentRequestContextInput {
   selectedPageNums?: number[];
   projectStatus?: string;
   slideCount?: number;
+  slides?: Array<{
+    page_num?: number;
+    type?: string;
+    headline?: string;
+    section_title?: string;
+  }>;
   contentPlanConfirmed?: boolean;
   hasSelectedStyle?: boolean;
   hasPrompt?: boolean;
@@ -157,6 +163,9 @@ const hasAny = (message: string, pattern: RegExp) => pattern.test(message);
 const CURRENT_SCOPE_RE = /(当前页|当前页面|这一页|这页|本页|这个页面|这一张|这张PPT|这张幻灯片|正在看的页|这一个页面)/i;
 const DECK_SCOPE_RE = /(整体|全局|全部|所有|整套|全套|每一页|每页|所有页|所有页面|统一|后面所有|后面都|后续所有|一整套|整个PPT|整份PPT|整套PPT)/i;
 const SELECTED_SCOPE_RE = /(选中页|选中的页|这几页|这些页|这几张|这些页面)/i;
+const COVER_SCOPE_RE = /(封面|首页|首屏|开场页|开篇页)/i;
+const ENDING_SCOPE_RE = /(结尾页|封底|结束页|收尾页|最后一页|尾页|致谢页)/i;
+const TOC_SCOPE_RE = /(目录页|目录|议程页|议程|大纲页|大纲)/i;
 
 const VISUAL_RE = /(风格|视觉|配色|颜色|色彩|字体|排版|版式|背景|质感|调性|商务|科技|高级|深色|浅色|小红书|生活感|杂志|极简|复古|品牌|Logo|logo|素材|参考图|画面|图片|生图|出图|打样|重画|生成图片|画面方案|视觉描述|Prompt|prompt)/i;
 const CONTENT_RE = /(内容|文案|标题|正文|小标题|结构|逻辑|故事|页数|原文|大纲|目录|讲稿|数据|案例|补充|改写|重写|扩写|删减|信息|表达|措辞)/i;
@@ -166,7 +175,7 @@ const DESTRUCTIVE_RE = /(重新做|重做|重新规划|重构|覆盖|从头|按�
 const TITLE_AREA_RE = /(标题|主标题|副标题|小标题|headline|title|subtitle)/i;
 const BODY_AREA_RE = /(正文|段落|要点|项目符号|bullet|文案|内容|说明|文本|文字|数据|案例|结构|逻辑|改写|重写|扩写|删减)/i;
 const NOTES_AREA_RE = /(备注|讲稿|演讲稿|speaker\s*notes?|notes?)/i;
-const VISUAL_AREA_RE = /(画面|风格|背景|配色|颜色|色彩|版式|排版|图片|图像|视觉|质感|调性|商务|科技|高级|深色|浅色|杂志|极简|重画|出图|生图|打样|生成图片|画面方案|视觉描述|Prompt|prompt)/i;
+const VISUAL_AREA_RE = /(画面|风格|背景|配色|颜色|色彩|字体|版式|排版|图片|图像|视觉|质感|调性|商务|科技|高级|深色|浅色|杂志|极简|重画|出图|生图|打样|生成图片|画面方案|视觉描述|Prompt|prompt)/i;
 const MATERIALS_AREA_RE = /(Logo|logo|产品图|素材|参考图|模板|物料|品牌资产|上传|贴图)/i;
 
 const AREA_LABELS: Record<AgentTargetArea, string> = {
@@ -180,6 +189,50 @@ const AREA_LABELS: Record<AgentTargetArea, string> = {
 
 const isVisualStage = (status?: string) =>
   ["visual_ready", "prompt_ready", "prototype", "prototype_ready", "generating", "completed", "failed"].includes(status || "");
+
+const normalizedSlideType = (slide: NonNullable<InferAgentRequestContextInput["slides"]>[number]) =>
+  String(slide.type || "").trim().toLowerCase();
+
+const slidePageNum = (slide: NonNullable<InferAgentRequestContextInput["slides"]>[number]) => {
+  const value = Number(slide.page_num);
+  return Number.isFinite(value) && value > 0 ? value : null;
+};
+
+const findRolePageNums = (input: InferAgentRequestContextInput, message: string) => {
+  const slides = (input.slides || [])
+    .map((slide) => ({ ...slide, page_num: slidePageNum(slide) }))
+    .filter((slide): slide is typeof slide & { page_num: number } => Boolean(slide.page_num))
+    .sort((a, b) => a.page_num - b.page_num);
+
+  if (hasAny(message, COVER_SCOPE_RE)) {
+    const cover = slides.find((slide) => ["cover", "title", "front_cover", "bookend_cover"].includes(normalizedSlideType(slide)));
+    return cover ? [cover.page_num] : input.slideCount && input.slideCount > 0 ? [1] : [];
+  }
+
+  if (hasAny(message, ENDING_SCOPE_RE)) {
+    const ending = [...slides]
+      .reverse()
+      .find((slide) => ["ending", "end", "closing", "backcover", "back_cover", "thanks"].includes(normalizedSlideType(slide)));
+    return ending
+      ? [ending.page_num]
+      : input.slideCount && input.slideCount > 0
+      ? [input.slideCount]
+      : slides.length > 0
+      ? [slides[slides.length - 1].page_num]
+      : [];
+  }
+
+  if (hasAny(message, TOC_SCOPE_RE)) {
+    const tocSlides = slides.filter((slide) => {
+      const type = normalizedSlideType(slide);
+      const headline = `${slide.headline || ""} ${slide.section_title || ""}`;
+      return ["toc", "agenda", "outline"].includes(type) || /(目录|议程|大纲)/.test(headline);
+    });
+    if (tocSlides.length === 1) return [tocSlides[0].page_num];
+  }
+
+  return [];
+};
 
 const inferTargetArea = (
   message: string,
@@ -225,6 +278,7 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
   const selectedPageNums = uniqueSortedNums(input.selectedPageNums || []);
   const requestedPageCount = inferRequestedPageCount(message);
   const explicitPageNums = requestedPageCount ? [] : extractPageNums(message);
+  const rolePageNums = requestedPageCount ? [] : findRolePageNums(input, message);
   const mentionsCurrent = hasAny(message, CURRENT_SCOPE_RE);
   const mentionsDeck = hasAny(message, DECK_SCOPE_RE);
   const mentionsSelected = hasAny(message, SELECTED_SCOPE_RE);
@@ -257,16 +311,24 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
     scope = "current_slide";
     pageNums = [input.editingPageNum];
     explicitScope = true;
+  } else if (activeScope === "current_slide" && input.editingPageNum) {
+    pageNums = [input.editingPageNum];
+  } else if (activeScope === "selected_slides" && selectedPageNums.length > 0) {
+    pageNums = selectedPageNums;
   } else if (input.activeAgentRole === "finetune" && input.editingPageNum) {
     scope = "current_slide";
     pageNums = [input.editingPageNum];
   } else if (selectedPageNums.length > 0) {
     scope = selectedPageNums.length === 1 ? "current_slide" : "selected_slides";
     pageNums = selectedPageNums;
-  } else if (activeScope === "current_slide" && input.editingPageNum) {
-    pageNums = [input.editingPageNum];
-  } else if (activeScope === "selected_slides" && selectedPageNums.length > 0) {
-    pageNums = selectedPageNums;
+  } else if (rolePageNums.length > 1) {
+    scope = "selected_slides";
+    pageNums = rolePageNums;
+    explicitScope = true;
+  } else if (rolePageNums.length === 1) {
+    scope = "current_slide";
+    pageNums = rolePageNums;
+    explicitScope = true;
   }
 
   if (scope === "deck") {

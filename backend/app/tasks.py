@@ -66,6 +66,15 @@ def _first_cached_reference_analysis(refs) -> dict | None:
     return None
 
 
+def _cached_reference_analyses(refs) -> list[dict]:
+    analyses = []
+    for ref in refs or []:
+        cached = _cached_reference_analysis(ref)
+        if cached:
+            analyses.append(cached)
+    return analyses
+
+
 def _first_existing_ref(refs):
     return next((ref for ref in refs or [] if _file_exists(getattr(ref, "file_path", None))), None)
 
@@ -388,6 +397,7 @@ def generate_style_proposals_task(
     run_id: str = None,
     credential_id: str = None,
     user_description: str | None = None,
+    previous_proposal: dict | None = None,
     **legacy_kwargs,
 ):
     """Celery task: 生成风格提案。"""
@@ -401,10 +411,22 @@ def generate_style_proposals_task(
         _finish_run_for_credential_error(run_id, message, exc)
         return {"project_id": project_id, "status": "failed", "error": message}
     with provider_credentials_context(credentials):
-        return _generate_style_proposals_task_inner(self, project_id, run_id, user_description=user_description)
+        return _generate_style_proposals_task_inner(
+            self,
+            project_id,
+            run_id,
+            user_description=user_description,
+            previous_proposal=previous_proposal,
+        )
 
 
-def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = None, user_description: str | None = None):
+def _generate_style_proposals_task_inner(
+    self,
+    project_id: str,
+    run_id: str = None,
+    user_description: str | None = None,
+    previous_proposal: dict | None = None,
+):
     """Style proposal task body with provider credentials installed in context."""
     db = SessionLocal()
     try:
@@ -433,6 +455,13 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
         user_description = (user_description or "").strip()
         if user_description:
             assets["user_description"] = user_description[:4000]
+        if previous_proposal and isinstance(previous_proposal, dict):
+            assets["previous_proposal"] = previous_proposal
+            logger.info(
+                "[StyleProposals Celery] Carrying previous_proposal for regeneration: project=%s name=%s",
+                project_id,
+                previous_proposal.get("name"),
+            )
         if project.reference_images:
             update_run_progress(db, run_id, stage="asset_analysis", message="正在读取项目素材...")
             db.commit()
@@ -459,27 +488,36 @@ def _generate_style_proposals_task_inner(self, project_id: str, run_id: str = No
                         logger.warning(f"[StyleProposals Celery] Logo analysis failed: {e}")
 
             if style_refs:
-                cached = _first_cached_reference_analysis(style_refs)
-                if cached:
+                cached_analyses = _cached_reference_analyses(style_refs)
+                if cached_analyses:
                     logger.info(f"[StyleProposals Celery] Reusing cached reference analysis for project={project_id}")
-                    assets["reference_analysis"] = cached
+                    assets["reference_analysis"] = cached_analyses[0]
+                    assets["reference_analyses"] = cached_analyses
                 else:
-                    style_ref = _first_existing_ref(style_refs)
-                    if not style_ref:
+                    existing_style_refs = [
+                        ref for ref in style_refs
+                        if _file_exists(getattr(ref, "file_path", None))
+                    ]
+                    if not existing_style_refs:
                         logger.warning(
                             "[StyleProposals Celery] Skipping %s missing style reference file(s) for project=%s; generating from remaining context",
                             len(style_refs),
                             project_id,
                         )
                     else:
-                        try:
-                            logger.info(f"[StyleProposals Celery] Analyzing reference image for project={project_id}")
-                            reference_analysis = analyze_reference_image(style_ref.file_path)
-                            assets["reference_analysis"] = reference_analysis
-                            if reference_analysis:
-                                style_ref.asset_analysis = {"analysis_status": "completed", **reference_analysis}
-                        except Exception as e:
-                            logger.warning(f"[StyleProposals Celery] Reference analysis failed: {e}")
+                        reference_analyses = []
+                        for style_ref in existing_style_refs:
+                            try:
+                                logger.info(f"[StyleProposals Celery] Analyzing reference image for project={project_id}")
+                                reference_analysis = analyze_reference_image(style_ref.file_path)
+                                if reference_analysis:
+                                    reference_analyses.append(reference_analysis)
+                                    style_ref.asset_analysis = {"analysis_status": "completed", **reference_analysis}
+                            except Exception as e:
+                                logger.warning(f"[StyleProposals Celery] Reference analysis failed: {e}")
+                        if reference_analyses:
+                            assets["reference_analysis"] = reference_analyses[0]
+                            assets["reference_analyses"] = reference_analyses
 
             if template_refs or project.selected_template_recommendations:
                 assets["template_analysis"] = {"has_template": True}

@@ -1,10 +1,13 @@
 from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VISUAL_ACTIONS, with_next_action
 from app.api.chat import (
+    _build_page_context_prompt_section,
     _content_result_needs_contract_review,
     _enforce_content_action_contract,
     _enforce_visual_action_contract,
+    _format_page_target_context,
     _infer_requested_page_count,
     _has_page_count_change_intent,
+    _has_visual_mutation_intent,
     _visual_result_needs_contract_review,
 )
 from app.api.slides import PageNumsRequest
@@ -135,6 +138,57 @@ def test_visual_plan_prompt_inherits_cross_stage_requirements():
     assert "OpenDay 39 场" in prompt
 
 
+def test_page_target_context_formats_fill_in_scope_and_area():
+    context = _format_page_target_context(
+        {
+            "mode": "global",
+            "scope": "deck",
+            "target_page_nums": [],
+            "target_area": "whole",
+            "area_label": "全页",
+        }
+    )
+
+    assert "范围：整套 PPT" in context
+    assert "区域：全页内容" in context
+    assert "35" not in context
+    assert "必须优先遵守这个修改目标" in context
+
+
+def test_page_target_context_keeps_selected_pages_and_specific_area():
+    context = _format_page_target_context(
+        {
+            "mode": "global",
+            "scope": "selected_slides",
+            "target_page_nums": [2, 4, 5],
+            "target_area": "title",
+            "area_label": "标题",
+        }
+    )
+
+    assert "范围：选中页" in context
+    assert "目标页：第 2、4、5 页" in context
+    assert "区域：标题" in context
+
+
+def test_page_context_prompt_section_includes_ui_target_before_slide_summary():
+    section = _build_page_context_prompt_section(
+        {
+            "mode": "global",
+            "scope": "deck",
+            "target_page_nums": [],
+            "target_area": "whole",
+            "area_label": "全页",
+            "slides": [{"page_num": 1, "headline": "封面"}],
+        }
+    )
+
+    assert "【本轮修改目标" in section
+    assert "范围：整套 PPT" in section
+    assert "区域：全页内容" in section
+    assert section.index("【本轮修改目标") < section.index("【当前处于全局调整模式")
+
+
 def test_visual_answer_before_style_can_offer_style_proposal():
     result = {"action": "answer", "response": "这个方向适合温暖生活感。"}
     context = {
@@ -189,17 +243,61 @@ def test_visual_generation_answer_is_coerced_to_confirmation_action():
     assert compiled["page_nums"] == [2, 3]
 
 
-def test_visual_page_edit_answer_is_coerced_to_reroll_action():
+def test_visual_page_edit_answer_is_coerced_to_precise_update_action():
     result = {"action": "answer", "response": "好的，我会把背景换成深蓝。"}
 
     compiled = _enforce_visual_action_contract(
         result=result,
         user_message="这一页背景换成深蓝，标题更亮",
-        page_context={"mode": "page", "current_page": {"page_num": 5}},
+        page_context={
+            "mode": "page",
+            "current_page": {
+                "page_num": 5,
+                "visual_json": {"visual_description": "白底，黑色标题。"},
+            },
+        },
+    )
+
+    assert compiled["action"] == "update_slide_visual"
+    assert compiled["page_nums"] == [5]
+    assert compiled["updated_visual"]["page_num"] == 5
+    assert "背景换成深蓝" in compiled["updated_visual"]["visual_json"]["visual_description"]
+
+
+def test_visual_readability_complaint_is_coerced_to_positive_single_page_update():
+    assert _has_visual_mutation_intent("封面黑色的字体看不清楚")
+    result = {"action": "answer", "response": "好的，我会调整封面字体。"}
+
+    compiled = _enforce_visual_action_contract(
+        result=result,
+        user_message="封面黑色的字体看不清楚",
+        page_context={
+            "mode": "page",
+            "current_page": {
+                "page_num": 1,
+                "visual_json": {"visual_description": "深蓝背景，黑色标题居中。"},
+            },
+        },
+    )
+
+    assert compiled["action"] == "update_slide_visual"
+    assert compiled["page_nums"] == [1]
+    visual_description = compiled["updated_visual"]["visual_json"]["visual_description"]
+    assert "提升文字对比度" in visual_description
+    assert "清晰可读" in visual_description
+
+
+def test_visual_reroll_request_still_uses_reroll_action():
+    result = {"action": "answer", "response": "好的，我再给这一页来一版。"}
+
+    compiled = _enforce_visual_action_contract(
+        result=result,
+        user_message="这一页不满意，再来一版画面方案",
+        page_context={"mode": "page", "current_page": {"page_num": 6}},
     )
 
     assert compiled["action"] == "reroll_page_visual_plan"
-    assert compiled["page_nums"] == [5]
+    assert compiled["page_nums"] == [6]
 
 
 def test_visual_deck_edit_answer_is_coerced_to_adjust_style_action():

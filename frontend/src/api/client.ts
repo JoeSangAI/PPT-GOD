@@ -183,7 +183,10 @@ export async function createProject(title: string, styleId?: string) {
   return (await checkRes(res)).json();
 }
 
-export async function updateProject(projectId: string, data: { title?: string; content_plan_confirmed?: boolean }) {
+export async function updateProject(
+  projectId: string,
+  data: { title?: string; content_plan_confirmed?: boolean; intent_contract?: Record<string, any> }
+) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -199,11 +202,12 @@ export async function deleteProject(projectId: string) {
   return (await checkRes(res)).json();
 }
 
-export async function generateContentPlan(projectId: string, topic?: string, pageCount?: number, attachmentIds?: string[]) {
+export async function generateContentPlan(projectId: string, topic?: string, pageCount?: number, attachmentIds?: string[], chatContext?: string) {
   const body: any = {};
   if (topic) body.topic = topic;
   if (pageCount) body.page_count = pageCount;
   if (attachmentIds?.length) body.attachment_ids = attachmentIds;
+  if (chatContext && chatContext.trim()) body.chat_context = chatContext.trim();
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/content-plan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -391,11 +395,13 @@ export async function updateReferenceImage(projectId: string, refId: string, dat
   return (await checkRes(res)).json();
 }
 
-export async function retrySlide(projectId: string, slideId: string, regeneratePrompt: boolean = false) {
+export async function retrySlide(projectId: string, slideId: string, regeneratePrompt: boolean = false, userFeedback?: string) {
+  const body: any = { regenerate_prompt: regeneratePrompt };
+  if (userFeedback && userFeedback.trim()) body.user_feedback = userFeedback.trim();
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/retry`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ regenerate_prompt: regeneratePrompt }),
+    body: JSON.stringify(body),
   });
   return (await checkRes(res)).json();
 }
@@ -573,6 +579,15 @@ export async function updateVisualPlan(projectId: string, pageNum: number, visua
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ page_num: pageNum, slide_id: slideId, visual_json: visualJson }),
+  });
+  return (await checkRes(res)).json();
+}
+
+export async function updateSlideType(projectId: string, pageNum: number, type: string, slideId?: string) {
+  const res = await apiFetch(`${API_BASE}/projects/${projectId}/slides/type`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ page_num: pageNum, slide_id: slideId, type }),
   });
   return (await checkRes(res)).json();
 }

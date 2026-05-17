@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 MINIMAX_API_KEY_HEADER = "x-pptgod-minimax-api-key"
 MINIMAX_API_BASE_HEADER = "x-pptgod-minimax-api-base"
 MINIMAX_LLM_MODEL_HEADER = "x-pptgod-minimax-llm-model"
-DEER_API_KEY_HEADER = "x-pptgod-deer-api-key"
-DEER_API_BASE_HEADER = "x-pptgod-deer-api-base"
-DEER_IMAGE_MODEL_HEADER = "x-pptgod-deer-image-model"
+COMET_API_KEY_HEADER = "x-pptgod-comet-api-key"
+COMET_API_BASE_HEADER = "x-pptgod-comet-api-base"
+COMET_IMAGE_MODEL_HEADER = "x-pptgod-comet-image-model"
 TESTER_NAME_HEADER = "x-pptgod-tester-name"
 
 TASK_CREDENTIAL_TTL_SECONDS = 12 * 60 * 60
@@ -29,9 +29,9 @@ class ProviderCredentials:
     minimax_api_key: str = ""
     minimax_api_base: str = ""
     minimax_llm_model: str = ""
-    deer_api_key: str = ""
-    deer_api_base: str = ""
-    deer_image_model: str = ""
+    comet_api_key: str = ""
+    comet_api_base: str = ""
+    comet_image_model: str = ""
     tester_name: str = ""
 
     def with_defaults(self) -> "ProviderCredentials":
@@ -39,14 +39,14 @@ class ProviderCredentials:
             minimax_api_key=self.minimax_api_key or settings.MINIMAX_API_KEY,
             minimax_api_base=_clean_base_url(self.minimax_api_base or settings.MINIMAX_API_BASE),
             minimax_llm_model=(self.minimax_llm_model or settings.MINIMAX_LLM_MODEL).strip(),
-            deer_api_key=self.deer_api_key or settings.DEER_API_KEY or self.minimax_api_key or settings.MINIMAX_API_KEY,
-            deer_api_base=_clean_base_url(self.deer_api_base or settings.DEER_API_BASE),
-            deer_image_model=(self.deer_image_model or settings.DEER_IMAGE_MODEL).strip(),
+            comet_api_key=self.comet_api_key or settings.COMET_API_KEY or self.minimax_api_key or settings.MINIMAX_API_KEY,
+            comet_api_base=_clean_base_url(self.comet_api_base or settings.COMET_API_BASE),
+            comet_image_model=(self.comet_image_model or settings.COMET_IMAGE_MODEL).strip(),
             tester_name=self.tester_name.strip(),
         )
 
     def has_request_override(self) -> bool:
-        return bool(self.minimax_api_key or self.deer_api_key)
+        return bool(self.minimax_api_key or self.comet_api_key)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -58,9 +58,9 @@ class ProviderCredentials:
             minimax_api_key=_clean_secret(data.get("minimax_api_key")),
             minimax_api_base=_clean_base_url(data.get("minimax_api_base")),
             minimax_llm_model=str(data.get("minimax_llm_model") or "").strip(),
-            deer_api_key=_clean_secret(data.get("deer_api_key")),
-            deer_api_base=_clean_base_url(data.get("deer_api_base")),
-            deer_image_model=str(data.get("deer_image_model") or "").strip(),
+            comet_api_key=_clean_secret(data.get("comet_api_key")),
+            comet_api_base=_clean_base_url(data.get("comet_api_base")),
+            comet_image_model=str(data.get("comet_image_model") or "").strip(),
             tester_name=str(data.get("tester_name") or "").strip()[:80],
         )
 
@@ -70,9 +70,9 @@ class ProviderCredentials:
             minimax_api_key=_clean_secret(headers.get(MINIMAX_API_KEY_HEADER)),
             minimax_api_base=_clean_base_url(headers.get(MINIMAX_API_BASE_HEADER)),
             minimax_llm_model=str(headers.get(MINIMAX_LLM_MODEL_HEADER) or "").strip(),
-            deer_api_key=_clean_secret(headers.get(DEER_API_KEY_HEADER)),
-            deer_api_base=_clean_base_url(headers.get(DEER_API_BASE_HEADER)),
-            deer_image_model=str(headers.get(DEER_IMAGE_MODEL_HEADER) or "").strip(),
+            comet_api_key=_clean_secret(headers.get(COMET_API_KEY_HEADER)),
+            comet_api_base=_clean_base_url(headers.get(COMET_API_BASE_HEADER)),
+            comet_image_model=str(headers.get(COMET_IMAGE_MODEL_HEADER) or "").strip(),
             tester_name=str(headers.get(TESTER_NAME_HEADER) or "").strip()[:80],
         )
 
@@ -123,8 +123,8 @@ def get_minimax_llm_model() -> str:
     return get_provider_credentials().minimax_llm_model
 
 
-def get_deer_image_model() -> str:
-    return get_provider_credentials().deer_image_model
+def get_comet_image_model() -> str:
+    return get_provider_credentials().comet_image_model
 
 
 def store_current_provider_credentials(redis_client) -> str | None:

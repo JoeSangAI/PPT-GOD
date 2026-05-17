@@ -8,7 +8,15 @@ from typing import Callable, Dict, List
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.services.document_parser import detect_ppt_sources
+from app.services.pptx_page_recovery import extract_ocr_text_from_unstructured_description
 from app.services.search_service import get_knowledge_augmenter
+from app.services.source_intent import (
+    contract_to_planning_policy,
+    infer_intent_contract,
+    normalize_intent_contract,
+    source_diagnostics_from_documents,
+)
+from app.services.visual_directives import separate_visual_directives_from_page
 from app.utils.text_cleaning import (
     is_markdown_thematic_break_line,
     normalize_markdown_content,
@@ -24,13 +32,13 @@ LONG_DECK_CHUNK_TIMEOUT_SECONDS = 60.0
 LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT = 0
 
 LONG_DECK_SECTION_TITLES = [
-    "开场定调：明确课程目标、听众语境和核心问题",
+    "开场定调：明确目标、受众语境和核心问题",
     "背景与痛点：解释为什么现在必须讨论这个主题",
-    "总框架：建立整场课程的主线模型和判断标准",
+    "总框架：建立整份内容的主线模型和判断标准",
     "模块一：拆解第一组关键概念、案例和常见误区",
     "模块二：展开方法步骤、工具和可迁移经验",
     "模块三：连接真实业务场景、决策问题和行动方案",
-    "互动与练习：安排讨论、复盘、提问或课堂练习",
+    "互动与复盘：安排讨论、提问、复盘或协作环节",
     "总结收束：回到主线，给出行动清单和结束页",
 ]
 
@@ -379,8 +387,37 @@ def _document_preservation_mode(documents: str, topic: str = "") -> str:
     return "synthesis"
 
 
-def _document_preservation_policy(documents: str, topic: str = "") -> str:
+def _effective_intent_contract(topic: str, documents: str, intent_contract: dict | None = None) -> dict:
+    if intent_contract is not None:
+        return normalize_intent_contract(intent_contract)
+    return infer_intent_contract(
+        topic,
+        source_diagnostics=source_diagnostics_from_documents(documents),
+    )
+
+
+def _planning_policy(topic: str, documents: str, intent_contract: dict | None = None) -> dict:
+    return contract_to_planning_policy(_effective_intent_contract(topic, documents, intent_contract))
+
+
+def _intent_contract_policy_text(intent_contract: dict | None) -> str:
+    contract = normalize_intent_contract(intent_contract)
+    policy = contract_to_planning_policy(contract)
+    if policy["task_type"] == "replicate":
+        return "【用户处理意图】按原 PPT 页序和页数整理，尽量保留原文，只做必要清理。\n"
+    if policy["task_type"] == "polish":
+        return "【用户处理意图】保留原 PPT 页序和主要事实，优化标题和正文表达，不重组叙事。\n"
+    if policy["task_type"] in {"restructure", "merge", "extract"}:
+        return "【用户处理意图】可按用户目标重组材料，但必须保留关键事实并标注来源页。\n"
+    if policy["task_type"] == "template_reference":
+        return "【用户处理意图】上传 PPT 主要作为视觉和版式参考，正文可依据 Brief 重新组织。\n"
+    return ""
+
+
+def _document_preservation_policy(documents: str, topic: str = "", intent_contract: dict | None = None) -> str:
     mode = _document_preservation_mode(documents, topic)
+    if mode == "ppt_source":
+        return _intent_contract_policy_text(_effective_intent_contract(topic, documents, intent_contract))
     if mode == "faithful":
         return (
             "【原文保真模式】\n"
@@ -408,9 +445,59 @@ def _document_preservation_policy(documents: str, topic: str = "") -> str:
     return ""
 
 
+_PPT_RECOVERED_OCR_BLOCK_RE = re.compile(
+    r"(?m)(?P<header>^【截图识别文字】\s*\n?)(?P<body>.*?)(?=^\s*---\s*第\s*\d+\s*页\s*---\s*$|^\s*【备注】\s*$|\Z)",
+    flags=re.DOTALL | re.MULTILINE,
+)
+_PPT_RECOVERY_METADATA_LINE_RE = re.compile(r"(?m)^\s*【(?:页面意图|识别置信度)】.*$")
+_PPT_RECOVERY_KEY_FACTS_BLOCK_RE = re.compile(
+    r"(?m)^\s*【关键事实】\s*$\n(?:^\s*[-*+]\s+.*$\n?)*"
+)
+_PPT_SOURCE_TEXT_MARKERS = {
+    "【截图识别文字】",
+    "【备注】",
+}
+
+
+def sanitize_ppt_recovery_text_for_content(documents: str) -> str:
+    """Remove vision-analysis scaffolding from PPT OCR recovery text.
+
+    Old extracted PPT files may contain the full image-analysis response under
+    "截图识别文字". Content planning must consume only recovered page text.
+    """
+    text = str(documents or "")
+    if not text:
+        return ""
+
+    def replace_ocr_block(match: re.Match) -> str:
+        body = str(match.group("body") or "")
+        ocr_text = extract_ocr_text_from_unstructured_description(body).strip()
+        if not ocr_text:
+            return "【截图识别文字】\n"
+        return "【截图识别文字】\n" + ocr_text + "\n"
+
+    if "【截图识别文字】" in text:
+        text = _PPT_RECOVERED_OCR_BLOCK_RE.sub(replace_ocr_block, text)
+    text = _PPT_RECOVERY_KEY_FACTS_BLOCK_RE.sub("", text)
+    text = _PPT_RECOVERY_METADATA_LINE_RE.sub("", text)
+    return re.sub(r"\n{4,}", "\n\n\n", text).strip()
+
+
+def _clean_ppt_source_page_lines(lines: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for line in lines:
+        value = str(line or "").strip()
+        if not value or value in _PPT_SOURCE_TEXT_MARKERS:
+            continue
+        if value.startswith("【页面意图】") or value.startswith("【识别置信度】"):
+            continue
+        cleaned.append(value)
+    return cleaned
+
+
 def _parse_ppt_source_pages(documents: str) -> list[dict]:
     """Parse the lightweight PPT text markers emitted by document_parser."""
-    text = documents or ""
+    text = sanitize_ppt_recovery_text_for_content(documents)
     source_match = re.search(
         r'---\s*PPT_SOURCE(?:\s+filename="([^"]*)")?\s+pages=(\d+)\s*---',
         text,
@@ -443,7 +530,9 @@ def _parse_ppt_source_pages(documents: str) -> list[dict]:
         slide_text = raw
         if "【备注】" in raw:
             slide_text, notes = raw.split("【备注】", 1)
-        lines = [line.strip() for line in slide_text.splitlines() if line.strip()]
+        lines = _clean_ppt_source_page_lines([
+            line.strip() for line in slide_text.splitlines() if line.strip()
+        ])
         notes = notes.strip()
         pages.append({
             "page_num": page_num,
@@ -566,10 +655,16 @@ def validate_direct_ppt_replicate_outline(
     }
 
 
-def build_direct_ppt_replicate_outline(documents: str, topic: str = "") -> list[dict]:
+def build_direct_ppt_replicate_outline(
+    documents: str,
+    topic: str = "",
+    intent_contract: dict | None = None,
+) -> list[dict]:
     """Build a deterministic 1:1 content plan from a single uploaded PPT."""
     sources = detect_ppt_sources(documents)
-    if len(sources) != 1 or _is_ppt_transform_request(topic):
+    if len(sources) != 1:
+        return []
+    if not _planning_policy(topic, documents, intent_contract)["allow_direct_ppt_replicate"]:
         return []
 
     parsed_pages = _parse_ppt_source_pages(documents)
@@ -632,9 +727,81 @@ def build_direct_ppt_replicate_outline(documents: str, topic: str = "") -> list[
     return outline
 
 
-def infer_page_count_from_single_ppt(documents: str, topic: str = "") -> int | None:
+def build_ppt_page_preserve_source_draft(
+    documents: str,
+    topic: str = "",
+    intent_contract: dict | None = None,
+) -> list[dict]:
+    """Build a page-by-page source draft for single-PPT polish tasks."""
+    documents = sanitize_ppt_recovery_text_for_content(documents)
     sources = detect_ppt_sources(documents)
-    if len(sources) != 1 or _is_ppt_transform_request(topic):
+    if len(sources) != 1:
+        return []
+
+    policy = _planning_policy(topic, documents, intent_contract)
+    if not (policy["preserve_source_page_order"] and policy["preserve_source_page_count"]):
+        return []
+    if policy["task_type"] == "template_reference":
+        return []
+
+    parsed_pages = _parse_ppt_source_pages(documents)
+    if not parsed_pages:
+        return []
+
+    source = sources[0]
+    filename = str(source.get("filename") or parsed_pages[0].get("source_document") or "").strip()
+    total_pages = int(source.get("pages") or len(parsed_pages) or 0)
+    outline: list[dict] = []
+    for idx, page in enumerate(parsed_pages, start=1):
+        page_num = int(page.get("page_num") or idx)
+        lines = _clean_ppt_source_page_lines([
+            str(line).strip() for line in (page.get("lines") or []) if str(line).strip()
+        ])
+        text_content = _ppt_page_text_content(page_num, lines)
+        outline.append({
+            "page_num": page_num,
+            "type": _ppt_page_type(page_num, total_pages or len(parsed_pages), lines),
+            "section_title": "原 PPT 逐页整理",
+            "text_content": text_content,
+            "speaker_notes": str(page.get("notes") or "").strip(),
+            "source_facts": {
+                "mode": "single_ppt_page_polish",
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_total_pages": total_pages or len(parsed_pages),
+                "source_line_count": len(lines),
+                "has_speaker_notes": bool(str(page.get("notes") or "").strip()),
+            },
+            "visual_suggestion": (
+                f"参考原 PPT 第{page_num}页的截图、背景、图片位置和信息层级；"
+                "内容可轻微整理，但页序和原页意图保持一致。"
+            ),
+            "source_refs": [{
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_type": "pptx_slide",
+                "reason": "single_ppt_page_polish",
+            }],
+            "generation_status": "pptx_preserve_source",
+        })
+
+    outline.sort(key=lambda page: int(page.get("page_num") or 0))
+    for idx, page in enumerate(outline, start=1):
+        page["page_num"] = idx
+        if isinstance(page.get("source_facts"), dict):
+            page["source_facts"]["source_page_num"] = idx
+    return _normalize_content_markdown(outline)
+
+
+def infer_page_count_from_single_ppt(
+    documents: str,
+    topic: str = "",
+    intent_contract: dict | None = None,
+) -> int | None:
+    sources = detect_ppt_sources(documents)
+    if len(sources) != 1:
+        return None
+    if not _planning_policy(topic, documents, intent_contract)["preserve_source_page_count"]:
         return None
     pages = int(sources[0].get("pages") or 0)
     return pages if pages > 0 else None
@@ -663,13 +830,19 @@ def _normalize_source_refs(value) -> list[dict]:
     return refs[:8]
 
 
-def _annotate_ppt_source_refs(outline: List[Dict], documents: str, topic: str = "") -> List[Dict]:
+def _annotate_ppt_source_refs(
+    outline: List[Dict],
+    documents: str,
+    topic: str = "",
+    intent_contract: dict | None = None,
+) -> List[Dict]:
     """Keep a stable link from generated pages back to source PPT pages."""
     sources = detect_ppt_sources(documents)
     if not sources:
         return outline
     single_source = sources[0] if len(sources) == 1 else None
-    direct_single_ppt_polish = bool(single_source and not _is_ppt_transform_request(topic))
+    policy = _planning_policy(topic, documents, intent_contract)
+    direct_single_ppt_polish = bool(single_source and policy["preserve_source_page_order"])
     single_filename = str((single_source or {}).get("filename") or "").strip()
     single_page_count = int((single_source or {}).get("pages") or 0) if single_source else 0
 
@@ -768,7 +941,7 @@ def _requested_range_soft_upper(min_pages: int, max_pages: int) -> int:
 
 
 def _estimate_document_page_capacity(documents: str) -> int | None:
-    text = (documents or "").strip()
+    text = sanitize_ppt_recovery_text_for_content(documents).strip()
     if not text:
         return None
     units = extract_document_outline_units(text)
@@ -799,7 +972,7 @@ def _estimate_document_page_capacity(documents: str) -> int | None:
 
 def _infer_document_driven_page_count(documents: str) -> int | None:
     """Pick a practical default page count when the user uploads a dense brief."""
-    text = (documents or "").strip()
+    text = sanitize_ppt_recovery_text_for_content(documents).strip()
     if len(text) < AUTO_DOCUMENT_PAGE_MIN_CHARS:
         return None
 
@@ -858,6 +1031,7 @@ def _resolve_soft_range_target(
 
 def resolve_content_plan_page_target(topic: str, page_count: int | None, documents: str = "") -> tuple[int, int, int]:
     """Return target, min, max pages using the same policy as content-plan generation."""
+    documents = sanitize_ppt_recovery_text_for_content(documents)
     requested_page_range = infer_page_count_range_from_topic(topic)
     explicit_page_count = page_count or infer_page_count_from_topic(topic)
     auto_document_page_count = None if explicit_page_count or requested_page_range else _infer_document_driven_page_count(documents)
@@ -925,7 +1099,7 @@ def _brief_title(topic: str) -> str:
         cleaned = re.sub(r"我[要想希望]?制作一份|请?帮我|做成|PPT|ppt", "", line).strip(" ：:，,。")
         if 4 <= len(cleaned) <= 36:
             return cleaned
-    return "课程内容规划"
+    return "PPT 内容规划"
 
 
 def _clean_markdown_inline(text: str) -> str:
@@ -970,6 +1144,36 @@ PAGINATED_MARKDOWN_FIELD_RE = re.compile(
 )
 
 
+_ARABIC_TO_CHINESE = {
+    "1": "一", "2": "二", "3": "三", "4": "四", "5": "五",
+    "6": "六", "7": "七", "8": "八", "9": "九", "10": "十",
+}
+
+
+def _normalize_section_title(title: str) -> str:
+    """统一章节标题的序号格式为「模块X：」。支持 Part/Module/中文数字/阿拉伯数字。"""
+    if not title:
+        return title
+    # Part/Module/Section + 数字
+    m = re.search(r"^(?:Part|Module|Section)\s*(\d+)\s*[:：]?\s*(.*)$", title, re.IGNORECASE)
+    if m:
+        chinese = _ARABIC_TO_CHINESE.get(m.group(1), m.group(1))
+        suffix = m.group(2).strip()
+        return f"模块{chinese}：{suffix}" if suffix else f"模块{chinese}"
+    # 中文数字前缀（一、二、三…）
+    m = re.search(r"^([一二三四五六七八九十]+)(?:[、．.\s]+(.+))?$", title)
+    if m:
+        suffix = (m.group(2) or "").strip()
+        return f"模块{m.group(1)}：{suffix}" if suffix else f"模块{m.group(1)}"
+    # 阿拉伯数字前缀（1、2、3… 或 1. 2. 3.）
+    m = re.search(r"^(\d+)(?:[、．.\s]+(.+))?$", title)
+    if m:
+        chinese = _ARABIC_TO_CHINESE.get(m.group(1), m.group(1))
+        suffix = (m.group(2) or "").strip()
+        return f"模块{chinese}：{suffix}" if suffix else f"模块{chinese}"
+    return title
+
+
 def _strip_module_prefix(title: str) -> str:
     return re.sub(r"^\s*模块\s*[:：]\s*", "", title or "").strip()
 
@@ -1007,6 +1211,60 @@ def _paginated_markdown_page_type(label: str, page_num: int) -> str:
     if any(marker in text for marker in ("金句", "使命")):
         return "hero"
     return "content"
+
+
+def _auto_reclassify_page_type(content_json: dict, current_type: str) -> str | None:
+    """根据内容特征判断是否应切换类型。只处理 content/data/hero 之间，其他类型不变。
+
+    返回新类型（如需切换），或 None（保持当前）。
+    """
+    text_content = content_json.get("text_content") or {}
+    body = str(text_content.get("body", "")).strip()
+    if not body:
+        return None
+
+    # 结构性类型不自动重分类
+    if current_type in ("cover", "ending", "section", "agenda", "toc"):
+        return None
+
+    lines = [l.strip() for l in body.split("\n") if l.strip()]
+    has_table = bool(re.search(r"(?m)^\|.*\|.*\|$", body))
+    bullet_lines = sum(1 for l in lines if l.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ", "5. ")))
+    total_chars = len(body)
+
+    # 数字/百分比/金额密度
+    digit_chars = len(re.findall(r"[0-9]", body))
+    percent_money = len(re.findall(r"%|％|元|万|亿|千|百|个|次|人", body))
+    data_density = (digit_chars + percent_money) / max(total_chars, 1)
+
+    # 独立数据指标（如 47%、1.2亿、增长率32%）
+    data_indicators = len(
+        re.findall(
+            r"\d+[,.]?\d*\s*[％%]|\d+[,.]?\d*\s*[万亿千百十个次人]|(?:增长|下降|提升|降低|占比|份额|率)\s*\d+",
+            body,
+        )
+    )
+
+    should_be_data = has_table or data_density > 0.40 or data_indicators >= 3
+    should_be_hero = (
+        not has_table and bullet_lines == 0 and total_chars < 80 and len(lines) <= 2
+    )
+
+    if current_type == "content":
+        if should_be_data:
+            return "data"
+        if should_be_hero:
+            return "hero"
+    elif current_type == "data":
+        if not should_be_data:
+            return "content"
+    elif current_type == "hero":
+        if should_be_data:
+            return "data"
+        if not should_be_hero:
+            return "content"
+
+    return None
 
 
 def parse_paginated_markdown_content_plan(documents: str) -> list[dict]:
@@ -1125,7 +1383,7 @@ def parse_paginated_markdown_content_plan(documents: str) -> list[dict]:
 
 def extract_document_outline_units(documents: str) -> list[dict]:
     """Extract source-driven units from Markdown-ish uploaded material."""
-    text = (documents or "").strip()
+    text = sanitize_ppt_recovery_text_for_content(documents).strip()
     if not text:
         return []
     units: list[dict] = []
@@ -1270,10 +1528,10 @@ def _expand_page_specs(specs: list[dict], required_count: int) -> list[dict]:
         return []
     expanded = [dict(spec) for spec in specs]
     expansion_angles = [
-        ("核心判断", "把本页材料转成课堂上需要先讲清楚的判断。"),
+        ("核心判断", "把本页材料转成页面上需要先讲清楚的判断。"),
         ("证据与案例", "提取本页材料中的数据、例子或可验证依据。"),
-        ("企业主启示", "把本页材料翻译成听众可以判断自己业务的启示。"),
-        ("课堂互动", "围绕本页材料设计一个提问、讨论或复盘点。"),
+        ("行动启示", "把本页材料翻译成听众可以理解和使用的启示。"),
+        ("互动与复盘", "围绕本页材料设计一个提问、讨论或复盘点。"),
     ]
     idx = 0
     while len(expanded) < required_count:
@@ -1298,6 +1556,7 @@ def build_document_driven_long_deck_draft(
     max_pages: int,
     deck_blueprint: str = "",
 ) -> list[dict]:
+    documents = sanitize_ppt_recovery_text_for_content(documents)
     units = extract_document_outline_units(documents)
     content_units = [unit for unit in units if str(unit.get("title") or "").strip() != "用户上传材料"]
     units_for_draft = _with_child_context(content_units or units)
@@ -1332,11 +1591,11 @@ def build_document_driven_long_deck_draft(
             "section_title": "封面",
             "text_content": {
                 "headline": title,
-                "subhead": f"{min_pages}-{max_pages} 页课程型 PPT 内容规划",
+                "subhead": f"{min_pages}-{max_pages} 页 PPT 内容规划",
                 "body": "",
             },
             "speaker_notes": "封面页。主题来自用户上传材料，后续页面按原文结构展开。",
-            "visual_suggestion": "封面应突出 AI 时代、企业营与销、面向大连中小企业主的课程语境。",
+            "visual_suggestion": "封面应突出上传材料中的主题、品牌或核心对象，视觉方向以用户材料为准。",
             "source_refs": [title],
             "generation_status": "source_draft",
         }
@@ -1346,14 +1605,14 @@ def build_document_driven_long_deck_draft(
     pages.append({
         "page_num": 2,
         "type": "agenda",
-        "section_title": "课程总览",
+        "section_title": "内容总览",
         "text_content": {
-            "headline": "今天这 90 分钟要解决什么",
-            "subhead": "从道、法、术、器建立 AI 时代企业营与销布局",
+            "headline": "本次内容怎么展开",
+            "subhead": "",
             "body": "\n".join(f"- {line}" for line in agenda_lines if line),
         },
-        "speaker_notes": "先把整场课的路径讲清楚：为什么必须变、平台怎么动、企业怎么布局、最后用什么工具落地。",
-        "visual_suggestion": "课程地图式页面，用四段路径或阶梯结构呈现。",
+        "speaker_notes": "先把整份内容的主线和页面路径讲清楚，帮助听众理解后续展开顺序。",
+        "visual_suggestion": "内容地图式页面，用清晰的分段路径或目录结构呈现。",
         "source_refs": agenda_lines,
         "generation_status": "source_draft",
     })
@@ -1362,17 +1621,17 @@ def build_document_driven_long_deck_draft(
         spec = specs[page_num - 3] if page_num - 3 < len(specs) else specs[-1]
         lines = [line for line in (spec.get("lines") or []) if line]
         if not lines:
-            lines = [f"围绕「{spec.get('headline') or '本页主题'}」展开课堂讲解。"]
+            lines = [f"围绕「{spec.get('headline') or '本页主题'}」展开内容。"]
         body_lines = lines[:5]
         if page_num == target_count:
             page_type = "ending"
             headline = "总结与下一步"
             section_title = "总结收束"
-            body = "回到整场课程主线：AI 会改变消费者决策中介，但企业仍要围绕信任、证据、审美和真实履约建立长期优势。"
+            body = "回到整份内容主线，提炼关键结论、行动建议和后续讨论方向。"
         else:
             page_type = "section" if page_num in {3, 12, 23, 34, 45, 56, 67} else "content"
             headline = str(spec.get("headline") or f"第 {page_num} 页").strip()
-            section_title = str(spec.get("section_title") or "课程内容").strip()
+            section_title = _normalize_section_title(str(spec.get("section_title") or "内容规划").strip())
             body = "\n".join(f"- {line}" for line in body_lines)
         pages.append({
             "page_num": page_num,
@@ -1384,8 +1643,8 @@ def build_document_driven_long_deck_draft(
                 "body": body,
             },
             "speaker_notes": (
-                "讲解重点：先复述本页判断，再用材料中的数据、例子或行业场景解释，"
-                "最后落到大连中小企业主可以执行或避免的动作。"
+                "讲述重点：先复述本页判断，再用材料中的数据、例子或行业场景解释，"
+                "最后落到听众可以理解、判断或执行的动作。"
             ),
             "visual_suggestion": "根据本页是数据、框架、案例还是行动清单，选择图表、对比表、流程图或案例卡片。",
             "source_refs": [str(spec.get("source_path") or "")],
@@ -1413,7 +1672,7 @@ def _outline_to_page_map(outline: list[dict], *, status: str = "page_map_source"
         page_map.append({
             "page_num": int(page.get("page_num") or idx),
             "type": str(page.get("type") or "content").strip() or "content",
-            "section_title": str(page.get("section_title") or "").strip(),
+            "section_title": _normalize_section_title(str(page.get("section_title") or "").strip()),
             "headline": str(text_content.get("headline") or "").strip() or f"第 {idx} 页",
             "subhead": str(text_content.get("subhead") or "").strip(),
             "bullets": bullets[:5],
@@ -1432,7 +1691,17 @@ def _fallback_page_map(
     target_count: int,
     min_pages: int,
     max_pages: int,
+    intent_contract: dict | None = None,
 ) -> list[dict]:
+    documents = sanitize_ppt_recovery_text_for_content(documents)
+    preserve_outline = build_ppt_page_preserve_source_draft(
+        documents,
+        topic,
+        intent_contract=intent_contract,
+    )
+    if preserve_outline:
+        return _outline_to_page_map(preserve_outline, status="page_map_source")
+
     fallback_outline = build_document_driven_long_deck_draft(
         topic=topic,
         documents=documents,
@@ -1557,7 +1826,7 @@ def _normalize_page_map(page_map: list[dict]) -> list[dict]:
         normalized.append({
             "page_num": page_num,
             "type": page_type,
-            "section_title": str(page.get("section_title") or "").strip(),
+            "section_title": _normalize_section_title(str(page.get("section_title") or "").strip()),
             "headline": str(page.get("headline") or "").strip() or f"第 {page_num} 页",
             "subhead": str(page.get("subhead") or "").strip(),
             "bullets": [str(item).strip() for item in bullets if str(item).strip()][:5],
@@ -1637,8 +1906,10 @@ def _generate_model_page_map(
     max_pages: int,
     search_context: str = "",
     source_page_map_markdown: str = "",
+    intent_contract: dict | None = None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> list[dict]:
+    documents = sanitize_ppt_recovery_text_for_content(documents)
     if on_progress:
         on_progress({
             "stage": "analyzing",
@@ -1649,8 +1920,8 @@ def _generate_model_page_map(
     doc_text = remove_markdown_structural_noise(documents or "")
     if len(doc_text) > PAGE_MAP_DOCUMENT_LIMIT:
         doc_text = _document_excerpt_for_extension(doc_text, limit=PAGE_MAP_DOCUMENT_LIMIT)
-    preservation_policy = _document_preservation_policy(documents, topic)
-    prompt = f"""你是一位顶尖的课程型 PPT 总架构师。请先生成整份 PPT 的“逐页内容地图”，不要输出 JSON。
+    preservation_policy = _document_preservation_policy(documents, topic, intent_contract)
+    prompt = f"""你是一位顶尖的 PPT 内容架构师。请先生成整份 PPT 的“逐页内容地图”，不要输出 JSON。
 
 【用户主题和约束】
 {topic}
@@ -1672,10 +1943,10 @@ def _generate_model_page_map(
 {search_context or "无"}
 
 【材料使用规则】
-{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成课程结构。"}
+{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成内容结构。"}
 
 【输出要求】
-1. 一次性给出全局逐页内容地图，必须覆盖整场演讲/课程的开场、主线、转场、案例、复盘和结尾。
+1. 一次性给出全局逐页内容地图，必须覆盖整份 PPT 的开场、主线、转场、案例、复盘和结尾。
 2. 每页都要有标题、2-3 个具体 bullet、演讲者备注；不要只写章节名或空泛框架。
 3. 标题和 bullet 必须尽量来自用户材料或 Brief，不能为了凑页数发明不相干内容。
 4. 如果提供了“系统预生成的正文底稿”，你必须以它为基础优化标题、顺序和取舍；content/agenda/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
@@ -1763,8 +2034,10 @@ def generate_content_page_map(
     page_count: int | None = None,
     documents: str = "",
     search_context: str = "",
+    intent_contract: dict | None = None,
     on_progress: Callable[[dict], None] | None = None,
 ) -> list[dict]:
+    documents = sanitize_ppt_recovery_text_for_content(documents)
     requested_page_range = infer_page_count_range_from_topic(topic)
     target_count, min_pages, max_pages = resolve_content_plan_page_target(topic, page_count, documents)
     strict_page_count = _is_strict_page_count_request(topic) and not requested_page_range
@@ -1787,6 +2060,7 @@ def generate_content_page_map(
         target_count=target_count,
         min_pages=min_pages,
         max_pages=max_pages,
+        intent_contract=intent_contract,
     )
     source_page_map_markdown = render_page_map_markdown(fallback)
     if len(source_page_map_markdown) > PAGE_MAP_SOURCE_DRAFT_LIMIT:
@@ -1805,6 +2079,7 @@ def generate_content_page_map(
             max_pages=max_pages,
             search_context=search_context,
             source_page_map_markdown=source_page_map_markdown,
+            intent_contract=intent_contract,
             on_progress=on_progress,
         )
         model_map = _merge_page_map_with_fallback(
@@ -1846,14 +2121,14 @@ def content_plan_from_page_map(page_map: list[dict]) -> list[dict]:
         outline.append({
             "page_num": idx,
             "type": page_type,
-            "section_title": str(page.get("section_title") or "").strip(),
+            "section_title": _normalize_section_title(str(page.get("section_title") or "").strip()),
             "text_content": {
                 "headline": str(page.get("headline") or "").strip() or f"第 {idx} 页",
                 "subhead": str(page.get("subhead") or "").strip(),
                 "body": body,
             },
             "speaker_notes": str(page.get("speaker_notes") or "").strip(),
-            "visual_suggestion": str(page.get("visual_suggestion") or "").strip() or "根据本页内容选择清晰的课程型版式，优先保证信息层级和演讲节奏。",
+            "visual_suggestion": str(page.get("visual_suggestion") or "").strip() or "根据本页内容选择清晰的版式，优先保证信息层级和演示节奏。",
             "source_refs": page.get("source_refs") if isinstance(page.get("source_refs"), list) else [],
             "generation_status": str(page.get("generation_status") or "page_map"),
             "page_map_markdown": render_page_map_markdown([page])[:2000],
@@ -1879,7 +2154,7 @@ def build_long_deck_skeleton(
         for start, end, section_title in section_ranges:
             if start <= page_num <= end:
                 return section_title
-        return "课程结构"
+        return "内容结构"
 
     for page_num in range(1, target_count + 1):
         if page_num == 1:
@@ -1889,10 +2164,10 @@ def build_long_deck_skeleton(
                 "section_title": "封面",
                 "text_content": {
                     "headline": title,
-                    "subhead": f"{min_pages}-{max_pages} 页课程型 PPT 内容规划",
+                    "subhead": f"{min_pages}-{max_pages} 页 PPT 内容规划",
                     "body": "",
                 },
-                "speaker_notes": "封面页。后续分段生成会补齐课程定位、开场话术和演讲备注。",
+                "speaker_notes": "封面页。后续分段生成会补齐内容定位、开场表达和演示备注。",
                 "visual_suggestion": "封面视觉待内容细化后统一生成。",
                 "source_refs": [],
                 "generation_status": "skeleton",
@@ -1905,9 +2180,9 @@ def build_long_deck_skeleton(
                 "text_content": {
                     "headline": "总结与下一步",
                     "subhead": "",
-                    "body": "回到整场课程主线，提炼关键结论、行动建议和后续讨论方向。",
+                    "body": "回到整份内容主线，提炼关键结论、行动建议和后续讨论方向。",
                 },
-                "speaker_notes": "封底页。后续分段生成会根据完整课程内容补齐收束话术。",
+                "speaker_notes": "封底页。后续分段生成会根据完整内容补齐收束表达。",
                 "visual_suggestion": "封底视觉待内容细化后统一生成。",
                 "source_refs": [],
                 "generation_status": "skeleton",
@@ -1923,9 +2198,9 @@ def build_long_deck_skeleton(
                 "text_content": {
                     "headline": short_section if is_section_start else f"{short_section} · 第 {page_num} 页",
                     "subhead": "内容待细化",
-                    "body": "本页已先放入 80 页课程结构中，系统会继续根据 Brief 和上传材料补齐正文、案例、讲稿备注和视觉建议。",
+                    "body": "本页已先放入长篇 PPT 结构中，系统会继续根据 Brief 和上传材料补齐正文、案例、备注和视觉建议。",
                 },
-                "speaker_notes": "占位讲稿。系统会继续分段补齐本页的讲解逻辑、课堂节奏和转场。",
+                "speaker_notes": "占位备注。系统会继续分段补齐本页的表达逻辑、演示节奏和转场。",
                 "visual_suggestion": "待内容细化后生成本页视觉建议。",
                 "source_refs": [],
                 "generation_status": "skeleton",
@@ -1940,10 +2215,10 @@ def _fallback_deck_blueprint(target_count: int, min_pages: int, max_pages: int) 
     target_count = max(1, int(target_count or max_pages or min_pages or 1))
     lines = [
         "## 全局蓝图",
-        f"- P1：封面。定主题、听众和演讲语境，正文留空。",
+        f"- P1：封面。定主题、受众和表达语境，正文留空。",
     ]
     for start, end, title in _long_deck_section_ranges(target_count):
-        lines.append(f"- P{start}-P{end}：{title}。围绕用户材料展开，按课程节奏拆成讲解、案例、方法和复盘页。")
+        lines.append(f"- P{start}-P{end}：{title}。围绕用户材料展开，按内容节奏拆成论点、案例、方法和复盘页。")
     if target_count >= 2:
         lines.append(f"- P{target_count}：封底。只做感谢、复盘或下一步，不引入新论点。")
     lines.append(f"\n页码必须完整覆盖 P1-P{target_count}；用户要求页数范围是 {min_pages}-{max_pages} 页。")
@@ -1964,14 +2239,14 @@ def _generate_deck_blueprint(
     if on_progress:
         on_progress({
             "stage": "analyzing",
-            "message": "正在快速设计全局课程结构...",
+            "message": "正在快速设计全局内容结构...",
             "current_page": 0,
             "total_pages": max_pages,
         })
 
     fallback = _fallback_deck_blueprint(target_count, min_pages, max_pages)
     doc_excerpt = _document_excerpt_for_extension(documents, limit=7000)
-    prompt = f"""你是一位顶尖的课程型 PPT 总架构师。先为一份长 PPT 设计全局蓝图，不要生成逐页 JSON。
+    prompt = f"""你是一位顶尖的 PPT 内容架构师。先为一份长 PPT 设计全局蓝图，不要生成逐页 JSON。
 
 【用户主题和约束】
 {topic}
@@ -1992,9 +2267,9 @@ def _generate_deck_blueprint(
 【蓝图要求】
 1. 输出 6-10 个一级章节，每章必须给出连续页码区间，例如 P1-P4。
 2. 页码区间必须完整覆盖 P1-P{target_count}，不能断档、重叠或提前结束。
-3. 标明每章的讲述目标、核心论点、关键材料来源、案例/练习/讨论安排、转场逻辑。
+3. 标明每章的表达目标、核心论点、关键材料来源、案例/互动安排、转场逻辑。
 4. 必须把封面、必要的过渡、复盘总结和封底纳入页码规划。
-5. 这是一场课程/演讲型 PPT，要服务用户的受众和时长，不要做成薄摘要。
+5. 这是一份长篇 PPT，要服务用户的受众、场景和时长，不要做成薄摘要。
 
 只输出可读的中文 Markdown 蓝图，不要输出 JSON。"""
 
@@ -2003,7 +2278,7 @@ def _generate_deck_blueprint(
         response = client.chat.completions.create(
             model=get_minimax_llm_model(),
             messages=[
-                {"role": "system", "content": "你是世界一流的长篇课程 PPT 总架构师。只输出全局蓝图，不生成逐页 JSON。"},
+                {"role": "system", "content": "你是世界一流的长篇 PPT 内容架构师。只输出全局蓝图，不生成逐页 JSON。"},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.35,
@@ -2090,7 +2365,7 @@ def _extend_outline_to_target_count(
 - 续写必须接上已有叙事，不要重复已生成页面。
 - 每页仍必须包含 type、section_title、text_content、speaker_notes、visual_suggestion、source_refs。
 - {"第 " + str(end_page) + " 页必须是 ending 封底页，用于收束全场。" if is_final_chunk else "本轮不是最后一组页面，不要生成 ending 封底页。"}
-- 如果材料不足，优先扩展为课程讲解页、案例页、讨论页、方法拆解页、过渡页和总结页，而不是灌水。
+- 如果材料不足，优先扩展为论点拆解页、案例页、讨论页、方法页、过渡页和总结页，而不是灌水。
 
 严格输出 JSON 数组，不要包含 Markdown 代码块标记。"""
 
@@ -2180,7 +2455,7 @@ def _generate_outline_from_blueprint_in_chunks(
 {search_context or "无"}
 
 【文档使用规则】
-{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成课程结构。"}
+{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成内容结构。"}
 
 【本轮任务】
 只生成第 {start_page} 页到第 {end_page} 页，共 {end_page - start_page + 1} 页。
@@ -2190,7 +2465,7 @@ def _generate_outline_from_blueprint_in_chunks(
 - 每页必须包含 type、section_title、text_content、speaker_notes、visual_suggestion、source_refs。
 - {"第 1 页必须是 cover 封面页，body 保持为空。" if is_first_chunk else "本轮不是封面段，不要再生成 cover。"}
 - {"第 " + str(end_page) + " 页必须是 ending 封底页，用于收束全场。" if is_final_chunk else "本轮不是最后一组页面，不要生成 ending 封底页。"}
-- 长课程页数要靠讲解、案例、方法、讨论、复盘自然展开，不能灌水。
+- 长篇页数要靠论点、案例、方法、讨论、复盘自然展开，不能灌水。
 
 严格输出 JSON 数组，不要包含 Markdown 代码块标记。"""
 
@@ -2277,7 +2552,7 @@ def generate_long_deck_outline_chunk(
 {search_context or "无"}
 
 【文档使用规则】
-{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成课程结构。"}
+{preservation_policy or "没有上传文档时，根据用户主题和受众目标生成内容结构。"}
 
 【本轮任务】
 只生成第 {start_page} 页到第 {end_page} 页，共 {end_page - start_page + 1} 页。
@@ -2287,7 +2562,7 @@ def generate_long_deck_outline_chunk(
 - 每页必须包含 type、section_title、text_content、speaker_notes、visual_suggestion、source_refs。
 - {"第 1 页必须是 cover 封面页，body 保持为空。" if is_first_chunk else "本轮不是封面段，不要再生成 cover。"}
 - {"第 " + str(end_page) + " 页必须是 ending 封底页，用于收束全场。" if is_final_chunk else "本轮不是最后一组页面，不要生成 ending 封底页。"}
-- 长课程页数要靠讲解、案例、方法、讨论、复盘自然展开，不能灌水。
+- 长篇页数要靠论点、案例、方法、讨论、复盘自然展开，不能灌水。
 
 严格输出 JSON 数组，不要包含 Markdown 代码块标记。"""
 
@@ -2400,6 +2675,10 @@ def _normalize_content_markdown(outline: List[Dict]) -> List[Dict]:
         if isinstance(notes, str):
             page["speaker_notes"] = normalize_markdown_content(notes)
         _normalize_punchline_page_content(page)
+        separated = separate_visual_directives_from_page(page)
+        if separated is not page:
+            page.clear()
+            page.update(separated)
     return outline
 
 
@@ -2460,12 +2739,40 @@ def generate_content_plan(
     page_count: int | None = None,
     documents: str = "",
     on_progress: Callable[[dict], None] | None = None,
+    intent_contract: dict | None = None,
+    chat_context: str | None = None,
 ) -> List[Dict]:
     """
     根据主题和文档生成 Content Plan。
     支持流式读取和进度回调，让前端能看到生成过程。
     """
+    documents = sanitize_ppt_recovery_text_for_content(documents)
+    # 把用户在 Agent 对话中针对内容规划的最新反馈（chat_context）作为最高优先级的指令
+    # 注入到 topic 顶端。这样下游所有 LLM prompt（共 6 个站点）都会自动看到，并且页数
+    # 启发式（如 _is_strict_page_count_request）也能感知到用户最新意图。
+    chat_context_text = (chat_context or "").strip()
+    if chat_context_text:
+        topic = (
+            "【⚠ 用户对内容规划的最新反馈 — 必须采纳】\n"
+            f"{chat_context_text}\n"
+            "—— 以上是用户最新指令，优先于下方的原始主题。\n\n"
+            "【原始主题】\n"
+            f"{topic}"
+        )
+        logger.info(
+            "ContentPlan: 注入 chat_context 反馈 (%s chars) 到 topic 前端，用于驱动重新生成",
+            len(chat_context_text),
+        )
     has_docs = bool(documents and documents.strip())
+    effective_intent_contract = _effective_intent_contract(topic, documents, intent_contract)
+    if page_count is None:
+        inferred_ppt_pages = infer_page_count_from_single_ppt(
+            documents,
+            topic,
+            intent_contract=effective_intent_contract,
+        )
+        if inferred_ppt_pages:
+            page_count = inferred_ppt_pages
     requested_page_range = infer_page_count_range_from_topic(topic)
     page_count, min_pages, max_pages = resolve_content_plan_page_target(topic, page_count, documents)
     strict_page_count = _is_strict_page_count_request(topic) and not requested_page_range
@@ -2510,7 +2817,11 @@ def generate_content_plan(
             })
         return paginated_markdown_outline
 
-    direct_ppt_outline = build_direct_ppt_replicate_outline(documents, topic)
+    direct_ppt_outline = build_direct_ppt_replicate_outline(
+        documents,
+        topic,
+        intent_contract=effective_intent_contract,
+    )
     if direct_ppt_outline and not requested_page_range and not strict_page_count:
         logger.info("ContentPlan: detected single PPT direct replicate request, reusing %s source pages", len(direct_ppt_outline))
         if on_progress:
@@ -2525,15 +2836,15 @@ def generate_content_plan(
     doc_section = ""
     if has_docs:
         ppt_sources = detect_ppt_sources(documents)
-        preservation_policy = _document_preservation_policy(documents, topic)
+        preservation_policy = _document_preservation_policy(documents, topic, effective_intent_contract)
         ppt_policy = ""
         if len(ppt_sources) == 1:
             ppt = ppt_sources[0]
             ppt_policy = f"""
 【上传 PPT 的特殊处理】
 系统识别到用户上传了 1 个 PPT：{ppt.get("filename") or "未命名 PPT"}，原始页数 {ppt.get("pages")} 页。
-- 如果用户没有明确要求扩展、缩减、提取特定主题、融合或重组，你必须按原 PPT 逐页复刻内容结构：输出页数等于 {ppt.get("pages")} 页，第 i 个 JSON 页面对应原 PPT 第 i 页。
-- 逐页复刻时，文字内容应尽量保留原页标题、要点、数据和备注，不要压缩成摘要，也不要重新发明叙事。
+- 如果用户处理意图要求保留原页顺序，第 i 个 JSON 页面优先对应原 PPT 第 i 页；只有用户明确要求重组、压缩、扩展或融合时才改变页序。
+- 对于轻优化任务，标题和正文可以更清晰，但必须忠于原页要表达的意思，不要重新发明叙事。
 - 原页中出现的关键数字、标签、对比项、流程节点、学校/城市名单、产品规格必须进入 text_content.body；不能只放在 speaker_notes，也不能因为“每页只说一件事”而删除原页事实。
 - 如果原页是信息密集页，允许 body 使用表格或分组 bullet 承载原文信息；视觉阶段会再做版式取舍，内容规划阶段不得提前丢信息。
 - 每一页必须输出 source_refs: [{{"source_document": "{ppt.get("filename") or "未命名 PPT"}", "source_page_num": 原PPT页码, "reason": "polish"}}]，确保新页能追溯到原 PPT 页。
@@ -2577,12 +2888,13 @@ def generate_content_plan(
         page_count=page_count,
         documents=documents,
         search_context=search_context,
+        intent_contract=effective_intent_contract,
         on_progress=on_progress,
     )
     outline = content_plan_from_page_map(page_map)
     outline = _normalize_outline_page_count(outline, page_count, strict_page_count=strict_page_count)
     outline = _enforce_requested_page_range(outline, requested_page_range)
-    outline = _annotate_ppt_source_refs(outline, documents, topic)
+    outline = _annotate_ppt_source_refs(outline, documents, topic, effective_intent_contract)
     logger.info("ContentPlan: Page Map 生成完成，共 %s 页", len(outline))
     if on_progress:
         on_progress({"stage": "saving", "message": "正在保存结果...", "current_page": len(outline), "total_pages": len(outline)})

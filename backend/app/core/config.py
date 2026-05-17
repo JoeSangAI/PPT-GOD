@@ -18,9 +18,9 @@ class Settings(BaseSettings):
     MINIMAX_API_KEY: str = ""
     MINIMAX_API_BASE: str = "https://api.minimaxi.com/v1"
     MINIMAX_LLM_MODEL: str = "MiniMax-M2.7"
-    DEER_API_KEY: str = ""
-    DEER_API_BASE: str = "https://api.deerapi.com/v1"
-    DEER_IMAGE_MODEL: str = "gpt-image-2-all"
+    COMET_API_KEY: str = ""
+    COMET_API_BASE: str = "https://api.cometapi.com/v1"
+    COMET_IMAGE_MODEL: str = "gpt-image-2-all"
     IMAGE_API_TIMEOUT_SECONDS: float = 125.0
     IMAGE_GEN_MODE: str = "real"  # real | mock | cached
     IMAGE_GEN_CACHE_DIR: str = "./outputs/image-cache"

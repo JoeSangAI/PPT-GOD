@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from fastapi import HTTPException
 from PIL import Image
@@ -141,6 +141,25 @@ def test_stale_running_run_without_heartbeat():
     assert "没有进度更新" in run.error_msg
 
 
+def test_serialize_run_marks_naive_datetimes_as_utc_for_browser_math():
+    db = make_session()
+    project = Project(title="UTC progress", status="planning")
+    db.add(project)
+    db.flush()
+
+    run = create_project_run(db, project.id, kind="content_plan", stage="content_plan", total_count=10)
+    run.started_at = datetime(2026, 5, 14, 13, 47, 0, 123456)
+    run.updated_at = datetime(2026, 5, 14, 13, 47, 5)
+    run.finished_at = datetime(2026, 5, 14, 13, 48, 0)
+    db.flush()
+
+    payload = serialize_run(run)
+
+    assert payload["started_at"] == "2026-05-14T13:47:00.123456Z"
+    assert payload["updated_at"] == "2026-05-14T13:47:05Z"
+    assert payload["finished_at"] == "2026-05-14T13:48:00Z"
+
+
 def test_confirmed_planning_project_normalizes_to_visual_ready():
     db = make_session()
     project = Project(title="Legacy confirmed", status="planning", content_plan_confirmed=True)
@@ -217,6 +236,48 @@ def test_reconcile_preserves_signed_visual_outputs_when_content_changes():
     assert slide.visual_json["layout"] == "old"
 
 
+def test_cancelled_prototype_with_preserved_old_image_returns_to_prompt_ready():
+    db = make_session()
+    project = Project(
+        title="Cancelled prototype",
+        status="prototype_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        content_json={"page_num": 1},
+        visual_json={"layout": "new"},
+        prompt_text="new prompt",
+        image_path="/tmp/old-sample.png",
+        error_msg="用户手动停止",
+    )
+    db.add(slide)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "cancelled"
+    run.message = "用户手动停止"
+    run.error_msg = "用户手动停止"
+    db.flush()
+
+    reconcile_project_state(project, [slide], run)
+
+    assert project.status == "prompt_ready"
+    assert slide.image_path == "/tmp/old-sample.png"
+    assert slide.status == "prompt_ready"
+
+
 def test_rollback_to_prompt_requires_selected_style():
     db = make_session()
     project = Project(title="Prompt rollback without style", status="completed", content_plan_confirmed=True)
@@ -275,10 +336,12 @@ def test_workflow_status_exposes_unified_progress_view_model():
     assert payload["project_phase"] == "prompt_ready"
     assert payload["project_status"] == "prompt_ready"
     assert payload["active_run"]["id"] == run.id
+    assert payload["active_run"]["updated_at"]
     assert payload["progress"]["label"] == "批量生成进度"
     assert payload["progress"]["current"] == 1
     assert payload["progress"]["total"] == 3
     assert payload["progress"]["unit"] == "页"
+    assert payload["progress"]["updated_at"] == payload["active_run"]["updated_at"]
     assert payload["progress"]["active_page_nums"] == [2, 3]
     assert payload["progress"]["running_count"] == 2
     assert payload["progress"]["can_cancel"] is True
@@ -439,3 +502,48 @@ def test_download_exports_partial_deck_with_blank_pages(tmp_path, monkeypatch):
     assert len(prs.slides[0].shapes) >= 1
     assert len(prs.slides[1].shapes) == 0
     assert len(prs.slides[2].shapes) == 0
+
+
+def test_download_completed_project_serves_final_presentation(tmp_path, monkeypatch):
+    from app.api import slides as slides_api
+
+    db = make_session()
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
+    project = Project(
+        title="Completed export",
+        status="completed",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+
+    original_slide_path = tmp_path / project.id / "slide_01.png"
+    original_slide_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (1792, 1024), "red").save(original_slide_path)
+
+    final_pptx_path = tmp_path / project.id / "presentation.pptx"
+    assemble_input = [{"page_num": 1, "image_path": str(original_slide_path), "speaker_notes": ""}]
+    slides_api.assemble_pptx(assemble_input, str(final_pptx_path))
+
+    db.add(
+        Slide(
+            project_id=project.id,
+            page_num=1,
+            status="completed",
+            content_json={"page_num": 1},
+            visual_json={"visual_description": "final"},
+            prompt_text="prompt",
+            image_path=str(original_slide_path),
+        )
+    )
+    db.commit()
+
+    def fail_partial_assemble(*_args, **_kwargs):
+        raise AssertionError("completed downloads should serve the final presentation")
+
+    monkeypatch.setattr(slides_api, "_assemble_partial_project_pptx", fail_partial_assemble)
+
+    response = slides_api.download_pptx(project.id, db=db)
+
+    assert response.path == str(final_pptx_path)

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.base import get_db
 from app.models.models import Project, ReferenceImage, Slide
@@ -19,6 +20,12 @@ from app.services.artifact_versions import content_signature, style_asset_signat
 from app.services.image_analyzer import describe_context_image
 from app.services.style_proposal import enforce_user_style_requirements
 from app.services.content_plan import infer_page_count_from_topic
+from app.services.source_intent import (
+    infer_intent_contract,
+    merge_intent_contract,
+    normalize_intent_contract,
+    source_diagnostics_from_documents,
+)
 
 router = APIRouter(prefix="/projects", tags=["chat"])
 
@@ -100,6 +107,107 @@ def _load_ambient_chat_attachments(db: Session, project_id: str, agent_role: str
     return usable[-8:]
 
 
+def _format_page_target_context(page_context: dict | None) -> str:
+    if not isinstance(page_context, dict):
+        return ""
+
+    scope_map = {
+        "deck": "整套 PPT",
+        "selected_slides": "选中页",
+        "current_slide": "当前页",
+    }
+    area_map = {
+        "whole": "全页内容",
+        "title": "标题",
+        "body": "正文",
+        "visual": "画面",
+        "materials": "素材",
+        "notes": "备注",
+    }
+
+    raw_scope = str(page_context.get("scope") or "").strip()
+    scope_label = scope_map.get(raw_scope)
+    if not scope_label:
+        scope_label = "当前页" if page_context.get("mode") == "page" else "整套 PPT"
+
+    raw_area = str(page_context.get("target_area") or "").strip()
+    if raw_area == "whole":
+        area_label = "全页内容"
+    else:
+        area_label = str(page_context.get("area_label") or "").strip() or area_map.get(raw_area, "全页内容")
+
+    page_nums: list[int] = []
+    target_nums = page_context.get("target_page_nums")
+    if isinstance(target_nums, list):
+        for item in target_nums:
+            try:
+                page_num = int(item)
+            except (TypeError, ValueError):
+                continue
+            if page_num > 0 and page_num not in page_nums:
+                page_nums.append(page_num)
+    if not page_nums and page_context.get("mode") == "page":
+        current_page = page_context.get("current_page")
+        if isinstance(current_page, dict):
+            try:
+                page_num = int(current_page.get("page_num"))
+            except (TypeError, ValueError):
+                page_num = 0
+            if page_num > 0:
+                page_nums.append(page_num)
+
+    lines = [
+        f"范围：{scope_label}",
+        f"区域：{area_label}",
+    ]
+    if page_nums:
+        lines.insert(1, f"目标页：第 {'、'.join(str(num) for num in page_nums)} 页")
+    lines.append("必须优先遵守这个修改目标；用户没有另行说明时，不得扩大或缩小范围，也不得修改目标区域之外的内容。")
+    return "\n".join(lines)
+
+
+def _build_page_context_prompt_section(page_context: dict | None) -> str:
+    if not isinstance(page_context, dict):
+        return ""
+
+    parts: list[str] = []
+    target_context = _format_page_target_context(page_context)
+    if target_context:
+        parts.append("【本轮修改目标（来自用户输入框上方的选择）】\n" + target_context)
+
+    cross_stage_context = str(page_context.get("cross_stage_context") or "").strip()
+    if cross_stage_context:
+        parts.append(
+            "【跨阶段用户补充要求】\n"
+            "这些内容来自用户在其他阶段提出的要求。即使当前阶段不能直接完成，也必须回应并在相关后续动作中考虑；"
+            "如果要求影响当前阶段产物，请落实到当前 action/payload 中。\n"
+            f"{cross_stage_context}"
+        )
+
+    if page_context.get("mode") == "global":
+        slides_summary = page_context.get("slides", [])
+        parts.append(
+            "【当前处于全局调整模式 —— 用户指令可能影响多个页面】\n"
+            f"所有页面摘要：\n{json.dumps(slides_summary, ensure_ascii=False, indent=2)}"
+        )
+    elif page_context.get("mode") == "page":
+        current_page = page_context.get("current_page", {})
+        other_pages = page_context.get("other_pages", [])
+        page_num = current_page.get("page_num") if isinstance(current_page, dict) else "?"
+        section = (
+            f"【当前处于单页编辑模式 —— 你只能修改第 {page_num} 页，不得影响其他页面】\n"
+            f"\n=== 当前正在编辑的页面（修改目标） ===\n{json.dumps(current_page, ensure_ascii=False, indent=2)}"
+        )
+        if other_pages:
+            section += f"\n\n=== 其他页面摘要（仅作风格/格式参考，禁止修改） ===\n{json.dumps(other_pages, ensure_ascii=False, indent=2)}"
+        parts.append(section)
+    else:
+        page_json = json.dumps(page_context, ensure_ascii=False, indent=2)
+        parts.append(f"=== 当前正在编辑的单页上下文 ===\n{page_json}\n=== 单页上下文结束 ===")
+
+    return "\n\n".join(parts).strip()
+
+
 def _build_attachment_context(attachments: list[ReferenceImage] | None, agent_role: str) -> str:
     lines: list[str] = []
     role_label_map = {
@@ -146,6 +254,51 @@ def _is_simple_confirmation(message: str) -> bool:
         "嗯",
         "嗯嗯",
     }
+
+
+def _source_intent_context_text(project_context: dict) -> str:
+    raw = project_context.get("intent_contract") if isinstance(project_context, dict) else None
+    if not isinstance(raw, dict):
+        return ""
+    contract = normalize_intent_contract(raw)
+    task_type = contract.get("task_type")
+    if task_type == "replicate":
+        guidance = "用户希望尽量按原文和原页顺序整理；不要主动重组结构，标题正文只做必要清理。"
+    elif task_type == "polish":
+        guidance = "用户希望保留原页顺序和主要事实，优化标题和正文表达，不重组叙事。"
+    elif task_type in {"restructure", "merge", "extract"}:
+        guidance = "用户允许按目标重组材料；必须保留关键事实，并说明内容来自哪些原页。"
+    elif task_type == "template_reference":
+        guidance = "用户主要把上传 PPT 当作版式或视觉参考；正文应根据 Brief 重新组织。"
+    else:
+        return ""
+    if float(contract.get("confidence") or 0) < 0.5:
+        guidance += " 如果处理方式会明显改变产物，只问一个窄问题：更接近按原页顺序轻优化，还是可以重组结构？"
+    return "【上传 PPT 的处理方式】\n" + guidance
+
+
+def _update_project_intent_from_message_if_needed(
+    project: Project,
+    user_message: str,
+    documents: str,
+    db: Session,
+) -> dict:
+    current = project.intent_contract if isinstance(project.intent_contract, dict) else None
+    diagnostics = source_diagnostics_from_documents(documents)
+    if not diagnostics.get("has_ppt_source") and not current:
+        return {}
+
+    incoming = infer_intent_contract(user_message, source_diagnostics=diagnostics)
+    if current and not incoming.get("evidence") and float(incoming.get("confidence") or 0) < 0.7:
+        return current
+
+    merged = merge_intent_contract(current, incoming)
+    if merged != current:
+        project.intent_contract = merged
+        flag_modified(project, "intent_contract")
+        db.commit()
+        db.refresh(project)
+    return project.intent_contract if isinstance(project.intent_contract, dict) else {}
 
 
 def _has_page_count_change_intent(message: str, project_context: dict) -> bool:
@@ -337,12 +490,12 @@ def _has_visual_mutation_intent(message: str) -> bool:
     if not text.strip():
         return False
     mutation_then_target = (
-        r"(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化)"
+        r"(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化|看不清|不清楚|看不见|读不清|不明显|对比度|再来一版|换个方向|不满意)"
         r".{0,35}(视觉|画面|图片|图|背景|配色|颜色|字体|排版|版式|风格|素材|Logo|logo|参考图|主色|标题|页面|整套|PPT|科技感|商务感)"
     )
     target_then_mutation = (
         r"(视觉|画面|图片|图|背景|配色|颜色|字体|排版|版式|风格|素材|Logo|logo|参考图|主色|标题|页面|整套|PPT|科技感|商务感)"
-        r".{0,35}(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化)"
+        r".{0,35}(重新|重做|修改|调整|换成|改成|改为|加入|添加|放到|放在|移到|去掉|删除|删掉|统一|放大|缩小|突出|弱化|看不清|不清楚|看不见|读不清|不明显|对比度|再来一版|换个方向|不满意)"
     )
     return bool(re.search(mutation_then_target, text, flags=re.IGNORECASE) or re.search(target_then_mutation, text, flags=re.IGNORECASE))
 
@@ -366,6 +519,27 @@ def _visual_action_payload_complete(result: dict) -> bool:
         # Adjustments can still be handled by backend regeneration when the UI is
         # in a state that can produce fresh proposal cards.
         return bool(result.get("response"))
+    if action == "update_slide_visual":
+        if not isinstance(payload, dict):
+            return False
+        visual_json = payload.get("visual_json")
+        return isinstance(visual_json, dict) and bool(
+            str(visual_json.get("visual_description") or "").strip()
+            or str(visual_json.get("design_notes") or "").strip()
+        )
+    if action == "update_all_slides_visual":
+        if not isinstance(payload, list) or not payload:
+            return False
+        return any(
+            isinstance(item, dict)
+            and item.get("page_num")
+            and isinstance(item.get("visual_json"), dict)
+            and (
+                str(item["visual_json"].get("visual_description") or "").strip()
+                or str(item["visual_json"].get("design_notes") or "").strip()
+            )
+            for item in payload
+        )
     if isinstance(payload, list):
         return len(payload) > 0
     if isinstance(payload, dict):
@@ -398,6 +572,83 @@ def _infer_visual_page_nums(user_message: str, page_context: dict | None) -> lis
         seen.add(num)
         ordered.append(num)
     return ordered
+
+
+def _has_visual_reroll_intent(message: str) -> bool:
+    return bool(
+        re.search(
+            r"(再来一版|换个方向|不满意|重新生成(?:一版)?画面方案|重写画面方案|重新出(?:一版)?方案|重做这一页|重画这一页)",
+            message or "",
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _visual_instruction_change_note(user_message: str) -> str:
+    text = re.sub(r"\s+", " ", user_message or "").strip()
+    if re.search(r"(看不清|不清楚|看不见|读不清|辨识|对比度|黑色.{0,8}(字体|文字|字)|(?:字体|文字|字).{0,8}黑色)", text):
+        return "提升文字对比度和可读性，避免黑色或低对比文字压在深色背景上，标题和关键信息必须清晰可读"
+    if re.search(r"(二维码|QR|qr)", text) and re.search(r"(靠下|太低|底部|下面|下沿)", text):
+        return "上移二维码并留出安全边距，确保二维码完整清晰、不会贴近画面底部"
+    if re.search(r"(太暗|过暗|暗了)", text):
+        return "提高画面亮度和主体层级，避免关键内容被深色背景压暗"
+    if re.search(r"(太浅|太淡|不明显)", text):
+        return "增强关键元素的对比度和视觉层级，让主体更明显"
+    return f"按用户反馈调整：{_short_text(text, 90)}"
+
+
+def _current_visual_json_for_page(page_context: dict | None, page_num: int) -> dict:
+    if not isinstance(page_context, dict):
+        return {}
+    current_page = page_context.get("current_page")
+    if isinstance(current_page, dict) and int(current_page.get("page_num") or 0) == page_num:
+        visual_json = current_page.get("visual_json")
+        return copy.deepcopy(visual_json) if isinstance(visual_json, dict) else {}
+    for item in page_context.get("slides") or []:
+        if isinstance(item, dict) and int(item.get("page_num") or 0) == page_num:
+            visual_json = item.get("visual_json")
+            return copy.deepcopy(visual_json) if isinstance(visual_json, dict) else {}
+    return {}
+
+
+def _build_visual_update_contract_payload(user_message: str, page_context: dict | None, page_nums: list[int]) -> dict | None:
+    if not page_nums or _has_visual_reroll_intent(user_message):
+        return None
+
+    note = _visual_instruction_change_note(user_message)
+    updates = []
+    for page_num in page_nums:
+        current_visual = _current_visual_json_for_page(page_context, page_num)
+        existing_desc = str(current_visual.get("visual_description") or "").strip()
+        existing_notes = str(current_visual.get("design_notes") or "").strip()
+        if existing_desc:
+            visual_description = f"{existing_desc}\n\n本轮修改：{note}。保持未提及的构图、素材关系和版式不变。"
+        else:
+            visual_description = f"本轮修改：{note}。保持页面原有内容目标，优先保证关键文字和主体元素清晰。"
+        design_notes = f"{existing_notes}\n本轮修改：{note}。".strip() if existing_notes else f"本轮修改：{note}。"
+        updates.append({
+            "page_num": page_num,
+            "visual_json": {
+                "visual_description": visual_description,
+                "design_notes": design_notes,
+            },
+        })
+
+    if len(updates) == 1:
+        page_num = updates[0]["page_num"]
+        return {
+            "action": "update_slide_visual",
+            "page_nums": [page_num],
+            "updated_visual": updates[0],
+            "response": f"已写入第 {page_num} 页：{note}",
+        }
+
+    return {
+        "action": "update_all_slides_visual",
+        "page_nums": [item["page_num"] for item in updates],
+        "updated_slides_visual": updates,
+        "response": f"已写入第 {', '.join(str(item['page_num']) for item in updates)} 页：{note}",
+    }
 
 
 def _is_deck_visual_scope(page_context: dict | None) -> bool:
@@ -466,8 +717,16 @@ def _enforce_visual_action_contract(
             payload["page_nums"] = page_nums
         return payload
 
-    if _has_visual_mutation_intent(user_message) or _response_promises_visual_mutation(result.get("response")):
+    if (
+        _has_visual_mutation_intent(user_message)
+        or _response_promises_visual_mutation(result.get("response"))
+        or result.get("action") in VISUAL_MUTATION_ACTIONS
+    ):
         if page_nums:
+            if _has_visual_mutation_intent(user_message) or result.get("action") in {"update_slide_visual", "update_all_slides_visual"}:
+                update_payload = _build_visual_update_contract_payload(user_message, page_context, page_nums)
+                if update_payload:
+                    return update_payload
             return {
                 "action": "reroll_page_visual_plan",
                 "page_nums": page_nums,
@@ -725,6 +984,43 @@ def _enforce_content_action_contract(
     return result
 
 
+def _get_current_stage_description(project_context: dict) -> str:
+    """根据项目状态返回当前阶段描述，让 LLM 明确知道用户在哪个 Gate 阶段以及该确认什么。"""
+    status = project_context.get("status", "")
+    content_confirmed = project_context.get("content_plan_confirmed", False)
+    has_selected_style = project_context.get("has_selected_style", False)
+    has_prompts = project_context.get("has_prompts", False)
+    has_images = project_context.get("has_images", False)
+
+    if status == "draft":
+        return "需求收集阶段 —— 用户正在确认需求和素材，待确认物：定调摘要"
+    if status in ("planning", "content_plan_ready"):
+        if not content_confirmed:
+            return "内容规划待确认阶段 —— 待确认物：整套内容规划（页数、标题、顺序、文案）"
+        return "内容规划已确认，等待进入视觉阶段"
+    if status == "visual_ready":
+        if not has_selected_style:
+            return "视觉方向待确认阶段 —— 待确认物：风格提案（配色、气质、字体、整体调性）"
+        if not has_prompts:
+            return "画面方案待生成阶段 —— 待确认物：每页的视觉描述和生图方案（尚未生成）"
+        return "画面方案已生成，等待样张确认"
+    if status in ("prompt_ready", "failed"):
+        if not has_prompts:
+            return "画面方案待生成阶段 —— 待确认物：每页的视觉描述和生图方案"
+        if not has_images:
+            return "画面方案已生成，等待样张确认 —— 待确认物：样张效果"
+        return "部分页面已生成样张，等待全部确认"
+    if status in ("prototype", "prototype_ready"):
+        if has_images:
+            return "样张已生成，等待确认批量生成 —— 待确认物：样张效果"
+        return "样张生成中"
+    if status == "generating":
+        return "批量生成中"
+    if status == "completed":
+        return "已完成"
+    return f"未知阶段（状态：{status}）"
+
+
 def _build_draft_prompt(has_documents: bool) -> str:
     """draft 阶段（无 slides）的对话收集 prompt。"""
     doc_hint = """
@@ -918,6 +1214,8 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "", nu
   4. **response 里用一两句话点出"我把 X 改成了 Y"**，让用户一眼看出差异
   5. 示例：用户说"主色太红了，换个温暖一点的"，你必须返回 `{{"action":"adjust_style","response":"我把主色从冷红 #E60012 换成了暖橘 #FF6B35，其余配色保持不变。","style_proposal":{{...完整对象...}}}}`
 - **当用户提出调整意见但当前还没有任何提案时**（即上下文里没有"当前已存在的风格提案"），你应当返回 action="propose_styles" 并按用户意见生成首次提案，而不是 adjust_style。
+- **【阶段优先规则·风格提案阶段】如果上下文里存在「当前风格提案」且尚未被用户确认，用户给出的任何与配色、风格气质、页面类型处理（如"内容页用浅色"、"封面要大气"、"数据页不要太花哨"）相关的反馈，必须优先视为对风格提案的调整，返回 action="adjust_style"，在 style_proposal 中输出调整后的新提案。禁止把这些反馈理解为对具体页面的修改（update_slide_visual / update_all_slides_visual）。**
+- **【阶段优先规则·画面方案阶段】如果风格已经确认（用户已选风格），但画面方案尚未生成或刚生成还未确认，用户给出的任何与配色、风格气质、整体画面方向、页面类型处理（如"内容页用浅色"、"封面要大气"、"数据页不要太花哨"）相关的反馈，必须优先视为对已确认风格的进一步调整，返回 action="adjust_style"，在 style_proposal 中输出调整后的新提案（这会触发重新生成画面方案）。只有当用户明确指定单页并给出具体画面修改指令时，才返回 update_slide_visual / reroll_page_visual_plan。**
 - **每次回复都必须包含下一步行动指引**。比如：提案后告诉用户"满意请确认，不满意告诉我调整方向"；确认风格后告诉用户"正在进入画面设计阶段"；调整画面后告诉用户"调整已应用，可以确认生成图片"。禁止只回答用户当前问题而不给下一步方向。
 - **当用户明确确认选择某个风格时（如"ok"、"就用这个"、"确认"、"选这个"），必须返回 action="confirm_style"，并在 `style` 字段中输出完整的风格对象。不要只返回 "answer"。**
 - 说话要有设计师的品味，但不要说空话套话。具体、有观点。
@@ -962,6 +1260,7 @@ def _build_normal_prompt() -> str:
 - **用户反馈整体内容质量问题时（叙事/主线/脉络/结构/逻辑/节奏/论证不完整、不清楚、不连贯、像罗列素材、没有递进或缺少转折）→ action="regenerate_plan"，不要只口头答应；topic 中必须写明需要重构整体内容规划，并补足缺失的铺垫、冲突、转折、证据或结尾。**
 - **用户提到"按照 content plan"、"按照原文/文档"、"完全按照...来"、"按原来的大纲"等，意图是让现有页面内容对齐文档/大纲时 → action="update_all_slides"，不要只口头答应**
 - **用户要求"重新生成内容规划"、"重新规划页面"、"按大纲重新来"、页数需要增减变化时 → action="regenerate_plan"，并在 topic 字段中输出完整的主题描述（用于重新生成内容规划）**
+- **【阶段优先规则·内容规划阶段】如果内容规划尚未被用户确认（上下文显示"内容规划已确认：否"），用户给出的任何与叙事结构、页面顺序、逻辑脉络、整体节奏、内容完整性、页数增减相关的反馈，必须优先视为对整套内容规划的调整，返回 action="regenerate_plan"（重构整套规划）或 "update_all_slides"（全局文字调整）。禁止把这些反馈理解为对单页内容的局部修改（update_slide_content），除非用户明确指定了具体页码和具体修改内容。**
 - 用户说"在第X页前面加一页"、"在前面插入一页"、"加一页" → action="add_slide_before"
 - 用户说"在第X页后面加一页"、"在后面插入一页"、"追加一页" → action="add_slide_after"
 - 如果用户提出的是偏视觉呈现的要求（如"后面视觉上突出这些数字/时间轴/对比关系"），但当前仍处于内容总监阶段：不能无响应。若这条要求会影响内容规划的页面类型、重点数据、标题或叙事顺序，返回对应内容 mutation；若只影响后续视觉表达，返回 action="answer"，明确说明内容层面已记录/会带入后续视觉阶段，并建议进入视觉总监后继续强调该视觉要求。
@@ -1115,6 +1414,10 @@ def _stream_intent(
         else:
             system_prompt = _build_normal_prompt()
 
+    source_intent_context = _source_intent_context_text(project_context)
+    if source_intent_context and agent_role == "content":
+        system_prompt += "\n\n" + source_intent_context
+
     # 把用户从 Brief / Agent 窗口上传的文件内容放到上下文中。
     if has_documents:
         if agent_role == "visual":
@@ -1129,30 +1432,9 @@ def _stream_intent(
     # 把页面上下文放到 system prompt 中
     if page_context:
         try:
-            cross_stage_context = ""
-            if isinstance(page_context, dict):
-                cross_stage_context = str(page_context.get("cross_stage_context") or "").strip()
-            if cross_stage_context:
-                system_prompt += (
-                    "\n\n【跨阶段用户补充要求】\n"
-                    "这些内容来自用户在其他阶段提出的要求。即使当前阶段不能直接完成，也必须回应并在相关后续动作中考虑；"
-                    "如果要求影响当前阶段产物，请落实到当前 action/payload 中。\n"
-                    f"{cross_stage_context}"
-                )
-            if isinstance(page_context, dict) and page_context.get("mode") == "global":
-                slides_summary = page_context.get("slides", [])
-                system_prompt += "\n\n【当前处于全局调整模式 —— 用户指令可能影响多个页面】"
-                system_prompt += f"\n所有页面摘要：\n{json.dumps(slides_summary, ensure_ascii=False, indent=2)}"
-            elif isinstance(page_context, dict) and page_context.get("mode") == "page":
-                current_page = page_context.get("current_page", {})
-                other_pages = page_context.get("other_pages", [])
-                system_prompt += f"\n\n【当前处于单页编辑模式 —— 你只能修改第 {current_page.get('page_num')} 页，不得影响其他页面】"
-                system_prompt += f"\n\n=== 当前正在编辑的页面（修改目标） ===\n{json.dumps(current_page, ensure_ascii=False, indent=2)}"
-                if other_pages:
-                    system_prompt += f"\n\n=== 其他页面摘要（仅作风格/格式参考，禁止修改） ===\n{json.dumps(other_pages, ensure_ascii=False, indent=2)}"
-            else:
-                page_json = json.dumps(page_context, ensure_ascii=False, indent=2)
-                system_prompt += f"\n\n=== 当前正在编辑的单页上下文 ===\n{page_json}\n=== 单页上下文结束 ==="
+            page_context_prompt = _build_page_context_prompt_section(page_context)
+            if page_context_prompt:
+                system_prompt += f"\n\n{page_context_prompt}"
         except Exception as e:
             logger.warning(f"Failed to serialize page_context: {e}")
 
@@ -1183,7 +1465,8 @@ def _stream_intent(
                 "必须优先基于这些读图结果回答，不要说自己无法读取图片。"
             )
 
-    context = f"项目：{project_context['title']}，状态：{project_context['status']}，共 {project_context['total_slides']} 页，已完成 {project_context['completed_slides']} 页，内容规划已确认：{'是' if project_context.get('content_plan_confirmed') else '否'}"
+    stage_desc = _get_current_stage_description(project_context)
+    context = f"项目：{project_context['title']}，状态：{project_context['status']}，当前阶段：{stage_desc}，共 {project_context['total_slides']} 页，已完成 {project_context['completed_slides']} 页，内容规划已确认：{'是' if project_context.get('content_plan_confirmed') else '否'}"
 
     # 把 history 中的 system 操作日志合并到 system prompt 中
     # MiniMax API 不支持 messages 中出现多条 system 角色，所以必须合并
@@ -1563,6 +1846,15 @@ def chat_with_agent(project_id: str, body: ChatMessage, db: Session = Depends(ge
     }
 
     documents = load_project_documents(project_id, parse_missing=True)
+    if body.agent_role == "content":
+        context["intent_contract"] = _update_project_intent_from_message_if_needed(
+            project,
+            body.message,
+            documents,
+            db,
+        )
+    else:
+        context["intent_contract"] = project.intent_contract if isinstance(project.intent_contract, dict) else None
     chat_attachments = _load_chat_attachments(db, project_id, body.attachment_ids)
     if not chat_attachments:
         chat_attachments = _load_ambient_chat_attachments(db, project_id, body.agent_role, body.message)

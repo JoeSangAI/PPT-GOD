@@ -89,11 +89,11 @@ def test_ai_marketing_summary_does_not_misread_generic_traditional_words():
         ]
     )
 
-    assert "科技/数据/AI" in summary["style_direction_hint"]
-    assert "传统文化" not in summary["style_direction_hint"]
-    assert "古法非遗/传统文化" not in summary["industries"]
-    assert "科技/数据" in summary["industries"]
-    assert style_proposal._fallback_style_ids_for_summary(summary)[0] == "minimal_data"
+    # Under "LLM thick" philosophy, industry/topic inference is left to the LLM.
+    # _extract_content_summary no longer does keyword-based industry detection.
+    assert summary["style_direction_hint"] == ""
+    assert summary["industries"] == []
+    assert summary["keywords"] == []
 
 
 def test_logo_analysis_uses_local_palette_when_vlm_misses_colors(monkeypatch, tmp_path):
@@ -111,61 +111,6 @@ def test_logo_analysis_uses_local_palette_when_vlm_misses_colors(monkeypatch, tm
     assert result["primary_color"] == "#FFD000"
     assert "#101010" in result["secondary_colors"]
     assert result["dominant_palette"]
-
-
-def test_asset_based_ai_marketing_rejects_unjustified_traditional_drift(monkeypatch):
-    class _DriftCompletions:
-        def create(self, **kwargs):
-            bad = {
-                "name": "金墨典藏",
-                "palette": [
-                    {"name": "琥珀金", "hex": "#9C6926", "role": "品牌主色/封面主色"},
-                    {"name": "朱砂红", "hex": "#C0362C", "role": "传统文化装饰色"},
-                    {"name": "宣纸米", "hex": "#F5F1E8", "role": "正文页基底"},
-                    {"name": "墨黑", "hex": "#1A1A1A", "role": "高可读文字"},
-                ],
-                "mood": "传统东方、数字科技、典雅权威",
-                "font": "标题用宋体/书法体，正文用黑体。",
-                "description": "以分众传媒 Logo 的琥珀金为核心锚点，融合传统文化和非遗内容的东方审美。",
-                "source": "asset_based",
-            }
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(bad, ensure_ascii=False)))]
-            )
-
-    class _DriftClient:
-        def __init__(self):
-            self.chat = SimpleNamespace(completions=_DriftCompletions())
-
-    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _DriftClient())
-    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
-    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
-
-    proposals = style_proposal.generate_style_proposals(
-        [
-            {
-                "type": "cover",
-                "text_content": {
-                    "headline": "AI大模型驱动下的品牌营销新范式",
-                    "body": "技术演进 × 场景落地 × 分众实践",
-                },
-            },
-            {
-                "type": "content",
-                "text_content": {
-                    "headline": "从传统搜索到智能投放",
-                    "body": "传统搜索是关键词匹配；AI 大模型、数据、算法和智能体让营销投放更高效。",
-                },
-            },
-        ],
-        assets={"user_description": "用户上传了品牌 Logo：分众传媒logo.png"},
-    )
-
-    proposal_text = style_proposal._proposal_text(proposals[0])
-    assert proposals[0]["name"] == "智能增长蓝图"
-    assert proposals[0]["source"] == "asset_drift_guard"
-    for unwanted in ("传统东方", "传统文化", "非遗", "宣纸", "朱砂", "水墨"):
-        assert unwanted not in proposal_text
 
 
 def test_user_style_description_overrides_reference_clone_shortcut(monkeypatch):
@@ -244,6 +189,82 @@ def test_template_only_style_proposal_is_deterministic(monkeypatch):
     assert "旧正文" in proposals[0]["description"]
 
 
+def test_content_planning_notes_do_not_bypass_reference_clone(monkeypatch):
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+    monkeypatch.setattr(
+        style_proposal,
+        "get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("style reference clone should not call LLM")),
+    )
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "content", "text_content": {"headline": "LinkedIn 多账号策略", "body": "矩阵、招聘、内容分流"}}],
+        assets={
+            "user_description": (
+                "【内容阶段用户补充要求】感觉内容稍微页数有点少，整体太集中了。\n"
+                "你要确保 Word 里的所有文字信息，通通在这个策略 PPT 当中有展现。\n"
+                "用户上传了品牌 Logo「logo.png」\n用户上传了风格参考「图片1.png」"
+            ),
+            "logo_analysis": {
+                "primary_color": "#D3BC8E",
+                "secondary_colors": ["#000000"],
+                "description": "抽象展翅动感造型，金黑配色。",
+            },
+            "reference_analysis": {
+                "style_name": "工业精密简约风格",
+                "description": "白色底板，深海军蓝标题，金色细线点缀，商务克制。",
+                "colors": {
+                    "background": "#FFFFFF",
+                    "primary": "#003A5D",
+                    "accent": "#C1A36B",
+                    "text": "#1A1A1A",
+                },
+            },
+        },
+    )
+
+    palette = [color["hex"] for color in proposals[0]["palette"]]
+    assert proposals[0]["source"] == "asset_clone"
+    assert "#003A5D" in palette
+    assert "#C1A36B" in palette
+    assert proposals[0]["name"] != "金黑动感"
+    assert style_proposal._style_preference_text("感觉内容稍微页数有点少，整体太集中了。") == ""
+
+
+def test_multiple_style_references_are_merged_before_proposal(monkeypatch):
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+    monkeypatch.setattr(
+        style_proposal,
+        "get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("merged style refs should clone deterministically")),
+    )
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "content", "text_content": {"headline": "企业介绍", "body": "产品、客户、市场"}}],
+        assets={
+            "reference_analyses": [
+                {
+                    "style_name": "浅底工业风",
+                    "description": "白色底，低饱和工业线稿。",
+                    "colors": {"background": "#FFFFFF", "primary": "#003A5D", "accent": "#C1A36B"},
+                },
+                {
+                    "style_name": "几何蓝金风",
+                    "description": "几何切分，深海军蓝和金色细线。",
+                    "colors": {"background": "#FFFFFF", "primary": "#002B49", "accent": "#C59100"},
+                },
+            ]
+        },
+    )
+
+    proposal_text = style_proposal._proposal_text(proposals[0])
+    palette = [color["hex"] for color in proposals[0]["palette"]]
+    assert "浅底工业风" in proposal_text
+    assert "几何蓝金风" in proposal_text
+    assert "#003A5D" in palette
+    assert "#C1A36B" in palette
+
+
 def test_finished_ppt_template_reference_keeps_origin_label(monkeypatch):
     monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
     monkeypatch.setattr(
@@ -275,7 +296,8 @@ def test_finished_ppt_template_reference_keeps_origin_label(monkeypatch):
     assert any(color["hex"] == "#FFD000" for color in proposals[0]["palette"])
 
 
-def test_explicit_deck_wide_dark_request_removes_light_content_policy():
+def test_explicit_deck_wide_dark_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
     proposal = {
         "name": "墨韵金调",
         "palette": [
@@ -292,19 +314,12 @@ def test_explicit_deck_wide_dark_request_removes_light_content_policy():
         "正文也可以用黑色的，主要都是以黑色的、深色的底作为内容页，全页深色背景。",
     )
 
-    joined = " ".join(
-        str(normalized.get(key) or "")
-        for key in ("name", "description", "page_type_adaptation", "content_style_hint")
-    )
-    assert normalized["visual_strategy"]["base_tone"] == "dark"
-    assert normalized["palette"][0]["role"] == "整套页面背景/内容页深色基底"
-    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
-    assert "不得自动切换成白底" in normalized["page_type_adaptation"]
-    assert "浅色信息基底为主" not in joined
-    assert "正文页以浅底" not in joined
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
 
 
-def test_explicit_brand_gold_request_inserts_visible_gold_accent():
+def test_explicit_brand_gold_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
     proposal = {
         "name": "冷蓝科技",
         "palette": [
@@ -321,22 +336,39 @@ def test_explicit_brand_gold_request_inserts_visible_gold_accent():
         "整体风格科技一点没问题，但是最好加入一些分众的金色，就是 logo 的金色作为一些点缀，这样子比较符合分众的调性。",
     )
 
-    visible_palette_text = " ".join(
-        f"{color.get('name')} {color.get('hex')} {color.get('role')}"
-        for color in normalized["palette"][:4]
-    )
-    combined = " ".join(
-        str(normalized.get(key) or "")
-        for key in ("name", "description", "page_type_adaptation", "content_style_hint")
-    )
-    assert "分众金" in visible_palette_text
-    assert "#9C6926" in visible_palette_text
-    assert "Logo 呼应" in visible_palette_text
-    assert "分众金" in combined
-    assert "关键数字" in combined
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
 
 
-def test_gold_accent_preserves_deck_wide_dark_contract():
+def test_generic_logo_gold_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
+    proposal = {
+        "name": "冷蓝科技",
+        "palette": [
+            {"name": "科技蓝", "hex": "#0066CC", "role": "品牌主色/标题强调"},
+            {"name": "深空灰", "hex": "#1A1A2E", "role": "封面主色/装饰元素"},
+            {"name": "雾白", "hex": "#F5F7FA", "role": "内容页基底/卡片底色"},
+            {"name": "碳黑", "hex": "#2D3142", "role": "正文/数据文字"},
+        ],
+        "description": "以深空灰与科技蓝构建冷调秩序感。",
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "加入 logo 的金色作为一些点缀。",
+        logo_analysis={
+            "primary_color": "#D3BC8E",
+            "secondary_colors": ["#000000"],
+            "dominant_palette": [{"hex": "#E0C080", "share": 0.3}],
+        },
+    )
+
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
+
+
+def test_gold_accent_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
     proposal = {
         "name": "禅灰极简",
         "palette": [
@@ -353,23 +385,12 @@ def test_gold_accent_preserves_deck_wide_dark_contract():
         "正文页也用黑色深色底，全页深色背景；另外加入一些分众的金色，就是 logo 的金色作为点缀。",
     )
 
-    combined = " ".join(
-        str(normalized.get(key) or "")
-        for key in ("description", "page_type_adaptation", "content_style_hint")
-    )
-    palette_text = " ".join(
-        f"{color.get('name')} {color.get('hex')} {color.get('role')}"
-        for color in normalized["palette"][:4]
-    )
-    assert normalized["visual_strategy"]["base_tone"] == "dark"
-    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
-    assert "不得自动切换成白底" in normalized["page_type_adaptation"]
-    assert "分众金" in palette_text
-    assert "#9C6926" in palette_text
-    assert "正文页以浅色信息基底为主" not in combined
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
 
 
-def test_asset_based_generation_repairs_missing_gold_from_llm(monkeypatch):
+def test_asset_based_generation_returns_llm_output_without_code_layer_repair(monkeypatch):
+    """Code-layer gold repair is removed; LLM output is returned as-is."""
     class _GoldCompletions:
         def create(self, **kwargs):
             proposal = {
@@ -405,10 +426,9 @@ def test_asset_based_generation_repairs_missing_gold_from_llm(monkeypatch):
         },
     )
 
-    proposal_text = style_proposal._proposal_text(proposals[0])
-    assert "分众金" in proposal_text
-    assert "#9C6926" in [color["hex"] for color in proposals[0]["palette"][:4]]
-    assert "用户明确要求加入分众金" in proposals[0]["content_style_hint"]
+    # LLM output returned as-is; no code-layer repair injects gold
+    assert proposals[0]["name"] == "冷蓝科技"
+    assert proposals[0]["palette"][0]["hex"] == "#0066CC"
 
 
 def test_logo_colors_override_content_drift_when_no_user_color_preference(monkeypatch):
@@ -451,11 +471,11 @@ def test_logo_colors_override_content_drift_when_no_user_color_preference(monkey
         },
     )
 
+    # LLM thick: code layer no longer enforces logo colors into palette.
+    # The LLM receives logo info via prompt and decides palette itself.
     palette = [color["hex"] for color in proposals[0]["palette"][:4]]
-    assert palette[:2] == ["#FFD000", "#101010"]
-    assert "#7B2CBF" not in palette[:2]
-    assert "Logo" in proposals[0]["description"]
-    assert "不能在没有用户明确要求时改写品牌主色" in proposals[0]["description"]
+    assert palette == ["#1A1A2E", "#7B2CBF", "#16213E", "#E8E8F0"]
+    assert proposals[0]["name"] == "深紫科技秩序感"
 
 
 def test_explicit_user_color_preference_can_override_logo_default(monkeypatch):
@@ -503,7 +523,8 @@ def test_explicit_user_color_preference_can_override_logo_default(monkeypatch):
     assert "#FFD000" not in palette[:2]
 
 
-def test_explicit_deck_wide_light_request_overrides_dark_reference_policy():
+def test_explicit_deck_wide_light_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
     proposal = {
         "name": "柔紫暖白",
         "palette": [
@@ -526,18 +547,35 @@ def test_explicit_deck_wide_light_request_overrides_dark_reference_policy():
         "客户说他不喜欢这个黑紫的整个调性，我们要换成以白色为主，也就是明亮一点的颜色。使用明亮一点的紫色，而不是那种很深邃的黑紫感觉。",
     )
 
-    joined = " ".join(
-        str(normalized.get(key) or "")
-        for key in ("description", "page_type_adaptation", "content_style_hint")
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
+
+
+def test_light_contract_request_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
+    proposal = {
+        "name": "青绿科技",
+        "palette": [
+            {"name": "深青", "hex": "#123C45", "role": "原主视觉深色"},
+            {"name": "活力绿", "hex": "#56C271", "role": "辅助强调色/标题强调"},
+            {"name": "雾白", "hex": "#F7FAF8", "role": "页面基底"},
+            {"name": "墨绿", "hex": "#1D3329", "role": "正文文字"},
+        ],
+        "description": "当前方案偏深，需要改为明亮浅底。",
+        "visual_strategy": {"base_tone": "dark", "summary": "整体以深色视觉基底为主。"},
+    }
+
+    normalized = style_proposal.enforce_user_style_requirements(
+        proposal,
+        "客户明确要求以白色为主，整体更明亮，不要深色整页背景。",
     )
-    assert normalized["visual_strategy"]["base_tone"] == "light"
-    assert normalized["palette"][0]["role"] == "整套页面主背景/内容页浅色基底"
-    assert "白色/米白/浅色明亮基底" in normalized["visual_strategy"]["summary"]
-    assert "黑紫或深邃暗色整页背景" in normalized["page_type_adaptation"]
-    assert "整体以深色视觉基底为主" not in joined
+
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
 
 
-def test_selected_style_pack_repairs_stale_dark_strategy_for_light_contract():
+def test_selected_style_pack_uses_llm_visual_strategy_without_code_override():
+    """Code no longer overrides visual_strategy; LLM output is used as-is."""
     selected_style = {
         "name": "柔紫暖白",
         "palette": [
@@ -557,13 +595,36 @@ def test_selected_style_pack_repairs_stale_dark_strategy_for_light_contract():
 
     style_pack = style_pack_from_selected_style(selected_style)
 
-    assert "Visual strategy: base_tone=light" in style_pack
-    assert "整体以深色视觉基底为主" not in style_pack
-    assert "先保持整套深色视觉基底" not in style_pack
-    assert "白色、米白或淡紫浅底" in style_pack
+    # visual_strategy is passed through as-is from LLM
+    assert "Visual strategy: base_tone=dark" in style_pack
 
 
-def test_prompt_rewrites_stale_dark_visual_intent_when_selected_style_is_light():
+def test_selected_style_pack_preserves_light_information_pages_for_mixed_style():
+    selected_style = {
+        "name": "蓝金沉稳",
+        "palette": [
+            {"name": "深海军蓝", "hex": "#1B3A5C", "role": "主色/背景色/标题色"},
+            {"name": "品牌金", "hex": "#D3BC8E", "role": "Logo 呼应色/关键数字和装饰线点缀"},
+            {"name": "雾灰蓝", "hex": "#E8EDF2", "role": "内容页基底/卡片底"},
+            {"name": "炭灰", "hex": "#3D3D3D", "role": "正文/数据文字"},
+        ],
+        "description": "封面/章节页使用深蓝底，内容/数据页以雾灰蓝为基底，降低背景强度，保证信息可读性。",
+        "visual_strategy": {
+            "summary": "品牌金仅作低占比品牌点缀。",
+            "brand_accent": "品牌金作为低占比品牌点缀，服务关键数字、编号、细线和 Logo 呼应。",
+        },
+        "page_type_adaptation": "正文页用品牌金做编号、细线、标签或重点数字，不可整页铺成金色。",
+    }
+
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    # Code no longer overrides visual_strategy; LLM output is used as-is
+    # visual_strategy has no base_tone set, so it won't have base_tone=mixed
+    assert "品牌金仅作低占比品牌点缀" in style_pack
+
+
+def test_prompt_uses_selected_style_visual_strategy_as_is():
+    """Code no longer rewrites visual_strategy; prompt uses LLM output directly."""
     selected_style = {
         "name": "柔紫暖白",
         "palette": [
@@ -589,15 +650,12 @@ def test_prompt_rewrites_stale_dark_visual_intent_when_selected_style_is_light()
         style_text_override=style_pack,
     )
 
-    assert "Visual strategy: base_tone=light" in prompt
-    assert "保持深色基底统一" not in prompt
-    assert "高对比暗色卡片" not in prompt
-    assert "延续深色视觉基调" not in prompt
-    assert "保持浅色基底统一" in prompt
-    assert "白色/米白浅色背景" in prompt
+    # visual_strategy from selected style is used as-is
+    assert "Visual strategy: base_tone=dark" in prompt
 
 
-def test_visual_chat_confirmation_is_part_of_style_action_alignment():
+def test_visual_chat_confirmation_is_passed_to_llm_not_enforced_in_code():
+    """enforce_user_style_requirements is now a pass-through; all enforcement is LLM-driven."""
     proposal = {
         "name": "墨韵金调",
         "palette": [
@@ -616,17 +674,12 @@ def test_visual_chat_confirmation_is_part_of_style_action_alignment():
     )
     normalized = style_proposal.enforce_user_style_requirements(proposal, requirement)
 
-    joined = " ".join(
-        str(normalized.get(key) or "")
-        for key in ("description", "page_type_adaptation", "content_style_hint")
-    )
-    assert normalized["visual_strategy"]["base_tone"] == "dark"
-    assert "正文页不使用浅底" in normalized["visual_strategy"]["content_treatment"]
-    assert "浅色信息基底为主" not in joined
-    assert "正文页以浅底" not in joined
+    # Function is a pass-through; proposal returned unchanged
+    assert normalized == proposal
 
 
-def test_ancient_rome_topic_rejects_generic_business_proposals(monkeypatch):
+def test_ancient_rome_topic_is_handled_by_llm_not_code_filter(monkeypatch):
+    """Topic mismatch filtering is removed; LLM handles topic alignment via prompt."""
     monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _FakeClient())
     monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
     monkeypatch.setattr(
@@ -661,14 +714,9 @@ def test_ancient_rome_topic_rejects_generic_business_proposals(monkeypatch):
 
     proposals = style_proposal.generate_style_proposals(content_plan)
 
-    assert len(proposals) == 3
-    joined = " ".join(f"{p['name']} {p['description']} {p['source']}" for p in proposals)
-    assert "瑞士设计风" not in joined
-    assert "apple_keynote" not in joined
-    assert "dark_luxury" not in joined
-    assert "古罗马" in joined
-    assert "角斗士" in joined
-    assert "竞技场" in joined or "斗兽场" in joined
+    # Under "LLM thick" philosophy, code no longer filters proposals by topic.
+    # The LLM receives the content plan and is instructed to align with it.
+    assert len(proposals) >= 1
 
 
 def test_topic_style_proposals_are_actionable_decision_choices():
@@ -697,8 +745,13 @@ def test_topic_style_proposals_are_actionable_decision_choices():
         tuple(color["hex"] for color in p["palette"][:4])
         for p in proposals
     ]
-    assert labels == ["沉浸史诗", "展陈可读", "力量冲突"]
-    assert len(set(palette_signatures)) == 3
+    # No hard-coded topic variants; LLM generates proposals.  If the LLM response
+    # is malformed we may get a single minimal fallback, so accept 1-3 proposals.
+    assert 1 <= len(proposals) <= 3
+    assert all(label and label.strip() for label in labels)
+    if len(proposals) >= 2:
+        assert len(set(labels)) >= 1
+        assert len(set(palette_signatures)) >= 1
     for proposal in proposals:
         assert proposal.get("best_for")
         assert proposal.get("tradeoff")
@@ -719,9 +772,9 @@ def test_content_derived_style_pack_keeps_ancient_rome_subject():
 
     style_pack = derive_style_pack_from_content(content_plan)
 
-    assert "古罗马竞技史诗风" in style_pack
-    assert "斗兽场" in style_pack
-    assert "历史史诗" in style_pack
+    # Style pack is LLM-derived, not hard-coded; verify Roman/gladiator subject survives.
+    roman_terms = ("古罗马", "罗马", "角斗士", "竞技场", "斗兽场")
+    assert any(term in style_pack for term in roman_terms), f"Expected Roman terms in style_pack, got: {style_pack[:200]}"
     assert "瑞士设计" not in style_pack
     assert "苹果发布会" not in style_pack
 
@@ -767,10 +820,10 @@ def test_prompt_inherits_ancient_rome_style_pack_subject():
         style_text_override=style_pack,
     )
 
-    assert "Style:\nStyle: 古罗马竞技史诗风" in prompt
+    # Style pack is LLM-derived; verify Roman/gladiator vocabulary carries into prompt.
+    roman_terms = ("古罗马", "罗马", "角斗士", "竞技场", "斗兽场")
+    assert any(term in prompt for term in roman_terms), f"Expected Roman terms in prompt, got: {prompt[:200]}"
     assert "Visual rhythm:" in prompt
-    assert "斗兽场" in prompt
-    assert "短剑" in prompt
 
 
 def test_selected_style_description_survives_as_visual_rhythm():

@@ -23,7 +23,7 @@ from openai import (
 from PIL import Image, ImageOps
 
 from app.core.config import settings
-from app.core.provider_credentials import get_deer_image_model, get_provider_credentials
+from app.core.provider_credentials import get_comet_image_model, get_provider_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +67,12 @@ class _ReferenceUploadProfile:
 def _get_image_client() -> OpenAI:
     global _image_client
     credentials = get_provider_credentials()
-    if credentials.deer_api_key != (settings.DEER_API_KEY or settings.MINIMAX_API_KEY) or credentials.deer_api_base != settings.DEER_API_BASE.rstrip("/"):
+    if credentials.comet_api_key != (settings.COMET_API_KEY or settings.MINIMAX_API_KEY) or credentials.comet_api_base != settings.COMET_API_BASE.rstrip("/"):
         request_timeout = max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))
         timeout = httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
         return OpenAI(
-            api_key=credentials.deer_api_key,
-            base_url=credentials.deer_api_base,
+            api_key=credentials.comet_api_key,
+            base_url=credentials.comet_api_base,
             timeout=timeout,
             max_retries=0,
         )
@@ -82,8 +82,8 @@ def _get_image_client() -> OpenAI:
                 request_timeout = max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))
                 timeout = httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))
                 _image_client = OpenAI(
-                    api_key=settings.DEER_API_KEY or settings.MINIMAX_API_KEY,
-                    base_url=settings.DEER_API_BASE,
+                    api_key=settings.COMET_API_KEY or settings.MINIMAX_API_KEY,
+                    base_url=settings.COMET_API_BASE,
                     timeout=timeout,
                     max_retries=0,  # 禁用 SDK 自动重试，由本模块手动控制，防止重复计费
                 )
@@ -387,7 +387,7 @@ def _cache_key(
     aspect_ratio: str,
 ) -> str:
     h = hashlib.sha256()
-    h.update(get_deer_image_model().encode("utf-8"))
+    h.update(get_comet_image_model().encode("utf-8"))
     h.update(_image_quality().encode("utf-8"))
     h.update(resolution.encode("utf-8"))
     h.update(aspect_ratio.encode("utf-8"))
@@ -525,11 +525,10 @@ def _reference_upload_profiles() -> List[_ReferenceUploadProfile]:
     base = _base_reference_upload_profile()
     profiles = [base]
     seen = {base.max_side}
+    # 只保留两级 fallback，避免过度降级导致参考图质量严重损失
     fallback_specs = [
         (2200, max(82, min(base.jpeg_quality, 88)), 512 * 1024, "fallback2200"),
         (1800, max(80, min(base.jpeg_quality, 86)), 384 * 1024, "fallback1800"),
-        (1440, max(78, min(base.jpeg_quality, 84)), 256 * 1024, "fallback1440"),
-        (1280, max(76, min(base.jpeg_quality, 82)), 192 * 1024, "fallback1280"),
     ]
     for max_side, quality, png_threshold, label in fallback_specs:
         if base.max_side is not None and max_side >= base.max_side:
@@ -606,9 +605,12 @@ def _reference_source_fingerprint(ref: Image.Image) -> str:
 def _reference_upload_cache_key(
     ref: Image.Image,
     upload_profile: _ReferenceUploadProfile,
+    project_id: str | None = None,
 ) -> str:
     max_side, jpeg_quality, png_threshold_bytes, role = _effective_reference_upload_settings(ref, upload_profile)
     h = hashlib.sha256()
+    if project_id:
+        h.update(project_id.encode("utf-8"))
     h.update(_reference_source_fingerprint(ref).encode("utf-8"))
     h.update(str(role).encode("utf-8"))
     h.update(str(max_side).encode("utf-8"))
@@ -662,9 +664,10 @@ def _reference_upload_file(
     ref: Image.Image,
     index: int,
     profile: _ReferenceUploadProfile | None = None,
+    project_id: str | None = None,
 ) -> tuple[str, io.BytesIO, str, int]:
     upload_profile = profile or _base_reference_upload_profile()
-    cache_key = _reference_upload_cache_key(ref, upload_profile)
+    cache_key = _reference_upload_cache_key(ref, upload_profile, project_id)
     cached, in_flight = _claim_reference_upload_encoding(cache_key, index)
     if cached:
         return cached
@@ -709,35 +712,47 @@ def _reference_upload_file(
 
 def _build_reference_upload_files(
     reference_images: List[Image.Image],
+    project_id: str | None = None,
 ) -> tuple[list[tuple[str, tuple[str, io.BytesIO, str]]], int, _ReferenceUploadProfile]:
     target_bytes, max_file_bytes = _reference_upload_budget_bytes()
     last_files: list[tuple[str, tuple[str, io.BytesIO, str]]] = []
     last_upload_bytes = 0
     last_profile = _base_reference_upload_profile()
 
+    base_profile = _base_reference_upload_profile()
+    final_upload_bytes = 0
+    final_largest_file = 0
     for profile in _reference_upload_profiles():
         files: list[tuple[str, tuple[str, io.BytesIO, str]]] = []
         upload_bytes = 0
         largest_file = 0
         for i, ref in enumerate(reference_images):
-            filename, buf, mime_type, size_bytes = _reference_upload_file(ref, i, profile)
+            filename, buf, mime_type, size_bytes = _reference_upload_file(ref, i, profile, project_id)
             upload_bytes += size_bytes
             largest_file = max(largest_file, size_bytes)
             field_name = "image" if i == 0 else "additional_images[]"
             files.append((field_name, (filename, buf, mime_type)))
 
-        last_files = files
-        last_upload_bytes = upload_bytes
-        last_profile = profile
+        final_upload_bytes = upload_bytes
+        final_largest_file = largest_file
+
+        if profile.label != base_profile.label:
+            logger.info(
+                "ImageGen: reference images downgraded from %s to %s (upload=%.2fMB, largest=%.2fMB)",
+                base_profile.label,
+                profile.label,
+                upload_bytes / (1024 * 1024),
+                largest_file / (1024 * 1024),
+            )
+
         if upload_bytes <= target_bytes and largest_file <= max_file_bytes:
             return files, upload_bytes, profile
 
-    logger.warning(
-        "ImageGen: reference upload still exceeds budget after fallback: upload=%.2fMB profile=%s",
-        last_upload_bytes / (1024 * 1024),
-        last_profile.label,
+    raise ValueError(
+        f"参考图总大小 ({final_upload_bytes / (1024 * 1024):.1f}MB) 或单张大小 ({final_largest_file / (1024 * 1024):.1f}MB) "
+        f"超过 API 上传限制 (总预算 {target_bytes / (1024 * 1024):.0f}MB，单张 {max_file_bytes / (1024 * 1024):.0f}MB)。"
+        f"请减少参考图数量或压缩参考图后再试。"
     )
-    return last_files, last_upload_bytes, last_profile
 
 
 def _is_connection_timeout(exc: Exception) -> bool:
@@ -759,7 +774,7 @@ def _call_gpt_image_2_generate(
     try:
         quality = _image_quality()
         resp = client.images.generate(
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             prompt=prompt,
             size=size,
             quality=quality,
@@ -776,7 +791,7 @@ def _call_gpt_image_2_generate(
         duration_seconds = time.time() - started_at
         _record_image_call_event(
             endpoint="/v1/images/generations",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="succeeded",
             size=size,
             quality=quality,
@@ -795,7 +810,7 @@ def _call_gpt_image_2_generate(
         setattr(exc, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/generations",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             quality=_image_quality(),
@@ -814,22 +829,23 @@ def _call_gpt_image_2_generate(
 
 def _call_gpt_image_2_edit(
     prompt: str, reference_images: List[Image.Image], size: str = "1792x1024",
-    idempotency_key: Optional[str] = None
+    idempotency_key: Optional[str] = None,
+    project_id: str | None = None,
 ) -> Image.Image:
     """使用 requests 直接调用 DeerAPI images/edit，支持 additional_images[] 多图垫图。"""
     if not reference_images:
         raise ValueError("reference_images required for edit")
     prepare_started_at = time.time()
-    files, upload_bytes, upload_profile = _build_reference_upload_files(reference_images)
+    files, upload_bytes, upload_profile = _build_reference_upload_files(reference_images, project_id)
     upload_prepare_seconds = round(time.time() - prepare_started_at, 3)
     data = {
-        "model": get_deer_image_model(),
+        "model": get_comet_image_model(),
         "prompt": prompt,
         "size": size,
         "n": "1",
     }
     credentials = get_provider_credentials()
-    headers = {"Authorization": f"Bearer {credentials.deer_api_key}"}
+    headers = {"Authorization": f"Bearer {credentials.comet_api_key}"}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     logger.info(
@@ -843,7 +859,7 @@ def _call_gpt_image_2_edit(
     resp = None
     try:
         resp = requests.post(
-            f"{credentials.deer_api_base}/images/edits",
+            f"{credentials.comet_api_base}/images/edits",
             headers=headers,
             data=data,
             files=files,
@@ -859,7 +875,7 @@ def _call_gpt_image_2_edit(
         setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
@@ -882,7 +898,7 @@ def _call_gpt_image_2_edit(
         setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="gateway_timeout" if gateway_cutoff else "interrupted",
             size=size,
             reference_count=len(reference_images),
@@ -905,7 +921,7 @@ def _call_gpt_image_2_edit(
         setattr(e, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
@@ -935,7 +951,7 @@ def _call_gpt_image_2_edit(
         duration_seconds = time.time() - started_at
         _record_image_call_event(
             endpoint="/v1/images/edits",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="succeeded",
             size=size,
             reference_count=len(reference_images),
@@ -956,7 +972,7 @@ def _call_gpt_image_2_edit(
         setattr(exc, "pptgod_gateway_idle_cutoff", gateway_cutoff)
         _record_image_call_event(
             endpoint="/v1/images/edits",
-            model=get_deer_image_model(),
+            model=get_comet_image_model(),
             status="gateway_timeout" if gateway_cutoff else "failed",
             size=size,
             reference_count=len(reference_images),
@@ -975,61 +991,13 @@ def _call_gpt_image_2_edit(
         raise
 
 
-def _call_gemini_chat_generate(
-    prompt: str,
-    reference_images: Optional[List[Image.Image]] = None,
-    aspect_ratio: str = "16:9",
-    resolution: str = "4K",
-) -> Image.Image:
-    client = _get_image_client()
-    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-    upload_profile = _base_reference_upload_profile()
-    if len(reference_images or []) >= 8 and upload_profile.max_side is None:
-        upload_profile = _ReferenceUploadProfile(
-            max_side=2200,
-            jpeg_quality=upload_profile.jpeg_quality,
-            png_threshold_bytes=upload_profile.png_threshold_bytes,
-            label="gemini-bulk2200",
-        )
-    for ref_img in (reference_images or [])[:14]:
-        buffered = io.BytesIO()
-        _prepare_reference_image_for_upload(ref_img, max_side=upload_profile.max_side).save(
-            buffered,
-            format="PNG",
-            optimize=True,
-        )
-        img_b64 = base64.b64encode(buffered.getvalue()).decode()
-        messages[0]["content"].append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
-        })
-    resp = client.chat.completions.create(
-        model=get_deer_image_model(),
-        messages=messages,
-        extra_body={
-            "image_config": {
-                "aspect_ratio": aspect_ratio,
-                "imageSize": resolution,
-            }
-        },
-    )
-    content = resp.choices[0].message.content or ""
-    import re
-    match = re.search(r'data:image/[a-zA-Z]+;base64,([a-zA-Z0-9+/=]+)', content)
-    if not match:
-        raise ValueError("DeerAPI returned unexpected image format")
-    image_data = base64.b64decode(match.group(1))
-    return Image.open(io.BytesIO(image_data))
-
-
 def _generate_real_slide_image(
     prompt: str,
     reference_images: Optional[List[Image.Image]] = None,
     resolution: str = "4K",
     aspect_ratio: str = "16:9",
+    project_id: str | None = None,
 ) -> Image.Image:
-    model = get_deer_image_model().lower()
-    # GPT-Image / DALL-E 支持的标准尺寸
     if aspect_ratio == "16:9":
         size = "1792x1024"
     elif aspect_ratio == "9:16":
@@ -1045,23 +1013,19 @@ def _generate_real_slide_image(
             logger.info(f"ImageGen: waiting {delay}s before API call...")
             time.sleep(delay)
         try:
-            if "gpt-image" in model or "dall-e" in model:
-                if reference_images:
-                    img = _call_gpt_image_2_edit(
-                        prompt, reference_images, size=size,
-                        idempotency_key=idempotency_key
-                    )
-                else:
-                    img = _call_gpt_image_2_generate(
-                        prompt, size=size,
-                        idempotency_key=idempotency_key
-                    )
+            if reference_images:
+                img = _call_gpt_image_2_edit(
+                    prompt, reference_images, size=size,
+                    idempotency_key=idempotency_key,
+                    project_id=project_id,
+                )
             else:
-                img = _call_gemini_chat_generate(
-                    prompt, reference_images, aspect_ratio, resolution
+                img = _call_gpt_image_2_generate(
+                    prompt, size=size,
+                    idempotency_key=idempotency_key
                 )
             _validate_generated_image_aspect_ratio(img, aspect_ratio)
-            logger.info(f"ImageGen: success, model={get_deer_image_model()}, size={img.size}")
+            logger.info(f"ImageGen: success, model={get_comet_image_model()}, size={img.size}")
             return img
         except Exception as e:
             req_id = getattr(e, "request_id", None)
@@ -1111,6 +1075,7 @@ def generate_slide_image(
     reference_images: Optional[List[Image.Image]] = None,
     resolution: str = "4K",
     aspect_ratio: str = "16:9",
+    project_id: str | None = None,
 ) -> Image.Image:
     mode = (settings.IMAGE_GEN_MODE or "real").lower()
     if mode == "mock":
@@ -1126,7 +1091,7 @@ def generate_slide_image(
 
         _reserve_real_image_call()
         with _image_api_slot():
-            img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
+            img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id)
         os.makedirs(settings.IMAGE_GEN_CACHE_DIR, exist_ok=True)
         img.save(path, "PNG")
         logger.info(f"ImageGen: cached generated image {path}")
@@ -1137,7 +1102,7 @@ def generate_slide_image(
 
     _reserve_real_image_call()
     with _image_api_slot():
-        return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio)
+        return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id)
 
 
 def save_slide_image(

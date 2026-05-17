@@ -5,10 +5,14 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const APP_URL = process.env.APP_URL || "http://127.0.0.1:8000";
+const APP_URL = process.env.APP_URL || "http://127.0.0.1:4173";
 const API_BASE = process.env.VITE_API_BASE_URL || "http://localhost:8000";
 const APP_ORIGIN = new URL(APP_URL).origin;
 const API_ORIGIN = new URL(API_BASE, APP_URL).origin;
+const testerAuth = {
+  testerId: "11111111-1111-4111-8111-111111111111",
+  displayName: "Low Cost Tester",
+};
 const project = {
   id: "low-cost-project",
   title: "Low Cost E2E",
@@ -119,7 +123,10 @@ await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
   window.localStorage.setItem(
     "pptgod.mvpAuth",
-    JSON.stringify({ testerId: "low-cost-tester", displayName: "Low Cost Tester" }),
+    JSON.stringify({
+      testerId: "11111111-1111-4111-8111-111111111111",
+      displayName: "Low Cost Tester",
+    }),
   );
 }, project.id);
 
@@ -133,6 +140,9 @@ await page.route("**/*", async (route) => {
     return route.continue();
   }
 
+  if (method === "GET" && path === "/auth/me") {
+    return route.fulfill({ json: { tester_id: testerAuth.testerId, display_name: testerAuth.displayName } });
+  }
   if (method === "GET" && path === "/projects") {
     return route.fulfill({ json: [project] });
   }
@@ -254,7 +264,7 @@ try {
   project.status = "prompt_ready";
   slides[0].status = "prompt_ready";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: /视觉方案/ }).click();
+  await page.getByRole("button", { name: /^2\s+视觉方案$/ }).click();
   await page.getByRole("button", { name: "确认" }).click();
   await page.getByText("回退成功", { exact: true }).waitFor({ timeout: 10_000 });
 
@@ -264,10 +274,10 @@ try {
   slides[0].image_path = "./outputs/low-cost-project/slide_01.png";
   slides[0].prompt_text = "Mock prompt";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByText("先确认种子页，再批量生成").waitFor({ timeout: 10_000 });
+  await page.getByText("当前阶段：确认打样").waitFor({ timeout: 10_000 });
   await page.getByRole("button", { name: "重新打样" }).first().waitFor({ timeout: 10_000 });
 
-  await page.getByPlaceholder("输入指令...").fill("测试聊天错误处理");
+  await page.locator("textarea.pg-chat-input").fill("测试聊天错误处理");
   await page.getByRole("button", { name: "发送" }).click();
   await page.getByText("❌ Mock chat failed").waitFor({ timeout: 10_000 });
 

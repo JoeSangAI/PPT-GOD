@@ -31,6 +31,7 @@ class Project(Base):
     style_proposal = Column(JSON, nullable=True)
     selected_style = Column(JSON, nullable=True)
     selected_template_recommendations = Column(JSON, nullable=True)
+    intent_contract = Column(JSON, nullable=True)
     has_unread_notification = Column(Boolean, default=False, nullable=False)
     unread_notification_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=utc_now)
@@ -94,6 +95,7 @@ class Slide(Base):
     project_id = Column(String, ForeignKey("projects.id"), nullable=False)
     page_num = Column(Integer, nullable=False)
     type = Column(String, default="content")
+    type_locked = Column(Boolean, default=False, nullable=False)
     status = Column(String, default="pending")
     error_msg = Column(Text, nullable=True)
 

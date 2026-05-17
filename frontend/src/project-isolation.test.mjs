@@ -82,8 +82,28 @@ assert.match(
 );
 assert.match(
   source,
+  /const pageReferenceRoute = \(ref: any\): AssetRoute => \{[\s\S]*mode === "original"[\s\S]*return "overlay"/,
+  "page reference assets saved as original must reopen as precise paste instead of defaulting to smart blend"
+);
+assert.match(
+  source,
   /const clearLegacyChatStorageIfNeeded =?\s*function clearLegacyChatStorageIfNeeded|function clearLegacyChatStorageIfNeeded/,
   "chat storage schema handling must be centralized"
+);
+assert.match(
+  source,
+  /const clearTransientProjectState[\s\S]*setReferenceImages\(\[\]\);[\s\S]*setDocuments\(\[\]\);[\s\S]*setTemplatePages\(\[\]\);/,
+  "project switches must clear uploaded document state before loading the next project"
+);
+assert.match(
+  source,
+  /if \(selectedProject\) \{[\s\S]*setReferenceImages\(\[\]\);[\s\S]*setDocuments\(\[\]\);[\s\S]*loadDocuments\(selectedProject\.id\);/,
+  "selected project hydration must start with empty document state and then load only that project"
+);
+assert.match(
+  source,
+  /if \(created\) \{[\s\S]*clearTransientProjectState\(created\.id\);[\s\S]*setSelectedProject\(normalizedCreated\);/,
+  "newly created projects must reset transient state before becoming active"
 );
 assert.doesNotMatch(
   source,
@@ -202,8 +222,13 @@ assert.match(
 );
 assert.match(
   source,
-  /const startContentPlanPoll = async \([\s\S]*Promise<GateActionResult>[\s\S]*正在读取当前页面，准备生成内容规划[\s\S]*return \{ ok: true, runId: result\?\.run\?\.id \};/,
+  /const startContentPlanPoll = async \([\s\S]*Promise<GateActionResult>[\s\S]*正在读取原 PPT 的文字和页面截图，准备生成内容规划。[\s\S]*return \{ ok: true, runId: result\?\.run\?\.id \};/,
   "content-plan generation must show immediate status and report startup success"
+);
+assert.doesNotMatch(
+  source,
+  /OCR pipeline|Intent Contract|classification=/,
+  "user-facing workflow copy must not expose internal processing labels"
 );
 assert.match(
   source,
@@ -322,8 +347,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const defaultPrototypePageNumsForSlides = \(slides: Slide\[]\): number\[] => \{[\s\S]*PROTOTYPE_FAMILY_ORDER[\s\S]*const getPrototypeTargetSlides = \(explicitPageNums: number\[] = \[]\)[\s\S]*prototypeSelectionTouched \? Array\.from\(selectedPages\) : defaultPrototypePageNums[\s\S]*const defaultPrototypePageNums = defaultPrototypePageNumsForSlides\(slides\);/,
-  "default prototype generation must target representative seed pages, not the full deck"
+  /const DEFAULT_PROTOTYPE_SAMPLE_COUNT = 3;[\s\S]*const PROTOTYPE_FAMILY_ORDER = \["bookend", "toc", "content", "section"[\s\S]*const defaultPrototypePageNumsForSlides = \(slides: Slide\[]\): number\[] => \{[\s\S]*\.slice\(0, DEFAULT_PROTOTYPE_SAMPLE_COUNT\)[\s\S]*const getPrototypeTargetSlides = \(explicitPageNums: number\[] = \[]\)[\s\S]*prototypeSelectionTouched \? Array\.from\(selectedPages\) : defaultPrototypePageNums[\s\S]*const defaultPrototypePageNums = defaultPrototypePageNumsForSlides\(slides\);/,
+  "default prototype generation must include a content page in the three-page sample"
 );
 assert.match(
   source,
@@ -364,6 +389,16 @@ assert.match(
   source,
   /case "resample_prototype": \{[\s\S]*const prototypePageNums = getPrototypeResampleTargetSlides\(pageNums\)\.map\(\(slide\) => slide\.page_num\);[\s\S]*handleStartGeneration\(true, true, prototypePageNums\);/,
   "prototype resampling must preserve the selected or already sampled pages"
+);
+assert.match(
+  source,
+  /currentProjectStatus\?\.last_run[\s\S]*evaluateImageGenerationOutcome\([\s\S]*上一轮打样未完成[\s\S]*重打样张/,
+  "the Agent status panel must explain a cancelled or failed prototype run instead of silently returning to generic sampling guidance"
+);
+assert.match(
+  source,
+  /currentStageNudge\.primary[\s\S]*onClick=\{currentStageNudge\.primary\.onClick\}[\s\S]*\{currentStageNudge\.primary\.label\}/,
+  "the Agent status panel must render its primary next action instead of burying it in state"
 );
 assert.match(
   source,
@@ -467,6 +502,36 @@ assert.match(
 );
 assert.match(
   source,
+  /className="pg-agent-command-sentence"[\s\S]*<span>将修改<\/span>[\s\S]*\{agentScopeButtonLabel\}[\s\S]*<span>的<\/span>[\s\S]*\{agentAreaButtonLabel\}/,
+  "Agent command bar must read as a fill-in sentence: 将修改 [范围] 的 [区域]"
+);
+assert.match(
+  source,
+  /:\s*"整套 PPT";/,
+  "Agent scope chip must use a stable deck label instead of repeating the slide count"
+);
+assert.match(
+  source,
+  /composerRequestContext\.targetArea === "whole" \? "全页内容" : composerRequestContext\.areaLabel/,
+  "Agent area chip must clarify that whole means the page content area, not another page scope"
+);
+assert.match(
+  source,
+  /className=\{`pg-composer-attach-button[\s\S]*title="添加参考材料"/,
+  "Agent reference upload must live beside the chat input instead of in the scope command bar"
+);
+assert.match(
+  css,
+  /\.pg-agent-command-chip\s*\{[\s\S]*white-space:\s*nowrap;[\s\S]*\}/,
+  "Agent command chip labels must not wrap within a pill"
+);
+assert.doesNotMatch(
+  source,
+  /pg-agent-command-summary[\s\S]{0,2200}title="添加参考材料"/,
+  "Agent reference upload must not sit at the same hierarchy as scope and area chips"
+);
+assert.match(
+  source,
   /target_area:\s*requestContext\.targetArea[\s\S]*area_label:\s*requestContext\.areaLabel[\s\S]*confidence:\s*requestContext\.confidence/,
   "Agent page_context must carry the inferred page area so the backend can act on the same target the UI shows"
 );
@@ -532,6 +597,22 @@ assert.doesNotMatch(
   source,
   /localStorage\.setItem\(`ppt_god_chat_(?:content|visual)_\$\{selectedProject\.id\}`,[\s\S]{0,180}allowLegacy:\s*true/,
   "persisted selected-project chat must not accept legacy/unowned messages"
+);
+
+assert.match(
+  source,
+  /visual_directive_suggestions[\s\S]*移到画面要求/,
+  "slide editor must surface visual directive suggestions from content saves"
+);
+assert.doesNotMatch(
+  source,
+  /title="插入(?:表格|飞轮|流程图|对比矩阵)"/,
+  "body editor toolbar must not expose structure-diagram insertion controls"
+);
+assert.doesNotMatch(
+  source,
+  /pg-insert-menu-title">结构/,
+  "slash menu must keep structure diagrams out of the body editor"
 );
 
 console.log("project isolation tests passed");

@@ -64,6 +64,16 @@ def _seconds_since(value: datetime | None) -> float:
     return max(0, (utc_now() - value).total_seconds())
 
 
+def serialize_utc_datetime(value: datetime | None) -> str | None:
+    if not value:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
 def stale_inactive_run_if_needed(
     db: Session,
     project_id: str,
@@ -376,8 +386,9 @@ def serialize_run(run: ProjectRun | None, slides: list[Slide] | None = None) -> 
         "failed_count": clamp_count(failed, total),
         "task_id": run.task_id,
         "error_msg": run.error_msg,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "started_at": serialize_utc_datetime(run.started_at),
+        "updated_at": serialize_utc_datetime(run.updated_at),
+        "finished_at": serialize_utc_datetime(run.finished_at),
     }
 
 
@@ -407,6 +418,7 @@ def serialize_run_progress(run: ProjectRun | None, slides: list[Slide] | None = 
         "percent": percent,
         "target_page_nums": run_data.get("target_page_nums"),
         "can_cancel": run_data.get("status") in ACTIVE_RUN_STATUSES,
+        "updated_at": run_data.get("updated_at"),
         "active_page_nums": active_page_nums,
         "running_count": len(active_page_nums),
         # Backward-compatible aliases for older frontend surfaces while the UI is
@@ -604,7 +616,7 @@ def enforce_project_invariants(project: Project, slides: list[Slide]) -> str:
         project.status = "visual_ready"
         return project.status
 
-    if any(s.image_path for s in slides):
+    if any(s.status == "completed" and s.image_path for s in slides):
         if project.status not in {"prototype_ready", "completed", "failed"}:
             project.status = "prototype_ready"
         return project.status

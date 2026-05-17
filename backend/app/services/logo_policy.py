@@ -170,9 +170,9 @@ def logo_reservation_instruction(page: Any, anchor: str | None = None) -> str:
     placement = ANCHOR_LABELS[placement_key]
     size = "readable small" if policy["scale"] == "small" else "modest"
     return (
-        f"Leave the {placement} visually quiet for a {size} logo/lockup overlay: no required text, "
-        "no key subject, and no dense detail in that area. Do not draw any logo placeholder, "
-        "box, border, rounded rectangle, dashed frame, label, badge, or decorative logo container."
+        f"Keep the {placement} visually quiet for a {size} brand signature overlay: no text, "
+        "no key subject, and no dense detail in that area. Do not draw any mark placeholder, "
+        "box, border, rounded rectangle, dashed frame, label, badge, or decorative container."
     )
 
 

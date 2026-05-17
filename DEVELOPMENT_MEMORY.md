@@ -27,6 +27,24 @@ Recorded 2026-05-12 from user direction.
 - Do not add extra orchestration, queues, or recovery layers when a single source of truth or a synchronous state write solves the problem.
 - Use Occam's razor in workflow/state bugs: first remove duplicated state paths and hidden async handoffs before adding new fallback behavior.
 
+## Source-Level Prevention Principle
+
+Recorded 2026-05-14 from user direction.
+
+- Always eliminate failures at the source; do not treat post-hoc checking, filtering, or validation as the primary solution when the source can be made clean.
+- General generation paths must not contain project-specific, demo-specific, or stale business-context defaults. Prompt inputs and deterministic drafts should come only from the current user intent, current project state, uploaded materials, and intentionally global templates.
+- Use downstream checks only as defense-in-depth or diagnostics. If a check catches an issue, follow it back to the contaminated source and remove that source instead of normalizing the symptom.
+- For cross-project contamination, stale defaults, or unintended domain bias, the fix is to remove the upstream contamination path, not to add a final-stage blocker.
+
+## Project Isolation Principle
+
+Recorded 2026-05-14 from user direction.
+
+- Every project must start as a fresh, isolated workspace. New projects must not inherit chat history, uploaded materials, slides, selected styles, generated assets, pending requests, composer drafts, or transient UI state from any previous project.
+- Any state that can influence prompts, Brief summaries, content plans, visual plans, or generation inputs must be keyed by `project_id` and cleared before the next project is hydrated.
+- On project switch or project creation, clear transient frontend state first, then load only that project's server state. Do not allow stale local state to appear as current project context during the loading window.
+- Backend reads and writes must stay project-scoped by storage path and database relation. Shared caches or background tasks must carry explicit project ownership and must drop stale writes if ownership changes.
+
 ## Non-Blocking Workflow Principle
 
 Recorded 2026-05-12 from user direction.

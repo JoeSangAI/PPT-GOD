@@ -122,16 +122,6 @@ def build_visual_strategy(
         str(ref.get(k) or "")
         for k in ("style_name", "mood", "description", "texture", "clone_rules", "composition_style")
     )
-    summary_text = " ".join(
-        str(x)
-        for x in [
-            " ".join(summary.get("industries") or []),
-            " ".join(summary.get("keywords") or []),
-            summary.get("style_direction_hint") or "",
-        ]
-    )
-    tech_context = bool(re.search(r"(AI|人工智能|科技|数据|算法|数字化|云计算)", summary_text, re.I))
-    traditional_or_food = bool(re.search(r"(食品|农业|花生油|粮油|非遗|古法|传统|东方|国潮)", summary_text))
     dark_reference = is_dark_color(background) or is_dark_color(primary) or bool(
         re.search(r"(深色|暗调|深暗|黑底|深黑|深紫|深邃|霓虹|赛博)", ref_text)
     )
@@ -140,14 +130,10 @@ def build_visual_strategy(
     table_ratio = float(summary.get("table_page_ratio") or 0)
     high_density = dense_ratio >= 0.45 or table_ratio >= 0.35
 
-    if dark_reference and (tech_context or logo_tone == "light" or not traditional_or_food):
+    if dark_reference:
         base_tone = "dark"
     elif high_density and not dark_reference and logo_tone != "light":
         base_tone = "light"
-    elif traditional_or_food and not dark_reference:
-        base_tone = "light"
-    elif dark_reference:
-        base_tone = "dark"
     else:
         base_tone = "mixed"
 

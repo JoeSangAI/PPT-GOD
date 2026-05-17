@@ -45,6 +45,21 @@ _MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千
 MAX_VERSIONS_PER_SLIDE = 10
 
 
+def _pipeline_image_worker_count() -> int:
+    try:
+        return max(1, min(3, int(settings.IMAGE_API_MAX_CONCURRENCY or 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _result_has_gateway_timeout(result: Dict) -> bool:
+    events = result.get("image_generation_events") or []
+    if any((event or {}).get("status") == "gateway_timeout" for event in events):
+        return True
+    error = str(result.get("error") or "")
+    return "上游连接窗口截断" in error or "gateway" in error.lower()
+
+
 def _prompt_audit(prompt: str | None) -> Dict:
     text = prompt or ""
     import hashlib
@@ -777,6 +792,7 @@ def _generate_one_slide(
             reference_images=ref_images if ref_images else None,
             resolution="4K",
             aspect_ratio="16:9",
+            project_id=project_id,
         )
 
         if use_product_refinement:
@@ -804,6 +820,7 @@ def _generate_one_slide(
                     reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
                     resolution="4K",
                     aspect_ratio="16:9",
+                    project_id=project_id,
                 )
                 logger.info(
                     f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
@@ -1051,6 +1068,72 @@ def run_generation_pipeline(
         )
         db.commit()
 
+    abort_generation_error: str | None = None
+
+    def should_abort_after_provider_cutoff(result: Dict) -> bool:
+        if not result.get("error") or not _result_has_gateway_timeout(result):
+            return False
+        if _pipeline_image_worker_count() > 1:
+            return False
+        _, completed, _ = progress_counts()
+        return completed == 0
+
+    def mark_unattempted_after_provider_cutoff(error: str) -> None:
+        message = (
+            "图片服务长时间没有返回，本次生成已停止，未继续生成此页。"
+            "请稍后重新打样，或检查图片服务配置。"
+        )
+        for slide in target_slides:
+            if slide.status == "generating":
+                slide.status = "prompt_ready"
+                slide.error_msg = message
+        db.commit()
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "pipeline_aborted",
+            reason="provider_gateway_timeout",
+            error=error[:1000],
+            log_path=log_path,
+        )
+
+    def run_slide_group(group_slides: List[Slide], ref_data_by_slide: Dict, on_success=None) -> None:
+        nonlocal abort_generation_error
+        if not group_slides or abort_generation_error:
+            return
+
+        max_workers = min(len(group_slides), _pipeline_image_worker_count())
+        if max_workers <= 1:
+            for slide in group_slides:
+                if abort_generation_error:
+                    break
+                result = _generate_one_slide(slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id)
+                record_generation_result(result)
+                if not result.get("error") and on_success:
+                    on_success(result)
+                if should_abort_after_provider_cutoff(result):
+                    abort_generation_error = str(result.get("error") or "图片服务长时间没有返回")
+                    mark_unattempted_after_provider_cutoff(abort_generation_error)
+                    break
+            return
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_slide = {
+                executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
+                for slide in group_slides
+            }
+            for future in as_completed(future_to_slide):
+                result = future.result()
+                record_generation_result(result)
+                if not result.get("error") and on_success:
+                    on_success(result)
+                if should_abort_after_provider_cutoff(result):
+                    abort_generation_error = str(result.get("error") or "图片服务长时间没有返回")
+                    for pending in future_to_slide:
+                        pending.cancel()
+                    mark_unattempted_after_provider_cutoff(abort_generation_error)
+                    break
+
     slides_with_prompt = [s for s in target_slides if s.prompt_text]
     if slides_with_prompt:
         # 两阶段生成：先生成同家族的种子页，再以种子图为版式锚点生成其它页。
@@ -1120,24 +1203,16 @@ def run_generation_pipeline(
         # Stage 1：生成种子页（不带种子参考图，因为它们本身就是种子）
         if seed_pages:
             ref_data_by_slide = {s.id: _load_reference_images(s, seed_image_paths=None) for s in seed_pages}
-            max_workers = min(len(seed_pages), 3)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_slide = {
-                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
-                    for slide in seed_pages
-                }
-                for future in as_completed(future_to_slide):
-                    result = future.result()
-                    record_generation_result(result)
-                    # 把成功生成的种子页加入 seeds_by_family，供 Stage 2 使用
-                    if not result.get("error"):
-                        slide = result["slide"]
-                        seed_key = _slide_seed_key(slide)
-                        if seed_key and result.get("image_path"):
-                            seeds_by_family.setdefault(seed_key, []).append(result["image_path"])
+            def add_seed_result(result: Dict) -> None:
+                slide = result["slide"]
+                seed_key = _slide_seed_key(slide)
+                if seed_key and result.get("image_path"):
+                    seeds_by_family.setdefault(seed_key, []).append(result["image_path"])
+
+            run_slide_group(seed_pages, ref_data_by_slide, on_success=add_seed_result)
 
         # Stage 2：生成非种子页，按家族注入种子参考图
-        if non_seed_pages:
+        if non_seed_pages and not abort_generation_error:
             ref_data_by_slide = {}
             for s in non_seed_pages:
                 seed_key = _slide_seed_key(s)
@@ -1146,15 +1221,7 @@ def run_generation_pipeline(
                 if _is_finetune_slide(s):
                     seed_paths = []
                 ref_data_by_slide[s.id] = _load_reference_images(s, seed_image_paths=seed_paths)
-            max_workers = min(len(non_seed_pages), 3)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_slide = {
-                    executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
-                    for slide in non_seed_pages
-                }
-                for future in as_completed(future_to_slide):
-                    result = future.result()
-                    record_generation_result(result)
+            run_slide_group(non_seed_pages, ref_data_by_slide)
 
     # 组装 PPTX 时，收集所有已完成页面的图片（包括之前任务生成的），
     # 而不是仅用当前任务生成的页面，避免重试单页后 PPTX 只剩 1 页。
@@ -1176,7 +1243,7 @@ def run_generation_pipeline(
     total_target, target_completed, target_failed = progress_counts()
     unfinished_run_targets = [
         s for s in progress_slides if s.status not in {"completed", "failed"}
-    ]
+    ] if not abort_generation_error else []
     if defer_finalization or unfinished_run_targets:
         update_run_progress(
             db,
@@ -1313,7 +1380,7 @@ def run_generation_pipeline(
         for s in target_slides
         if s.status == "failed" and s.error_msg and str(s.error_msg).strip()
     ]
-    failure_summary = target_errors[0] if target_errors else "部分页面生成失败"
+    failure_summary = abort_generation_error or (target_errors[0] if target_errors else "部分页面生成失败")
 
     if not current_run_active():
         logger.info(f"Pipeline: run {run_id} is no longer active before final writeback; skipping")

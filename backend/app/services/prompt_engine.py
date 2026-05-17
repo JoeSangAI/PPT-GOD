@@ -2,12 +2,20 @@ import logging
 import re
 from typing import Dict, List, Optional
 
-from app.services.logo_policy import logo_prompt_instruction, logo_reservation_instruction
 from app.services.overlay_layers import overlay_reservation_instruction
-from app.services.style_pack import derive_style_pack_from_content
+from app.services.visual_directives import (
+    extract_visual_directives,
+    normalize_visual_requirements,
+)
 from app.utils.text_cleaning import is_markdown_thematic_break_line, normalize_markdown_emphasis
 
 logger = logging.getLogger(__name__)
+
+BRAND_MARK_DRAWING_TERMS = (
+    "logo", "wordmark", "lockup", "标识", "徽标", "角标", "小logo", "小 Logo",
+    "品牌标识", "品牌角标", "品牌抽象", "展翅", "翅膀", "翼形", "飞翼",
+)
+WATERMARK_TERMS = ("虎课", "虎课网", "watermark", "水印", "stock", "template watermark")
 
 
 def _strip_markdown(text: str) -> str:
@@ -58,10 +66,39 @@ def _strip_markdown(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _image_typography_line(line: str) -> str:
+    """Reduce typography metadata to visual intent so font names are not drawn."""
+    raw = str(line or "")
+    lowered = raw.lower()
+    cues: list[str] = []
+    if any(token in raw for token in ("衬线", "宋体", "明朝")) or "serif" in lowered:
+        cues.append("serif-flavored headline option")
+    if (
+        any(token in raw for token in ("无衬线", "黑体", "思源黑体", "苹方"))
+        or any(token in lowered for token in ("sans", "inter", "source han", "helvetica", "arial", "roboto", "san francisco"))
+    ):
+        cues.append("clean sans-serif hierarchy")
+    if any(token in raw for token in ("粗", "大字", "标题")) or any(token in lowered for token in ("bold", "heavy", "semibold", "headline")):
+        cues.append("strong headline weight")
+    if any(token in raw for token in ("正文", "高可读")) or any(token in lowered for token in ("body", "regular", "readable")):
+        cues.append("readable body copy")
+    if not cues:
+        cues.append("clear presentation hierarchy")
+    unique_cues = list(dict.fromkeys(cues))[:3]
+    return "Typography: " + ", ".join(unique_cues) + "; do not render or spell out font family names."
+
+
 def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 1100) -> str:
     """Keep the global style useful but short so page evidence stays dominant."""
     if not style_text:
-        return derive_style_pack_from_content([])
+        return (
+            "Style: 由页面内容自然决定\n"
+            "Palette: 由主题和场景自然选择\n"
+            "Mood: 贴合当前页面内容气质\n"
+            "Typography: 由风格气质决定字体搭配\n"
+            "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
+            "Visual rhythm: 每页由文案决定画面证据"
+        )
     lines = [line.strip() for line in style_text.splitlines() if line.strip()]
     priority_by_key: dict[str, str] = {}
     # Keep the semantic contract before cosmetic details. Visual rhythm is where
@@ -74,7 +111,12 @@ def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 11
     for line in lines:
         for keyword in keywords:
             if line.startswith(keyword):
-                cleaned = _remove_negative_clauses(line)
+                if keyword == "Typography:":
+                    cleaned = _image_typography_line(line)
+                else:
+                    cleaned = _remove_brand_mark_drawing_language(
+                        _remove_microcopy_clauses(_remove_negative_clauses(line))
+                    )
                 if cleaned and keyword not in priority_by_key:
                     priority_by_key[keyword] = cleaned
                 break
@@ -86,16 +128,27 @@ def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 11
     return compact
 
 
-_NEGATIVE_PROMPT_MARKERS = (
-    "不要", "不得", "禁止", "严禁", "避免", "不允许", "不能",
-)
+def _remove_brand_mark_drawing_language(text: str) -> str:
+    """Strip positive instructions that would make the image model redraw logos or watermarks."""
+    cleaned: list[str] = []
+    for clause in re.split(r"[。；;\n]+", str(text or "")):
+        value = clause.strip()
+        if not value:
+            continue
+        compact = re.sub(r"\s+", "", value).lower()
+        if any(re.sub(r"\s+", "", term).lower() in compact for term in WATERMARK_TERMS):
+            continue
+        if any(re.sub(r"\s+", "", term).lower() in compact for term in BRAND_MARK_DRAWING_TERMS):
+            continue
+        cleaned.append(value)
+    return "；".join(cleaned).strip()
 
 _PRODUCT_DETAIL_MARKERS = (
     "5升", "5L", "桶身", "瓶身", "瓶盖", "瓶颈", "提手", "吊牌",
     "标签", "标贴", "红底", "金边", "书法字体", "非遗", "透明",
     "金黄", "金色", "包装文字", "完整保留", "完整展示",
-    "产品", "产品实物", "产品图", "产品照片", "包装", "瓶型", "花生油产品", "胡姬花花生油",
-    "胡姬花古法花生油", "古法香", "品牌标识", "品牌资产", "品牌识别",
+    "产品", "产品实物", "产品图", "产品照片", "包装", "瓶型", "具体产品", "品牌产品",
+    "品牌名称", "产品名称", "品牌标识", "品牌资产", "品牌识别",
     "文化符号", "品质背书", "视觉锚点",
 )
 
@@ -105,20 +158,67 @@ def _split_clauses(text: str) -> list[str]:
     return [part.strip(" ，,。；;") for part in re.split(r"[。；;]\s*", str(text or "")) if part.strip()]
 
 
+def _has_visible_content_value(value) -> bool:
+    if isinstance(value, str):
+        return bool(_strip_markdown(value).strip())
+    if isinstance(value, list):
+        return any(_has_visible_content_value(item.get("content") if isinstance(item, dict) else item) for item in value)
+    return bool(value)
+
+
+def _strip_absent_text_slot_clauses(text: str, content_text: Optional[Dict] = None) -> str:
+    """Remove layout prose that asks for text slots the slide content does not have."""
+    if not text:
+        return str(text or "")
+    content_text = content_text or {}
+    has_subhead = _has_visible_content_value(content_text.get("subhead"))
+    has_body = _has_visible_content_value(content_text.get("body"))
+    if has_subhead and has_body:
+        return str(text)
+
+    subhead_markers = ("副标题", "小标题", "subtitle", "subhead")
+    body_markers = (
+        "说明文字", "说明文案", "正文", "正文文字", "正文文案",
+        "body copy", "body text", "small copy", *_MICROCOPY_MARKERS,
+    )
+    kept: list[str] = []
+    for clause in _split_clauses(text):
+        lowered = clause.lower()
+        mentions_subhead = any(marker in lowered for marker in subhead_markers)
+        mentions_body = any(marker in lowered for marker in body_markers)
+        if mentions_subhead and not has_subhead:
+            continue
+        if mentions_body and not has_body:
+            continue
+        kept.append(clause)
+    return "；".join(kept).strip()
+
+
 def _split_product_clauses(text: str) -> list[str]:
     """Product-related cleanup needs finer cuts than normal copy."""
     return [part.strip(" ：:，,。；;") for part in re.split(r"[。；;，,]\s*", str(text or "")) if part.strip()]
 
 
-def _remove_negative_clauses(text: str) -> str:
+_MICROCOPY_MARKERS = (
+    "小字号", "小字", "微文案", "细小文字", "装饰文字", "占位文字",
+    "microcopy", "decorative text", "placeholder text", "lorem ipsum",
+)
+
+
+def _remove_microcopy_clauses(text: str) -> str:
     clauses = _split_clauses(text)
     if not clauses:
         return str(text or "").strip()
     kept = [
         clause for clause in clauses
-        if not any(marker in clause for marker in _NEGATIVE_PROMPT_MARKERS)
+        if not any(marker in clause.lower() for marker in _MICROCOPY_MARKERS)
     ]
     return "；".join(kept).strip()
+
+
+def _remove_negative_clauses(text: str) -> str:
+    """保留原文，不再过滤含否定词的分句。LLM 应自行理解并遵守用户的否定/约束指令。"""
+    return str(text or "").strip()
 
 
 def _is_product_ref(ref: Dict) -> bool:
@@ -201,66 +301,37 @@ def _compact_visual_evidence(page_intent: Dict, reference_images: Optional[List[
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
-    visual_evidence = _rewrite_stale_dark_language_for_light_style(visual_evidence, "")
+    visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
     return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
 
 
-def _style_text_requests_light(style_text: str | None) -> bool:
-    text = re.sub(r"\s+", "", str(style_text or "")).lower()
-    return bool(
-        text
-        and (
-            "base_tone=light" in text
-            or "白色/米白" in text
-            or "浅色明亮基底" in text
-            or "浅底为主" in text
-            or "以白色为主" in text
-        )
-    )
-
-
-def _rewrite_stale_dark_language_for_light_style(text: str, style_text: str | None) -> str:
-    if not _style_text_requests_light(style_text):
-        return text
-    rewritten = str(text or "")
-    replacements = [
-        ("保持深色基底统一", "保持浅色基底统一"),
-        ("延续深色基底统一", "延续浅色基底统一"),
-        ("深色视觉基底", "浅色明亮视觉基底"),
-        ("深色视觉基调", "浅色明亮视觉基调"),
-        ("深色基底", "浅色基底"),
-        ("深色背景", "白色/米白浅色背景"),
-        ("黑紫背景", "明亮柔紫浅色背景"),
-        ("黑紫", "明亮柔紫"),
-        ("深邃暗色", "明亮浅色"),
-        ("高对比暗色卡片", "淡紫/米白浅色卡片"),
-        ("暗色卡片", "浅色卡片"),
-        ("暗色内容区", "浅色内容区"),
-        ("深色系语言", "浅色系语言"),
-        ("深色系风格", "浅色系风格"),
-    ]
-    for old, new in replacements:
-        rewritten = rewritten.replace(old, new)
-    if rewritten != text:
-        rewritten = rewritten.rstrip("。；; ") + "；当前确认风格要求整页以白色/米白/淡紫浅底为主，深色只能用于文字、细线或局部强调。"
-    return rewritten
-
-
-def _compact_visual_evidence_with_style(page_intent: Dict, reference_images: Optional[List[Dict]], style_text: str | None) -> str:
+def _compact_visual_evidence_with_style(
+    page_intent: Dict,
+    reference_images: Optional[List[Dict]],
+    style_text: str | None,
+    content_text: Optional[Dict] = None,
+) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
-    visual_evidence = _rewrite_stale_dark_language_for_light_style(visual_evidence, style_text)
+    visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
+    visual_evidence = _strip_absent_text_slot_clauses(visual_evidence, content_text)
     return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
 
 
-def _compact_layout_intent(page_intent: Dict, reference_images: Optional[List[Dict]] = None, style_text: str | None = None) -> str:
+def _compact_layout_intent(
+    page_intent: Dict,
+    reference_images: Optional[List[Dict]] = None,
+    style_text: str | None = None,
+    content_text: Optional[Dict] = None,
+) -> str:
     layout = page_intent.get("layout") or page_intent.get("type", "content")
     visual_desc = " ".join(str(page_intent.get("visual_description", "")).split())
     visual_desc = _remove_negative_clauses(visual_desc)
     if _has_product_ref(reference_images):
         visual_desc = _sanitize_product_reference_text(visual_desc)
-    visual_desc = _rewrite_stale_dark_language_for_light_style(visual_desc, style_text)
+    visual_desc = _remove_brand_mark_drawing_language(visual_desc)
+    visual_desc = _strip_absent_text_slot_clauses(visual_desc, content_text)
     if len(visual_desc) > 260:
         visual_desc = visual_desc[:260].rstrip() + "..."
     if visual_desc:
@@ -273,6 +344,43 @@ def _compact_reference_text(text: str, max_chars: int = 260) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def _content_visual_contract(content_text: Dict) -> tuple[Dict, list[str], list[str]]:
+    """Split body copy into visible text, visual intent, and diagram labels."""
+    next_content = dict(content_text or {})
+    body = next_content.get("body")
+    visual_intents: list[str] = []
+    diagram_labels: list[str] = []
+
+    def add_requirement(requirement: Dict) -> None:
+        directive = str(requirement.get("directive") or "").strip()
+        if directive and directive not in visual_intents:
+            visual_intents.append(directive)
+        for label in requirement.get("diagram_labels") or []:
+            value = str(label or "").strip()
+            if value and value not in diagram_labels:
+                diagram_labels.append(value)
+
+    for requirement in normalize_visual_requirements(next_content.get("visual_requirements")):
+        add_requirement(requirement)
+
+    if isinstance(body, str):
+        extraction = extract_visual_directives(body)
+        next_content["body"] = extraction["cleaned_markdown"]
+        for suggestion in extraction["suggestions"]:
+            add_requirement(suggestion)
+    elif isinstance(body, list):
+        cleaned_items = []
+        for item in body:
+            extraction = extract_visual_directives(str(item or ""))
+            if extraction["cleaned_markdown"]:
+                cleaned_items.append(extraction["cleaned_markdown"])
+            for suggestion in extraction["suggestions"]:
+                add_requirement(suggestion)
+        next_content["body"] = cleaned_items
+
+    return next_content, visual_intents, diagram_labels
 
 
 def _is_protected_asset(ref: Dict) -> bool:
@@ -326,7 +434,7 @@ def _protected_assets_block(reference_images: Optional[List[Dict]]) -> str:
         if role == "logo":
             label = ref.get("asset_name") or "Logo / lockup"
             rule = (
-                "use the exact uploaded mark or co-brand lockup as a small, quiet brand signature."
+                "overlay-only identity asset; do not draw or reinterpret it in the base image."
             )
         elif _is_product_ref(ref):
             label = ref.get("asset_name") or "Product"
@@ -351,14 +459,7 @@ def _valid_overlay_asset_ids(page_intent: Dict) -> set[str] | None:
 
 
 def _brand_mark_safety_instruction(page_intent: Dict) -> str:
-    logo_reservation = logo_reservation_instruction(page_intent)
-    if logo_reservation:
-        return (
-            "Brand marks: do not draw, invent, or stylize any logo, wordmark, brand icon, "
-            "or placeholder mark. Leave only low-detail negative space at the logo position; "
-            "do not draw an outline, frame, box, badge, label, or container for it."
-        )
-    return "Brand marks: do not draw or invent logos, wordmarks, brand icons, or placeholder marks."
+    return ""
 
 
 def _reference_descriptions_for_prompt(
@@ -384,9 +485,8 @@ def _reference_descriptions_for_prompt(
                     "Style reference: borrow only mood, palette, and composition rhythm."
                 )
             elif role == "logo":
-                logo_instruction = logo_prompt_instruction(page_intent)
                 reference_descriptions.append(
-                    f"Logo / lockup: exact uploaded mark. {logo_instruction}"
+                    "Uploaded identity asset: use only when explicitly requested as a scene object."
                 )
             elif role == "content_ref":
                 detail = _compact_reference_text(desc, 180) if desc else ""
@@ -457,6 +557,7 @@ def generate_prompt_for_page(
     style_id: str = "default",
     reference_images: Optional[List[Dict]] = None,
     style_text_override: Optional[str] = None,
+    user_feedback: Optional[str] = None,
 ) -> str:
     """
     为一页生成 Final Image Prompt。
@@ -464,15 +565,21 @@ def generate_prompt_for_page(
     输出：自然流畅的 Final Prompt 字符串
     """
     logger.info(f"PromptEngine: 为第 {page_intent.get('page_num')} 页生成 Final Prompt")
+    content_text, visual_intents, diagram_labels = _content_visual_contract(content_text or {})
 
     if style_text_override is not None:
         style_text = style_text_override
     elif isinstance(page_intent, dict) and page_intent.get("style_pack_snapshot"):
         style_text = str(page_intent.get("style_pack_snapshot") or "")
     else:
-        style_text = derive_style_pack_from_content([
-            {"type": page_intent.get("type", "content"), "text_content": content_text or {}}
-        ])
+        style_text = (
+            "Style: 由页面内容自然决定\n"
+            "Palette: 由主题和场景自然选择\n"
+            "Mood: 贴合当前页面内容气质\n"
+            "Typography: 由风格气质决定字体搭配\n"
+            "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
+            "Visual rhythm: 每页由文案决定画面证据"
+        )
 
     reference_descriptions = _reference_descriptions_for_prompt(page_intent, content_text or {}, reference_images)
 
@@ -510,9 +617,22 @@ def generate_prompt_for_page(
                 cleaned = _escape(_strip_markdown(item))
                 if cleaned:
                     text_directives.append(f'Body: "{cleaned}"')
+    for label in diagram_labels[:16]:
+        cleaned = _escape(_strip_markdown(label))
+        if cleaned:
+            text_directives.append(f'Diagram label: "{cleaned}"')
 
     if text_directives:
-        text_directives.append("All listed text must appear, clearly rendered and highly legible.")
+        text_directives.append("Visible text rule: render only quoted strings from this section; no labels, headers, color codes, invented copy, lorem ipsum, or decorative microtext.")
+    if visual_intents or diagram_labels:
+        text_directives.append("Do not render visual intent phrases as text.")
+        text_directives.append("Render diagram labels as visible labels inside the diagram.")
+        text_directives.append("Render visible body text only as readable slide copy.")
+    visual_intent_section = ""
+    if visual_intents:
+        visual_intent_section = "\n\nVisual Intent:\n" + "\n".join(
+            f"- {_compact_reference_text(intent, 140)}" for intent in visual_intents[:6]
+        )
 
     punchline_treatment = ""
     if is_punchline_page:
@@ -525,77 +645,56 @@ def generate_prompt_for_page(
     protected_block = _protected_assets_block(reference_images)
     protected_section = f"{protected_block}\n\n" if protected_block else ""
     brand_mark_safety = _brand_mark_safety_instruction(page_intent)
+    artifact_safety = (
+        "Watermarks and stray marks: no third-party watermarks, stock/template labels, "
+        "tutorial-site stamps, 虎课网, or unauthorized extra text."
+    )
 
-    if text_directives:
-        # Keep the first-pass prompt compact: text contract, optional logo rule,
-        # style, page intent, and short reference roles. Uploaded images carry
-        # asset identity; long product descriptions are intentionally omitted.
-        text_block = "\n".join(text_directives)
-        style_block = _compact_style_pack(style_text)
-        visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text)
-        layout_intent = _compact_layout_intent(page_intent, reference_images, style_text)
-        refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
-        refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
-        logo_reservation = logo_reservation_instruction(page_intent)
-        logo_section = f"\n\nLogo Placement Note:\n{logo_reservation}" if logo_reservation else ""
-        overlay_reservation = overlay_reservation_instruction(
-            page_intent,
-            valid_asset_ids=_valid_overlay_asset_ids(page_intent),
-        )
-        overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
-        final_prompt = (
-            "Text:\n"
-            + text_block
-            + "\n\n"
-            + protected_section
-            + (refs_section.strip() + "\n\n" if refs_section else "")
-            + "Rules:\n"
-            + brand_mark_safety
-            + "\n\n"
-            + "Style:\n"
-            + style_block
-            + "\n\n"
-            + "Visual:\n"
-            + str(visual_evidence)
-            + "\n\n"
-            + "Layout:\n"
-            + str(layout_intent)
-            + (f"\n{punchline_treatment}" if punchline_treatment else "")
-            + logo_section
-            + overlay_section
-            + "\n\n"
-            + "Render one 16:9 presentation slide. Keep text legible."
-        )
-    else:
-        style_block = _compact_style_pack(style_text)
-        visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text)
-        layout_intent = _compact_layout_intent(page_intent, reference_images, style_text)
-        refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
-        refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
-        logo_reservation = logo_reservation_instruction(page_intent)
-        logo_section = f"\n\nLogo Placement Note:\n{logo_reservation}" if logo_reservation else ""
-        overlay_reservation = overlay_reservation_instruction(
-            page_intent,
-            valid_asset_ids=_valid_overlay_asset_ids(page_intent),
-        )
-        overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
-        final_prompt = (
-            protected_section
-            + (refs_section.strip() + "\n\n" if refs_section else "")
-            + "Rules:\n"
-            + brand_mark_safety
-            + "\n\n"
-            + "Style:\n"
-            + style_block
-            + "\n\nVisual:\n"
-            + str(visual_evidence)
-            + "\n\nLayout:\n"
-            + str(layout_intent)
-            + (f"\n{punchline_treatment}" if punchline_treatment else "")
-            + logo_section
-            + overlay_section
-            + "\n\nRender one 16:9 presentation slide."
-        )
+    # Keep the first-pass prompt compact: visible copy, style, page intent, and
+    # short reference roles. Uploaded images carry asset identity; long product
+    # descriptions are intentionally omitted.
+    text_block = "\n".join(text_directives)
+    text_section = f"Visible Text:\n{text_block}\n\n" if text_block else ""
+    # 用户在 chat 中对单页的最新反馈（重试时携带）— 必须放在 prompt 最前面，
+    # 让模型在生图时优先采纳，不被后续 Style/Visual 规则覆盖。
+    user_feedback_text = (user_feedback or "").strip()
+    if len(user_feedback_text) > 1500:
+        user_feedback_text = user_feedback_text[-1500:]
+    user_feedback_section = (
+        f"User Feedback (must honor, overrides style/layout defaults):\n{user_feedback_text}\n\n"
+        if user_feedback_text
+        else ""
+    )
+    style_block = _compact_style_pack(style_text)
+    visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text, content_text)
+    layout_intent = _compact_layout_intent(page_intent, reference_images, style_text, content_text)
+    refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
+    refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
+    overlay_reservation = overlay_reservation_instruction(
+        page_intent,
+        valid_asset_ids=_valid_overlay_asset_ids(page_intent),
+    )
+    overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
+    final_prompt = (
+        user_feedback_section
+        + text_section
+        + protected_section
+        + (refs_section.strip() + "\n\n" if refs_section else "")
+        + (visual_intent_section.strip() + "\n\n" if visual_intent_section else "")
+        + "Rules:\n"
+        + ((brand_mark_safety + "\n") if brand_mark_safety else "")
+        + artifact_safety
+        + "\n\n"
+        + "Style:\n"
+        + style_block
+        + "\n\nVisual:\n"
+        + str(visual_evidence)
+        + "\n\nLayout:\n"
+        + str(layout_intent)
+        + (f"\n{punchline_treatment}" if punchline_treatment else "")
+        + overlay_section
+        + "\n\nCreate one polished widescreen landscape presentation slide. Keep visible text legible."
+    )
 
     prompt_len = len(final_prompt)
     if prompt_len > 3000:
@@ -639,6 +738,8 @@ def generate_prompts_for_all_pages(
             content_text = {**content_text, "reference_user_hint": content_item["reference_user_hint"]}
         if content_item.get("global_user_requirements"):
             content_text = {**content_text, "global_user_requirements": content_item["global_user_requirements"]}
+        if content_item.get("visual_requirements"):
+            content_text = {**content_text, "visual_requirements": content_item["visual_requirements"]}
         prompt = generate_prompt_for_page(
             page_intent=intent,
             content_text=content_text,

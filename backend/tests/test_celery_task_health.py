@@ -43,6 +43,59 @@ def test_generation_worker_check_targets_image_queue(monkeypatch):
     assert captured["queue"] == settings.CELERY_IMAGE_QUEUE
 
 
+def test_stop_generation_releases_page_locks(monkeypatch):
+    db = make_session()
+    project = Project(title="Stop clears locks", status="prototype", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="generating", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="generating", prompt_text="p2"),
+            Slide(project_id=project.id, page_num=3, status="completed", prompt_text="p3"),
+        ]
+    )
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    run.task_id = "task-1"
+    db.commit()
+
+    deleted = []
+    revoked = {}
+
+    class FakeRedis:
+        def get(self, key):
+            return b"task-1" if key.endswith(":task_id") else None
+
+        def delete(self, *keys):
+            deleted.extend(keys)
+            return len(keys)
+
+    class FakeAsyncResult:
+        def __init__(self, task_id):
+            revoked["task_id"] = task_id
+
+        def revoke(self, terminate=False):
+            revoked["terminate"] = terminate
+
+    monkeypatch.setattr(slides_api, "redis_client", FakeRedis())
+    monkeypatch.setattr(slides_api, "AsyncResult", FakeAsyncResult)
+
+    result = slides_api.stop_generation(project.id, db=db)
+
+    assert result["message"] == "Generation stopped"
+    assert revoked == {"task_id": "task-1", "terminate": True}
+    for page_num in (1, 2, 3):
+        assert f"project:{project.id}:slide:{page_num}:generating" in deleted
+
+
 def test_generation_page_chunks_are_bounded(monkeypatch):
     monkeypatch.setattr(image_tasks.settings, "IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE", 3)
 
@@ -221,6 +274,62 @@ def test_final_generation_chunk_finishes_shared_run(tmp_path, monkeypatch):
     assert refreshed_run.completed_count == 3
     assert refreshed_project.status == "completed"
     assert assembled["count"] == 3
+
+
+def test_generation_stops_after_first_provider_gateway_cutoff(monkeypatch):
+    db = make_session()
+    project = Project(title="Provider outage", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="prompt_ready", prompt_text="p2"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2],
+        total_count=2,
+    )
+    run.status = "running"
+    db.commit()
+
+    calls = []
+
+    def fake_generate_one_slide(slide, project_id, output_dir, ref_data, run_id=None):
+        calls.append(slide.page_num)
+        return {
+            "slide": slide,
+            "error": "图片接口超过约 120 秒仍未返回，被上游连接窗口截断；已停止重复重试。",
+            "image_generation_events": [{"status": "gateway_timeout"}],
+        }
+
+    monkeypatch.setattr(generation_pipeline.settings, "IMAGE_API_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(
+        generation_pipeline,
+        "assemble_pptx",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not assemble")),
+    )
+
+    generation_pipeline.run_generation_pipeline(project.id, db, page_nums=[1, 2], prototype=True, run_id=run.id)
+
+    refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).one()
+    refreshed_slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+
+    assert calls == [1]
+    assert refreshed_run.status == "failed"
+    assert refreshed_run.completed_count == 0
+    assert refreshed_run.failed_count == 1
+    assert refreshed_slides[0].status == "failed"
+    assert refreshed_slides[1].status == "prompt_ready"
+    assert "未继续生成" in (refreshed_slides[1].error_msg or "")
 
 
 def test_missing_started_celery_task_marks_generation_recoverable(monkeypatch):

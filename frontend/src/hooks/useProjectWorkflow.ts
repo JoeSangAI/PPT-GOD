@@ -21,6 +21,7 @@ export interface WorkflowProgress {
   total_pages?: number;
   active_page_nums?: number[];
   running_count?: number;
+  updated_at?: string | null;
 }
 
 export interface WorkflowStatus {

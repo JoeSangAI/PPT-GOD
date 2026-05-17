@@ -23,8 +23,22 @@ function loadTsModule(filename) {
   return sandbox.module.exports;
 }
 
-const { buildGateContext, buildWorkflowState, getPrimaryActionKey } = loadTsModule("workflow.ts");
+const {
+  buildGateContext,
+  buildWorkflowState,
+  buildWorkflowProgressDisclosure,
+  evaluateImageGenerationOutcome,
+  getPrimaryActionKey,
+  planStaleSlideAction,
+} = loadTsModule("workflow.ts");
 const { inferAgentRequestContext, inferRequestedPageCount } = loadTsModule("agentRequestContext.ts");
+const {
+  buildChangeReceipt,
+  formatPageNumsForReceipt,
+  summarizeContentChange,
+  summarizeVisualChange,
+  summarizeInsertedSlide,
+} = loadTsModule("changeReceipt.ts");
 
 function context(input) {
   return buildGateContext(buildWorkflowState(input), input.revision ?? 0);
@@ -35,6 +49,129 @@ function plain(value) {
 }
 
 assert.equal(context({ projectStatus: "draft" }).mainStageMode, "brief_studio");
+
+assert.equal(formatPageNumsForReceipt([1, 3, 2]), "第 1, 2, 3 页");
+assert.equal(
+  buildChangeReceipt({
+    status: "applied",
+    subject: "已更新第 1 页画面描述，并同步了生图提示词",
+    change: "提升文字对比度和可读性",
+    next: "图片未自动重生成，请检查后再确认生图。",
+  }),
+  "✅ 已更新第 1 页画面描述，并同步了生图提示词。\n\n变更：提升文字对比度和可读性\n\n下一步：图片未自动重生成，请检查后再确认生图。"
+);
+assert.equal(
+  summarizeContentChange({
+    text_content: {
+      headline: "新标题",
+      subhead: "新副标题",
+      body: "第一行\n第二行",
+    },
+  }),
+  "标题：新标题；副标题：新副标题；正文：第一行"
+);
+assert.equal(
+  summarizeVisualChange(
+    "封面黑色的字体看不清楚",
+    { visual_json: { design_notes: "本轮修改：提升文字对比度。" } },
+    "已写入第 1 页"
+  ),
+  "本轮修改：提升文字对比度。"
+);
+assert.equal(
+  summarizeInsertedSlide({ text_content: { headline: "新增案例" } }),
+  "新增页面：新增案例"
+);
+
+const runningImageDisclosure = buildWorkflowProgressDisclosure({
+  active_run: {
+    kind: "batch_generation",
+    status: "running",
+    started_at: "2026-05-14T05:00:00.000Z",
+    updated_at: "2026-05-14T05:01:20.000Z",
+    target_page_nums: [2, 3, 4],
+    total_count: 3,
+    completed_count: 1,
+  },
+  progress: {
+    kind: "batch_generation",
+    status: "running",
+    label: "批量生成进度",
+    message: "正在生成图片",
+    current: 1,
+    total: 3,
+    unit: "页",
+    active_page_nums: [3],
+  },
+}, Date.parse("2026-05-14T05:01:30.000Z"));
+
+assert.equal(runningImageDisclosure.headline, "批量生成进度");
+assert.equal(runningImageDisclosure.summary, "正在生成第 3 页：1 / 3 页完成");
+assert.equal(runningImageDisclosure.detail, "第 3 页正在生成；完成后会直接出现在画布中。");
+assert.deepEqual(
+  plain(runningImageDisclosure.metrics.map((item) => [item.label, item.value])),
+  [
+    ["进度", "1 / 3 页"],
+    ["处理范围", "第 2、3、4 页"],
+    ["已运行", "1 分 30 秒"],
+    ["最近更新", "10 秒前"],
+  ]
+);
+assert.deepEqual(
+  plain(runningImageDisclosure.steps.map((step) => [step.label, step.status])),
+  [
+    ["准备页面", "done"],
+    ["生成图片", "current"],
+    ["写入画布", "pending"],
+  ]
+);
+
+const queuedDisclosure = buildWorkflowProgressDisclosure({
+  active_run: {
+    kind: "content_plan",
+    status: "queued",
+    started_at: "2026-05-14T05:00:00.000Z",
+    total_count: 50,
+    completed_count: 0,
+  },
+}, Date.parse("2026-05-14T05:00:42.000Z"));
+
+assert.equal(queuedDisclosure.summary, "内容规划已排队，等待开始，已等待 42 秒");
+assert.equal(queuedDisclosure.detail, "任务已提交，正在等待后台开始；页面会自动刷新进度。");
+assert.equal(queuedDisclosure.steps[0].status, "current");
+
+const visualPromptDisclosure = buildWorkflowProgressDisclosure({
+  active_run: {
+    kind: "visual_prompts",
+    status: "running",
+    started_at: "2026-05-14T14:01:58.000Z",
+    updated_at: "2026-05-14T14:03:56.000Z",
+    total_count: 26,
+    completed_count: 21,
+  },
+  progress: {
+    kind: "visual_prompts",
+    status: "running",
+    stage: "visual_planning",
+    message: "正在生成视觉方案",
+    current: 21,
+    total: 26,
+    unit: "页",
+    updated_at: "2026-05-14T14:03:56.000Z",
+  },
+}, Date.parse("2026-05-14T14:04:05.000Z"));
+
+assert.equal(visualPromptDisclosure.headline, "画面方案进度");
+assert.equal(visualPromptDisclosure.summary, "正在生成每页画面方案：21 / 26 页完成");
+assert.equal(visualPromptDisclosure.detail, "正在把每页内容转换成可生成样张的画面方案；完成后每页会出现检查项。");
+assert.deepEqual(
+  plain(visualPromptDisclosure.metrics.map((item) => [item.label, item.value])),
+  [
+    ["进度", "21 / 26 页"],
+    ["已运行", "2 分 7 秒"],
+    ["最近更新", "刚刚"],
+  ]
+);
 
 const content = context({
   projectStatus: "planning",
@@ -98,6 +235,26 @@ assert.equal(getPrimaryActionKey(buildWorkflowState({
   hasSelectedStyle: true,
 })), "start-prototype");
 
+const imageOnlyStaleAction = planStaleSlideAction([
+  { slide: { id: "s1", page_num: 1 }, stale: { image: true } },
+  { slide: { id: "s2", page_num: 2 }, stale: { image: true } },
+]);
+assert.equal(imageOnlyStaleAction.primaryActionKey, "regenerate_images");
+assert.equal(imageOnlyStaleAction.primaryLabel, "重新生成图片");
+assert.equal(imageOnlyStaleAction.contentOrVisualCount, 0);
+assert.equal(imageOnlyStaleAction.imageOnlyCount, 2);
+
+const mixedStaleAction = planStaleSlideAction([
+  { slide: { id: "s1", page_num: 1 }, stale: { content: true, image: true } },
+  { slide: { id: "s2", page_num: 2 }, stale: { visual: true, image: true } },
+  { slide: { id: "s3", page_num: 3 }, stale: { image: true } },
+]);
+assert.equal(mixedStaleAction.primaryActionKey, "update_visual_plan");
+assert.equal(mixedStaleAction.primaryLabel, "更新画面方案");
+assert.deepEqual(plain(mixedStaleAction.pageNumsForVisualPlan), [1]);
+assert.deepEqual(plain(mixedStaleAction.pageNumsForPrompt), [1, 2]);
+assert.deepEqual(plain(mixedStaleAction.imageOnlyPageNums), [3]);
+
 const prototype = context({
   projectStatus: "prototype_ready",
   slides: [{ status: "completed", image_path: "./outputs/demo.png", prompt_text: "prompt" }],
@@ -107,6 +264,25 @@ assert.equal(
   JSON.stringify(prototype.allowedActions.filter((action) => action === "resample_prototype" || action === "confirm_prototype").sort()),
   JSON.stringify(["confirm_prototype", "resample_prototype"])
 );
+
+const cancelledPrototypeOutcome = evaluateImageGenerationOutcome({
+  prototype: true,
+  projectStatus: "prototype_ready",
+  run: {
+    id: "run-cancelled",
+    kind: "prototype_generation",
+    status: "cancelled",
+    message: "用户手动停止",
+    total_count: 3,
+    completed_count: 0,
+    failed_count: 0,
+    target_page_nums: [1, 2, 5],
+  },
+});
+assert.equal(cancelledPrototypeOutcome.kind, "cancelled");
+assert.equal(cancelledPrototypeOutcome.isSuccess, false);
+assert.equal(cancelledPrototypeOutcome.canConfirmPrototype, false);
+assert.match(cancelledPrototypeOutcome.message, /没有生成新样张/);
 
 assert.deepEqual(
   plain(inferAgentRequestContext({
@@ -151,6 +327,102 @@ assert.deepEqual(
     scopeLabel: "第 3 页",
     routeReason: "visual_intent",
   }
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "封面黑色的字体看不清楚",
+    activeAgentRole: "visual",
+    activeScope: "deck",
+    projectStatus: "prototype_ready",
+    slideCount: 35,
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+    hasPrompt: true,
+    hasGeneratedImage: true,
+    slides: [
+      { page_num: 1, type: "cover", headline: "疯火轮 AI" },
+      { page_num: 35, type: "ending", headline: "下一步，用起来" },
+    ],
+  })),
+  {
+    targetRole: "visual",
+    scope: "current_slide",
+    risk: "safe",
+    targetArea: "visual",
+    areaLabel: "画面",
+    confidence: "explicit",
+    pageNums: [1],
+    explicitScope: true,
+    scopeLabel: "第 1 页",
+    routeReason: "visual_intent",
+  }
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "结尾页二维码太靠下了",
+    activeAgentRole: "visual",
+    activeScope: "deck",
+    projectStatus: "prototype_ready",
+    slideCount: 35,
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+    hasPrompt: true,
+    hasGeneratedImage: true,
+    slides: [
+      { page_num: 1, type: "cover", headline: "疯火轮 AI" },
+      { page_num: 35, type: "ending", headline: "下一步，用起来" },
+    ],
+  })).pageNums,
+  [35]
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "封面黑色的字体看不清楚",
+    activeAgentRole: "visual",
+    activeScope: "current_slide",
+    editingPageNum: 4,
+    projectStatus: "prototype_ready",
+    slideCount: 35,
+    contentPlanConfirmed: true,
+    slides: [
+      { page_num: 1, type: "cover", headline: "封面" },
+      { page_num: 4, type: "content", headline: "当前正在看的页" },
+    ],
+  })).pageNums,
+  [4]
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "封面黑色的字体看不清楚",
+    activeAgentRole: "visual",
+    activeScope: "selected_slides",
+    selectedPageNums: [2, 4],
+    projectStatus: "prototype_ready",
+    slideCount: 35,
+    contentPlanConfirmed: true,
+    slides: [
+      { page_num: 1, type: "cover", headline: "封面" },
+      { page_num: 2, type: "content", headline: "选中页 A" },
+      { page_num: 4, type: "content", headline: "选中页 B" },
+    ],
+  })).pageNums,
+  [2, 4]
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "第 3 页字体看不清楚",
+    activeAgentRole: "visual",
+    activeScope: "current_slide",
+    editingPageNum: 4,
+    projectStatus: "prototype_ready",
+    contentPlanConfirmed: true,
+  })).pageNums,
+  [3]
 );
 
 assert.deepEqual(

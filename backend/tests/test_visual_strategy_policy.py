@@ -40,7 +40,7 @@ def test_dark_tech_reference_with_light_logo_keeps_dark_content_strategy():
 
     assert proposal["visual_strategy"]["base_tone"] == "dark"
     assert "#F7F3EA" not in proposal["page_type_adaptation"]
-    assert "自动切成米白" in proposal["page_type_adaptation"]
+    assert "自动切成浅色" in proposal["page_type_adaptation"]
     assert "Logo 偏浅" in proposal["visual_strategy"]["logo_contrast"]
 
 
@@ -65,12 +65,10 @@ def test_ai_tech_weak_reference_uses_neutral_modern_defaults():
         for key in ("name", "mood", "font", "description", "clone_rules", "ornaments", "texture")
     )
 
-    assert proposal["name"] == "品牌主色复刻"
-    assert "现代" in proposal["mood"]
-    assert "几何无衬线" in proposal["font"]
+    assert proposal["name"] == "参考图风格基因"
+    # LLM thick: code layer no longer infers mood/font from palette traits.
     for unwanted in ("古朴", "宋体/书法体", "中式", "国潮", "山水"):
         assert unwanted not in combined
-    assert "不要引入参考图中没有的文化符号" in proposal["clone_rules"]
 
 
 def test_reference_texture_and_typography_survive_to_compact_prompt():
@@ -97,7 +95,11 @@ def test_reference_texture_and_typography_survive_to_compact_prompt():
     )
 
     assert "Typography:" in prompt
-    assert "Inter Display" in prompt
+    assert "clean sans-serif hierarchy" in prompt
+    assert "strong headline weight" in prompt
+    assert "Inter Display" not in prompt
+    assert "Inter Regular" not in prompt
+    assert "font family names" in prompt
     assert "Texture/material:" in prompt
     assert "soft blur glow" in prompt
 

@@ -67,6 +67,91 @@ const darkInformationPagesPreview = buildSelectedStylePreview({
 assert.equal(darkInformationPagesPreview.baseTone, "dark");
 assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "content").tone, "dark");
 assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "data").tone, "dark");
+assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "content").accent, "#C7A348");
+assert.equal(darkInformationPagesPreview.pages.find((page) => page.key === "data").accent, "#C7A348");
+
+const mixedLightInformationPagesPreview = buildSelectedStylePreview({
+  name: "蓝金沉稳",
+  palette: [
+    { name: "深海军蓝", hex: "#1B3A5C", role: "主色/背景色/标题色" },
+    { name: "品牌金", hex: "#D3BC8E", role: "Logo 呼应色/关键数字和装饰线点缀" },
+    { name: "雾灰蓝", hex: "#E8EDF2", role: "内容页基底/卡片底" },
+    { name: "炭灰", hex: "#3D3D3D", role: "正文/数据文字" },
+  ],
+  description: "封面/章节页大胆使用深蓝底，内容/数据页以雾灰蓝为基底，降低背景强度，保证信息可读性。",
+  visual_strategy: {
+    summary: "品牌金仅作低占比品牌点缀。",
+  },
+});
+
+assert.equal(mixedLightInformationPagesPreview.baseTone, "mixed");
+assert.equal(mixedLightInformationPagesPreview.pages.find((page) => page.key === "cover").tone, "dark");
+assert.equal(mixedLightInformationPagesPreview.pages.find((page) => page.key === "content").tone, "light");
+assert.equal(mixedLightInformationPagesPreview.pages.find((page) => page.key === "data").tone, "light");
+
+const brightLogoGoldPreview = buildSelectedStylePreview({
+  name: "明亮精密工业蓝金",
+  palette: [
+    { name: "米白", hex: "#F8F6F0", role: "白色/米白/浅色明亮基底" },
+    { name: "品牌金", hex: "#C4A25A", role: "Logo 色/品牌识别色（低占比）" },
+    { name: "明亮柔紫", hex: "#D9CBE8", role: "辅助强调色/标题强调/视觉锚点" },
+    { name: "浅粉", hex: "#E6C7D7", role: "辅助装饰色" },
+    { name: "工业蓝黑", hex: "#203A5F", role: "正文/标题文字" },
+  ],
+  visual_strategy: {
+    base_tone: "light",
+    summary: "整体以白色/米白/浅色明亮基底为主；使用明亮柔紫作为品牌主色，品牌金仅作低占比品牌点缀。",
+  },
+});
+
+assert.equal(brightLogoGoldPreview.baseTone, "light");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "cover").background, "#F8F6F0");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "cover").brand, "#C4A25A");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "cover").accent, "#D9CBE8");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "section").accent, "#D9CBE8");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "content").accent, "#D9CBE8");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "data").accent, "#D9CBE8");
+assert.equal(brightLogoGoldPreview.pages.find((page) => page.key === "content").text, "#203A5F");
+assert.match(brightLogoGoldPreview.summary, /品牌金作为品牌识别色/);
+assert.doesNotMatch(brightLogoGoldPreview.summary, /柔紫作为品牌主色/);
+
+const redLogoBlueAccentPreview = buildSelectedStylePreview({
+  name: "明亮品牌红蓝",
+  palette: [
+    { name: "瓷白", hex: "#FBFAF7", role: "整套页面浅色基底" },
+    { name: "品牌红", hex: "#E60012", role: "Logo 色/品牌识别色（低占比）" },
+    { name: "清透蓝", hex: "#2F80ED", role: "辅助强调色/图表主强调/视觉锚点" },
+    { name: "墨灰", hex: "#263238", role: "正文/图表文字" },
+  ],
+  visual_strategy: {
+    base_tone: "light",
+    summary: "清透蓝定调品牌识别和主装饰，品牌红仅作低占比品牌点缀。",
+  },
+});
+
+assert.equal(redLogoBlueAccentPreview.pages.find((page) => page.key === "cover").brand, "#E60012");
+assert.equal(redLogoBlueAccentPreview.pages.find((page) => page.key === "cover").accent, "#2F80ED");
+assert.equal(redLogoBlueAccentPreview.pages.find((page) => page.key === "data").accent, "#2F80ED");
+assert.match(redLogoBlueAccentPreview.summary, /品牌红作为品牌识别色/);
+assert.doesNotMatch(redLogoBlueAccentPreview.summary, /清透蓝定调品牌识别/);
+
+const trueBrandPrimaryPreview = buildSelectedStylePreview({
+  name: "蓝色品牌",
+  palette: [
+    { name: "科技蓝", hex: "#0066CC", role: "品牌主色/标题强调" },
+    { name: "白色", hex: "#FFFFFF", role: "页面基底" },
+    { name: "灰蓝", hex: "#E8EEF6", role: "内容区底色" },
+    { name: "深灰", hex: "#1F2937", role: "正文文字" },
+  ],
+  visual_strategy: {
+    base_tone: "light",
+    summary: "科技蓝作为品牌主色，整套页面保持白底高可读。",
+  },
+});
+
+assert.equal(trueBrandPrimaryPreview.pages.find((page) => page.key === "cover").brand, "#0066CC");
+assert.equal(trueBrandPrimaryPreview.pages.find((page) => page.key === "cover").accent, "#0066CC");
+assert.match(trueBrandPrimaryPreview.summary, /科技蓝作为品牌主色/);
 
 const lightPreview = buildSelectedStylePreview({
   name: "柔紫暖白",

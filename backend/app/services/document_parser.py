@@ -1,9 +1,36 @@
 import os
 from io import BytesIO
 import re
+from typing import Callable
+
+from app.services.pptx_page_recovery import recover_sparse_slide_text
+
+DocumentProgressCallback = Callable[[dict], None]
 
 
-def parse_document(file_bytes: bytes, filename: str) -> str:
+def _page_recovery_timeout_seconds() -> float:
+    try:
+        return max(3.0, float(os.getenv("PPTGOD_PPT_PAGE_OCR_TIMEOUT_SECONDS", "20")))
+    except ValueError:
+        return 20.0
+
+
+def _emit_progress(progress_callback: DocumentProgressCallback | None, **payload) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:
+        pass
+
+
+def parse_document(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    progress_callback: DocumentProgressCallback | None = None,
+    recovery_timeout_seconds: float | None = None,
+) -> str:
     """根据文件扩展名解析文档，返回纯文本内容。"""
     ext = os.path.splitext(filename)[1].lower()
 
@@ -12,7 +39,12 @@ def parse_document(file_bytes: bytes, filename: str) -> str:
     elif ext in (".docx", ".doc"):
         return _parse_docx(file_bytes)
     elif ext in (".pptx", ".ppt"):
-        return _parse_pptx(file_bytes, filename)
+        return _parse_pptx(
+            file_bytes,
+            filename,
+            progress_callback=progress_callback,
+            recovery_timeout_seconds=recovery_timeout_seconds,
+        )
     elif ext in (".md", ".txt", ".json", ".csv", ".html", ".htm"):
         return _parse_text(file_bytes)
     else:
@@ -41,19 +73,53 @@ def _parse_docx(file_bytes: bytes) -> str:
     return "\n\n".join(paragraphs)
 
 
-def _parse_pptx(file_bytes: bytes, filename: str = "") -> str:
+def _parse_pptx(
+    file_bytes: bytes,
+    filename: str = "",
+    *,
+    progress_callback: DocumentProgressCallback | None = None,
+    recovery_timeout_seconds: float | None = None,
+) -> str:
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
     prs = Presentation(BytesIO(file_bytes))
+    total_pages = len(prs.slides)
+    recovery_timeout = recovery_timeout_seconds if recovery_timeout_seconds is not None else _page_recovery_timeout_seconds()
     text_parts = []
-    text_parts.append(f'--- PPT_SOURCE filename="{filename}" pages={len(prs.slides)} ---')
+    text_parts.append(f'--- PPT_SOURCE filename="{filename}" pages={total_pages} ---')
     for i, slide in enumerate(prs.slides, 1):
+        _emit_progress(
+            progress_callback,
+            phase="pptx_page_read",
+            current_page=i,
+            total_pages=total_pages,
+            completed_count=i - 1,
+            message=f"正在识别 PPT 第 {i}/{total_pages} 页文字和截图...",
+        )
         slide_texts = _extract_shape_texts(slide.shapes, MSO_SHAPE_TYPE)
+        slide_texts.extend(
+            text for text in recover_sparse_slide_text(
+                slide,
+                page_num=i,
+                source_filename=filename,
+                existing_lines=slide_texts,
+                timeout_seconds=recovery_timeout,
+            )
+            if text
+        )
         notes = _extract_notes_text(slide)
         if notes:
             slide_texts.append("【备注】\n" + notes)
         text_parts.append(f"--- 第{i}页 ---\n" + "\n".join(slide_texts))
+        _emit_progress(
+            progress_callback,
+            phase="pptx_page_done",
+            current_page=i,
+            total_pages=total_pages,
+            completed_count=i,
+            message=f"已读取 PPT 第 {i}/{total_pages} 页",
+        )
     return "\n\n".join(text_parts)
 
 

@@ -82,6 +82,64 @@ def test_style_proposal_uses_cached_style_ref_when_file_is_missing(monkeypatch, 
     verify.close()
 
 
+def test_style_proposal_passes_all_cached_style_refs(monkeypatch, tmp_path):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+
+    project = Project(title="Multiple style refs", status="visual_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, content_json={"title": "测试页"}))
+    db.add_all(
+        [
+            ReferenceImage(
+                project_id=project.id,
+                role="style_ref",
+                file_path=str(tmp_path / "missing-1.png"),
+                asset_analysis={
+                    "analysis_status": "completed",
+                    "style_name": "浅底蓝金",
+                    "colors": {"background": "#FFFFFF", "primary": "#003A5D", "accent": "#C1A36B"},
+                },
+            ),
+            ReferenceImage(
+                project_id=project.id,
+                role="style_ref",
+                file_path=str(tmp_path / "missing-2.png"),
+                asset_analysis={
+                    "analysis_status": "completed",
+                    "style_name": "几何蓝金",
+                    "colors": {"background": "#FFFFFF", "primary": "#002B49", "accent": "#C59100"},
+                },
+            ),
+        ]
+    )
+    db.flush()
+    run = create_project_run(db, project.id, kind="style_proposal", stage="style_proposal", total_count=1)
+    project_id = project.id
+    run_id = run.id
+    db.commit()
+    db.close()
+
+    captured = {}
+
+    def fake_generate_style_proposals(content_plan, assets=None):
+        captured["assets"] = assets
+        return [{"name": "合并参考图", "source": "asset_clone"}]
+
+    monkeypatch.setattr(tasks, "SessionLocal", Session)
+    monkeypatch.setattr(tasks, "generate_style_proposals", fake_generate_style_proposals)
+    monkeypatch.setattr(tasks, "analyze_reference_image", lambda path: (_ for _ in ()).throw(AssertionError("should use cache")))
+
+    result = tasks._generate_style_proposals_task_inner(SimpleNamespace(), project_id, run_id)
+
+    assert result["status"] == "completed"
+    assert captured["assets"]["reference_analysis"]["style_name"] == "浅底蓝金"
+    assert [item["style_name"] for item in captured["assets"]["reference_analyses"]] == ["浅底蓝金", "几何蓝金"]
+
+
 def test_style_proposal_task_passes_visual_chat_requirements(monkeypatch):
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)

@@ -54,6 +54,12 @@ from app.services.content_plan import (
     resolve_content_plan_page_target,
     should_generate_incremental_long_deck,
     _fallback_deck_blueprint,
+    _auto_reclassify_page_type,
+)
+from app.services.source_intent import (
+    infer_intent_contract,
+    merge_intent_contract,
+    source_diagnostics_from_documents,
 )
 from app.services.logo_policy import (
     DEFAULT_LOGO_ANCHOR,
@@ -74,7 +80,7 @@ from app.services.overlay_layers import (
     normalize_overlay_layers,
     remove_asset_from_overlay_layers,
 )
-from app.services.visual_plan import generate_visual_plan, _recall_visual_assets_for_page
+from app.services.visual_plan import VisualPlanGenerationError, generate_visual_plan, _recall_visual_assets_for_page
 from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
 from app.services.pptx_assembler import assemble_pptx
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
@@ -88,6 +94,7 @@ from app.services.visual_block_renderer import (
     route_to_asset_route_mode,
     stable_block_hash,
 )
+from app.services.visual_directives import extract_visual_directives
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
 from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
 from app.tasks import generate_slides_task, redis_client
@@ -1920,6 +1927,7 @@ class ContentPlanRequest(BaseModel):
     topic: Optional[str] = None
     page_count: Optional[int] = None
     attachment_ids: Optional[List[str]] = None
+    chat_context: Optional[str] = None
 
 
 class CreateSlideRequest(BaseModel):
@@ -1937,6 +1945,12 @@ class UpdateVisualRequest(BaseModel):
     page_num: int
     slide_id: Optional[str] = None
     visual_json: dict
+
+
+class UpdateTypeRequest(BaseModel):
+    page_num: int
+    slide_id: Optional[str] = None
+    type: str
 
 
 class AssetPinsRequest(BaseModel):
@@ -2275,6 +2289,7 @@ def _generate_content_plan_bg(
     page_count: int | None = None,
     run_id: str | None = None,
     attachment_ids: list[str] | None = None,
+    chat_context: str | None = None,
 ):
     """后台任务：异步生成 Content Plan。"""
     import logging
@@ -2287,7 +2302,30 @@ def _generate_content_plan_bg(
         db.commit()
         _update_progress(project_id, {"stage": "document_parse", "message": "正在读取上传材料...", "current_page": 0, "total_pages": page_count or 10}, run_id)
 
-        documents = load_project_documents(project_id, parse_missing=True, text_limit=PAGE_MAP_DOCUMENT_LIMIT)
+        def report_document_progress(payload: dict):
+            current_page = payload.get("current_page")
+            total_pages = payload.get("total_pages")
+            message = str(payload.get("message") or "正在读取上传材料...")
+            _update_progress(project_id, {
+                "stage": "document_parse",
+                "message": message,
+                "current_page": current_page or 0,
+                "total_pages": total_pages or page_count or 10,
+            }, run_id)
+
+        try:
+            document_wait_seconds = max(0.0, float(os.getenv("PPTGOD_CONTENT_PLAN_DOCUMENT_WAIT_SECONDS", "900")))
+        except ValueError:
+            document_wait_seconds = 900.0
+
+        documents = load_project_documents(
+            project_id,
+            parse_missing=True,
+            text_limit=PAGE_MAP_DOCUMENT_LIMIT,
+            preserve_ppt_sources=True,
+            running_wait_seconds=document_wait_seconds,
+            progress_callback=report_document_progress,
+        )
         explicit_attachment_context = _content_plan_attachment_context(db, project_id, attachment_ids)
         if explicit_attachment_context:
             documents = "\n\n".join(
@@ -2319,9 +2357,23 @@ def _generate_content_plan_bg(
         if image_context_parts:
             image_context = "\n\n".join(image_context_parts)
             documents = "\n\n".join(part for part in [documents, image_context] if part)
+        intent_contract = None
+        project_for_intent = db.query(Project).filter(Project.id == project_id).first()
+        if project_for_intent:
+            inferred_contract = infer_intent_contract(
+                topic,
+                source_diagnostics=source_diagnostics_from_documents(documents),
+            )
+            project_for_intent.intent_contract = merge_intent_contract(
+                project_for_intent.intent_contract,
+                inferred_contract,
+            )
+            flag_modified(project_for_intent, "intent_contract")
+            intent_contract = project_for_intent.intent_contract
+            db.commit()
         if documents:
             logger.info(f"[ContentPlan BG] Loaded documents, length={len(documents)}")
-            inferred_page_count = infer_page_count_from_single_ppt(documents, topic)
+            inferred_page_count = infer_page_count_from_single_ppt(documents, topic, intent_contract=intent_contract)
             if page_count is None and inferred_page_count:
                 page_count = inferred_page_count
                 update_run_progress(db, run_id, total_count=page_count)
@@ -2344,6 +2396,8 @@ def _generate_content_plan_bg(
             page_count=page_count,
             documents=documents,
             on_progress=report_progress,
+            intent_contract=intent_contract,
+            chat_context=chat_context,
         )
         db.expire_all()
         if not is_run_active(db, run_id):
@@ -2474,7 +2528,15 @@ def create_content_plan(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    background_tasks.add_task(_generate_content_plan_bg, project_id, topic, page_count, run.id, body.attachment_ids or [])
+    background_tasks.add_task(
+        _generate_content_plan_bg,
+        project_id,
+        topic,
+        page_count,
+        run.id,
+        body.attachment_ids or [],
+        (body.chat_context or "").strip() or None,
+    )
     return {"message": "Content plan generation started", "status": project.status, "run": serialize_run(run)}
 
 
@@ -2620,14 +2682,17 @@ def create_visual_plan(
     style_text_override = _derive_project_style_pack(project, content_plan)
     style_override = _style_override_from_text(style_text_override)
 
-    visual_plan = generate_visual_plan(
-        content_plan=content_plan,
-        style_id=project.style_id or "default",
-        reference_image_ids=ref_ids,
-        style_override=style_override,
-        global_visual_assets=global_visual_assets,
-        has_project_logo=bool(_project_logo_refs(project)),
-    )
+    try:
+        visual_plan = generate_visual_plan(
+            content_plan=content_plan,
+            style_id=project.style_id or "default",
+            reference_image_ids=ref_ids,
+            style_override=style_override,
+            global_visual_assets=global_visual_assets,
+            has_project_logo=bool(_project_logo_refs(project)),
+        )
+    except VisualPlanGenerationError as exc:
+        raise HTTPException(status_code=502, detail=f"视觉方案生成失败：{str(exc)[:300]}") from exc
     artifact_deps = dependency_signature(project, slides)
 
     # 保存 visual_plan 到每页 slide（只更新选中的页，或全部）
@@ -2715,11 +2780,14 @@ def create_prompts(
         if ref_user_hints.get(s.page_num):
             item["reference_user_hint"] = ref_user_hints[s.page_num]
         content_plan.append(item)
-    visual_plan = [
-        _with_prompt_asset_policies(s.visual_json, project, s)
-        for s in target_slides
-        if s.visual_json
-    ]
+    visual_plan = []
+    for s in target_slides:
+        if not s.visual_json:
+            continue
+        intent = _with_prompt_asset_policies(s.visual_json, project, s) or {}
+        if isinstance(intent, dict) and not intent.get("page_num"):
+            intent = {**intent, "page_num": s.page_num}
+        visual_plan.append(intent)
     visual_intent_by_page = {
         int(intent.get("page_num") or 0): intent
         for intent in visual_plan
@@ -3401,6 +3469,13 @@ def stop_generation(
         redis_client.delete(f"project:{project_id}:task_id")
         redis_client.delete(f"project:{project_id}:task_started_at")
 
+    lock_page_nums = set()
+    if active_run and active_run.target_page_nums:
+        lock_page_nums.update(int(p) for p in active_run.target_page_nums if str(p).isdigit())
+    lock_page_nums.update(s.page_num for s in slides if s.status == "generating")
+    for page_num in sorted(lock_page_nums):
+        redis_client.delete(f"project:{project_id}:slide:{page_num}:generating")
+
     # 清除进度缓存
     if project_id in generation_progress:
         del generation_progress[project_id]
@@ -3575,12 +3650,22 @@ def download_pptx(project_id: str, prototype: bool = False, db: Session = Depend
         raise HTTPException(status_code=404, detail="Project not found")
     slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
 
-    filename = "prototype.pptx" if prototype else "partial_presentation.pptx"
-    pptx_path = os.path.join(
+    output_dir = os.path.join(
         settings.OUTPUT_DIR or "./outputs",
         project_id,
-        filename,
     )
+    if not prototype and project.status == "completed":
+        final_pptx_path = os.path.join(output_dir, "presentation.pptx")
+        if os.path.exists(final_pptx_path) and not _project_has_stale_artifacts(slides):
+            display_name = f"{project.title}.pptx"
+            return FileResponse(
+                path=final_pptx_path,
+                filename=display_name,
+                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            )
+
+    filename = "prototype.pptx" if prototype else "partial_presentation.pptx"
+    pptx_path = os.path.join(output_dir, filename)
     generated_count = _assemble_partial_project_pptx(project, slides, pptx_path)
     if generated_count == 0:
         raise HTTPException(status_code=404, detail="还没有生成过页面，暂时不能导出 PPTX。")
@@ -4452,9 +4537,10 @@ def retry_failed_slides(
 
 class RetryRequest(BaseModel):
     regenerate_prompt: bool = False
+    user_feedback: Optional[str] = None
 
 
-def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str:
+def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_feedback: str | None = None) -> str:
     """为单页重新生成 prompt_text，基于最新的 content_json 和 visual_json。"""
     content_json = slide.content_json or {}
     visual_json = slide.visual_json or {}
@@ -4481,6 +4567,8 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
             "subhead": content_text.get("subhead", ""),
             "body": content_text.get("body", ""),
         }
+        if content_json.get("visual_requirements"):
+            content_text["visual_requirements"] = content_json.get("visual_requirements")
     else:
         content_text = {"headline": "", "subhead": "", "body": ""}
 
@@ -4500,6 +4588,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session) -> str
         style_id=project.style_id or "default",
         reference_images=reference_images or None,
         style_text_override=style_text_override,
+        user_feedback=user_feedback,
     )
 
     slide.prompt_text = prompt
@@ -4530,7 +4619,7 @@ def _finetune_should_attach_project_product_assets(instruction: str) -> bool:
     text = (instruction or "").lower()
     action_terms = ("换成", "替换", "换上", "改成", "改为", "replace", "use the uploaded", "上传")
     asset_terms = (
-        "核心资产", "客户", "产品", "油瓶", "瓶", "包装",
+        "核心资产", "客户", "产品", "瓶", "包装",
         "visual asset", "product", "bottle", "packaging",
     )
     return any(term in text for term in action_terms) and any(term in text for term in asset_terms)
@@ -4740,7 +4829,7 @@ def retry_slide(
 
     # 如果要求重新生成 prompt，基于最新 content/visual 重新生成
     if body.regenerate_prompt:
-        _regenerate_slide_prompt(slide, project, db)
+        _regenerate_slide_prompt(slide, project, db, user_feedback=(body.user_feedback or "").strip() or None)
 
     if has_stale_flags(slide.visual_json, "content", "visual"):
         raise HTTPException(status_code=400, detail="该页面有未应用的内容或画面修改，请先更新画面方案。")
@@ -4814,18 +4903,39 @@ def update_slide_content(
         existing["text_content"] = existing_text
     if "speaker_notes" in new_content:
         existing["speaker_notes"] = new_content["speaker_notes"]
+    if "visual_suggestion" in new_content:
+        existing["visual_suggestion"] = new_content["visual_suggestion"]
+    if "visual_requirements" in new_content:
+        existing["visual_requirements"] = new_content["visual_requirements"]
     if "content_blocks" in new_content:
         existing["content_blocks"] = new_content["content_blocks"]
 
     existing = _sync_content_block_assets(db, project, slide, existing)
+    text_content = existing.get("text_content") if isinstance(existing.get("text_content"), dict) else {}
+    directive_extraction = extract_visual_directives(str(text_content.get("body") or ""))
     slide.content_json = existing
     _mark_slide_artifacts_stale(slide, content=True)
     db.commit()
+
+    # 自动重分类：若未锁定，根据内容特征判断是否需要切换类型
+    type_changed = False
+    new_type = None
+    if not slide.type_locked:
+        detected = _auto_reclassify_page_type(slide.content_json, slide.type)
+        if detected and detected != slide.type:
+            slide.type = detected
+            db.commit()
+            type_changed = True
+            new_type = detected
 
     return {
         "message": "Slide content updated",
         "page_num": slide.page_num,
         "slide_id": slide.id,
+        "type_changed": type_changed,
+        "type": slide.type,
+        "new_type": new_type,
+        "visual_directive_suggestions": directive_extraction.get("suggestions", []),
     }
 
 
@@ -4880,6 +4990,42 @@ def update_slide_visual(
         "message": "Slide visual updated",
         "page_num": slide.page_num,
         "slide_id": slide.id,
+    }
+
+
+@router.patch("/{project_id}/slides/type")
+def update_slide_type(
+    project_id: str,
+    body: UpdateTypeRequest,
+    db: Session = Depends(get_db),
+):
+    """手动更新 slide 类型并锁定，后续自动重分类不再覆盖。"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if body.slide_id:
+        slide = db.query(Slide).filter(Slide.project_id == project_id, Slide.id == body.slide_id).first()
+    else:
+        slide = (
+            db.query(Slide)
+            .filter(Slide.project_id == project_id, Slide.page_num == body.page_num)
+            .first()
+        )
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found")
+
+    slide.type = body.type
+    slide.type_locked = True
+    _mark_slide_artifacts_stale(slide, content=True)
+    db.commit()
+
+    return {
+        "message": "Slide type updated and locked",
+        "page_num": slide.page_num,
+        "slide_id": slide.id,
+        "type": slide.type,
+        "type_locked": slide.type_locked,
     }
 
 

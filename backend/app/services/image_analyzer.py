@@ -157,12 +157,13 @@ def _minimax_coding_plan_url() -> str:
     return f"{base}/v1/coding_plan/vlm"
 
 
-def _call_vision_model(image_path: str, prompt: str) -> str:
+def _call_vision_model(image_path: str, prompt: str, *, timeout_seconds: float | None = None) -> str:
     """调用 MiniMax Token Plan VLM 分析图片，返回文本结果。"""
     try:
         b64 = _encode_image_to_base64(image_path)
         mime = _guess_mime_type(image_path)
         image_url = f"data:{mime};base64,{b64}"
+        request_timeout = 120 if timeout_seconds is None else max(3, float(timeout_seconds))
         resp = requests.post(
             _minimax_coding_plan_url(),
             headers={
@@ -171,7 +172,7 @@ def _call_vision_model(image_path: str, prompt: str) -> str:
                 "MM-API-Source": "Minimax-MCP",
             },
             json={"prompt": prompt, "image_url": image_url},
-            timeout=120,
+            timeout=request_timeout,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -322,7 +323,14 @@ def analyze_visual_asset(image_path: str, asset_name: str = "", asset_kind: str 
     return result
 
 
-def describe_context_image(image_path: str, image_name: str = "", role: str = "", purpose: str = "") -> str:
+def describe_context_image(
+    image_path: str,
+    image_name: str = "",
+    role: str = "",
+    purpose: str = "",
+    *,
+    timeout_seconds: float | None = None,
+) -> str:
     """
     Read a user-supplied context image for Agent chat and content planning.
     This is content-facing: OCR first, then summarize the visual material so
@@ -346,7 +354,7 @@ def describe_context_image(image_path: str, image_name: str = "", role: str = ""
 图片角色：{role or "用户上传图片"}
 使用场景：{purpose or "Agent 对话上下文"}"""
 
-    raw = _call_vision_model(image_path, prompt)
+    raw = _call_vision_model(image_path, prompt, timeout_seconds=timeout_seconds)
     return (raw or "").strip()[:4000]
 
 

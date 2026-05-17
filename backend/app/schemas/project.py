@@ -19,6 +19,7 @@ class ProjectUpdate(BaseModel):
     status: Optional[str] = None
     style_id: Optional[str] = None
     content_plan_confirmed: Optional[bool] = None
+    intent_contract: Optional[dict] = None
 
 
 class ProjectResponse(ProjectBase):
@@ -28,6 +29,7 @@ class ProjectResponse(ProjectBase):
     style_proposal: Optional[dict] = None
     selected_style: Optional[dict] = None
     selected_template_recommendations: Optional[dict] = None
+    intent_contract: Optional[dict] = None
     has_unread_notification: bool = False
     unread_notification_message: Optional[str] = None
     created_at: datetime
