@@ -424,23 +424,27 @@ def _document_preservation_policy(documents: str, topic: str = "", intent_contra
             "- 用户材料篇幅可控，默认目标是整理成 PPT，而不是重写。\n"
             "- 尽量保留原文的关键句、术语、数据、案例和表达顺序；标题可优化，但正文不要大幅改写。\n"
             "- 只有为分段、去重、纠正明显病句或适配版面时才做轻微编辑。\n"
+            "- 如果材料来自 PPT 解析，自动识别并过滤版式模板占位文字和布局结构标注，只保留真实内容。\n"
         )
     if mode == "structured_extract":
         return (
             "【结构化摘取模式】\n"
             "- 材料较长，但仍应优先摘取原文中的关键段落和数据，不要重新发明叙事。\n"
             "- 每页正文使用原文要点的压缩版；删减只针对重复、旁枝和低信息密度内容。\n"
+            "- 如果材料来自 PPT 解析，自动识别并过滤版式模板占位文字和布局结构标注，只保留真实内容。\n"
         )
     if mode == "synthesis":
         return (
             "【综合提炼模式】\n"
             "- 材料过长，允许按 PPT 方法论提炼主线。\n"
             "- 必须保留核心论点、专有名词、关键数字、引用和结论，避免改写用户立场。\n"
+            "- 如果材料来自 PPT 解析，自动识别并过滤版式模板占位文字和布局结构标注，只保留真实内容。\n"
         )
     if mode == "transform":
         return (
             "【用户要求改写/提炼】\n"
             "- 可按用户目标重组材料，但不得改变事实、立场和关键术语。\n"
+            "- 如果材料来自 PPT 解析，自动识别并过滤版式模板占位文字和布局结构标注，只保留真实内容。\n"
         )
     return ""
 
@@ -653,6 +657,19 @@ def validate_direct_ppt_replicate_outline(
         "missing_pages": missing_pages,
         "marker_pages": marker_pages,
     }
+
+
+def _is_direct_replicate_request(
+    topic: str,
+    documents: str,
+    intent_contract: dict | None = None,
+) -> bool:
+    """Detect if the user is requesting a 1:1 PPT replication."""
+    sources = detect_ppt_sources(documents)
+    if len(sources) != 1:
+        return False
+    policy = _planning_policy(topic, documents, intent_contract)
+    return bool(policy.get("allow_direct_ppt_replicate"))
 
 
 def build_direct_ppt_replicate_outline(
@@ -1908,6 +1925,7 @@ def _generate_model_page_map(
     source_page_map_markdown: str = "",
     intent_contract: dict | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    mode: str = "default",
 ) -> list[dict]:
     documents = sanitize_ppt_recovery_text_for_content(documents)
     if on_progress:
@@ -1921,7 +1939,16 @@ def _generate_model_page_map(
     if len(doc_text) > PAGE_MAP_DOCUMENT_LIMIT:
         doc_text = _document_excerpt_for_extension(doc_text, limit=PAGE_MAP_DOCUMENT_LIMIT)
     preservation_policy = _document_preservation_policy(documents, topic, intent_contract)
-    prompt = f"""你是一位顶尖的 PPT 内容架构师。请先生成整份 PPT 的“逐页内容地图”，不要输出 JSON。
+    mode_instruction = ""
+    if mode == "direct_replicate":
+        mode_instruction = """
+【直接复刻约束】
+- 严格按原PPT页数和顺序输出，不要合并、拆分或重新排序页面。
+- 尽量保留原PPT的标题和正文，不要改写内容。
+- 自动识别并过滤版式模板占位符，只保留真实信息。
+- 保持原PPT的信息密度，不要因为"每页只说一件事"而删减原文内容。"""
+
+    prompt = f"""你是一位顶尖的 PPT 内容架构师。请先生成整份 PPT 的"逐页内容地图"，不要输出 JSON。
 
 【用户主题和约束】
 {topic}
@@ -1944,18 +1971,20 @@ def _generate_model_page_map(
 
 【材料使用规则】
 {preservation_policy or "没有上传文档时，根据用户主题和受众目标生成内容结构。"}
+{mode_instruction}
 
 【输出要求】
 1. 一次性给出全局逐页内容地图，必须覆盖整份 PPT 的开场、主线、转场、案例、复盘和结尾。
 2. 每页都要有标题、2-3 个具体 bullet、演讲者备注；不要只写章节名或空泛框架。
 3. 标题和 bullet 必须尽量来自用户材料或 Brief，不能为了凑页数发明不相干内容。
-4. 如果提供了“系统预生成的正文底稿”，你必须以它为基础优化标题、顺序和取舍；content/agenda/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
-5. 不要把同一个来源主题拆成“简短版”和“展开版”两页；如果两页标题、bullet 或来源线索接近，必须合并为一页，只保留更完整的一版。
+4. 如果提供了"系统预生成的正文底稿"，你必须以它为基础优化标题、顺序和取舍；content/agenda/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
+5. 不要把同一个来源主题拆成"简短版"和"展开版"两页；如果两页标题、bullet 或来源线索接近，必须合并为一页，只保留更完整的一版。
 6. 相邻页面必须有明确的新信息、新问题、新活动或新叙事功能；不能出现连续两页同标题、同 bullet、同来源框架。
 7. 页间要有连续叙事：上一页为什么引出下一页要想清楚。
 8. 封面页可以没有 bullet；封底页只收束，不引入新论点。
 9. 用户材料中的 Markdown 分隔线（如 ---、***、___）只代表结构，不能作为标题、bullet 或正文输出。
-10. 输出格式必须固定为：
+10. 如果用户上传材料来自 PPT 解析，其中可能残留版式模板占位文字（如"单击此处添加标题""标题/主文案""第一行："等）或布局结构标注。你必须自动识别并过滤这些非内容元素，只保留真实信息。
+11. 输出格式必须固定为：
 P1｜cover｜封面｜标题
 - bullet
 - bullet
@@ -2036,6 +2065,7 @@ def generate_content_page_map(
     search_context: str = "",
     intent_contract: dict | None = None,
     on_progress: Callable[[dict], None] | None = None,
+    mode: str = "default",
 ) -> list[dict]:
     documents = sanitize_ppt_recovery_text_for_content(documents)
     requested_page_range = infer_page_count_range_from_topic(topic)
@@ -2081,6 +2111,7 @@ def generate_content_page_map(
             source_page_map_markdown=source_page_map_markdown,
             intent_contract=intent_contract,
             on_progress=on_progress,
+            mode=mode,
         )
         model_map = _merge_page_map_with_fallback(
             model_map,
@@ -2817,22 +2848,6 @@ def generate_content_plan(
             })
         return paginated_markdown_outline
 
-    direct_ppt_outline = build_direct_ppt_replicate_outline(
-        documents,
-        topic,
-        intent_contract=effective_intent_contract,
-    )
-    if direct_ppt_outline and not requested_page_range and not strict_page_count:
-        logger.info("ContentPlan: detected single PPT direct replicate request, reusing %s source pages", len(direct_ppt_outline))
-        if on_progress:
-            on_progress({
-                "stage": "saving",
-                "message": "已按上传 PPT 逐页整理，正在保存结果...",
-                "current_page": len(direct_ppt_outline),
-                "total_pages": len(direct_ppt_outline),
-            })
-        return direct_ppt_outline
-
     doc_section = ""
     if has_docs:
         ppt_sources = detect_ppt_sources(documents)
@@ -2845,7 +2860,7 @@ def generate_content_plan(
 系统识别到用户上传了 1 个 PPT：{ppt.get("filename") or "未命名 PPT"}，原始页数 {ppt.get("pages")} 页。
 - 如果用户处理意图要求保留原页顺序，第 i 个 JSON 页面优先对应原 PPT 第 i 页；只有用户明确要求重组、压缩、扩展或融合时才改变页序。
 - 对于轻优化任务，标题和正文可以更清晰，但必须忠于原页要表达的意思，不要重新发明叙事。
-- 原页中出现的关键数字、标签、对比项、流程节点、学校/城市名单、产品规格必须进入 text_content.body；不能只放在 speaker_notes，也不能因为“每页只说一件事”而删除原页事实。
+- 原页中出现的关键数字、标签、对比项、流程节点、学校/城市名单、产品规格必须进入 text_content.body；不能只放在 speaker_notes，也不能因为"每页只说一件事"而删除原页事实。
 - 如果原页是信息密集页，允许 body 使用表格或分组 bullet 承载原文信息；视觉阶段会再做版式取舍，内容规划阶段不得提前丢信息。
 - 每一页必须输出 source_refs: [{{"source_document": "{ppt.get("filename") or "未命名 PPT"}", "source_page_num": 原PPT页码, "reason": "polish"}}]，确保新页能追溯到原 PPT 页。
 - 如果用户明确要求扩展/缩减/提取/融合/加入新想法，则按用户意图动态调整页数和结构。
@@ -2882,6 +2897,11 @@ def generate_content_plan(
 """
         logger.info(f"ContentPlan: 已注入搜索上下文，topic={topic[:30]}")
 
+    # Detect direct replicate mode from topic/intent
+    mode = "default"
+    if _is_direct_replicate_request(topic, documents, effective_intent_contract):
+        mode = "direct_replicate"
+
     page_map = generate_content_page_map(
         topic=topic,
         audience=audience,
@@ -2890,6 +2910,7 @@ def generate_content_plan(
         search_context=search_context,
         intent_contract=effective_intent_contract,
         on_progress=on_progress,
+        mode=mode,
     )
     outline = content_plan_from_page_map(page_map)
     outline = _normalize_outline_page_count(outline, page_count, strict_page_count=strict_page_count)
@@ -2959,10 +2980,10 @@ def generate_content_plan(
 {blueprint_section}
 
 【任务要求】
-1. 设计清晰结构；有充分原文时以“组织原文”为主，不主动换叙事。
+1. 设计清晰结构；有充分原文时以"组织原文"为主，不主动换叙事。
 2. 每页必须包含：
    - page_num: 页码
-   - type: 页面类型（cover/目录 toc/章节 section/content/hero/data/ending）。其中 hero 是“金句页/punchline slide”，不是普通内容页。
+   - type: 页面类型（cover/目录 toc/章节 section/content/hero/data/ending）。其中 hero 是"金句页/punchline slide"，不是普通内容页。
    - section_title: 所属章节
    - text_content.headline: 大标题（有力、简洁的断言句）
    - text_content.subhead: 副标题（可选）
@@ -2973,10 +2994,10 @@ def generate_content_plan(
    - source_refs: 来源页引用数组。使用上传 PPT 内容时必须填写，元素格式为 {{"source_document": "源文件名", "source_page_num": 原页码, "reason": "使用原因"}}；纯新增页可为空数组。
 3. 封面和封底各占一页。封面只定主题和语境，body 保持为空；封底只做收束、感谢、下一步或联系方式，不引入新论点。
 4. 内容页不要堆砌，每页只说一件事。
-   - 但当任务是“改写/美化一个已上传 PPT”时，这条不能被理解为删掉原页信息；应保留原页事实，只把同一页信息组织得更清楚。
+   - 但当任务是"改写/美化一个已上传 PPT"时，这条不能被理解为删掉原页信息；应保留原页事实，只把同一页信息组织得更清楚。
 5. 标题可优化表达，但不能改变原文判断；原文标题已经清楚时直接沿用。
 6. 如果一个页面同时包含多个强画面证据/大事件，可主动拆页，而不是硬塞进同一页。
-7. 普通“期望页数/约 X 页/从 X 到 Y 页”是软目标；优先满足用户范围，但材料不足时生成更合适的长度，不要用空泛页面凑数。只有用户明确说“必须/严格/固定/只能 X 页/一页不能多也不能少”时才严格等于 X 页。
+7. 普通"期望页数/约 X 页/从 X 到 Y 页"是软目标；优先满足用户范围，但材料不足时生成更合适的长度，不要用空泛页面凑数。只有用户明确说"必须/严格/固定/只能 X 页/一页不能多也不能少"时才严格等于 X 页。
 8. 目录页只在原文结构复杂且目录能降低理解成本时使用；不要默认插入。
 9. 章节页（type="section"）只用于重大章节转换或叙事转折；它是短标题的分隔页，不承载正文论证。headline 放章节名或转场判断，body 保持为空或只放极短一句。
 10. 数据页（type="data"）只在确有数字、比例、排名、时间序列、规模量级或可视化表格时使用；不要为了显得专业而编造图表。

@@ -323,6 +323,33 @@ def analyze_visual_asset(image_path: str, asset_name: str = "", asset_kind: str 
     return result
 
 
+def describe_ppt_page_ocr(
+    image_path: str,
+    page_num: int,
+    source_filename: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> str:
+    """Extract OCR text from a PPT page screenshot. Focuses only on readable text."""
+    if not os.path.exists(image_path):
+        logger.warning(f"PPT page image not found: {image_path}")
+        return ""
+
+    prompt = f"""你是PPT文字提取专家。请仔细识别这张PPT页面截图中的所有可读文字。
+
+要求：
+1. 只提取图片中实际出现的文字，包括标题、正文、标签、数字、品牌名
+2. 不要描述视觉元素、颜色、布局、图片内容或符号形状
+3. 不要添加任何分析、解释或总结
+4. 如果图片中没有可读文字，只返回"无明显文字"
+5. 按阅读顺序输出文字，保持原有的段落和列表结构
+
+图片：{source_filename} 第{page_num}页"""
+
+    raw = _call_vision_model(image_path, prompt, timeout_seconds=timeout_seconds)
+    return (raw or "").strip()[:4000]
+
+
 def describe_context_image(
     image_path: str,
     image_name: str = "",

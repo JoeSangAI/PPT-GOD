@@ -243,22 +243,13 @@ def derive_style_pack_from_content(
         rhythm = ref_clone or ref_ornaments or "每页由文案决定画面证据，参考图只统一色彩、材质和装饰强度"
     else:
         # 没有参考图时，让 LLM 根据内容计划生成风格推荐
-        try:
-            from app.services.style_proposal import generate_style_proposals
-            proposals = generate_style_proposals(content_plan or [])
-            if proposals and isinstance(proposals[0], dict):
-                style_pack = style_pack_from_selected_style(proposals[0])
-                if style_pack:
-                    return style_pack
-        except Exception:
-            pass
-        # 极简兜底：不硬编码具体风格，让生图模型根据内容自行推导
-        style = "由内容主题自然适配"
-        palette = []
-        mood = "贴合内容气质，不预设具体风格"
-        typography = "由风格气质决定字体搭配"
-        page_rule = "封面/章节页可强化情绪；内容/数据页优先可读。"
-        rhythm = "每页由文案决定画面证据，风格由内容主题自然推导"
+        from app.services.style_proposal import generate_style_proposals
+        proposals = generate_style_proposals(content_plan or [])
+        if proposals and isinstance(proposals[0], dict):
+            style_pack = style_pack_from_selected_style(proposals[0])
+            if style_pack:
+                return style_pack
+        raise RuntimeError("StylePack: LLM 未返回有效风格提案")
 
     strategy = build_visual_strategy(
         summary={

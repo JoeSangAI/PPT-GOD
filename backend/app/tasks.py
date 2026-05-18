@@ -316,6 +316,10 @@ def _generate_slides_task_inner(
             run_id=run_id,
             defer_finalization=bool(remaining_pages),
         )
+        # 被跳过的页（因锁占用）不能永久丢失，加回剩余队列
+        if skipped_pages:
+            remaining_pages = list(dict.fromkeys(remaining_pages + skipped_pages))
+
         if remaining_pages and is_run_active(db, run_id):
             next_task = _enqueue_generation_continuation(
                 db,
@@ -380,6 +384,13 @@ def _generate_slides_task_inner(
         return {"project_id": project_id, "status": "failed", "error": str(exc), "page_nums": acquired_pages, "prototype": prototype}
     finally:
         _release_page_locks(project_id, acquired_pages)
+        # 清理任何可能残留的孤儿锁（包括被跳过或尚未处理的页）
+        all_related_pages = list(dict.fromkeys(acquired_pages + skipped_pages + remaining_pages))
+        if all_related_pages:
+            try:
+                _cleanup_stale_generating_slides(project_id, all_related_pages)
+            except Exception as exc:
+                logger.warning("Failed to cleanup stale generating slides in finally for project %s: %s", project_id, exc)
         try:
             if not continuation_enqueued:
                 redis_client.delete(f"project:{project_id}:task_id")

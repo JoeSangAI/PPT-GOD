@@ -186,11 +186,14 @@ def visual_strategy_text(strategy: Mapping[str, Any] | None) -> str:
 
 
 def visual_language_group(page_type: str | None, layout: str | None, strategy: Mapping[str, Any] | None) -> str:
+    """MECE family → language_group 映射（与 seed_family / layout 一一对应）。"""
     base_tone = str((strategy or {}).get("base_tone") or "mixed").lower()
     page_type = str(page_type or "content").lower()
     layout = str(layout or "").lower()
-    if page_type in {"cover", "ending"}:
-        role = "bookend"
+    if page_type == "cover" or layout == "cover":
+        role = "cover"
+    elif page_type == "ending" or layout == "ending":
+        role = "ending"
     elif page_type in {"hero", "quote"} or layout == "hero":
         role = "hero"
     elif page_type == "toc" or layout == "toc":

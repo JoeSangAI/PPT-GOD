@@ -7342,11 +7342,16 @@ function App() {
       ? (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length
       : 0);
   const failedSlidePageNums = slides.filter((s) => s.status === "failed").map((s) => s.page_num);
+  const incompleteSlidePageNums = slides
+    .filter((s) => s.status !== "completed" && s.status !== "failed")
+    .map((s) => s.page_num)
+    .filter((n) => Number.isFinite(n));
   const statusCard: StatusCardData | null = selectedProject
     ? getStatusCard({
         workflowState,
         staleActionPlan,
         failedPageNums: failedSlidePageNums,
+        incompletePageNums: incompleteSlidePageNums,
         visiblePrototypePageNums,
         resamplePageNums: resamplePrototypePageNums,
         prototypePromptTargetCount: prototypePromptTargets.length,
@@ -7364,6 +7369,9 @@ function App() {
         return;
       case "retry-failed":
         void dispatchGateAction("retry_failed");
+        return;
+      case "continue-generation":
+        void dispatchGateAction("start_generation", { page_nums: incompleteSlidePageNums });
         return;
       case "update-stale-visual":
         void handleUpdateStaleSlides();
@@ -8796,16 +8804,24 @@ function App() {
 
                       {/* 重试按钮 */}
                       {slide.status === "failed" && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleRetry(slide.id);
-                          }}
-                          disabled={isBusy || chatLoading}
-                          className="mt-1 text-xs bg-red-50 text-red-600 px-2 py-1 rounded hover:bg-red-100 self-start disabled:opacity-50 leading-none"
-                        >
-                          {isBusy ? "重试中..." : "重试"}
-                        </button>
+                        <div className="flex flex-col gap-0.5 self-start">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleRetry(slide.id);
+                            }}
+                            disabled={isBusy || chatLoading}
+                            className="text-xs bg-red-50 text-red-600 px-2 py-1 rounded hover:bg-red-100 self-start disabled:opacity-50 leading-none"
+                            title={slide.error_msg || undefined}
+                          >
+                            {isBusy ? "重试中..." : "重试"}
+                          </button>
+                          {slide.error_msg && (
+                            <span className="text-[10px] text-slate-400 truncate max-w-[140px]" title={slide.error_msg}>
+                              {slide.error_msg.length > 20 ? `${slide.error_msg.slice(0, 20)}...` : slide.error_msg}
+                            </span>
+                          )}
+                        </div>
                       )}
                     </div>
 
@@ -11389,7 +11405,7 @@ function SingleSlideEditor({
             enabled: true,
             preset: "right-card",
             fit: "contain",
-            mode: "exact_card",
+            mode: "exact_cutout",
             usage_note: `${pageReferenceLabel(ref)}：原图保留`,
           },
         ]);
@@ -11449,7 +11465,7 @@ function SingleSlideEditor({
             enabled: true,
             preset: "right-card",
             fit: "contain",
-            mode: "exact_card",
+            mode: "exact_cutout",
             usage_note: visualAssetUsage[assetId] || "用户切换为精确粘贴",
           },
         ]);

@@ -1589,17 +1589,56 @@ def _update_progress(project_id: str, data: dict, run_id: str | None = None):
 
 def _mark_generation_idle(project: Project | None, db: Session, reason: str):
     """Return a stale generating project to a recoverable state."""
-    if project:
-        slides = db.query(Slide).filter(
-            Slide.project_id == project.id,
-            Slide.status == "generating",
-        ).all()
-        for slide in slides:
-            slide.status = "prompt_ready"
-            slide.error_msg = reason
-        if project.status not in {"draft", "planning", "visual_ready", "prompt_ready", "prototype_ready", "completed", "failed"}:
-            project.status = "prompt_ready"
+    if not project:
+        return
+    slides = db.query(Slide).filter(
+        Slide.project_id == project.id,
+        Slide.status == "generating",
+    ).all()
+    for slide in slides:
+        slide.status = "prompt_ready"
+        slide.error_msg = reason
+        try:
+            redis_client.delete(f"project:{project.id}:slide:{slide.page_num}:generating")
+        except Exception as exc:
+            logger.warning(
+                "Failed to release stale page lock project=%s page=%s: %s",
+                project.id, slide.page_num, exc,
+            )
+    if project.status not in {"draft", "planning", "visual_ready", "prompt_ready", "prototype_ready", "completed", "failed"}:
+        project.status = "prompt_ready"
+    db.commit()
+
+
+def _cleanup_stale_generating_slides_for_project(db: Session, project_id: str) -> int:
+    """Release orphaned Redis locks and reset generating slides to prompt_ready.
+
+    Called before starting a new generation run to ensure stale locks from
+    crashed or interrupted tasks do not block the new run.
+    """
+    slides = db.query(Slide).filter(
+        Slide.project_id == project_id,
+        Slide.status == "generating",
+    ).all()
+    cleaned = 0
+    for slide in slides:
+        lock_key = f"project:{project_id}:slide:{slide.page_num}:generating"
+        try:
+            # If lock is gone the task clearly died; if lock exists we also
+            # delete it because the caller has already verified no active run.
+            redis_client.delete(lock_key)
+        except Exception as exc:
+            logger.warning(
+                "Pre-clean failed to delete lock project=%s page=%s: %s",
+                project_id, slide.page_num, exc,
+            )
+        slide.status = "prompt_ready"
+        slide.error_msg = None
+        cleaned += 1
+    if cleaned:
         db.commit()
+        logger.info("Pre-cleaned %s stale generating slides for project %s", cleaned, project_id)
+    return cleaned
 
 
 def _celery_task_id_from_payload(payload: dict | None) -> str | None:
@@ -1741,7 +1780,80 @@ def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, a
     redis_client.delete(f"project:{project.id}:task_id")
     redis_client.delete(f"project:{project.id}:task_started_at")
     db.commit()
+    _auto_restart_generation_if_needed(project, db, active_run)
     return True
+
+
+def _auto_restart_generation_if_needed(project: Project, db: Session, previous_run) -> bool:
+    """After a Celery task is lost, automatically restart generation so the user does not need to manually retry.
+
+    Conservative policy: only auto-restart if the previous run had already made some
+    progress (completed_count > 0). This avoids wasting tokens when the root cause is
+    a permanent failure (e.g. worker misconfiguration) rather than a transient crash.
+    """
+    if previous_run.kind not in {"batch_generation", "page_generation", "prototype_generation", "retry_failed"}:
+        return False
+
+    # If the run never completed a single page, the failure is likely permanent
+    # (bad config, bad deployment, etc.). Don't auto-restart — let the user investigate.
+    if (previous_run.completed_count or 0) == 0:
+        return False
+
+    restart_key = f"project:{project.id}:auto_restart_run_id"
+    try:
+        already_restarted = redis_client.get(restart_key)
+        if already_restarted and already_restarted.decode() == previous_run.id:
+            logger.info("Auto-restart already attempted for run %s, skipping", previous_run.id)
+            return False
+    except Exception:
+        pass
+
+    slides = (
+        db.query(Slide)
+        .filter(
+            Slide.project_id == project.id,
+            Slide.status.in_(["prompt_ready", "failed"]),
+            Slide.prompt_text.isnot(None),
+        )
+        .order_by(Slide.page_num)
+        .all()
+    )
+    slides = [s for s in slides if str(s.prompt_text or "").strip()]
+    if not slides:
+        return False
+
+    page_nums = [s.page_num for s in slides]
+    prototype = previous_run.kind == "prototype_generation"
+    run_kind = previous_run.kind if previous_run.kind == "prototype_generation" else "batch_generation"
+    run_stage = "prototype_generation" if prototype else "batch_generation"
+
+    run = create_project_run(
+        db,
+        project.id,
+        kind=run_kind,
+        stage=run_stage,
+        target_page_nums=page_nums,
+        total_count=len(page_nums),
+        message="后台任务中断，已自动恢复生成",
+    )
+    run.status = "queued"
+    db.commit()
+
+    try:
+        redis_client.set(restart_key, previous_run.id, ex=3600)
+    except Exception:
+        pass
+
+    try:
+        _enqueue_generation_task(db, project.id, page_nums, run=run, prototype=prototype)
+        logger.info(
+            "Auto-restarted generation for project=%s previous_run=%s new_run=%s pages=%s",
+            project.id, previous_run.id, run.id, page_nums,
+        )
+        return True
+    except Exception as exc:
+        logger.exception("Auto-restart failed for project=%s", project.id)
+        return False
 
 
 def _format_reference_analysis(analysis: dict) -> str:
@@ -3283,6 +3395,7 @@ def start_generation(
             status_code=400,
             detail=f"第 {', '.join(map(str, missing_prompt_pages))} 页缺少生图 Prompt，请先生成画面描述。"
         )
+    _cleanup_stale_generating_slides_for_project(db, project_id)
     ensure_generation_worker_ready()
     run_kind = "prototype_generation" if body.prototype else ("page_generation" if page_nums else "batch_generation")
     run_stage = "prototype_generation" if body.prototype else "batch_generation"
@@ -4418,17 +4531,15 @@ def update_slide_overlay_layers(
         ).all()
         valid_assets = [
             asset for asset in candidates
-            if (
-                (asset.role == "visual_asset" and asset.slide_id is None)
-                or (asset.role in {"content_ref", "chart_ref"} and asset.slide_id == slide.id)
-            )
+            if asset.file_path and os.path.exists(asset.file_path)
         ]
-    valid_ids = {
-        asset.id for asset in valid_assets
-        if asset.file_path and os.path.exists(asset.file_path)
-    }
+    valid_ids = {asset.id for asset in valid_assets}
     missing = [asset_id for asset_id in requested_asset_ids if asset_id not in valid_ids]
     if missing:
+        logger.warning(
+            "update_slide_overlay_layers: requested asset_ids not found or missing file: %s",
+            missing,
+        )
         raise HTTPException(status_code=400, detail=f"Invalid overlay asset ids: {', '.join(missing[:5])}")
 
     normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
@@ -4501,6 +4612,7 @@ def retry_failed_slides(
     if not page_nums:
         raise HTTPException(status_code=400, detail="所有失败页面正在重试中，请稍候")
 
+    _cleanup_stale_generating_slides_for_project(db, project_id)
     ensure_generation_worker_ready()
     run = create_project_run(
         db,

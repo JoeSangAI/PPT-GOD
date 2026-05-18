@@ -99,7 +99,7 @@ def test_parse_pptx_recovers_only_ocr_section_from_unstructured_vision_response(
 【识别置信度】0.60
 """
 
-    monkeypatch.setattr(pptx_page_recovery, "describe_context_image", fake_describe)
+    monkeypatch.setattr(pptx_page_recovery, "describe_ppt_page_ocr", fake_describe)
 
     text = parse_document(_pptx_with_full_slide_picture(), "平台介绍.pptx")
 

@@ -131,9 +131,17 @@ def overlay_reservation_instruction(
         parts.append(label)
     joined = "; ".join(parts)
     return (
-        "Reserve clean empty space for exact post-generation overlay assets in these areas: "
-        f"{joined}. Do not place required text, faces, key subjects, charts, dense texture, "
-        "or decorative marks inside those reserved areas."
+        "CRITICAL LAYOUT INSTRUCTION: Reserve clean empty background space for post-generation overlay assets in these areas: "
+        f"{joined}. "
+        "TEXT PLACEMENT RULE: Place ALL visible text, headlines, subheads, and body copy strictly in safe zones that do NOT overlap with reserved areas. "
+        "When left and right areas are both reserved, place all text in the upper-center region only, keeping it well above and clear of any reserved zones. "
+        "Never place text between two reserved side areas or inside reserved zones. "
+        "RESERVED AREA RULES: These reserved areas MUST remain completely free of ALL text, faces, key subjects, "
+        "charts, icons, logos, dense texture, decorative marks, placeholder rectangles, tinted panels, card backgrounds, "
+        "or ANY visual elements. The reserved space should be visually indistinguishable from the background — "
+        "no visual indication that space is held. Generate only soft muted background tones with subtle edge gradients for natural blending. "
+        "Do NOT add borders, frames, decorative edges, shadows, boxes, cards, placeholders, or ANY content inside or around these reserved areas. "
+        "Treat these as invisible strict no-content zones where absolutely nothing should be rendered."
     )
 
 

@@ -65,10 +65,15 @@ def _infer_seed_family(page_type: str) -> str:
     家族规则：同家族的页面共享版式、字体、配色和装饰语言。
     每个家族里第一张已生成的页会自动成为该家族的"种子页"，
     后续兄弟页生成时拿种子图作为视觉参考，保证商业提案级一致性。
+
+    MECE 分类（按视觉语言划分，与 layout 一一对应）：
+    cover | ending | section | toc | data | hero | content
     """
     page_type = str(page_type or "content").strip().lower()
-    if page_type in ("cover", "ending"):
-        return "bookend"
+    if page_type == "cover":
+        return "cover"
+    if page_type == "ending":
+        return "ending"
     if _is_punchline_page_type(page_type):
         return "hero"
     if page_type in ("toc", "agenda"):
@@ -161,7 +166,12 @@ def _remove_logo_placeholder_language(text: str, *, remove_logo_mentions: bool =
 
 
 def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subhead: str = "") -> str:
-    """根据页面类型和内容特征分配合适的 layout。"""
+    """根据页面类型分配 layout。同一 seed_family 内的页面使用统一 layout，确保版式一致。
+
+    MECE 映射（family 与 layout 一一对应）：
+    cover → cover | ending → ending | section → section | toc → toc
+    data → data | hero → hero | content → content
+    """
     page_type = str(page_type or "content").strip().lower()
     mapping = {
         "cover": "cover",
@@ -173,21 +183,7 @@ def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subh
         "data": "data",
         "ending": "ending",
     }
-    if page_type in mapping:
-        return mapping[page_type]
-
-    # content 类型根据内容特征多样化分配，避免所有页面都是同一版式
-    if body_count > 6:
-        # 文字极多：以文字为主，背景氛围为辅
-        return "content_dense"
-    if body_count <= 2 and len(headline) < 25 and not subhead:
-        # 短标题、极少正文、无副标题：视觉可以占主导，全幅沉浸
-        return "content_hero"
-    if body_count <= 3 and len(headline) > 15:
-        # 中等标题、少量正文：上下结构，顶部大视觉
-        return "content_top"
-    # 默认：分栏布局，但强调视觉与文字平等，视觉是内容翻译而非配图
-    return "content_split"
+    return mapping.get(page_type, "content")
 
 
 def _fallback_visual_evidence(page: Dict) -> str:

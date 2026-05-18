@@ -759,7 +759,7 @@ def test_topic_style_proposals_are_actionable_decision_choices():
         assert "选它如果" in proposal["description"]
 
 
-def test_content_derived_style_pack_keeps_ancient_rome_subject():
+def test_content_derived_style_pack_keeps_ancient_rome_subject(monkeypatch):
     content_plan = [
         {
             "type": "cover",
@@ -769,6 +769,24 @@ def test_content_derived_style_pack_keeps_ancient_rome_subject():
             },
         }
     ]
+
+    def fake_generate_style_proposals(_content_plan, _assets=None):
+        return [
+            {
+                "name": "血色罗马",
+                "palette": [
+                    {"name": "深炭黑", "hex": "#1A1A1A", "role": "主背景色"},
+                    {"name": "琥珀金", "hex": "#D4AF37", "role": "标题色"},
+                    {"name": "暗红", "hex": "#8B0000", "role": "点缀色"},
+                    {"name": "羊皮纸", "hex": "#E8DDC8", "role": "正文页基底"},
+                ],
+                "mood": "史诗、粗粝、古典、戏剧化",
+                "font": "衬线体，标题加粗",
+                "description": "以古罗马竞技场为灵感的史诗风格，深炭黑配琥珀金与暗红，呈现角斗士的血腥舞台。",
+            }
+        ]
+
+    monkeypatch.setattr(style_proposal, "generate_style_proposals", fake_generate_style_proposals)
 
     style_pack = derive_style_pack_from_content(content_plan)
 

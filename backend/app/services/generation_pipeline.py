@@ -26,7 +26,7 @@ from app.services.image_task_audit import append_image_generation_log, image_gen
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, should_show_logo, should_use_logo_as_scene_asset
-from app.services.overlay_layers import exact_overlay_asset_ids
+from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids, overlay_reservation_instruction
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import cleanup_generation_progress, finish_run, get_run, is_run_active, mark_run_running, update_run_progress
 from app.utils.reference_image import default_visual_asset_process_mode
@@ -271,6 +271,12 @@ def _load_reference_images(
     refs = []
     visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
     overlay_asset_ids = exact_overlay_asset_ids(visual)
+    if overlay_asset_ids:
+        logger.info(
+            "Slide %s: overlay_asset_ids=%s (来自 visual_json.overlay_layers)",
+            slide.page_num,
+            overlay_asset_ids,
+        )
     asset_route_modes = {}
     raw_route_modes = visual.get("asset_route_modes") or {}
     if isinstance(raw_route_modes, dict):
@@ -578,10 +584,12 @@ def _slide_family(slide: Slide) -> Optional[str]:
         family = slide.visual_json.get("seed_family")
         if family:
             return str(family)
-    # 老数据 fallback：按 slide.type 推断
+    # 老数据 fallback：按 slide.type 推断（MECE：cover/ending 已拆分）
     slide_type = (slide.type or "content").lower()
-    if slide_type in ("cover", "ending"):
-        return "bookend"
+    if slide_type == "cover":
+        return "cover"
+    if slide_type == "ending":
+        return "ending"
     if slide_type in {"hero", "quote"}:
         return "hero"
     if slide_type == "toc":
@@ -737,6 +745,14 @@ def _generate_one_slide(
         first_pass_ref_data = list(ref_data)
         ref_images = [r["image"] for r in first_pass_ref_data if r.get("image") is not None]
         prompt = slide.prompt_text
+
+        # 如果用户事后把参考图切换为精确粘贴（overlay），预生成的 prompt 可能仍包含该参考图的描述。
+        # 这里根据当前 slide.visual_json 中的 overlay_layers 动态追加留白指令，避免 AI 在背景中生成重叠内容。
+        current_visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+        overlay_reservation = overlay_reservation_instruction(current_visual)
+        if overlay_reservation and overlay_reservation not in prompt:
+            prompt = prompt + f"\n\nExact Overlay Reservation:\n{overlay_reservation}"
+            logger.info(f"Slide {slide.page_num}: 动态追加 overlay reservation 到 prompt")
 
         # 当本页带有种子参考图时，在 prompt 末尾追加一行明确告知模型，
         # 让它把同家族种子页当作版式锚点 — 不复制内容、只复用视觉系统。
@@ -1097,6 +1113,31 @@ def run_generation_pipeline(
             log_path=log_path,
         )
 
+    def _is_transient_error(error: str | None) -> bool:
+        if not error:
+            return False
+        lower = error.lower()
+        transient_markers = (
+            "timeout", "timed out", "connection error", "connection reset",
+            "connection aborted", "remote end closed", "read operation timed out",
+            "gateway", "上游连接窗口截断", "rate limit", "too many requests",
+            "429", " temporarily unavailable", "service unavailable", "503",
+        )
+        return any(marker in lower for marker in transient_markers)
+
+    def _generate_one_slide_with_retry(
+        slide: Slide, project_id: str, output_dir: str,
+        preloaded_ref_data: Optional[List[Dict]] = None, run_id: str | None = None,
+    ) -> Dict:
+        result = _generate_one_slide(slide, project_id, output_dir, preloaded_ref_data, run_id)
+        if result.get("error") and _is_transient_error(result["error"]):
+            logger.info("Retrying slide %s after transient error: %s", slide.page_num, result["error"][:120])
+            time.sleep(1.0)
+            result = _generate_one_slide(slide, project_id, output_dir, preloaded_ref_data, run_id)
+            if result.get("error"):
+                logger.warning("Slide %s retry also failed: %s", slide.page_num, result["error"][:120])
+        return result
+
     def run_slide_group(group_slides: List[Slide], ref_data_by_slide: Dict, on_success=None) -> None:
         nonlocal abort_generation_error
         if not group_slides or abort_generation_error:
@@ -1107,7 +1148,7 @@ def run_generation_pipeline(
             for slide in group_slides:
                 if abort_generation_error:
                     break
-                result = _generate_one_slide(slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id)
+                result = _generate_one_slide_with_retry(slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id)
                 record_generation_result(result)
                 if not result.get("error") and on_success:
                     on_success(result)
@@ -1119,7 +1160,7 @@ def run_generation_pipeline(
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_slide = {
-                executor.submit(_generate_one_slide, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
+                executor.submit(_generate_one_slide_with_retry, slide, project_id, output_dir, ref_data_by_slide.get(slide.id), run_id): slide
                 for slide in group_slides
             }
             for future in as_completed(future_to_slide):
@@ -1337,16 +1378,56 @@ def run_generation_pipeline(
                         "asset_kind": ref.asset_kind,
                     }
                     for ref in project.reference_images or []
-                    if (
-                        (
-                            ref.role == "visual_asset" and not ref.slide_id
-                        )
-                        or (
-                            ref.role in {"content_ref", "chart_ref"} and ref.slide_id
-                        )
-                    )
-                    and os.path.exists(ref.file_path)
+                    if os.path.exists(ref.file_path)
                 }
+                if overlay_assets:
+                    logger.info(
+                        "Pipeline: overlay_assets 构建完成，共 %s 个素材: %s",
+                        len(overlay_assets),
+                        list(overlay_assets.keys()),
+                    )
+
+                # 并发检测文字区域（exact_cutout 避让用）
+                slides_with_overlay = [
+                    sd for sd in all_completed_images
+                    if enabled_overlay_layers(sd.get("visual_json"))
+                ]
+                if slides_with_overlay:
+                    from app.services.text_region_detector import detect_text_regions
+                    logger.info(
+                        "Pipeline: 开始并发检测 %s 页的文字区域",
+                        len(slides_with_overlay),
+                    )
+
+                    def _detect_for_slide(sd):
+                        img_path = sd.get("image_path")
+                        if not img_path:
+                            return sd["page_num"], None
+                        try:
+                            regions = detect_text_regions(img_path)
+                            return sd["page_num"], regions
+                        except Exception as e:
+                            logger.warning(
+                                "Pipeline: 文字检测失败 page=%s: %s",
+                                sd.get("page_num"), e,
+                            )
+                            return sd["page_num"], None
+
+                    slide_data_map = {sd["page_num"]: sd for sd in all_completed_images}
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        futures = [
+                            executor.submit(_detect_for_slide, sd)
+                            for sd in slides_with_overlay
+                        ]
+                        for future in as_completed(futures):
+                            page_num, regions = future.result()
+                            if regions is not None:
+                                slide_data_map[page_num]["text_regions"] = regions
+                                logger.info(
+                                    "Pipeline: page %s 检测到 %s 个文字区域",
+                                    page_num, len(regions),
+                                )
+
                 assemble_pptx(
                     slide_images=all_completed_images,
                     output_path=pptx_path,

@@ -173,11 +173,12 @@ def test_section_toc_and_data_are_separate_seed_families():
         if item.get("is_seed_recommended")
     }
     assert recommended == {
-        "bookend": 1,
+        "cover": 1,
         "toc": 2,
         "section": 3,
         "content": 4,
         "data": 5,
+        "ending": 6,
     }
 
 

@@ -6,7 +6,7 @@ import re
 import tempfile
 from typing import Any
 
-from app.services.image_analyzer import describe_context_image
+from app.services.image_analyzer import describe_context_image, describe_ppt_page_ocr
 
 
 def slide_text_is_sparse(lines: list[str], min_chars: int = 20) -> bool:
@@ -176,11 +176,10 @@ def read_ppt_page_image(
     source_filename: str,
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
-    description = describe_context_image(
+    description = describe_ppt_page_ocr(
         image_path,
-        f"{source_filename} 第{page_num}页",
-        "原 PPT 页面截图",
-        "恢复这页 PPT 中可读文字、界面标签、关键事实和页面意图",
+        page_num=page_num,
+        source_filename=source_filename,
         timeout_seconds=timeout_seconds,
     )
     return parse_page_recovery_description(description)

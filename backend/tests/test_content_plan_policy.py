@@ -262,7 +262,7 @@ madfireai.com
     assert "---" not in rendered
 
 
-def test_single_uploaded_ppt_replicate_uses_source_pages_without_llm(monkeypatch):
+def test_single_uploaded_ppt_replicate_uses_model_path_with_direct_mode(monkeypatch):
     documents = """--- 文档: 混沌-分众传媒AI落地实践-20250527.pptx ---
 --- PPT_SOURCE filename="混沌-分众传媒AI落地实践-20250527.pptx" pages=3 ---
 
@@ -284,7 +284,44 @@ AI 业务场景
 创意流程
 """
 
-    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: (_ for _ in ()).throw(AssertionError("LLM should not be called")))
+    captured = {}
+
+    def fake_generate_model_page_map(**kwargs):
+        captured["mode"] = kwargs.get("mode")
+        return [
+            {
+                "page_num": 1,
+                "type": "cover",
+                "headline": "分众传媒 AI 实践分享",
+                "subhead": "分众 KA 负责人/AI 创新业务负责人 桑卓豪",
+                "bullets": [],
+                "speaker_notes": "开场备注",
+                "source_refs": [{"source_document": "混沌-分众传媒AI落地实践-20250527.pptx", "source_page_num": 1, "reason": "direct_replicate"}],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 2,
+                "type": "section",
+                "headline": "为什么今天\n分众要做AI？",
+                "subhead": "",
+                "bullets": [],
+                "speaker_notes": "",
+                "source_refs": [{"source_document": "混沌-分众传媒AI落地实践-20250527.pptx", "source_page_num": 2, "reason": "direct_replicate"}],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 3,
+                "type": "content",
+                "headline": "目前已开发落地的\nAI 业务场景",
+                "subhead": "",
+                "bullets": ["客户管理", "创意流程"],
+                "speaker_notes": "",
+                "source_refs": [{"source_document": "混沌-分众传媒AI落地实践-20250527.pptx", "source_page_num": 3, "reason": "direct_replicate"}],
+                "generation_status": "page_map_model",
+            },
+        ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_generate_model_page_map)
 
     outline = generate_content_plan(
         topic="【文件：混沌-分众传媒AI落地实践-20250527.pptx】 1:1 复刻这个 ppt",
@@ -295,8 +332,9 @@ AI 业务场景
         "\n".join(str(v) for v in page.get("text_content", {}).values())
         for page in outline
     )
+    assert captured.get("mode") == "direct_replicate"
     assert len(outline) == 3
-    assert [page["generation_status"] for page in outline] == ["pptx_direct"] * 3
+    assert [page["generation_status"] for page in outline] == ["page_map_model"] * 3
     assert outline[0]["text_content"]["headline"] == "分众传媒 AI 实践分享"
     assert "分众 KA 负责人" in outline[0]["text_content"]["subhead"]
     assert outline[0]["speaker_notes"] == "开场备注"
@@ -309,16 +347,8 @@ AI 业务场景
         "source_type": "pptx_slide",
         "reason": "direct_replicate",
     }]
-    assert outline[1]["source_facts"] == {
-        "mode": "direct_ppt_replicate",
-        "source_document": "混沌-分众传媒AI落地实践-20250527.pptx",
-        "source_page_num": 2,
-        "source_total_pages": 3,
-        "source_line_count": 2,
-        "has_speaker_notes": False,
-    }
-    assert outline[0]["replicate_quality"]["status"] == "passed"
-    assert outline[0]["replicate_quality"]["checks"]["marker_free"] is True
+    assert "source_facts" not in outline[1]
+    assert "replicate_quality" not in outline[0]
 
 
 def test_direct_ppt_outline_is_disabled_for_transform_requests():

@@ -10,7 +10,7 @@ LOGO_RENDER_VARIANTS = {"full", "symbol", "omit"}
 LOGO_REVIEW_CONFIRMED_STATUSES = {"auto_confirmed", "user_confirmed"}
 LOGO_REVIEW_NON_CONFIRMED_STATUSES = {"needs_review", "dismissed", "not_logo"}
 LOGO_OPTIONAL_PAGE_TYPES = {"section", "hero", "quote"}
-LOGO_OPTIONAL_LAYOUTS = {"hero", "content_hero"}
+LOGO_OPTIONAL_LAYOUTS = {"hero"}
 ANCHOR_LABELS = {
     "top-left": "top-left safe corner",
     "top-right": "top-right safe corner",
@@ -58,7 +58,7 @@ def should_show_logo(page: Any) -> bool:
         return True
     if page_type in {"hero", "quote"}:
         return False
-    if layout in {"hero", "content_hero"}:
+    if layout in {"hero"}:
         return False
     return True
 

@@ -1,7 +1,9 @@
 export interface WorkflowSlide {
+  page_num?: number;
   status?: string;
   prompt_text?: string | null;
   image_path?: string | null;
+  error_msg?: string | null;
 }
 
 export interface WorkflowInput {
@@ -127,6 +129,7 @@ export interface WorkflowState {
   contentPlanConfirmed: boolean;
   hasSelectedStyle: boolean;
   activeRun: WorkflowRun | null;
+  incompletePageNums: number[];
 }
 
 export interface SlideStaleFlags {
@@ -282,6 +285,11 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
   const hasGeneratedImage = slides.some((s) => Boolean(s.image_path));
   const hasPrompt = slides.some((s) => Boolean(s.prompt_text));
   const hasFailedSlide = slides.some((s) => s.status === "failed");
+  const incompletePageNums = slides
+    .filter((s) => s.status !== "completed" && s.status !== "failed")
+    .map((s) => s.page_num)
+    .filter((n): n is number => typeof n === "number" && Number.isFinite(n))
+    .sort((a, b) => a - b);
   const stepIndex = getStepIndex(projectStatus, {
     contentPlanConfirmed: input.contentPlanConfirmed,
     hasSelectedStyle: input.hasSelectedStyle,
@@ -309,6 +317,7 @@ export function buildWorkflowState(input: WorkflowInput): WorkflowState {
     contentPlanConfirmed: Boolean(input.contentPlanConfirmed),
     hasSelectedStyle: Boolean(input.hasSelectedStyle),
     activeRun,
+    incompletePageNums,
   };
 }
 
@@ -839,7 +848,7 @@ function getAllowedGateActions(state: WorkflowState, gate: WorkflowGate): GateAc
 // ============================================================
 // StatusCard: 状态栏的唯一数据源
 // 原则:任何时刻只显示一张卡 + 一个主 CTA(异常态最多一个副 CTA)
-// 优先级:任务运行中 > 失败 > 过期 > 样张就绪 > 待操作
+// 优先级:任务运行中 > 失败 > 未完成 > 过期 > 样张就绪 > 待操作
 // ============================================================
 
 export type StatusCardTone = "running" | "danger" | "warning" | "success" | "info";
@@ -847,6 +856,7 @@ export type StatusCardTone = "running" | "danger" | "warning" | "success" | "inf
 export type StatusActionKey =
   | "stop"
   | "retry-failed"
+  | "continue-generation"
   | "update-stale-visual"
   | "regenerate-stale-images"
   | "confirm-prototype"
@@ -881,6 +891,7 @@ export interface StatusCardInput {
   workflowState: WorkflowState;
   staleActionPlan: StaleSlideActionPlan;
   failedPageNums: number[];
+  incompletePageNums: number[];
   visiblePrototypePageNums: number[];
   resamplePageNums: number[];
   prototypePromptTargetCount: number;
@@ -896,6 +907,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     workflowState: w,
     staleActionPlan,
     failedPageNums,
+    incompletePageNums,
     visiblePrototypePageNums,
     resamplePageNums,
     prototypePromptTargetCount,
@@ -943,7 +955,29 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     };
   }
 
-  // 优先级 3:有过期画面(异常态独占)
+  // 优先级 3:有未完成的页(可以继续生成)——仅在中断续跑场景显示
+  // 条件:已可生图 + 至少已有部分页完成过(避免全新状态抢 start-prototype)
+  const canContinueGeneration = ["prompt_ready", "prototype_ready", "completed"].includes(w.projectStatus);
+  const hasPartiallyCompleted = completedSlideCount > 0;
+  if (!w.activeRun && canContinueGeneration && hasPartiallyCompleted && incompletePageNums.length > 0) {
+    const pageText = formatWorkflowPageNumsForUser(incompletePageNums);
+    return {
+      tone: "warning",
+      title: incompletePageNums.length === 1
+        ? `第 ${incompletePageNums[0]} 页尚未生成`
+        : `${incompletePageNums.length} 页尚未生成`,
+      description: incompletePageNums.length === 1
+        ? "该页面等待生成，点击继续"
+        : `第 ${pageText} 页等待生成，点击继续`,
+      primary: {
+        key: "continue-generation",
+        label: "继续生成剩余页",
+        variant: "primary",
+      },
+    };
+  }
+
+  // 优先级 4:有过期画面(异常态独占)
   if (staleActionPlan.primaryActionKey === "update_visual_plan") {
     return {
       tone: "warning",
@@ -969,7 +1003,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     };
   }
 
-  // 优先级 4:样张已生成,等待用户判断
+  // 优先级 5:样张已生成,等待用户判断
   if (w.projectStatus === "prototype_ready") {
     const scopeText = formatWorkflowPageNumsForUser(visiblePrototypePageNums);
     const totalSuffix = totalSlideCount > 0 && visiblePrototypePageNums.length < totalSlideCount
@@ -998,7 +1032,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     };
   }
 
-  // 优先级 5:批量完成
+  // 优先级 6:批量完成
   if (w.projectStatus === "completed") {
     return {
       tone: "success",
@@ -1012,7 +1046,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     };
   }
 
-  // 优先级 6:按 stage 引导(画面方案就绪 → 生成样张)
+  // 优先级 7:按 stage 引导(画面方案就绪 → 生成样张)
   if ((w.projectStatus === "prompt_ready" || w.projectStatus === "failed") && w.hasPrompt) {
     const scopeText = formatWorkflowPageNumsForUser(visiblePrototypePageNums);
     return {

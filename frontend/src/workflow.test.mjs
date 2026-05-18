@@ -29,6 +29,7 @@ const {
   buildWorkflowProgressDisclosure,
   evaluateImageGenerationOutcome,
   getPrimaryActionKey,
+  getStatusCard,
   planStaleSlideAction,
 } = loadTsModule("workflow.ts");
 const { inferAgentRequestContext, inferRequestedPageCount } = loadTsModule("agentRequestContext.ts");
@@ -621,5 +622,138 @@ assert.equal(inferRequestedPageCount("第 3 页标题更锐利"), undefined);
 assert.equal(inferRequestedPageCount("P12 页标题改小"), undefined);
 assert.equal(inferRequestedPageCount("12页标题改小"), undefined);
 assert.equal(inferRequestedPageCount("Make this into 60-80 slides for a workshop"), 80);
+
+// --- stuck-slide / continue-generation tests ---
+
+const incompleteState = buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [
+    { page_num: 1, status: "completed" },
+    { page_num: 2, status: "generating" },
+    { page_num: 3, status: "prompt_ready" },
+    { page_num: 4, status: "failed" },
+    { page_num: 5, status: "pending" },
+  ],
+});
+assert.deepEqual(incompleteState.incompletePageNums, [2, 3, 5]);
+
+const allDoneState = buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [
+    { page_num: 1, status: "completed" },
+    { page_num: 2, status: "completed" },
+    { page_num: 3, status: "failed" },
+  ],
+});
+assert.deepEqual(allDoneState.incompletePageNums, []);
+
+const incompleteNoFailedState = buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [
+    { page_num: 1, status: "completed" },
+    { page_num: 2, status: "generating" },
+    { page_num: 3, status: "prompt_ready" },
+    { page_num: 4, status: "completed" },
+    { page_num: 5, status: "pending" },
+  ],
+});
+assert.deepEqual(incompleteNoFailedState.incompletePageNums, [2, 3, 5]);
+
+const continueCard = getStatusCard({
+  workflowState: incompleteNoFailedState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [],
+  incompletePageNums: [2, 3, 5],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 2,
+  totalSlideCount: 5,
+});
+assert.equal(continueCard.tone, "warning");
+assert.equal(continueCard.primary.key, "continue-generation");
+assert.ok(continueCard.description.includes("2、3、5"));
+
+const runningState = buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [
+    { page_num: 1, status: "completed" },
+    { page_num: 2, status: "generating" },
+  ],
+  activeRun: { kind: "batch_generation", status: "running" },
+});
+const runningCard = getStatusCard({
+  workflowState: runningState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [],
+  incompletePageNums: [2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 1,
+  totalSlideCount: 2,
+});
+assert.equal(runningCard.primary.key, "stop");
+
+const noIncompleteCard = getStatusCard({
+  workflowState: allDoneState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [3],
+  incompletePageNums: [],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 2,
+  totalSlideCount: 3,
+});
+assert.equal(noIncompleteCard.tone, "danger");
+assert.equal(noIncompleteCard.primary.key, "retry-failed");
+
+// visual_ready 阶段不应显示 continue-generation，应走正常的生成风格提案流程
+const visualReadyState = buildWorkflowState({
+  projectStatus: "visual_ready",
+  slides: [
+    { page_num: 1, status: "pending" },
+    { page_num: 2, status: "pending" },
+  ],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: false,
+});
+const visualReadyCard = getStatusCard({
+  workflowState: visualReadyState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.notEqual(visualReadyCard.primary.key, "continue-generation");
+
+// 全新 prompt_ready(0 completed)不应显示 continue-generation,应走 start-prototype
+const freshPromptReadyState = buildWorkflowState({
+  projectStatus: "prompt_ready",
+  slides: [
+    { page_num: 1, status: "prompt_ready", prompt_text: "p1" },
+    { page_num: 2, status: "prompt_ready", prompt_text: "p2" },
+  ],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: true,
+});
+const freshPromptReadyCard = getStatusCard({
+  workflowState: freshPromptReadyState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.notEqual(freshPromptReadyCard.primary.key, "continue-generation");
+assert.equal(freshPromptReadyCard.primary.key, "start-prototype");
 
 console.log("workflow gate tests passed");

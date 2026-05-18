@@ -136,6 +136,14 @@ def _extract_shape_texts(shapes, shape_type_enum) -> list[str]:
             texts.extend(text for text in _extract_shape_texts(shape.shapes, shape_type_enum) if text not in texts)
             continue
 
+        # Skip page-level metadata placeholders (date, footer, slide number, etc.)
+        # These carry no slide content value and only add noise.
+        if getattr(shape, "is_placeholder", False):
+            from pptx.enum.shapes import PP_PLACEHOLDER
+            ph_type = getattr(getattr(shape, "placeholder_format", None), "type", None)
+            if ph_type in {PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.HEADER, PP_PLACEHOLDER.SLIDE_NUMBER}:
+                continue
+
         if getattr(shape, "has_table", False):
             for row in shape.table.rows:
                 cells = []

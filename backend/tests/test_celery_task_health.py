@@ -276,7 +276,7 @@ def test_final_generation_chunk_finishes_shared_run(tmp_path, monkeypatch):
     assert assembled["count"] == 3
 
 
-def test_generation_stops_after_first_provider_gateway_cutoff(monkeypatch):
+def test_generation_retries_once_on_provider_gateway_cutoff_then_stops(monkeypatch):
     db = make_session()
     project = Project(title="Provider outage", status="prompt_ready", content_plan_confirmed=True)
     db.add(project)
@@ -323,13 +323,13 @@ def test_generation_stops_after_first_provider_gateway_cutoff(monkeypatch):
     refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).one()
     refreshed_slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
 
-    assert calls == [1]
+    # Gateway cutoff is transient -> retried once on page 1, then pipeline stops
+    assert calls == [1, 1]
     assert refreshed_run.status == "failed"
     assert refreshed_run.completed_count == 0
     assert refreshed_run.failed_count == 1
     assert refreshed_slides[0].status == "failed"
     assert refreshed_slides[1].status == "prompt_ready"
-    assert "未继续生成" in (refreshed_slides[1].error_msg or "")
 
 
 def test_missing_started_celery_task_marks_generation_recoverable(monkeypatch):
@@ -466,3 +466,413 @@ def test_pending_celery_task_stales_quickly_when_worker_is_offline(monkeypatch):
     assert run.status == "stale"
     assert "后台生成服务未在线" in run.error_msg
     assert slide.status == "prompt_ready"
+
+
+def test_stale_detection_releases_redis_page_locks(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Lock release",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    generating = Slide(
+        project_id=project.id,
+        page_num=2,
+        status="generating",
+        prompt_text="prompt",
+    )
+    db.add(generating)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2],
+        total_count=2,
+    )
+    run.status = "running"
+    run.task_id = "dead-task"
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    deleted_locks = []
+
+    def capture_delete(*keys):
+        deleted_locks.extend(keys)
+        return len(keys)
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "STARTED")
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 600)
+    monkeypatch.setattr(slides_api.redis_client, "delete", capture_delete)
+
+    stale = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+
+    assert stale is True
+    assert f"project:{project.id}:slide:2:generating" in deleted_locks
+    assert generating.status == "prompt_ready"
+
+
+def test_start_generation_pre_cleans_stale_generating_slides(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Pre-clean",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    generating = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="generating",
+        prompt_text="prompt",
+    )
+    db.add(generating)
+    db.flush()
+
+    cleaned = []
+
+    def fake_cleanup(db, project_id):
+        slide = db.query(Slide).filter(
+            Slide.project_id == project_id,
+            Slide.status == "generating",
+        ).first()
+        if slide:
+            slide.status = "prompt_ready"
+            slide.error_msg = None
+            cleaned.append(slide.page_num)
+        return len(cleaned)
+
+    class FakeTask:
+        id = "task-1"
+
+    monkeypatch.setattr(slides_api, "_cleanup_stale_generating_slides_for_project", fake_cleanup)
+    monkeypatch.setattr(slides_api, "ensure_generation_worker_ready", lambda: True)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", lambda *args, **kwargs: FakeTask())
+
+    result = slides_api.start_generation(project.id, db=db)
+
+    assert cleaned == [1]
+    assert result["message"] == "Generation started"
+
+
+def test_skipped_pages_are_appended_to_remaining_pages(monkeypatch):
+    db = make_session()
+    project = Project(title="Skipped retry", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="prompt_ready", prompt_text="p2"),
+            Slide(project_id=project.id, page_num=3, status="prompt_ready", prompt_text="p3"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    db.commit()
+    project_id = project.id
+    run_id = run.id
+
+    captured = {}
+
+    class NextTask:
+        id = "next-task"
+
+    def fake_enqueue(_db, project_id, remaining_page_nums, *, prototype, run_id, credential_id):
+        captured.update(remaining_page_nums=remaining_page_nums)
+        return NextTask()
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks.settings, "IMAGE_GENERATION_TASK_PAGE_CHUNK_SIZE", 2)
+    # Simulate page 1 being locked by another task
+    monkeypatch.setattr(image_tasks, "_acquire_page_locks", lambda _project_id, pages: [p for p in pages if p != 1])
+    monkeypatch.setattr(image_tasks, "_release_page_locks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "_cleanup_stale_generating_slides", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "run_generation_pipeline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "is_run_active", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(image_tasks, "_enqueue_generation_continuation", fake_enqueue)
+
+    result = image_tasks._generate_slides_task_inner(
+        project_id,
+        page_nums=[1, 2, 3],
+        run_id=run_id,
+        credential_id="credential-1",
+    )
+
+    assert result["status"] == "continued"
+    # Page 1 was skipped (locked), page 3 was remaining from chunking
+    assert captured["remaining_page_nums"] == [3, 1]
+
+
+def test_transient_error_triggers_one_retry(monkeypatch):
+    db = make_session()
+    project = Project(title="Transient retry", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    db.commit()
+
+    calls = []
+
+    def fake_generate_one_slide(slide, project_id, output_dir, ref_data, run_id=None):
+        calls.append("attempt")
+        if len(calls) == 1:
+            return {"slide": slide, "error": "Timed out waiting for image API slot after 600s"}
+        return {"slide": slide, "image_path": "/tmp/slide_01.png"}
+
+    monkeypatch.setattr(generation_pipeline.settings, "IMAGE_API_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(generation_pipeline.redis_client, "set", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(generation_pipeline.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    generation_pipeline.run_generation_pipeline(project.id, db, page_nums=[1], run_id=run.id)
+
+    refreshed_slide = db.query(Slide).filter(Slide.project_id == project.id).one()
+    assert calls == ["attempt", "attempt"]
+    assert refreshed_slide.status == "completed"
+
+
+def test_non_transient_error_does_not_retry(monkeypatch):
+    db = make_session()
+    project = Project(title="Non-transient no retry", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"),
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    db.commit()
+
+    calls = []
+
+    def fake_generate_one_slide(slide, project_id, output_dir, ref_data, run_id=None):
+        calls.append("attempt")
+        return {"slide": slide, "error": "Content policy violation: invalid prompt"}
+
+    monkeypatch.setattr(generation_pipeline.settings, "IMAGE_API_MAX_CONCURRENCY", 1)
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(generation_pipeline.redis_client, "set", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(generation_pipeline.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    generation_pipeline.run_generation_pipeline(project.id, db, page_nums=[1], run_id=run.id)
+
+    refreshed_slide = db.query(Slide).filter(Slide.project_id == project.id).one()
+    assert calls == ["attempt"]
+    assert refreshed_slide.status == "failed"
+
+
+def test_stale_detection_auto_restarts_generation(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Auto-restart",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(project_id=project.id, page_num=1, status="generating", prompt_text="p1"),
+            Slide(project_id=project.id, page_num=2, status="prompt_ready", prompt_text="p2"),
+            Slide(project_id=project.id, page_num=3, status="completed", prompt_text="p3", image_path="/tmp/03.png"),
+        ]
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1, 2, 3],
+        total_count=3,
+    )
+    run.status = "running"
+    run.task_id = "dead-task"
+    run.completed_count = 1  # Page 3 already completed, so auto-restart should trigger
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    enqueued = {}
+
+    class FakeTask:
+        id = "auto-restart-task"
+
+    def fake_enqueue_task(db, project_id, page_nums, *, run, prototype=False):
+        enqueued.update(
+            project_id=project_id,
+            page_nums=page_nums,
+            run_id=run.id,
+            prototype=prototype,
+        )
+        return FakeTask()
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "STARTED")
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 600)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(slides_api.redis_client, "set", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(slides_api.redis_client, "get", lambda key: None)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", fake_enqueue_task)
+
+    stale = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+
+    assert stale is True
+    # Auto-restart should pick up page 1 (was generating, reset to prompt_ready) and page 2 (prompt_ready)
+    # Page 3 is completed, so excluded
+    assert enqueued["page_nums"] == [1, 2]
+    assert enqueued["prototype"] is False
+
+
+def test_stale_detection_auto_restart_only_once(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Auto-restart once",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(project_id=project.id, page_num=1, status="generating", prompt_text="p1"),
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    run.task_id = "dead-task"
+    run.completed_count = 1
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    enqueue_calls = []
+
+    class FakeTask:
+        id = "auto-restart-task"
+
+    def fake_enqueue_task(db, project_id, page_nums, *, run, prototype=False):
+        enqueue_calls.append(run.id)
+        return FakeTask()
+
+    redis_store = {}
+
+    def fake_redis_get(key):
+        val = redis_store.get(key)
+        return val.encode() if val else None
+
+    def fake_redis_set(key, value, ex=None):
+        redis_store[key] = value
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "STARTED")
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 600)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(slides_api.redis_client, "set", fake_redis_set)
+    monkeypatch.setattr(slides_api.redis_client, "get", fake_redis_get)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", fake_enqueue_task)
+
+    # First stale detection should trigger auto-restart
+    stale1 = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+    assert stale1 is True
+    assert len(enqueue_calls) == 1
+
+    # Second stale detection on the same run should NOT trigger again
+    stale2 = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+    assert stale2 is True
+    assert len(enqueue_calls) == 1
+
+
+def test_stale_detection_no_auto_restart_when_zero_completed(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="No auto-restart on zero completed",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(project_id=project.id, page_num=1, status="generating", prompt_text="p1"),
+    )
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="batch_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    run.task_id = "dead-task"
+    run.completed_count = 0  # Never completed anything
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    enqueue_calls = []
+
+    class FakeTask:
+        id = "auto-restart-task"
+
+    def fake_enqueue_task(db, project_id, page_nums, *, run, prototype=False):
+        enqueue_calls.append(run.id)
+        return FakeTask()
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "STARTED")
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 600)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(slides_api.redis_client, "set", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(slides_api.redis_client, "get", lambda key: None)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", fake_enqueue_task)
+
+    stale = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+
+    assert stale is True
+    assert len(enqueue_calls) == 0  # Should NOT auto-restart when zero pages completed
