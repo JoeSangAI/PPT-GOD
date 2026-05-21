@@ -8315,3 +8315,489 @@ body {
     justify-content: flex-end;
   }
 }
+
+/* PPT GOD VI application pass: approved carved wordmark, warm stone workspace, ink and copper accents. */
+:root {
+  --pg-obsidian: #171410;
+  --pg-obsidian-2: #272017;
+  --pg-panel: #fffaf0;
+  --pg-panel-2: #f7f0e2;
+  --pg-bg-soft: #f4efe6;
+  --pg-canvas: #fbf7ee;
+  --pg-canvas-2: #ece2d1;
+  --pg-ink: #211a12;
+  --pg-muted: #6c6257;
+  --pg-muted-2: rgba(33, 26, 18, 0.55);
+  --pg-line: rgba(80, 63, 41, 0.16);
+  --pg-line-soft: rgba(80, 63, 41, 0.09);
+  --pg-gold: #a77432;
+  --pg-gold-2: #c99b55;
+  --pg-copper: #8e622e;
+  --pg-aegean: #2b7777;
+  --pg-olive: #68744a;
+  --pg-primary: #211a12;
+  --pg-primary-hover: #3a2c1c;
+  --pg-accent: #a77432;
+  --pg-focus: #2b7777;
+  --pg-success: #497a55;
+  --pg-danger: #b6453f;
+  --pg-shadow: 0 22px 58px rgba(48, 37, 24, 0.12);
+  --pg-shadow-light: 0 12px 28px rgba(48, 37, 24, 0.08);
+}
+
+body {
+  background: var(--pg-bg-soft);
+  color: var(--pg-ink);
+}
+
+.pg-app {
+  background:
+    linear-gradient(rgba(80, 63, 41, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(80, 63, 41, 0.04) 1px, transparent 1px),
+    radial-gradient(circle at 12% 0%, rgba(167, 116, 50, 0.13), transparent 31%),
+    radial-gradient(circle at 88% 4%, rgba(43, 119, 119, 0.1), transparent 28%),
+    linear-gradient(180deg, #fbf8f1 0%, #f4efe6 48%, #eee5d6 100%) !important;
+  background-size: 36px 36px, 36px 36px, auto, auto, auto;
+  color: var(--pg-ink);
+}
+
+.pg-app::before {
+  opacity: 0.28;
+  background:
+    linear-gradient(90deg, transparent 0 49%, rgba(80, 63, 41, 0.09) 49% 50%, transparent 50% 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.58), transparent 68%);
+  background-size: 96px 100%, auto;
+  mask-image: linear-gradient(180deg, #000 0%, transparent 74%);
+}
+
+.pg-logo-lockup {
+  display: inline-flex;
+  width: var(--pg-logo-width, 152px);
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  line-height: 1;
+}
+
+.pg-logo-wordmark {
+  display: block;
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
+.pg-brand {
+  min-width: 0;
+}
+
+.pg-brand .pg-logo-lockup {
+  --pg-logo-width: 148px;
+}
+
+.pg-auth-wordmark {
+  --pg-logo-width: min(430px, 72vw);
+  display: block;
+}
+
+.pg-brand-mark-wordmark {
+  width: 38px !important;
+  height: 38px !important;
+  overflow: hidden;
+  border: 1px solid rgba(80, 63, 41, 0.16) !important;
+  border-radius: 8px !important;
+  background: rgba(255, 250, 240, 0.9) !important;
+  padding: 4px;
+}
+
+.pg-brand-mark-wordmark img {
+  display: block;
+  width: 94px;
+  max-width: none;
+  height: auto;
+  transform: translate(-21px, 1px);
+}
+
+.pg-logo-text,
+.pg-logo-name,
+.pg-logo-subtitle {
+  display: none !important;
+}
+
+.pg-sidebar {
+  border-color: rgba(80, 63, 41, 0.18) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 252, 246, 0.98), rgba(246, 239, 226, 0.98)),
+    var(--pg-panel) !important;
+  color: var(--pg-ink) !important;
+  box-shadow: 12px 0 34px rgba(48, 37, 24, 0.08);
+}
+
+.pg-sidebar-header {
+  min-height: 72px;
+  border-color: rgba(80, 63, 41, 0.14) !important;
+  background:
+    linear-gradient(90deg, rgba(167, 116, 50, 0.11), transparent 44%),
+    rgba(255, 250, 240, 0.92) !important;
+}
+
+.pg-sidebar .pg-primary-button {
+  min-height: 38px;
+  border: 1px solid #211a12 !important;
+  border-radius: 8px !important;
+  background: #211a12 !important;
+  color: #fffaf0 !important;
+  box-shadow: 0 12px 28px rgba(33, 26, 18, 0.18);
+}
+
+.pg-sidebar .pg-primary-button:hover {
+  background: #3a2c1c !important;
+}
+
+.pg-project-card {
+  border-color: rgba(80, 63, 41, 0.12) !important;
+  background: transparent;
+  color: var(--pg-ink);
+}
+
+.pg-project-card:hover {
+  background: rgba(255, 250, 240, 0.78) !important;
+}
+
+.pg-project-card.bg-blue-50,
+.pg-project-card.border-blue-200 {
+  border-color: rgba(167, 116, 50, 0.32) !important;
+  background: linear-gradient(90deg, rgba(167, 116, 50, 0.16), rgba(255, 250, 240, 0.82)) !important;
+}
+
+.pg-project-title,
+.pg-project-card .pg-project-title {
+  color: var(--pg-ink) !important;
+}
+
+.pg-project-meta {
+  color: var(--pg-muted-2) !important;
+}
+
+.pg-project-icon-button {
+  color: rgba(33, 26, 18, 0.48);
+}
+
+.pg-project-icon-button:hover {
+  border-color: rgba(80, 63, 41, 0.2);
+  background: #fffaf0;
+  color: var(--pg-ink);
+}
+
+.pg-collapsed-rail,
+.pg-resizer {
+  border-color: rgba(80, 63, 41, 0.16) !important;
+  background: #f8f2e7 !important;
+  color: rgba(33, 26, 18, 0.58) !important;
+}
+
+.pg-main,
+.pg-workbench-body,
+.pg-workspace,
+.pg-empty-state {
+  background:
+    linear-gradient(rgba(80, 63, 41, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(80, 63, 41, 0.028) 1px, transparent 1px),
+    #f4efe6 !important;
+  background-size: 32px 32px, 32px 32px, auto;
+}
+
+.pg-topbar.pg-project-header {
+  min-height: 58px;
+  border-color: rgba(80, 63, 41, 0.15) !important;
+  background:
+    linear-gradient(90deg, #fffaf0, rgba(255, 250, 240, 0.88)),
+    #fffaf0 !important;
+  box-shadow: 0 10px 24px rgba(48, 37, 24, 0.04);
+}
+
+.pg-project-header .pg-project-title {
+  color: var(--pg-ink) !important;
+}
+
+.pg-project-export-link,
+.pg-workflow-actions > button,
+.pg-workflow-actions > a,
+.pg-selection-pill,
+.pg-workbench-module-button,
+.pg-style-bar-toggle {
+  border-color: rgba(80, 63, 41, 0.17) !important;
+  border-radius: 8px !important;
+  background: rgba(255, 250, 240, 0.9) !important;
+  color: #3b3023 !important;
+}
+
+.pg-project-export-link:hover,
+.pg-workflow-actions > button:hover,
+.pg-workflow-actions > a:hover,
+.pg-selection-pill:hover,
+.pg-workbench-module-button:hover,
+.pg-style-bar-toggle:hover {
+  border-color: rgba(167, 116, 50, 0.38) !important;
+  background: #fff7e8 !important;
+  color: var(--pg-ink) !important;
+}
+
+.pg-workflow,
+.pg-workbench-modulebar,
+.pg-style-bar {
+  border-color: rgba(80, 63, 41, 0.13) !important;
+  background: rgba(255, 250, 240, 0.72) !important;
+  backdrop-filter: blur(18px);
+}
+
+.pg-workflow-step {
+  border-color: rgba(80, 63, 41, 0.16) !important;
+  background: #fffaf0 !important;
+  color: rgba(33, 26, 18, 0.62) !important;
+}
+
+.pg-workflow-step.bg-blue-600 {
+  border-color: #211a12 !important;
+  background: #211a12 !important;
+  color: #fffaf0 !important;
+}
+
+.pg-workflow-step.bg-emerald-50 {
+  border-color: rgba(104, 116, 74, 0.32) !important;
+  background: rgba(239, 245, 231, 0.92) !important;
+  color: #4c5f35 !important;
+}
+
+.pg-workflow-connector {
+  background: rgba(80, 63, 41, 0.18);
+}
+
+.pg-workflow-connector.is-done {
+  background: var(--pg-olive);
+}
+
+.pg-workflow-status,
+.pg-progress-overview,
+.pg-status-card,
+.pg-side-drawer,
+.pg-template-picker-group,
+.pg-agent-command-bar,
+.pg-agent-material-sheet,
+.pg-progress-detail-card {
+  border-color: rgba(80, 63, 41, 0.15) !important;
+  background: rgba(255, 250, 240, 0.94) !important;
+  color: var(--pg-ink) !important;
+}
+
+.pg-workflow-status-meter i,
+.pg-progress-overview-bar i {
+  background: linear-gradient(90deg, var(--pg-copper), var(--pg-aegean)) !important;
+}
+
+.pg-modulebar-label,
+.pg-style-bar-name,
+.pg-progress-overview-head b,
+.pg-progress-metrics em,
+.pg-progress-detail-card b {
+  color: var(--pg-ink) !important;
+}
+
+.pg-modulebar-summary,
+.pg-style-bar-description,
+.pg-style-bar-meta,
+.pg-progress-overview-head span,
+.pg-progress-metrics b,
+.pg-progress-detail-card p {
+  color: var(--pg-muted) !important;
+}
+
+.pg-style-page-mini {
+  border-color: rgba(80, 63, 41, 0.16);
+  border-radius: 8px;
+}
+
+.pg-style-page-mini-brand {
+  width: 32px;
+  height: 7px;
+  border-radius: 0;
+  background:
+    repeating-linear-gradient(90deg, var(--style-page-brand) 0 2px, transparent 2px 4px),
+    linear-gradient(90deg, var(--style-page-brand), var(--style-page-highlight));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--style-page-text) 13%, transparent);
+}
+
+.pg-oracle-panel {
+  border-color: rgba(80, 63, 41, 0.16) !important;
+  background: #f3eee4 !important;
+  box-shadow: -12px 0 34px rgba(48, 37, 24, 0.08);
+}
+
+.pg-oracle-header {
+  border-color: rgba(80, 63, 41, 0.14) !important;
+  background:
+    linear-gradient(90deg, rgba(43, 119, 119, 0.09), transparent),
+    rgba(255, 250, 240, 0.88) !important;
+}
+
+.pg-oracle-panel .pg-chat-stream {
+  background: #f3eee4 !important;
+}
+
+.pg-oracle-panel .pg-message,
+.pg-oracle-panel .pg-documents-panel,
+.pg-oracle-card,
+.pg-draft-card,
+.pg-composer-input-shell,
+.pg-oracle-panel .pg-composer-row {
+  border-color: rgba(80, 63, 41, 0.14) !important;
+  background: rgba(255, 250, 240, 0.96) !important;
+  color: var(--pg-ink) !important;
+}
+
+.pg-oracle-panel > .border-t {
+  border-color: rgba(80, 63, 41, 0.16) !important;
+  background: rgba(251, 247, 238, 0.95) !important;
+}
+
+.pg-oracle-panel .pg-system-message {
+  background: rgba(222, 212, 195, 0.65) !important;
+  color: rgba(33, 26, 18, 0.68) !important;
+}
+
+.pg-composer-attach-button:hover,
+.pg-agent-command-chip:hover,
+.pg-oracle-panel .pg-composer-attach:hover {
+  border-color: rgba(167, 116, 50, 0.34) !important;
+  background: #fff7e8 !important;
+  color: var(--pg-ink) !important;
+}
+
+.pg-agent-command-chip.is-active,
+.pg-agent-area-panel button.is-active,
+.pg-agent-scope-panel button.is-active {
+  border-color: #211a12 !important;
+  background: #211a12 !important;
+  color: #fffaf0 !important;
+  box-shadow: none !important;
+}
+
+.pg-auth.pg-auth-v2 {
+  background:
+    linear-gradient(rgba(80, 63, 41, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(80, 63, 41, 0.035) 1px, transparent 1px),
+    #f4efe6 !important;
+  background-size: 36px 36px, 36px 36px, auto;
+  color: var(--pg-ink);
+}
+
+.pg-auth-v2 .pg-auth-backdrop {
+  background-image:
+    linear-gradient(90deg, rgba(244, 239, 230, 0.98) 0%, rgba(244, 239, 230, 0.92) 38%, rgba(244, 239, 230, 0.68) 62%, rgba(244, 239, 230, 0.88) 100%),
+    url("./assets/pptgod-greek-deity-hero.png") !important;
+  background-position: center;
+  background-size: cover;
+  opacity: 0.9;
+}
+
+.pg-auth.pg-auth-v2::after {
+  background:
+    linear-gradient(90deg, rgba(167, 116, 50, 0.14), transparent 34%, rgba(43, 119, 119, 0.08)),
+    linear-gradient(180deg, rgba(255, 250, 240, 0.42), rgba(236, 226, 209, 0.42)) !important;
+}
+
+.pg-auth-v2 .pg-auth-shell {
+  grid-template-columns: minmax(320px, 1fr) minmax(400px, 500px);
+  gap: 56px;
+}
+
+.pg-auth-v2 .pg-auth-story {
+  max-width: 600px;
+  color: var(--pg-ink);
+  text-shadow: none;
+}
+
+.pg-auth-v2 .pg-auth-story h1 {
+  color: var(--pg-ink);
+}
+
+.pg-auth-v2 .pg-auth-lead {
+  max-width: 510px;
+  margin-top: 28px;
+  color: rgba(33, 26, 18, 0.72);
+  font-size: 17px;
+}
+
+.pg-auth-v2 .pg-auth-value {
+  border-left-color: rgba(167, 116, 50, 0.34);
+}
+
+.pg-auth-v2 .pg-auth-value p {
+  color: rgba(33, 26, 18, 0.64);
+}
+
+.pg-auth-v2 .pg-auth-card-v2 {
+  border-color: rgba(80, 63, 41, 0.18);
+  background: rgba(255, 250, 240, 0.92);
+  color: var(--pg-ink);
+  box-shadow: 0 26px 70px rgba(48, 37, 24, 0.16);
+}
+
+.pg-auth-v2 .pg-auth-card-head {
+  border-color: rgba(80, 63, 41, 0.13);
+}
+
+.pg-auth-v2 .pg-auth-card-head h2,
+.pg-auth-field span,
+.pg-provider-title,
+.pg-endpoint-head span {
+  color: var(--pg-ink);
+}
+
+.pg-auth-v2 .pg-auth-card-head p,
+.pg-auth-field em,
+.pg-provider-header p,
+.pg-endpoint-head p,
+.pg-auth-assurance {
+  color: var(--pg-muted);
+}
+
+.pg-auth-input {
+  border-color: rgba(80, 63, 41, 0.18);
+  background: rgba(255, 252, 246, 0.9);
+  color: var(--pg-ink);
+}
+
+.pg-auth-input:focus {
+  border-color: rgba(167, 116, 50, 0.64);
+  box-shadow: 0 0 0 3px rgba(167, 116, 50, 0.16);
+}
+
+.pg-auth-v2 .pg-login-submit {
+  background: linear-gradient(135deg, #211a12 0%, #3a2c1c 56%, #8e622e 100%) !important;
+  color: #fffaf0 !important;
+  box-shadow: 0 16px 36px rgba(33, 26, 18, 0.22);
+}
+
+.pg-auth-v2 .pg-login-submit:hover {
+  background: linear-gradient(135deg, #18130d 0%, #322516 56%, #7b5224 100%) !important;
+}
+
+@media (max-width: 900px) {
+  .pg-brand .pg-logo-lockup {
+    --pg-logo-width: 136px;
+  }
+
+  .pg-auth-v2 .pg-auth-shell {
+    grid-template-columns: 1fr;
+    gap: 24px;
+    padding: 32px 20px;
+  }
+
+  .pg-auth-v2 .pg-auth-story {
+    padding-top: 20px;
+  }
+
+  .pg-auth-wordmark {
+    --pg-logo-width: min(360px, 82vw);
+  }
+}
