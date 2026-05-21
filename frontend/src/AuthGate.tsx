@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import App from "./App";
+import PptGodLogo from "./components/PptGodLogo";
 import {
   API_BASE,
   CLIENT_PROVIDER_SETTINGS_ENABLED,
@@ -427,8 +428,7 @@ export default function AuthGate() {
       <div className="pg-auth-backdrop" aria-hidden="true" />
       <main className="pg-auth-shell">
         <section className="pg-auth-story">
-          <h1>PPT God</h1>
-          <div className="pg-auth-slogan">古希腊掌管 PPT 的神</div>
+          <PptGodLogo className="pg-auth-wordmark" />
           <p className="pg-auth-lead">
             从真实资料出发，先整理叙事逻辑，再完成页面设计与视觉生成；导出前，你可以在工作台里持续调整结构、内容和风格。
           </p>
