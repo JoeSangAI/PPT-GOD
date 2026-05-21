@@ -20,6 +20,7 @@ from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
 from app.services.source_intent import normalize_intent_contract
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
+from app.celery_app import celery_app
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -154,11 +155,12 @@ def update_project_style(
         project.content_plan_confirmed = True
         project.status = "visual_ready"
         for slide in slides:
-            had_outputs = bool(slide.visual_json or slide.prompt_text or slide.image_path)
             slide.visual_json = with_stale_flags(slide.visual_json if isinstance(slide.visual_json, dict) else {}, content=True)
             slide.error_msg = None
-            if not had_outputs:
-                slide.status = "pending"
+            # 视觉方案改变后，所有已生成图片和 prompt 都作废，防止旧图冒充新风格
+            slide.image_path = None
+            slide.prompt_text = None
+            slide.status = "pending"
     db.commit()
     db.refresh(project)
     return project
@@ -421,7 +423,7 @@ def rollback_project(
     active_run = cancel_active_run(db, project_id, "用户回退流程")
     if active_run and active_run.task_id:
         try:
-            AsyncResult(active_run.task_id).revoke(terminate=True)
+            AsyncResult(active_run.task_id, app=celery_app).revoke(terminate=True)
             logger.info(f"Rollback: revoked run task {active_run.task_id} for project {project_id}")
         except Exception as e:
             logger.warning(f"Rollback: failed to revoke run task {active_run.task_id}: {e}")
@@ -443,7 +445,7 @@ def rollback_project(
     task_id = redis_client.get(f"project:{project_id}:task_id")
     if task_id:
         try:
-            AsyncResult(task_id.decode() if isinstance(task_id, bytes) else task_id).revoke(terminate=True)
+            AsyncResult(task_id.decode() if isinstance(task_id, bytes) else task_id, app=celery_app).revoke(terminate=True)
             logger.info(f"Rollback: revoked Celery task {task_id} for project {project_id}")
         except Exception as e:
             logger.warning(f"Rollback: failed to revoke task {task_id}: {e}")

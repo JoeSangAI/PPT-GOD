@@ -10,7 +10,7 @@ import json_repair
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model, get_raw_provider_credentials, provider_credentials_context
 from app.services.logo_policy import logo_policy_for_page
-from app.services.overlay_layers import normalize_overlay_layers
+from app.services.overlay_layers import apply_llm_overlay_layout, normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
 from app.services.style_pack import derive_style_pack_from_content
 from app.services.visual_strategy import visual_language_group
@@ -543,6 +543,59 @@ def _build_batch_prompt(
 
 """
 
+    # 检查是否有 exact_cutout overlay 的页面
+    has_exact_cutout = False
+    overlay_pages: list[dict] = []
+    for p in pages_summary:
+        layers = p.get("overlay_layers") or []
+        exact_layers = [
+            layer for layer in layers
+            if isinstance(layer, dict) and layer.get("mode") == "exact_cutout" and layer.get("enabled", True)
+        ]
+        if exact_layers:
+            has_exact_cutout = True
+            overlay_pages.append({
+                "page_num": p.get("page_num"),
+                "presets": [layer.get("preset", "right-card") for layer in exact_layers],
+                "layers": [
+                    {
+                        "asset_id": layer.get("asset_id"),
+                        "preset": layer.get("preset", "right-card"),
+                        "usage_note": layer.get("usage_note", ""),
+                    }
+                    for layer in exact_layers
+                ],
+            })
+
+    overlay_instruction = ""
+    if has_exact_cutout:
+        overlay_pages_desc = "\n".join(
+            f"  - 第 {op['page_num']} 页: "
+            + "; ".join(
+                f"素材 {i+1}(asset={l.get('asset_id')}, 当前位置={l.get('preset')}, 说明={l.get('usage_note') or '无'})"
+                for i, l in enumerate(op.get("layers", []))
+            )
+            for op in overlay_pages
+        )
+        overlay_instruction = f"""
+【精确粘贴（exact_cutout）页面处理规则 — 必须遵守】
+以下页面包含精确粘贴素材（用户上传的截图将原样放置在指定位置，不是由 AI 绘制）：
+{overlay_pages_desc}
+
+对于这些页面：
+1. visual_evidence 必须只描述背景/氛围/基底，绝对不能描述将要被精确粘贴的截图内容本身。
+2. visual_description 只能描述背景如何处理、文字放在哪里、预留区域保持干净；不要描述截图里的具体内容、界面、文字或产品外观。
+3. 这些页面的画面主体是"背景"，不是"截图内容"。截图由后端程序粘贴，AI 只负责生成干净的背景。
+4. 预留区域必须保持完全干净：无文字、无图表、无主体物、无密集纹理，只生成柔和的背景色调。
+5. 如果一页有多个精确粘贴素材，请在 overlay_layout 中为每张素材分配互补的位置，确保它们不重叠。
+   - 选择原则：根据页面类型、标题位置、文字密度决定
+   - 章节页/封面：大标题通常在左或中，截图可以放在右侧 (right-card) 或底部 (bottom-band)
+   - 内容页：文字较多的页面，截图可以放在右侧 (right-card) 或左下角 (left-card)
+   - 多张截图时：主图放大在右侧 (right-card)，辅助图缩小放在右下角 (bottom-right-small) 或底部 (bottom-band)
+   - 避免所有截图挤在同一个位置
+
+"""
+
     page_type_style_rules = """
 【页面类型适配规则 — 必须遵守】
 参考图/风格方案只提供“风格基因”，不是每页画面模板。具体每页画什么，必须由该页文案内容决定。
@@ -597,6 +650,7 @@ def _build_batch_prompt(
 {json.dumps(sanitized_pages, ensure_ascii=False, indent=2)}
 {requirements_instruction}
 {ref_instruction}
+{overlay_instruction}
 {visual_asset_instruction}
 {page_type_style_rules}
 【Logo 管道规则】
@@ -635,6 +689,12 @@ def _build_batch_prompt(
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
 {{"1": {{"visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {logo_policy_example}}}, "2": {{...}}, ...}}
+
+对于包含 overlay_layers 的页面，请在对应页面的对象中增加 overlay_layout 字段：
+"overlay_layout": [{{"asset_id": "素材ID", "preset": "right-card", "reason": "简要理由"}}]
+
+可选 preset：top-right-small, bottom-right-small, left-card, right-card, center-card, bottom-band
+如果一页有多张 overlay，必须为每张分配不同的 preset，确保不重叠。
 
 为当前批次的每一页都生成，不要遗漏。"""
     return prompt
@@ -793,6 +853,9 @@ def _do_generate_visual_plan(
         }
         if recalled_assets:
             summary["must_consider_visual_assets"] = recalled_assets
+        overlay_layers = page.get("overlay_layers")
+        if overlay_layers:
+            summary["overlay_layers"] = overlay_layers
         pages_summary.append(summary)
 
     # 2. 分批调用 LLM 生成 visual_description，避免单 prompt 过长导致超时
@@ -934,6 +997,9 @@ def _do_generate_visual_plan(
         manual_asset_ids = _manual_visual_asset_ids(page, valid_asset_ids)
         manual_asset_usage = _manual_visual_asset_usage(page, manual_asset_ids)
         overlay_layers = _manual_overlay_layers(page, valid_asset_ids)
+        # 应用 LLM 建议的 overlay 布局（如果 LLM 返回了 overlay_layout）
+        if isinstance(desc_data, dict) and desc_data.get("overlay_layout"):
+            overlay_layers = apply_llm_overlay_layout(overlay_layers, desc_data.get("overlay_layout"))
         if not isinstance(visual_asset_ids, list):
             visual_asset_ids = []
         visual_asset_ids = [

@@ -12,9 +12,12 @@ export interface StylePagePreview {
   tone: StylePreviewTone;
   background: string;
   accent: string;
+  secondary: string;
+  highlight: string;
   brand: string;
   text: string;
   surface: string;
+  chartColors: string[];
   intensity: "strong" | "medium" | "calm";
 }
 
@@ -254,9 +257,51 @@ function pickVisualAccent(palette: StylePreviewColor[], brandColor: StylePreview
   );
 }
 
+function pickSecondaryColor(palette: StylePreviewColor[], accent: StylePreviewColor, brandColor: StylePreviewColor | null) {
+  const isUsableSecondary = (color: StylePreviewColor) =>
+    color.hex !== accent.hex &&
+    color.hex !== brandColor?.hex &&
+    !isBaseColor(color) &&
+    !isTextColor(color) &&
+    !isNeutralColor(color);
+  const isStrongContrast = (color: StylePreviewColor) =>
+    /(?:强对比|撞色|对比|关键行动|活力|橙|红|黄|金)/i.test(colorSignal(color));
+  return (
+    palette.find((color) => isStrongContrast(color) && isUsableSecondary(color)) ||
+    palette.find((color) => /(?:辅助|装饰|霓虹|荧红)/i.test(colorSignal(color)) && isUsableSecondary(color) && !isLowRatioColor(color)) ||
+    palette.find(isUsableSecondary) ||
+    brandColor ||
+    accent
+  );
+}
+
+function pickHighlightColor(
+  palette: StylePreviewColor[],
+  accent: StylePreviewColor,
+  secondary: StylePreviewColor,
+  brandColor: StylePreviewColor | null
+) {
+  const isUsableHighlight = (color: StylePreviewColor) =>
+    color.hex !== accent.hex &&
+    color.hex !== secondary.hex &&
+    color.hex !== brandColor?.hex &&
+    !isBaseColor(color) &&
+    !isTextColor(color) &&
+    !isNeutralColor(color);
+  return (
+    palette.find((color) => isLowRatioColor(color) && isUsableHighlight(color)) ||
+    palette.find((color) => /(?:图表|数据|高亮|线条|辅助|荧光青|青|蓝绿|关键)/i.test(colorSignal(color)) && isUsableHighlight(color)) ||
+    palette.find(isUsableHighlight) ||
+    secondary ||
+    accent
+  );
+}
+
 function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColor[]): StylePagePreview[] {
   const brandColor = pickBrandColor(palette);
   const accent = pickVisualAccent(palette, brandColor);
+  const secondary = pickSecondaryColor(palette, accent, brandColor);
+  const highlight = pickHighlightColor(palette, accent, secondary, brandColor);
   const lightBase = pickColor(palette, /白|浅|米|明亮|内容区|卡片|背景|基底/i, 2, "light");
   const darkBase = pickColor(palette, /深|黑|暗|背景|基底/i, 3, "dark");
   const textColor = pickColor(palette, /正文|文字|图表文字|text/i, 3);
@@ -277,9 +322,12 @@ function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColo
       tone: baseTone === "light" ? "light" : "dark",
       background: baseTone === "light" ? lightBackground : darkBackground,
       accent: accent.hex,
+      secondary: secondary.hex,
+      highlight: highlight.hex,
       brand,
       text: baseTone === "light" ? lightText : darkText,
       surface: accent.hex,
+      chartColors: [accent.hex, highlight.hex, secondary.hex, accent.hex],
       intensity: "strong",
     },
     {
@@ -288,9 +336,12 @@ function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColo
       tone: baseTone === "light" ? "light" : "dark",
       background: baseTone === "light" ? lightBackground : darkBackground,
       accent: accent.hex,
+      secondary: secondary.hex,
+      highlight: highlight.hex,
       brand,
       text: baseTone === "light" ? lightText : darkText,
       surface: brand,
+      chartColors: [accent.hex, secondary.hex, highlight.hex, brand],
       intensity: "medium",
     },
     {
@@ -299,9 +350,12 @@ function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColo
       tone: informationTone,
       background: informationBackground,
       accent: accent.hex,
+      secondary: secondary.hex,
+      highlight: highlight.hex,
       brand,
       text: informationText,
       surface: informationSurface,
+      chartColors: [accent.hex, highlight.hex, secondary.hex, accent.hex],
       intensity: "calm",
     },
     {
@@ -310,9 +364,12 @@ function buildPagePreviews(baseTone: StylePreviewTone, palette: StylePreviewColo
       tone: informationTone,
       background: informationBackground,
       accent: accent.hex,
+      secondary: secondary.hex,
+      highlight: highlight.hex,
       brand,
       text: informationText,
       surface: informationSurface,
+      chartColors: [accent.hex, highlight.hex, secondary.hex, accent.hex],
       intensity: "calm",
     },
   ];

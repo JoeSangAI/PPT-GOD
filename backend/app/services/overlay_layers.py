@@ -97,6 +97,51 @@ def normalize_overlay_layers(
     return normalized
 
 
+def apply_llm_overlay_layout(
+    overlay_layers: list[dict[str, Any]],
+    llm_overlay_layout: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """应用 LLM 建议的 overlay 布局到 overlay_layers，自动避免 preset 冲突。"""
+    if not llm_overlay_layout or not overlay_layers:
+        return overlay_layers
+
+    # 创建 asset_id -> preset 的映射
+    llm_presets: dict[str, str] = {}
+    for item in llm_overlay_layout:
+        if isinstance(item, dict):
+            asset_id = str(item.get("asset_id") or "").strip()
+            preset = str(item.get("preset") or "").strip()
+            if asset_id and preset and preset in OVERLAY_PRESETS:
+                llm_presets[asset_id] = preset
+
+    # 应用 LLM 建议的 preset，自动处理冲突
+    updated: list[dict[str, Any]] = []
+    used_presets: set[str] = set()
+
+    for layer in overlay_layers:
+        asset_id = str(layer.get("asset_id") or "")
+        preset = llm_presets.get(asset_id) or layer.get("preset", DEFAULT_OVERLAY_PRESET)
+
+        # 验证 preset 合法性
+        if preset not in OVERLAY_PRESETS:
+            preset = DEFAULT_OVERLAY_PRESET
+
+        # 处理冲突：如果 preset 已被使用，找下一个可用的
+        if preset in used_presets:
+            for p in OVERLAY_PRESETS:
+                if p not in used_presets:
+                    preset = p
+                    break
+
+        used_presets.add(preset)
+
+        updated_layer = copy.deepcopy(layer)
+        updated_layer["preset"] = preset
+        updated.append(updated_layer)
+
+    return updated
+
+
 def merge_overlay_layers_into_visual_json(visual_json: dict | None, existing_visual_json: dict | None) -> dict:
     visual = copy.deepcopy(visual_json) if isinstance(visual_json, dict) else {}
     existing = existing_visual_json if isinstance(existing_visual_json, dict) else {}
@@ -125,14 +170,27 @@ def overlay_reservation_instruction(
     layers = enabled_overlay_layers(visual_json, valid_asset_ids=valid_asset_ids)
     if not layers:
         return ""
-    parts = []
-    for layer in layers[:4]:
-        label = OVERLAY_PRESET_LABELS.get(str(layer.get("preset")), "reserved media slot")
-        parts.append(label)
-    joined = "; ".join(parts)
+    area_descriptions = []
+    for i, layer in enumerate(layers[:4], 1):
+        preset = str(layer.get("preset") or DEFAULT_OVERLAY_PRESET)
+        label = OVERLAY_PRESET_LABELS.get(preset, "reserved media slot")
+        # 基于 preset 给出更具体的区域描述
+        position_hints = {
+            "top-right-small": "upper-right corner",
+            "bottom-right-small": "lower-right corner",
+            "left-card": "left side (approximately 36% width, center vertically)",
+            "right-card": "right side (approximately 34% width, center vertically)",
+            "center-card": "center (approximately 44% width, center vertically)",
+            "bottom-band": "bottom edge (approximately 76% width, lower portion)",
+        }
+        position = position_hints.get(preset, label)
+        area_descriptions.append(f"{i}. {position}")
+    areas_text = "\n".join(area_descriptions)
     return (
-        "CRITICAL LAYOUT INSTRUCTION: Reserve clean empty background space for post-generation overlay assets in these areas: "
-        f"{joined}. "
+        "CRITICAL LAYOUT INSTRUCTION: This page requires "
+        f"{len(layers[:4])} clean empty background zone(s) for post-generation overlay assets. "
+        "Reserve the following areas completely free of any content:\n"
+        f"{areas_text}\n\n"
         "TEXT PLACEMENT RULE: Place ALL visible text, headlines, subheads, and body copy strictly in safe zones that do NOT overlap with reserved areas. "
         "When left and right areas are both reserved, place all text in the upper-center region only, keeping it well above and clear of any reserved zones. "
         "Never place text between two reserved side areas or inside reserved zones. "

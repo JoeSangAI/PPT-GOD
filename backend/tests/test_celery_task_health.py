@@ -79,8 +79,9 @@ def test_stop_generation_releases_page_locks(monkeypatch):
             return len(keys)
 
     class FakeAsyncResult:
-        def __init__(self, task_id):
+        def __init__(self, task_id, *, app):
             revoked["task_id"] = task_id
+            revoked["app"] = app
 
         def revoke(self, terminate=False):
             revoked["terminate"] = terminate
@@ -91,7 +92,7 @@ def test_stop_generation_releases_page_locks(monkeypatch):
     result = slides_api.stop_generation(project.id, db=db)
 
     assert result["message"] == "Generation stopped"
-    assert revoked == {"task_id": "task-1", "terminate": True}
+    assert revoked == {"task_id": "task-1", "app": celery_app, "terminate": True}
     for page_num in (1, 2, 3):
         assert f"project:{project.id}:slide:{page_num}:generating" in deleted
 

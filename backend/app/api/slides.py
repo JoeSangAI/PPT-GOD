@@ -39,6 +39,24 @@ from app.utils.reference_image import (
 # 全局运行中任务跟踪（project_id -> asyncio.Task）
 _running_tasks: dict = {}
 _running_tasks_lock = asyncio.Lock()
+
+
+def _resolve_file_path(file_path: str) -> str:
+    """安全解析文件路径，兼容从不同工作目录启动的情况。"""
+    if not file_path:
+        return file_path
+    if os.path.exists(file_path):
+        return file_path
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidate = os.path.join(backend_dir, file_path)
+    if os.path.exists(candidate):
+        return candidate
+    abs_path = os.path.abspath(file_path)
+    if os.path.exists(abs_path):
+        return abs_path
+    return file_path
+
+
 from app.core.config import settings
 from app.services.content_plan import (
     LONG_DECK_CHUNK_SIZE,
@@ -119,6 +137,7 @@ from app.services.run_state import (
     generation_progress,
 )
 from app.services.project_quality_report import build_project_quality_report
+from app.celery_app import celery_app
 from celery.result import AsyncResult
 
 router = APIRouter(prefix="/projects", tags=["slides"])
@@ -833,7 +852,7 @@ def _valid_overlay_asset_ids_for_slide(project: Project, slide: Slide | None) ->
             continue
         if ref.role == "visual_asset" and not ref.slide_id:
             valid.add(ref_id)
-        elif ref.role in {"content_ref", "chart_ref"} and ref.slide_id == slide.id:
+        elif ref.role in {"content_ref", "chart_ref"} and (not ref.slide_id or ref.slide_id == slide.id):
             valid.add(ref_id)
     return valid
 
@@ -1165,6 +1184,7 @@ def _clear_slide_generation_outputs(slide: Slide, *, clear_visual: bool):
 
 def _mark_slide_artifacts_stale(slide: Slide, **flags: bool):
     slide.visual_json = with_stale_flags(slide.visual_json if isinstance(slide.visual_json, dict) else {}, **flags)
+    flag_modified(slide, "visual_json")
 
 
 def _project_has_stale_artifacts(slides: list[Slide]) -> bool:
@@ -1244,7 +1264,7 @@ def _reassemble_generated_pptx_if_possible(project: Project) -> bool:
         if logo_refs else None
     )
     overlay_assets = {
-        ref.id: {
+        str(ref.id): {
             "file_path": ref.file_path,
             "asset_name": ref.asset_name,
             "asset_kind": ref.asset_kind,
@@ -1275,7 +1295,7 @@ def _reassemble_generated_pptx_if_possible(project: Project) -> bool:
 
 def _project_export_overlay_assets(project: Project) -> dict:
     return {
-        ref.id: {
+        str(ref.id): {
             "file_path": ref.file_path,
             "asset_name": ref.asset_name,
             "asset_kind": ref.asset_kind,
@@ -1445,7 +1465,7 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
     for ref in existing_refs:
         block_id = str((ref.asset_analysis or {}).get("content_block_id") or "")
         if block_id and block_id not in visual_by_id:
-            overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != ref.id]
+            overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != str(ref.id)]
             db.delete(ref)
 
     output_dir = _content_block_asset_dir(project.id, slide.id)
@@ -1481,7 +1501,7 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
             }
         block["rendered_asset_id"] = ref.id
 
-        overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != ref.id]
+        overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != str(ref.id)]
         if route_mode == "original":
             overlay_layers.append({
                 "id": f"ov_{ref.id}",
@@ -1949,7 +1969,13 @@ def _build_slide_reference_contexts(
         hint_parts: list[str] = []
         ref_count = len(slide.reference_images or [])
         logger.info(f"RefContext: slide {slide.page_num} has {ref_count} reference_images")
+        overlay_asset_ids = exact_overlay_asset_ids(
+            slide.visual_json if isinstance(slide.visual_json, dict) else {}
+        )
         for idx, ref in enumerate(sorted(slide.reference_images or [], key=_reference_image_sort_key), start=1):
+            if str(ref.id) in overlay_asset_ids:
+                logger.info(f"RefContext: slide {slide.page_num} ref {idx} skipped (overlay)")
+                continue
             file_exists = os.path.exists(ref.file_path)
             logger.info(f"RefContext: slide {slide.page_num} ref {idx} file={ref.file_path} exists={file_exists} role={ref.role}")
             if not file_exists:
@@ -2098,7 +2124,7 @@ def _content_plan_attachment_context(db: Session, project_id: str, attachment_id
         ReferenceImage.id.in_(ids),
         ReferenceImage.role.in_(["chat_ref", "content_ref", "chart_ref", "visual_asset"]),
     ).all()
-    by_id = {ref.id: ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
+    by_id = {str(ref.id): ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
     parts: list[str] = []
     role_label = {
         "chat_ref": "本轮对话图片",
@@ -2455,7 +2481,7 @@ def _generate_content_plan_bg(
             ReferenceImage.slide_id.is_(None),
         ).all()
         for idx, ref in enumerate(content_refs[:8], start=1):
-            if ref.id in explicit_attachment_ids:
+            if str(ref.id) in explicit_attachment_ids:
                 continue
             analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
             if analysis.get("pptx_source_page_num"):
@@ -2775,6 +2801,9 @@ def create_visual_plan(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        visual = s.visual_json if isinstance(s.visual_json, dict) else {}
+        if visual.get("overlay_layers"):
+            item["overlay_layers"] = visual["overlay_layers"]
         if stage_context:
             item["global_user_requirements"] = stage_context
         if ref_contexts.get(s.page_num):
@@ -2885,6 +2914,9 @@ def create_prompts(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        visual = s.visual_json if isinstance(s.visual_json, dict) else {}
+        if visual.get("overlay_layers"):
+            item["overlay_layers"] = visual["overlay_layers"]
         if stage_context:
             item["global_user_requirements"] = stage_context
         if ref_contexts.get(s.page_num):
@@ -2942,6 +2974,7 @@ def create_prompts(
                 prompt_dependencies=artifact_deps,
             )
             slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+            flag_modified(slide, "visual_json")
             slide.status = "prompt_ready"
 
     # 如果全部都有 prompt，项目状态推进
@@ -2982,6 +3015,9 @@ async def create_visual_and_prompts(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        visual = s.visual_json if isinstance(s.visual_json, dict) else {}
+        if visual.get("overlay_layers"):
+            item["overlay_layers"] = visual["overlay_layers"]
         content_plan.append(item)
 
     ref_images_project = project.reference_images
@@ -3085,6 +3121,9 @@ async def _do_generate_visual_and_prompts(
             item["page_num"] = s.page_num
             item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
             item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+            visual = s.visual_json if isinstance(s.visual_json, dict) else {}
+            if visual.get("overlay_layers"):
+                item["overlay_layers"] = visual["overlay_layers"]
             if stage_context:
                 item["global_user_requirements"] = stage_context
             if ref_contexts.get(s.page_num):
@@ -3147,6 +3186,7 @@ async def _do_generate_visual_and_prompts(
             if slide.prompt_text or slide.image_path or has_stale_flags(existing_visual, "content", "visual"):
                 next_visual = with_stale_flags(next_visual, content=False, visual=True)
             slide.visual_json = next_visual
+            flag_modified(slide, "visual_json")
             if slide.status in ("pending", "planning"):
                 slide.status = "visual_ready"
         db.commit()
@@ -3236,6 +3276,7 @@ async def _do_generate_visual_and_prompts(
                     prompt_dependencies=artifact_deps,
                 )
                 slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+                flag_modified(slide, "visual_json")
                 slide.status = "prompt_ready"
 
         # 状态更新：优先按目标页判断（支持部分生成），再回退到全局判断
@@ -3575,7 +3616,7 @@ def stop_generation(
     task_id = redis_client.get(f"project:{project_id}:task_id")
     if task_id:
         try:
-            AsyncResult(task_id.decode() if isinstance(task_id, bytes) else task_id).revoke(terminate=True)
+            AsyncResult(task_id.decode() if isinstance(task_id, bytes) else task_id, app=celery_app).revoke(terminate=True)
             logger.info(f"Revoked Celery task {task_id} for project {project_id}")
         except Exception as e:
             logger.warning(f"Failed to revoke task {task_id}: {e}")
@@ -4285,6 +4326,7 @@ def delete_reference_image(
                     visual["manual_visual_asset_usage"] = manual_usage
             visual = remove_asset_from_overlay_layers(visual, ref_id)
             slide.visual_json = visual
+            flag_modified(slide, "visual_json")
         _invalidate_visual_asset_dependent_outputs(project)
     db.delete(ref)
     db.commit()
@@ -4531,9 +4573,9 @@ def update_slide_overlay_layers(
         ).all()
         valid_assets = [
             asset for asset in candidates
-            if asset.file_path and os.path.exists(asset.file_path)
+            if asset.file_path and os.path.exists(_resolve_file_path(asset.file_path))
         ]
-    valid_ids = {asset.id for asset in valid_assets}
+    valid_ids = {str(asset.id) for asset in valid_assets}
     missing = [asset_id for asset_id in requested_asset_ids if asset_id not in valid_ids]
     if missing:
         logger.warning(
@@ -4545,7 +4587,7 @@ def update_slide_overlay_layers(
     normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
     overlay_asset_ids = {str(layer.get("asset_id")) for layer in normalized_layers if layer.get("asset_id")}
     for asset in valid_assets:
-        if asset.id in overlay_asset_ids:
+        if str(asset.id) in overlay_asset_ids:
             asset.process_mode = "original"
             analysis = asset.asset_analysis if isinstance(asset.asset_analysis, dict) else {}
             asset.asset_analysis = {
@@ -4556,6 +4598,7 @@ def update_slide_overlay_layers(
     visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
     visual["overlay_layers"] = normalized_layers
     slide.visual_json = visual
+    flag_modified(slide, "visual_json")
     _invalidate_visual_plan_dependent_outputs(project, [slide])
     db.commit()
     db.refresh(slide)
@@ -4713,6 +4756,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
         prompt_dependencies=artifact_deps,
     )
     slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+    flag_modified(slide, "visual_json")
     db.commit()
     logger.info(f"RetrySlide: 已重新生成第 {slide.page_num} 页 prompt")
     return prompt
@@ -4756,11 +4800,11 @@ def _project_visual_asset_ids_for_finetune(project: Project, slide: Slide, instr
     ]
     candidate_refs.sort(
         key=lambda ref: (
-            selected_ids.index(ref.id) if ref.id in selected_ids else 999,
+            selected_ids.index(str(ref.id)) if str(ref.id) in selected_ids else 999,
             ref.asset_name or "",
         )
     )
-    return [ref.id for ref in candidate_refs[:3]]
+    return [str(ref.id) for ref in candidate_refs[:3]]
 
 
 def _build_direct_finetune_prompt(
@@ -4869,7 +4913,7 @@ def finetune_slide(
                 ReferenceImage.id.in_(attachment_ids),
                 ReferenceImage.role == "finetune_ref",
             ).all()
-            found_ids = {ref.id for ref in refs}
+            found_ids = {str(ref.id) for ref in refs}
             valid_attachment_ids = [ref_id for ref_id in attachment_ids if ref_id in found_ids]
 
         project_visual_asset_ids = _project_visual_asset_ids_for_finetune(project, slide, instruction)
@@ -4885,6 +4929,7 @@ def finetune_slide(
         visual_json["finetune_attachment_ids"] = valid_attachment_ids
         visual_json["finetune_visual_asset_ids"] = project_visual_asset_ids
         slide.visual_json = visual_json
+        flag_modified(slide, "visual_json")
     else:
         slide.prompt_text = new_prompt
     slide.status = "generating"
