@@ -8801,3 +8801,223 @@ body {
     --pg-logo-width: min(360px, 82vw);
   }
 }
+
+/* Marble refinement: whiter translucent surfaces with only restrained copper accents. */
+:root {
+  --pg-obsidian: #1d1c1a;
+  --pg-obsidian-2: #2a2926;
+  --pg-panel: #ffffff;
+  --pg-panel-2: #f5f7f7;
+  --pg-bg-soft: #f7f8f8;
+  --pg-canvas: #ffffff;
+  --pg-canvas-2: #eef1f2;
+  --pg-ink: #201f1d;
+  --pg-muted: #63686d;
+  --pg-muted-2: rgba(32, 31, 29, 0.52);
+  --pg-line: rgba(41, 46, 50, 0.13);
+  --pg-line-soft: rgba(41, 46, 50, 0.08);
+  --pg-gold: #a77a42;
+  --pg-gold-2: #c39b61;
+  --pg-copper: #8d6a3f;
+  --pg-aegean: #2d7777;
+  --pg-olive: #64724f;
+  --pg-primary: #201f1d;
+  --pg-primary-hover: #33302b;
+  --pg-accent: #a77a42;
+  --pg-focus: #2d7777;
+  --pg-success: #4d7556;
+  --pg-danger: #b6453f;
+  --pg-shadow: 0 22px 58px rgba(28, 31, 33, 0.1);
+  --pg-shadow-light: 0 12px 28px rgba(28, 31, 33, 0.07);
+}
+
+body {
+  background: #f7f8f8;
+}
+
+.pg-app,
+.pg-auth.pg-auth-v2 {
+  background:
+    linear-gradient(128deg, transparent 0 19%, rgba(120, 126, 130, 0.055) 19.2%, transparent 20.4% 100%),
+    linear-gradient(34deg, transparent 0 61%, rgba(120, 126, 130, 0.045) 61.2%, transparent 62.3% 100%),
+    linear-gradient(162deg, rgba(255, 255, 255, 0.95), rgba(244, 247, 247, 0.88) 46%, rgba(255, 255, 255, 0.96)),
+    #f7f8f8 !important;
+  color: var(--pg-ink);
+}
+
+.pg-app::before {
+  opacity: 0.36;
+  background:
+    repeating-linear-gradient(118deg, transparent 0 34px, rgba(92, 98, 102, 0.04) 34px 35px, transparent 35px 76px),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.72), transparent 72%);
+  background-size: auto;
+  mask-image: linear-gradient(180deg, #000 0%, transparent 78%);
+}
+
+.pg-sidebar {
+  border-color: rgba(41, 46, 50, 0.12) !important;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.88), rgba(247, 249, 249, 0.74)),
+    rgba(255, 255, 255, 0.72) !important;
+  box-shadow: 12px 0 34px rgba(28, 31, 33, 0.06);
+  backdrop-filter: blur(22px) saturate(1.08);
+}
+
+.pg-sidebar-header,
+.pg-topbar.pg-project-header,
+.pg-workflow,
+.pg-workbench-modulebar,
+.pg-style-bar,
+.pg-oracle-header {
+  border-color: rgba(41, 46, 50, 0.11) !important;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.8), rgba(247, 249, 249, 0.58)),
+    rgba(255, 255, 255, 0.62) !important;
+  backdrop-filter: blur(24px) saturate(1.12);
+}
+
+.pg-brand-mark-wordmark {
+  border-color: rgba(41, 46, 50, 0.12) !important;
+  background: rgba(255, 255, 255, 0.72) !important;
+}
+
+.pg-main,
+.pg-workbench-body,
+.pg-workspace,
+.pg-empty-state,
+.pg-oracle-panel,
+.pg-oracle-panel .pg-chat-stream {
+  background:
+    linear-gradient(128deg, transparent 0 22%, rgba(120, 126, 130, 0.042) 22.2%, transparent 23.2% 100%),
+    linear-gradient(34deg, transparent 0 64%, rgba(120, 126, 130, 0.035) 64.2%, transparent 65.1% 100%),
+    #f7f8f8 !important;
+  background-size: auto;
+}
+
+.pg-oracle-panel {
+  border-color: rgba(41, 46, 50, 0.12) !important;
+  box-shadow: -12px 0 34px rgba(28, 31, 33, 0.06);
+}
+
+.pg-project-export-link,
+.pg-workflow-actions > button,
+.pg-workflow-actions > a,
+.pg-selection-pill,
+.pg-workbench-module-button,
+.pg-style-bar-toggle,
+.pg-workflow-step,
+.pg-workflow-status,
+.pg-progress-overview,
+.pg-status-card,
+.pg-side-drawer,
+.pg-template-picker-group,
+.pg-agent-command-bar,
+.pg-agent-material-sheet,
+.pg-progress-detail-card,
+.pg-oracle-panel .pg-message,
+.pg-oracle-panel .pg-documents-panel,
+.pg-oracle-card,
+.pg-draft-card,
+.pg-composer-input-shell,
+.pg-oracle-panel .pg-composer-row {
+  border-color: rgba(41, 46, 50, 0.12) !important;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.86), rgba(248, 250, 250, 0.7)),
+    rgba(255, 255, 255, 0.66) !important;
+  color: var(--pg-ink) !important;
+  backdrop-filter: blur(18px) saturate(1.08);
+}
+
+.pg-project-export-link:hover,
+.pg-workflow-actions > button:hover,
+.pg-workflow-actions > a:hover,
+.pg-selection-pill:hover,
+.pg-workbench-module-button:hover,
+.pg-style-bar-toggle:hover,
+.pg-project-card:hover,
+.pg-composer-attach-button:hover,
+.pg-agent-command-chip:hover,
+.pg-oracle-panel .pg-composer-attach:hover {
+  border-color: rgba(141, 106, 63, 0.28) !important;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 250, 0.78)),
+    rgba(255, 255, 255, 0.74) !important;
+}
+
+.pg-project-card.bg-blue-50,
+.pg-project-card.border-blue-200 {
+  border-color: rgba(141, 106, 63, 0.28) !important;
+  background:
+    linear-gradient(90deg, rgba(141, 106, 63, 0.085), rgba(255, 255, 255, 0.74)),
+    rgba(255, 255, 255, 0.66) !important;
+}
+
+.pg-sidebar .pg-primary-button,
+.pg-workflow-step.bg-blue-600,
+.pg-workflow-actions .pg-action-primary,
+.pg-agent-command-chip.is-active,
+.pg-agent-area-panel button.is-active,
+.pg-agent-scope-panel button.is-active {
+  border-color: #201f1d !important;
+  background: #201f1d !important;
+  color: #ffffff !important;
+  box-shadow: 0 12px 28px rgba(32, 31, 29, 0.14);
+}
+
+.pg-sidebar .pg-primary-button:hover,
+.pg-workflow-actions .pg-action-primary:hover {
+  background: #33302b !important;
+}
+
+.pg-collapsed-rail,
+.pg-resizer,
+.pg-oracle-panel > .border-t,
+.pg-auth-assurance,
+.pg-provider-footnote {
+  border-color: rgba(41, 46, 50, 0.11) !important;
+  background: rgba(255, 255, 255, 0.7) !important;
+  color: var(--pg-muted) !important;
+  backdrop-filter: blur(18px) saturate(1.08);
+}
+
+.pg-auth-v2 .pg-auth-backdrop {
+  background-image:
+    linear-gradient(90deg, rgba(247, 248, 248, 0.98) 0%, rgba(247, 248, 248, 0.93) 42%, rgba(247, 248, 248, 0.74) 68%, rgba(247, 248, 248, 0.9) 100%),
+    url("./assets/pptgod-greek-deity-hero.png") !important;
+  opacity: 0.82;
+}
+
+.pg-auth.pg-auth-v2::after {
+  background:
+    linear-gradient(128deg, transparent 0 24%, rgba(120, 126, 130, 0.06) 24.2%, transparent 25.2% 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.58), rgba(243, 246, 247, 0.5)) !important;
+}
+
+.pg-auth-v2 .pg-auth-card-v2 {
+  border-color: rgba(41, 46, 50, 0.12);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.88), rgba(248, 250, 250, 0.72)),
+    rgba(255, 255, 255, 0.74);
+  box-shadow: 0 26px 70px rgba(28, 31, 33, 0.13);
+  backdrop-filter: blur(26px) saturate(1.12);
+}
+
+.pg-auth-input {
+  border-color: rgba(41, 46, 50, 0.14);
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.pg-auth-input:focus {
+  border-color: rgba(45, 119, 119, 0.48);
+  box-shadow: 0 0 0 3px rgba(45, 119, 119, 0.12);
+}
+
+.pg-auth-v2 .pg-login-submit {
+  background: linear-gradient(135deg, #201f1d 0%, #33302b 58%, #8d6a3f 100%) !important;
+  color: #ffffff !important;
+  box-shadow: 0 16px 36px rgba(32, 31, 29, 0.2);
+}
+
+.pg-auth-v2 .pg-login-submit:hover {
+  background: linear-gradient(135deg, #171615 0%, #2b2925 58%, #755735 100%) !important;
+}
