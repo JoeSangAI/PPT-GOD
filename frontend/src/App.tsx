@@ -958,6 +958,30 @@ function dedupeReferenceImages<T>(items?: T[]) {
   }) as T[];
 }
 
+function visualAssetIdsForSlide(slide: any) {
+  const ids: string[] = [];
+  const addId = (value: any) => {
+    const id = String(value || "");
+    if (id && !ids.includes(id)) ids.push(id);
+  };
+  if (Array.isArray(slide?.visual_json?.visual_asset_ids)) {
+    slide.visual_json.visual_asset_ids.forEach(addId);
+  }
+  if (Array.isArray(slide?.visual_json?.manual_visual_asset_ids)) {
+    slide.visual_json.manual_visual_asset_ids.forEach(addId);
+  }
+  if (Array.isArray(slide?.visual_json?.overlay_layers)) {
+    slide.visual_json.overlay_layers.forEach((layer: any) => {
+      if (layer?.enabled !== false) addId(layer?.asset_id);
+    });
+  }
+  return ids;
+}
+
+function referenceDisplayName(ref: any, fallback = "参考图") {
+  return ref?.asset_name || ref?.asset_analysis?.subject || fallback;
+}
+
 function directReplicateSourceFacts(slide: any) {
   const content = slide?.content_json || {};
   const facts = content.source_facts || {};
@@ -1270,7 +1294,7 @@ function SlideImageWithOverlays({
             style={{ ...box, zIndex: 8 + index }}
           >
             <img
-              src={`${API_BASE}${asset.url}`}
+              src={resolveAssetUrl(API_BASE, asset.url)}
               alt=""
               className="pointer-events-none select-none"
             />
@@ -6919,6 +6943,15 @@ function App() {
     section: "bg-pink-100 text-pink-700",
   };
   const projectLogo = referenceImages.find(isConfirmedLogoRef);
+  const projectVisualAssetById = useMemo(() => {
+    const map = new Map<string, any>();
+    referenceImages.forEach((ref: any) => {
+      if (ref?.role === "visual_asset" && ref?.id) {
+        map.set(String(ref.id), ref);
+      }
+    });
+    return map;
+  }, [referenceImages]);
   const styleDockProposals: StyleProposal[] =
     styleProposalsInChat.length > 0
       ? styleProposalsInChat
@@ -7855,9 +7888,15 @@ function App() {
                       style={{
                         "--style-page-bg": page.background,
                         "--style-page-accent": page.accent,
+                        "--style-page-secondary": page.secondary,
+                        "--style-page-highlight": page.highlight,
                         "--style-page-brand": page.brand,
                         "--style-page-text": page.text,
                         "--style-page-surface": page.surface,
+                        "--style-page-chart-1": page.chartColors[0],
+                        "--style-page-chart-2": page.chartColors[1],
+                        "--style-page-chart-3": page.chartColors[2],
+                        "--style-page-chart-4": page.chartColors[3],
                       } as CSSProperties}
                     >
                       <span className="pg-style-page-mini-label">{page.label}</span>
@@ -8095,10 +8134,23 @@ function App() {
               onDeleteVersion={(versionId) => handleDeleteVersion(editingSlide.id, versionId)}
               unescapeText={unescapeText}
               onImageClick={(url) => {
-                if (url.includes("/uploads/")) {
-                  const refUrls = dedupeReferenceImages(editingSlide?.reference_images || []).map((r: any) => `${API_BASE}${r.url}`);
-                  const index = refUrls.indexOf(url);
-                  setGalleryModal({ urls: refUrls, index: index >= 0 ? index : 0, title: "本页参考图" });
+                const resolvedUrl = resolveAssetUrl(API_BASE, url);
+                if (resolvedUrl.includes("/uploads/")) {
+                  const pageRefUrls = dedupeReferenceImages(editingSlide?.reference_images || []).map((r: any) =>
+                    resolveAssetUrl(API_BASE, r.url)
+                  );
+                  const projectRefUrls = visualAssetIdsForSlide(editingSlide)
+                    .map((id) => {
+                      const asset = projectVisualAssetById.get(id);
+                      return resolveAssetUrl(API_BASE, asset?.overlay_url || asset?.url);
+                    })
+                    .filter(Boolean);
+                  const refUrls = [...pageRefUrls, ...projectRefUrls].filter((v, i, a) => v && a.indexOf(v) === i);
+                  const galleryUrls = refUrls.includes(resolvedUrl)
+                    ? refUrls
+                    : [resolvedUrl, ...refUrls].filter((v, i, a) => v && a.indexOf(v) === i);
+                  const index = galleryUrls.indexOf(resolvedUrl);
+                  setGalleryModal({ urls: galleryUrls, index: index >= 0 ? index : 0, title: "本页参考图" });
                 } else {
                   const gallerySlides = slides
                     .filter((s) => s.status === "completed" && s.image_path)
@@ -8215,10 +8267,6 @@ function App() {
                         const proposalKey = `${proposal.name}-${index}`;
                         const isExpanded = expandedStyleProposalKey === proposalKey;
                         const palette = Array.isArray(proposal.palette) ? proposal.palette : [];
-                        const mood = stripHexCodes(proposal.mood) || "—";
-                        const font = stripHexCodes(proposal.font) || "—";
-                        const pageTypeAdaptation = stripHexCodes((proposal as any).page_type_adaptation || "");
-                        const contentStyleHint = stripHexCodes((proposal as any).content_style_hint || "");
                         const strategySummary = visualStrategyText(proposal);
                         const bestFor = proposalDecisionField(proposal, "best_for");
                         const tradeoff = proposalDecisionField(proposal, "tradeoff");
@@ -8259,7 +8307,6 @@ function App() {
                             {isExpanded && (
                               <div className="pg-style-dock-detail">
                                 <div className="pg-style-dock-preview-block">
-                                  <p className="pg-style-preview-summary">{proposalPreview.summary}</p>
                                   <div className="pg-style-page-previews pg-style-proposal-page-previews" aria-label="视觉方向页面类型图例">
                                     {proposalPreview.pages.map((page) => (
                                       <div
@@ -8268,9 +8315,15 @@ function App() {
                                         style={{
                                           "--style-page-bg": page.background,
                                           "--style-page-accent": page.accent,
+                                          "--style-page-secondary": page.secondary,
+                                          "--style-page-highlight": page.highlight,
                                           "--style-page-brand": page.brand,
                                           "--style-page-text": page.text,
                                           "--style-page-surface": page.surface,
+                                          "--style-page-chart-1": page.chartColors[0],
+                                          "--style-page-chart-2": page.chartColors[1],
+                                          "--style-page-chart-3": page.chartColors[2],
+                                          "--style-page-chart-4": page.chartColors[3],
                                         } as CSSProperties}
                                       >
                                         <span className="pg-style-page-mini-label">{page.label}</span>
@@ -8290,76 +8343,29 @@ function App() {
                                       </div>
                                     ))}
                                   </div>
-                                  <div className="pg-style-preview-notes">
-                                    <div>
+                                  <div className="pg-style-dock-compact-meta" aria-label="视觉方向摘要">
+                                    <span>
                                       <b>视觉节奏</b>
-                                      <p>{proposalPreview.rhythmText}</p>
-                                    </div>
-                                    <div>
-                                      <b>字体体系</b>
-                                      <p>{proposalPreview.fontText}</p>
-                                    </div>
+                                      <em>{proposalPreview.rhythmText}</em>
+                                    </span>
+                                    <span>
+                                      <b>字体</b>
+                                      <em>{proposalPreview.fontText}</em>
+                                    </span>
+                                    {strategySummary && (
+                                      <span>
+                                        <b>整体基底</b>
+                                        <em>{strategySummary}</em>
+                                      </span>
+                                    )}
+                                    {visualFocus && (
+                                      <span>
+                                        <b>视觉重点</b>
+                                        <em>{visualFocus}</em>
+                                      </span>
+                                    )}
                                   </div>
                                 </div>
-                                {bestFor && (
-                                  <div className="pg-style-dock-detail-block">
-                                    <b>适合选择</b>
-                                    <p>{bestFor}</p>
-                                  </div>
-                                )}
-                                {tradeoff && (
-                                  <div className="pg-style-dock-detail-block">
-                                    <b>需要接受</b>
-                                    <p>{tradeoff}</p>
-                                  </div>
-                                )}
-                                {visualFocus && (
-                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
-                                    <b>视觉重点</b>
-                                    <p>{visualFocus}</p>
-                                  </div>
-                                )}
-                                {strategySummary && (
-                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
-                                    <b>整体基底</b>
-                                    <p>{strategySummary}</p>
-                                  </div>
-                                )}
-                                <div className="pg-style-dock-detail-block pg-style-dock-palette-block">
-                                  <b>配色</b>
-                                  <div className="pg-style-dock-color-list">
-                                    {palette.slice(0, 5).map((color: any, colorIndex: number) => {
-                                      const swatch = proposalColorValue(color);
-                                      const label = proposalColorLabel(color, colorIndex);
-                                      return (
-                                        <span key={`${swatch}-${colorIndex}`}>
-                                          <i style={{ backgroundColor: swatch }} />
-                                          <em>{label}</em>
-                                        </span>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                                <div className="pg-style-dock-detail-block">
-                                  <b>氛围</b>
-                                  <p>{mood}</p>
-                                </div>
-                                <div className="pg-style-dock-detail-block">
-                                  <b>字体</b>
-                                  <p>{font}</p>
-                                </div>
-                                {pageTypeAdaptation && (
-                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
-                                    <b>页面使用方式</b>
-                                    <p>{pageTypeAdaptation}</p>
-                                  </div>
-                                )}
-                                {contentStyleHint && (
-                                  <div className="pg-style-dock-detail-block pg-style-dock-wide-block">
-                                    <b>内容适配</b>
-                                    <p>{contentStyleHint}</p>
-                                  </div>
-                                )}
                               </div>
                             )}
                             <div className="pg-style-dock-card-actions">
@@ -8404,6 +8410,10 @@ function App() {
                   body: content.bullets || content.body,
                 };
                 const visual = slide.visual_json || {};
+                const slidePageReferenceItems = dedupeReferenceImages(slide.reference_images || []);
+                const slideProjectMaterialItems = visualAssetIdsForSlide(slide)
+                  .map((id) => ({ id, asset: projectVisualAssetById.get(id) }))
+                  .filter(({ asset }) => Boolean(asset?.url || asset?.overlay_url));
                 const hasVisualDescription = Boolean(visual.visual_description && String(visual.visual_description).trim());
                 const hasPromptText = Boolean(slide.prompt_text && String(slide.prompt_text).trim());
                 const isPrototypePageChecked = visiblePrototypePageSet.has(slide.page_num);
@@ -8734,21 +8744,28 @@ function App() {
                       {/* 页面级参考图（紧凑模式） */}
                       <div className="flex min-h-7 items-center gap-1 shrink-0">
                         <div className="flex min-w-0 flex-1 items-center gap-1">
-                          {dedupeReferenceImages(slide.reference_images || []).length > 0 && (
+                          {slidePageReferenceItems.length > 0 && (
                             <div className="flex gap-0.5 flex-nowrap overflow-x-auto">
-                              {dedupeReferenceImages(slide.reference_images || []).map((ref: any) => (
+                              {slidePageReferenceItems.map((ref: any) => (
                                 <div key={ref.id} className="relative group flex-shrink-0">
                                   <img
-                                    src={`${API_BASE}${ref.url}`}
+                                    src={resolveAssetUrl(API_BASE, ref.url)}
                                     alt="ref"
                                     className="w-7 h-7 rounded object-cover border cursor-pointer"
                                     title={referenceThumbTitle(ref)}
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const allRefUrls = slides
-                                        .flatMap((s) => dedupeReferenceImages(s.reference_images || []).map((r: any) => `${API_BASE}${r.url}`))
+                                        .flatMap((s) => [
+                                          ...dedupeReferenceImages(s.reference_images || []).map((r: any) => resolveAssetUrl(API_BASE, r.url)),
+                                          ...visualAssetIdsForSlide(s).map((id) => {
+                                            const asset = projectVisualAssetById.get(id);
+                                            return resolveAssetUrl(API_BASE, asset?.overlay_url || asset?.url);
+                                          }),
+                                        ])
+                                        .filter(Boolean)
                                         .filter((v, i, a) => a.indexOf(v) === i);
-                                      const url = `${API_BASE}${ref.url}`;
+                                      const url = resolveAssetUrl(API_BASE, ref.url);
                                       const index = allRefUrls.indexOf(url);
                                       setGalleryModal({ urls: allRefUrls, index: index >= 0 ? index : 0, title: "本页参考图" });
                                     }}
@@ -8777,6 +8794,39 @@ function App() {
                                   </button>
                                 </div>
                               ))}
+                            </div>
+                          )}
+                          {slideProjectMaterialItems.length > 0 && (
+                            <div className="flex gap-0.5 flex-nowrap overflow-x-auto">
+                              {slideProjectMaterialItems.map(({ id, asset }) => {
+                                const url = resolveAssetUrl(API_BASE, asset.overlay_url || asset.url);
+                                return (
+                                  <div key={`project-material-${slide.id}-${id}`} className="relative group flex-shrink-0">
+                                    <img
+                                      src={url}
+                                      alt={referenceDisplayName(asset, "项目素材")}
+                                      className="w-7 h-7 rounded object-contain bg-white border border-emerald-200 cursor-pointer"
+                                      title="项目素材 — 点击查看"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const allRefUrls = slides
+                                          .flatMap((s) => [
+                                            ...dedupeReferenceImages(s.reference_images || []).map((r: any) => resolveAssetUrl(API_BASE, r.url)),
+                                            ...visualAssetIdsForSlide(s).map((assetId) => {
+                                              const linkedAsset = projectVisualAssetById.get(assetId);
+                                              return resolveAssetUrl(API_BASE, linkedAsset?.overlay_url || linkedAsset?.url);
+                                            }),
+                                          ])
+                                          .filter(Boolean)
+                                          .filter((v, i, a) => a.indexOf(v) === i);
+                                        const index = allRefUrls.indexOf(url);
+                                        setGalleryModal({ urls: allRefUrls, index: index >= 0 ? index : 0, title: "本页参考图" });
+                                      }}
+                                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                                    />
+                                  </div>
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -11279,7 +11329,7 @@ function SingleSlideEditor({
   const routeAssetName = (asset: any, fallback: string) =>
     asset?.asset_name || asset?.asset_analysis?.subject || fallback;
   const routeAssetUrl = (asset: any) =>
-    asset?.overlay_url || asset?.url ? `${API_BASE}${asset.overlay_url || asset.url}` : "";
+    resolveAssetUrl(API_BASE, asset?.overlay_url || asset?.url);
 
   const routeHelp = (route: string) =>
     ASSET_ROUTE_HELP[ASSET_ROUTE_OPTIONS.includes(route as AssetRoute) ? route as AssetRoute : "blend"];
@@ -12018,14 +12068,15 @@ function SingleSlideEditor({
             {pageReferenceItems.map((ref: any) => {
               const route = pageReferenceRoute(ref);
               const refId = String(ref.id);
+              const refUrl = resolveAssetUrl(API_BASE, ref.url);
               return (
                 <div key={ref.id} className="flex items-center gap-3 rounded-md bg-white border border-slate-200 p-2">
                   <div className="relative group flex-shrink-0">
                     <img
-                      src={`${API_BASE}${ref.url}`}
+                      src={refUrl}
                       alt="ref"
                       className="w-14 h-14 rounded object-cover border cursor-pointer"
-                      onClick={() => onImageClick?.(`${API_BASE}${ref.url}`)}
+                      onClick={() => onImageClick?.(refUrl)}
                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                     />
                     <button

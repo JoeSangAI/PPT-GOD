@@ -78,7 +78,7 @@ def _load_chat_attachments(db: Session, project_id: str, attachment_ids: list[st
         ReferenceImage.id.in_(ids),
         ReferenceImage.role.in_(["chat_ref", "content_ref", "chart_ref", "visual_asset", "finetune_ref"]),
     ).all()
-    by_id = {ref.id: ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
+    by_id = {str(ref.id): ref for ref in refs if ref.file_path and os.path.exists(ref.file_path)}
     return [by_id[ref_id] for ref_id in ids if ref_id in by_id]
 
 

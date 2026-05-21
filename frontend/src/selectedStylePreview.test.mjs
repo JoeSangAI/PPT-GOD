@@ -51,6 +51,51 @@ assert.equal(darkPreview.pages.find((page) => page.key === "data").tone, "dark")
 assert.match(darkPreview.rhythmText, /封面\/章节页/);
 assert.match(darkPreview.fontText, /思源黑体/);
 
+const neonPreview = buildSelectedStylePreview({
+  name: "疯狂轮AI",
+  palette: [
+    { name: "电光蓝紫", hex: "#6D3BFF", role: "主色/标题强调/视觉锚点" },
+    { name: "霓虹橙", hex: "#FF6A3D", role: "强对比撞色/关键数字点缀" },
+    { name: "荧光青", hex: "#4DE6D1", role: "辅助色/图表高亮/线条" },
+    { name: "深空黑", hex: "#050611", role: "背景/页面基底" },
+    { name: "雾白", hex: "#F8FAFF", role: "正文/图表文字" },
+  ],
+  visual_strategy: {
+    base_tone: "dark",
+    summary: "以高饱和蓝紫为主调，引入霓虹橙和荧光青形成强对比撞色，深空黑作为背景衬托。",
+  },
+});
+
+for (const page of neonPreview.pages) {
+  assert.equal(page.accent, "#6D3BFF");
+  assert.equal(page.secondary, "#FF6A3D");
+  assert.equal(page.highlight, "#4DE6D1");
+  assert.equal(page.background, "#050611");
+}
+assert.equal(neonPreview.pages.find((page) => page.key === "data").chartColors.join(","), "#6D3BFF,#4DE6D1,#FF6A3D,#6D3BFF");
+
+const roleDirectedPreview = buildSelectedStylePreview({
+  name: "蓝橙撞色",
+  palette: [
+    { name: "深空蓝", hex: "#061526", role: "背景底色" },
+    { name: "电光蓝", hex: "#12C8F4", role: "主视觉/标题强调" },
+    { name: "活力橙", hex: "#FF6A3D", role: "强烈撞色对比/关键行动" },
+    { name: "霓虹紫", hex: "#7C5CFF", role: "点缀平衡冷暖/低占比" },
+    { name: "雾白", hex: "#F8FAFF", role: "正文/图表文字" },
+  ],
+  visual_strategy: {
+    base_tone: "dark",
+    summary: "采用深空蓝作为背景底色，电光蓝和活力橙形成强烈撞色对比，霓虹紫作为点缀平衡冷暖。",
+  },
+});
+
+for (const page of roleDirectedPreview.pages) {
+  assert.equal(page.background, "#061526");
+  assert.equal(page.accent, "#12C8F4");
+  assert.equal(page.secondary, "#FF6A3D");
+  assert.equal(page.highlight, "#7C5CFF");
+}
+
 const darkInformationPagesPreview = buildSelectedStylePreview({
   name: "禅灰极简（金色点缀）",
   palette: [

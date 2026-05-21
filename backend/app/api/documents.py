@@ -44,7 +44,12 @@ def _get_docs_dir(project_id: str) -> str:
 
 
 def _get_pptx_assets_dir(project_id: str) -> str:
-    assets_dir = os.path.join(settings.UPLOAD_DIR, project_id, "pptx_assets")
+    upload_dir = settings.UPLOAD_DIR
+    if not os.path.isabs(upload_dir):
+        # 基于当前文件位置解析（app/api/ -> backend/）
+        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        upload_dir = os.path.join(backend_dir, upload_dir)
+    assets_dir = os.path.join(upload_dir, project_id, "pptx_assets")
     os.makedirs(assets_dir, exist_ok=True)
     return assets_dir
 

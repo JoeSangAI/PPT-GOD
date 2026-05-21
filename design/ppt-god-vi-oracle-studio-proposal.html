@@ -1,0 +1,1709 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PPT God VI Proposal</title>
+    <style>
+      :root {
+        --bg: #f7f5ef;
+        --bg-2: #efebe1;
+        --surface: #fffefa;
+        --surface-2: #f4f0e7;
+        --ink: #1f1e1a;
+        --ink-2: #3c3931;
+        --muted: #777065;
+        --muted-2: #a39b8d;
+        --line: #ded8ca;
+        --line-strong: #c7bdac;
+        --primary: #2d2a24;
+        --copper: #8b7658;
+        --copper-2: #c9ad7d;
+        --blue: #3f6f8f;
+        --red: #9b5148;
+        --green: #657963;
+        --serif: "Times New Roman", Times, Georgia, serif;
+        --inscription: "Times New Roman", Times, Georgia, serif;
+        --cn-serif: "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif;
+        --shadow: 0 24px 72px rgba(45, 42, 36, 0.12);
+        --shadow-soft: 0 12px 32px rgba(45, 42, 36, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background:
+          linear-gradient(rgba(31, 30, 26, 0.028) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31, 30, 26, 0.02) 1px, transparent 1px),
+          var(--bg);
+        background-size: 56px 56px;
+        color: var(--ink);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        letter-spacing: 0;
+      }
+
+      .page {
+        width: min(1500px, calc(100vw - 48px));
+        margin: 0 auto;
+        padding: 34px 0 80px;
+      }
+
+      .topline {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 18px;
+        margin-bottom: 22px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 680;
+      }
+
+      .topline span:first-child {
+        color: var(--copper);
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        min-height: 680px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background:
+          radial-gradient(circle at 88% 16%, rgba(63, 111, 143, 0.16), transparent 30%),
+          radial-gradient(circle at 20% 10%, rgba(201, 173, 125, 0.22), transparent 32%),
+          linear-gradient(135deg, #fffefa 0%, #f4f0e7 52%, #eee7da 100%);
+        box-shadow: var(--shadow);
+      }
+
+      .hero::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(rgba(31, 30, 26, 0.032) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31, 30, 26, 0.024) 1px, transparent 1px);
+        background-size: 48px 48px;
+        mask-image: linear-gradient(180deg, #000, transparent 80%);
+        pointer-events: none;
+      }
+
+      .hero-inner {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: minmax(0, 0.82fr) minmax(520px, 1.18fr);
+        min-height: 680px;
+      }
+
+      .hero-copy {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 58px 54px;
+      }
+
+      .brand-lockup {
+        display: inline-flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .brand-lockup.wordmark-only {
+        display: inline-grid;
+        align-items: start;
+        gap: 7px;
+      }
+
+      .mark {
+        position: relative;
+        display: grid;
+        width: 54px;
+        height: 54px;
+        place-items: center;
+        border: 1px solid var(--line-strong);
+        border-radius: 12px;
+        background: var(--surface);
+        color: var(--primary);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+      }
+
+      .mark::after {
+        content: none;
+        position: absolute;
+        top: 11px;
+        right: 10px;
+        width: 7px;
+        height: 7px;
+        border-radius: 99px;
+        background: var(--copper);
+        box-shadow: 0 0 0 5px rgba(139, 118, 88, 0.12);
+      }
+
+      .mark svg {
+        width: 34px;
+        height: 34px;
+      }
+
+      .mark img {
+        width: 42px;
+        height: 42px;
+        object-fit: contain;
+      }
+
+      .brand-name {
+        font-family: var(--inscription);
+        font-size: 20px;
+        font-weight: 560;
+        letter-spacing: 0.13em;
+        line-height: 1;
+        text-transform: uppercase;
+      }
+
+      .brand-sub {
+        margin-top: 6px;
+        color: var(--copper);
+        font-family: var(--cn-serif);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.24em;
+      }
+
+      .wordmark {
+        color: var(--ink);
+        font-family: var(--inscription);
+        font-weight: 560;
+        letter-spacing: 0.13em;
+        line-height: 0.92;
+        text-transform: uppercase;
+        white-space: nowrap;
+        -webkit-text-stroke: 0.35px rgba(31, 30, 26, 0.72);
+        text-shadow:
+          0 1px 0 rgba(255, 254, 250, 0.9),
+          0 -1px 0 rgba(31, 30, 26, 0.16),
+          0.7px 0 0 rgba(31, 30, 26, 0.18);
+      }
+
+      .wordmark.xl {
+        font-size: clamp(54px, 5.4vw, 96px);
+      }
+
+      .wordmark.large {
+        font-size: clamp(42px, 4vw, 64px);
+      }
+
+      .wordmark.medium {
+        font-size: 26px;
+      }
+
+      .wordmark.small {
+        font-size: 14px;
+        letter-spacing: 0.16em;
+        -webkit-text-stroke-width: 0.2px;
+      }
+
+      .approved-wordmark {
+        display: block;
+        width: min(100%, 500px);
+        height: auto;
+        object-fit: contain;
+      }
+
+      .approved-wordmark.light {
+        mix-blend-mode: multiply;
+      }
+
+      .approved-wordmark.brand {
+        width: 170px;
+      }
+
+      .approved-wordmark.mini {
+        width: 128px;
+      }
+
+      .approved-wordmark.slide-logo-img {
+        width: 168px;
+        border-radius: 4px;
+        background: #fffefa;
+        padding: 4px 6px;
+      }
+
+      .approved-wordmark.main-logo-img {
+        width: min(100%, 640px);
+      }
+
+      .approved-wordmark.lockup-card-img {
+        width: min(82%, 320px);
+      }
+
+      .approved-wordmark.brand-hero-img {
+        width: min(100%, 450px);
+      }
+
+      .approved-wordmark.dark-placement-img {
+        width: min(100%, 430px);
+        border-radius: 8px;
+        background: #fffefa;
+        padding: 10px 14px;
+      }
+
+      .inscription-subtitle {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        color: var(--copper);
+        font-family: var(--cn-serif);
+        font-size: clamp(15px, 1.45vw, 25px);
+        font-weight: 600;
+        letter-spacing: 0.34em;
+        line-height: 1.1;
+        white-space: nowrap;
+      }
+
+      .inscription-subtitle::before,
+      .inscription-subtitle::after {
+        content: "";
+        width: 42px;
+        height: 1px;
+        background: currentColor;
+        opacity: 0.82;
+      }
+
+      .inscription-subtitle.compact {
+        justify-content: flex-start;
+        gap: 9px;
+        font-size: 10px;
+        letter-spacing: 0.18em;
+      }
+
+      .inscription-subtitle.compact::before,
+      .inscription-subtitle.compact::after {
+        width: 18px;
+      }
+
+      .hero h1 {
+        max-width: 650px;
+        margin: 78px 0 0;
+        font-size: clamp(48px, 6vw, 98px);
+        font-weight: 760;
+        line-height: 0.94;
+      }
+
+      .hero p {
+        max-width: 620px;
+        margin: 22px 0 0;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.85;
+      }
+
+      .hero-meta {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .meta-card {
+        min-height: 92px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 254, 250, 0.7);
+        padding: 14px;
+      }
+
+      .meta-card b {
+        display: block;
+        margin-bottom: 8px;
+        font-size: 12px;
+      }
+
+      .meta-card span {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.55;
+      }
+
+      .hero-showcase {
+        position: relative;
+        overflow: hidden;
+        padding: 38px 42px 38px 0;
+      }
+
+      .app-window {
+        position: relative;
+        min-height: 600px;
+        overflow: hidden;
+        border: 1px solid var(--line-strong);
+        border-radius: 14px;
+        background: var(--surface);
+        box-shadow: 0 34px 90px rgba(45, 42, 36, 0.16);
+      }
+
+      .app-window::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          linear-gradient(rgba(31, 30, 26, 0.02) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31, 30, 26, 0.016) 1px, transparent 1px);
+        background-size: 32px 32px;
+        pointer-events: none;
+      }
+
+      .app-chrome {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        height: 38px;
+        border-bottom: 1px solid var(--line);
+        padding: 0 14px;
+        background: rgba(255, 254, 250, 0.9);
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 99px;
+        background: var(--line-strong);
+      }
+
+      .mock-app {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: 160px minmax(0, 1fr) 230px;
+        min-height: 562px;
+      }
+
+      .mock-side,
+      .mock-agent {
+        background: rgba(255, 254, 250, 0.86);
+      }
+
+      .mock-side {
+        border-right: 1px solid var(--line);
+        padding: 16px 12px;
+      }
+
+      .mock-agent {
+        border-left: 1px solid var(--line);
+        padding: 14px;
+      }
+
+      .mini-brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 22px;
+        font-size: 13px;
+        font-weight: 750;
+      }
+
+      .mini-brand.wordmark-mini {
+        display: grid;
+        gap: 4px;
+        align-items: start;
+        font-weight: 600;
+      }
+
+      .mini-brand.wordmark-mini span {
+        color: var(--copper);
+        font-family: var(--cn-serif);
+        font-size: 8px;
+        letter-spacing: 0.12em;
+        white-space: nowrap;
+      }
+
+      .mini-mark {
+        width: 26px;
+        height: 26px;
+        border: 1px solid var(--line-strong);
+        border-radius: 7px;
+        background: var(--surface);
+      }
+
+      .project-item {
+        margin-bottom: 8px;
+        border: 1px solid transparent;
+        border-radius: 8px;
+        padding: 10px;
+      }
+
+      .project-item.active {
+        border-color: var(--line);
+        background: var(--surface);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .project-item b {
+        display: block;
+        font-size: 11px;
+      }
+
+      .project-item span {
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .mock-main {
+        min-width: 0;
+      }
+
+      .mock-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        min-height: 58px;
+        border-bottom: 1px solid var(--line);
+        padding: 0 18px;
+        background: rgba(255, 254, 250, 0.78);
+      }
+
+      .mock-title b {
+        display: block;
+        font-size: 12px;
+      }
+
+      .mock-title span {
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .steps {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .step {
+        display: grid;
+        width: 25px;
+        height: 25px;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 99px;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 740;
+      }
+
+      .step.on {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: #fffefa;
+      }
+
+      .mock-body {
+        padding: 20px;
+      }
+
+      .stage-card {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background:
+          linear-gradient(135deg, rgba(139, 118, 88, 0.14), transparent 48%),
+          var(--surface);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .slide-preview {
+        position: relative;
+        aspect-ratio: 16 / 9;
+        border-bottom: 1px solid var(--line);
+        background:
+          radial-gradient(circle at 80% 28%, rgba(63, 111, 143, 0.17), transparent 28%),
+          linear-gradient(135deg, #2d2a24 0%, #4c4437 100%);
+        color: #fffefa;
+        padding: 34px;
+      }
+
+      .slide-preview::before {
+        content: "";
+        position: absolute;
+        inset: 18px;
+        border: 1px solid rgba(255, 254, 250, 0.18);
+        border-radius: 4px;
+      }
+
+      .slide-preview .slide-logo {
+        position: relative;
+        z-index: 1;
+        display: inline-grid;
+        gap: 5px;
+        margin-bottom: 82px;
+      }
+
+      .slide-preview .slide-logo .wordmark {
+        color: #fffefa;
+        font-size: 19px;
+        -webkit-text-stroke-color: rgba(255, 254, 250, 0.7);
+        text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.3);
+      }
+
+      .slide-preview .slide-logo span {
+        color: rgba(201, 173, 125, 0.96);
+        font-family: var(--cn-serif);
+        font-size: 8px;
+        letter-spacing: 0.18em;
+      }
+
+      .slide-preview h2 {
+        position: relative;
+        z-index: 1;
+        max-width: 330px;
+        margin: 0;
+        font-size: 36px;
+        line-height: 0.98;
+      }
+
+      .slide-preview p {
+        position: relative;
+        z-index: 1;
+        max-width: 300px;
+        margin: 18px 0 0;
+        color: rgba(255, 254, 250, 0.68);
+        font-size: 12px;
+        line-height: 1.65;
+      }
+
+      .seed-strip {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        padding: 10px;
+      }
+
+      .seed-thumb {
+        aspect-ratio: 16 / 10;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--surface-2);
+      }
+
+      .seed-thumb:nth-child(1) {
+        background: linear-gradient(135deg, var(--primary), var(--copper));
+      }
+
+      .seed-thumb:nth-child(2) {
+        background: linear-gradient(135deg, var(--surface), var(--surface-2));
+      }
+
+      .seed-thumb:nth-child(3) {
+        background: linear-gradient(135deg, #e8edf0, #fffefa);
+      }
+
+      .seed-thumb:nth-child(4) {
+        background: linear-gradient(135deg, #fffefa, #efe5d6);
+      }
+
+      .agent-tabs {
+        display: flex;
+        gap: 6px;
+        margin-bottom: 12px;
+      }
+
+      .agent-tabs span {
+        border: 1px solid var(--line);
+        border-radius: 99px;
+        padding: 5px 8px;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 680;
+      }
+
+      .agent-tabs span:first-child {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: #fffefa;
+      }
+
+      .oracle-note {
+        margin-bottom: 10px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--surface);
+        padding: 12px;
+      }
+
+      .oracle-note b {
+        display: block;
+        margin-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .oracle-note p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.55;
+      }
+
+      .section {
+        margin-top: 28px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(255, 254, 250, 0.74);
+        box-shadow: var(--shadow-soft);
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: end;
+        gap: 24px;
+        border-bottom: 1px solid var(--line);
+        padding: 26px 28px;
+      }
+
+      .section-kicker {
+        margin-bottom: 10px;
+        color: var(--copper);
+        font-size: 11px;
+        font-weight: 760;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .section h2 {
+        margin: 0;
+        font-size: clamp(28px, 3vw, 48px);
+        line-height: 1;
+      }
+
+      .section-head p {
+        max-width: 520px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.7;
+      }
+
+      .logo-grid {
+        display: grid;
+        grid-template-columns: 1.1fr repeat(3, 1fr);
+        gap: 14px;
+        padding: 18px;
+      }
+
+      .logo-card {
+        min-height: 278px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--surface);
+        padding: 20px;
+      }
+
+      .logo-card.main {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        background:
+          radial-gradient(circle at 76% 22%, rgba(139, 118, 88, 0.14), transparent 34%),
+          var(--surface);
+      }
+
+      .logo-card.generated-main {
+        grid-column: span 2;
+        overflow: hidden;
+        padding: 0;
+      }
+
+      .logo-lockup-preview {
+        display: grid;
+        min-height: 212px;
+        place-items: center;
+        border-bottom: 1px solid var(--line);
+        background:
+          radial-gradient(circle at 78% 18%, rgba(201, 173, 125, 0.13), transparent 32%),
+          #fffefa;
+        padding: 24px;
+      }
+
+      .logo-lockup-preview img {
+        width: min(100%, 560px);
+        height: auto;
+        display: block;
+      }
+
+      .logo-wordmark-preview {
+        display: grid;
+        width: min(100%, 700px);
+        justify-items: center;
+        gap: 18px;
+        padding: 38px 12px;
+      }
+
+      .logo-wordmark-preview .engrave-rule {
+        width: min(86%, 560px);
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--line-strong), transparent);
+      }
+
+      .generated-main-copy {
+        padding: 18px 20px 20px;
+      }
+
+      .big-symbol {
+        display: grid;
+        width: 150px;
+        height: 150px;
+        place-items: center;
+        border: 1px solid var(--line-strong);
+        border-radius: 28px;
+        background:
+          radial-gradient(circle at 72% 24%, rgba(201, 173, 125, 0.24), transparent 32%),
+          #fffefa;
+      }
+
+      .big-symbol svg {
+        width: 104px;
+        height: 104px;
+      }
+
+      .big-symbol img {
+        width: 128px;
+        height: 128px;
+        object-fit: contain;
+      }
+
+      .wordmark-row {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .wordmark-row strong {
+        display: block;
+        font-size: 32px;
+        line-height: 1;
+      }
+
+      .wordmark-row strong.inscription {
+        font-family: var(--inscription);
+        font-weight: 560;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .wordmark-row span {
+        display: block;
+        margin-top: 8px;
+        color: var(--copper);
+        font-family: var(--cn-serif);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.22em;
+      }
+
+      .logo-mini {
+        display: grid;
+        height: 146px;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--surface-2);
+      }
+
+      .logo-mini.dark {
+        background: var(--primary);
+        color: #fffefa;
+      }
+
+      .logo-mini svg {
+        width: 76px;
+        height: 76px;
+      }
+
+      .logo-mini img {
+        width: 82%;
+        max-height: 82%;
+        object-fit: contain;
+      }
+
+      .logo-mini.wide img {
+        width: 92%;
+        max-height: 72%;
+      }
+
+      .main-logo-note {
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .logo-card h3 {
+        margin: 18px 0 8px;
+        font-size: 16px;
+      }
+
+      .logo-card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .system-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .swatches {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .swatch {
+        min-height: 148px;
+        display: flex;
+        flex-direction: column;
+        justify-content: end;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        background: var(--c);
+        padding: 12px;
+        color: var(--t, var(--ink));
+      }
+
+      .swatch b {
+        font-size: 12px;
+      }
+
+      .swatch span {
+        margin-top: 5px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        opacity: 0.78;
+      }
+
+      .type-card {
+        min-height: 306px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--surface);
+        padding: 28px;
+      }
+
+      .type-card .display {
+        margin: 0 0 26px;
+        font-size: clamp(42px, 5vw, 74px);
+        font-weight: 760;
+        line-height: 0.92;
+      }
+
+      .type-samples {
+        display: grid;
+        gap: 14px;
+      }
+
+      .type-samples div {
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        border-top: 1px solid var(--line);
+        padding-top: 12px;
+      }
+
+      .type-samples b {
+        font-size: 13px;
+      }
+
+      .type-samples span {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .screens {
+        display: grid;
+        grid-template-columns: 0.82fr 1.18fr;
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .screen-card {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+        min-height: 520px;
+      }
+
+      .login-mock {
+        display: grid;
+        min-height: 520px;
+        grid-template-rows: 1fr auto;
+        padding: 34px;
+        background:
+          radial-gradient(circle at 26% 18%, rgba(201, 173, 125, 0.22), transparent 34%),
+          linear-gradient(135deg, var(--surface), var(--surface-2));
+      }
+
+      .login-mock h3 {
+        margin: 72px 0 0;
+        max-width: 360px;
+        font-size: 52px;
+        line-height: 0.96;
+      }
+
+      .login-mock p {
+        max-width: 430px;
+        color: var(--muted);
+        line-height: 1.75;
+      }
+
+      .login-box {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(255, 254, 250, 0.84);
+        padding: 16px;
+      }
+
+      .fake-input {
+        height: 38px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        margin: 10px 0;
+      }
+
+      .fake-button {
+        display: grid;
+        height: 38px;
+        place-items: center;
+        border-radius: 8px;
+        background: var(--primary);
+        color: #fffefa;
+        font-size: 13px;
+        font-weight: 720;
+      }
+
+      .workbench-mock {
+        display: grid;
+        grid-template-columns: 150px minmax(0, 1fr) 210px;
+        min-height: 520px;
+      }
+
+      .workbench-mock .mock-side,
+      .workbench-mock .mock-agent {
+        padding-top: 18px;
+      }
+
+      .board {
+        padding: 18px;
+      }
+
+      .status-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 14px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--surface);
+        padding: 12px;
+      }
+
+      .status-bar b {
+        font-size: 12px;
+      }
+
+      .status-bar span {
+        color: var(--blue);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .slide-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .mini-slide {
+        position: relative;
+        overflow: hidden;
+        aspect-ratio: 16 / 10;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--surface);
+        padding: 16px;
+      }
+
+      .mini-slide.dark {
+        background: linear-gradient(135deg, var(--primary), #554b3e);
+        color: #fffefa;
+      }
+
+      .mini-slide.blue {
+        background: linear-gradient(135deg, #eef3f4, #fffefa);
+      }
+
+      .mini-slide::after {
+        content: "";
+        position: absolute;
+        right: 14px;
+        bottom: 14px;
+        width: 46px;
+        height: 46px;
+        border: 1px solid currentColor;
+        border-radius: 99px;
+        opacity: 0.18;
+      }
+
+      .mini-slide b {
+        display: block;
+        max-width: 130px;
+        font-size: 15px;
+        line-height: 1.05;
+      }
+
+      .mini-slide span {
+        display: block;
+        width: 48%;
+        height: 5px;
+        margin-top: 16px;
+        border-radius: 99px;
+        background: currentColor;
+        opacity: 0.22;
+        box-shadow: 0 10px 0 currentColor, 0 20px 0 currentColor;
+      }
+
+      .applications {
+        display: grid;
+        grid-template-columns: 1.05fr 0.95fr 1fr;
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .application-card {
+        min-height: 340px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+        overflow: hidden;
+      }
+
+      .social-card {
+        min-height: 340px;
+        padding: 26px;
+        background:
+          radial-gradient(circle at 80% 20%, rgba(63, 111, 143, 0.18), transparent 28%),
+          linear-gradient(135deg, var(--primary), #4b4438);
+        color: #fffefa;
+      }
+
+      .social-card h3 {
+        margin: 72px 0 0;
+        font-size: 42px;
+        line-height: 0.96;
+      }
+
+      .social-card p {
+        color: rgba(255, 254, 250, 0.66);
+        line-height: 1.65;
+      }
+
+      .deck-sample {
+        padding: 20px;
+      }
+
+      .deck-sample .mini-slide {
+        margin-bottom: 12px;
+      }
+
+      .token-card {
+        padding: 22px;
+      }
+
+      .token-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        border-bottom: 1px solid var(--line);
+        padding: 13px 0;
+      }
+
+      .token-row:first-child {
+        padding-top: 0;
+      }
+
+      .token-row b {
+        font-size: 13px;
+      }
+
+      .token-row span {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .wordmark-apps {
+        display: grid;
+        grid-template-columns: 1.05fr 0.95fr 1fr;
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .wordmark-app-card {
+        min-height: 360px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+      }
+
+      .wordmark-app-card.hero-card {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 30px;
+        background:
+          linear-gradient(90deg, rgba(139, 118, 88, 0.1) 1px, transparent 1px),
+          linear-gradient(rgba(139, 118, 88, 0.08) 1px, transparent 1px),
+          linear-gradient(135deg, #fffefa, #efe8dc);
+        background-size: 34px 34px, 34px 34px, auto;
+      }
+
+      .wordmark-app-card.dark-card {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 28px;
+        background:
+          linear-gradient(135deg, var(--primary), #4d4437);
+        color: #fffefa;
+      }
+
+      .wordmark-app-card.dark-card .wordmark {
+        color: #fffefa;
+        -webkit-text-stroke-color: rgba(255, 254, 250, 0.7);
+        text-shadow: 0 -1px 0 rgba(0, 0, 0, 0.28);
+      }
+
+      .wordmark-app-card.dark-card p,
+      .wordmark-app-card.dark-card span {
+        color: rgba(255, 254, 250, 0.68);
+      }
+
+      .topbar-demo {
+        min-height: 360px;
+        display: grid;
+        grid-template-rows: 58px 1fr;
+      }
+
+      .topbar-demo header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        border-bottom: 1px solid var(--line);
+        padding: 0 18px;
+      }
+
+      .topbar-demo nav {
+        display: flex;
+        gap: 8px;
+      }
+
+      .topbar-demo nav i {
+        width: 54px;
+        height: 9px;
+        border-radius: 99px;
+        background: var(--line);
+      }
+
+      .topbar-demo main {
+        padding: 22px;
+      }
+
+      .ui-panel-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-top: 18px;
+      }
+
+      .ui-panel {
+        min-height: 118px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background:
+          linear-gradient(135deg, rgba(63, 111, 143, 0.08), transparent),
+          var(--surface-2);
+        padding: 14px;
+      }
+
+      .ui-panel b {
+        display: block;
+        margin-bottom: 18px;
+        font-size: 12px;
+      }
+
+      .ui-panel span {
+        display: block;
+        width: 74%;
+        height: 5px;
+        border-radius: 99px;
+        background: currentColor;
+        opacity: 0.18;
+        box-shadow: 0 10px 0 currentColor, 0 20px 0 currentColor;
+      }
+
+      .generated-assets {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+        padding: 18px;
+      }
+
+      .generated-card {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--surface);
+      }
+
+      .generated-card img {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .generated-caption {
+        border-top: 1px solid var(--line);
+        padding: 15px 16px;
+      }
+
+      .generated-caption b {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 14px;
+      }
+
+      .generated-caption span {
+        display: block;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      .footer-note {
+        margin-top: 20px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.7;
+        text-align: center;
+      }
+
+      @media (max-width: 1180px) {
+        .hero-inner,
+        .screens,
+        .system-grid,
+        .wordmark-apps,
+        .applications {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-showcase {
+          padding: 0 36px 36px;
+        }
+
+        .logo-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .logo-card.generated-main {
+          grid-column: span 2;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .page {
+          width: min(100vw - 24px, 1500px);
+        }
+
+        .wordmark {
+          letter-spacing: 0.08em;
+        }
+
+        .wordmark.xl {
+          font-size: clamp(38px, 12vw, 54px);
+        }
+
+        .wordmark.large {
+          font-size: clamp(34px, 11vw, 48px);
+        }
+
+        .inscription-subtitle {
+          flex-wrap: wrap;
+          gap: 8px;
+          font-size: 13px;
+          letter-spacing: 0.16em;
+          white-space: normal;
+        }
+
+        .hero-copy {
+          padding: 30px 24px;
+        }
+
+        .hero h1 {
+          margin-top: 48px;
+        }
+
+        .hero-meta,
+        .logo-grid,
+        .swatches,
+        .mock-app,
+        .workbench-mock,
+        .wordmark-apps,
+        .generated-assets {
+          grid-template-columns: 1fr;
+        }
+
+        .mock-agent,
+        .mock-side {
+          border: 0;
+          border-top: 1px solid var(--line);
+        }
+
+        .section-head {
+          align-items: start;
+          flex-direction: column;
+        }
+
+        .logo-card.generated-main {
+          grid-column: span 1;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <div class="topline">
+        <span>PPT God / 古希腊掌管 PPT 的神 VI Proposal</span>
+        <span>Brand system concept · visual review draft</span>
+      </div>
+
+      <section class="hero">
+        <div class="hero-inner">
+          <div class="hero-copy">
+            <div>
+              <div class="brand-lockup wordmark-only">
+                <img class="approved-wordmark brand light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+              </div>
+              <h1>让 PPT 看起来像已经被设计过。</h1>
+              <p>
+                这个方向把 PPT God 定义成专业 AI Deck Studio：界面耐看、低噪、适合长时间工作；
+                “God”的记忆点收敛到铭文字标和铜色中文副标里，不再依赖图形符号。
+              </p>
+            </div>
+
+            <div class="hero-meta">
+              <div class="meta-card">
+                <b>品牌性格</b>
+                <span>专业、克制、聪明、有一点神性，但不做神话主题皮肤。</span>
+              </div>
+              <div class="meta-card">
+                <b>产品信任</b>
+                <span>视觉重点服务于“资料到可交付 PPT”的确定感。</span>
+              </div>
+              <div class="meta-card">
+                <b>主视觉钩子</b>
+                <span>Inscription Wordmark：把 PPT GOD 本身固定成品牌资产。</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="hero-showcase">
+            <div class="app-window">
+              <div class="app-chrome"><i class="dot"></i><i class="dot"></i><i class="dot"></i></div>
+              <div class="mock-app">
+                <aside class="mock-side">
+                  <div class="mini-brand wordmark-mini">
+                    <img class="approved-wordmark mini light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                  </div>
+                  <div class="project-item active"><b>Investor narrative</b><span>Style ready</span></div>
+                  <div class="project-item"><b>Brand launch</b><span>Prototype</span></div>
+                  <div class="project-item"><b>Training deck</b><span>Outline</span></div>
+                </aside>
+                <section class="mock-main">
+                  <div class="mock-top">
+                    <div class="mock-title">
+                      <b>Investor narrative</b>
+                      <span>Brief -&gt; Outline -&gt; Style -&gt; Visual plan -&gt; Prototype</span>
+                    </div>
+                    <div class="steps"><i class="step on">1</i><i class="step on">2</i><i class="step on">3</i><i class="step">4</i></div>
+                  </div>
+                  <div class="mock-body">
+                    <div class="stage-card">
+                      <div class="slide-preview">
+                        <div class="slide-logo">
+                          <img class="approved-wordmark slide-logo-img" src="ppt-god-wordmark-approved-inscription.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                        </div>
+                        <h2>From raw material to a finished deck.</h2>
+                        <p>Structured narrative, visual direction, and slide-level decisions before image generation.</p>
+                      </div>
+                      <div class="seed-strip">
+                        <i class="seed-thumb"></i><i class="seed-thumb"></i><i class="seed-thumb"></i><i class="seed-thumb"></i>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+                <aside class="mock-agent">
+                  <div class="agent-tabs"><span>视觉</span><span>风格</span><span>素材</span></div>
+                  <div class="oracle-note">
+                    <b>视觉判断</b>
+                    <p>这套资料适合暖白工作台和深色封面种子页，正文页保持更高可读性。</p>
+                  </div>
+                  <div class="oracle-note">
+                    <b>下一步</b>
+                    <p>生成 4 张样张，先锁定封面、章节、正文、数据页的共同语言。</p>
+                  </div>
+                  <div class="oracle-note">
+                    <b>素材策略</b>
+                    <p>Logo 固定右上；产品图只在需要证明时出现，不做装饰堆叠。</p>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">01 / Logo System</div>
+            <h2>PPT GOD 铭文字标固定为主 Logo。</h2>
+          </div>
+          <p>这版不再把图形 mark 当主 Logo。品牌识别直接落在 PPT GOD 的石刻铭文感字标，以及下方中文“古希腊掌管 PPT 的神”。</p>
+        </div>
+        <div class="logo-grid">
+          <article class="logo-card main generated-main">
+            <div class="logo-lockup-preview">
+              <div class="logo-wordmark-preview">
+                <img class="approved-wordmark main-logo-img light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                <i class="engrave-rule"></i>
+              </div>
+            </div>
+            <div class="generated-main-copy">
+              <div class="wordmark-row">
+                <div>
+                  <img class="approved-wordmark mini light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                </div>
+              </div>
+              <p class="main-logo-note">推荐定稿方向：主标只保留英文铭文字标；中文用铜色副标题承接“古希腊掌管 PPT 的神”的记忆点。</p>
+            </div>
+          </article>
+          <article class="logo-card">
+            <div class="logo-mini">
+              <div class="brand-lockup wordmark-only">
+                <img class="approved-wordmark lockup-card-img light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+              </div>
+            </div>
+            <h3>Primary Lockup</h3>
+            <p>用于登录页、官网首屏、品牌页和导出物封面。这里不再加图示，避免图形抢走字标识别。</p>
+          </article>
+          <article class="logo-card">
+            <div class="logo-mini dark">
+              <div class="brand-lockup wordmark-only">
+                <img class="approved-wordmark lockup-card-img" src="ppt-god-wordmark-approved-inscription.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+              </div>
+            </div>
+            <h3>Dark Placement</h3>
+            <p>深色封面和深色 UI 上只反白字标，中文仍用铜色。古希腊感来自字形，不来自神庙或桂冠。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">02 / Visual Tokens</div>
+            <h2>暖白工作台，深色行动，铜金记忆。</h2>
+          </div>
+          <p>界面不是炫酷 AI 黑盒，而是一张可被反复编辑和判断的生产桌面。</p>
+        </div>
+        <div class="system-grid">
+          <div class="swatches">
+            <div class="swatch" style="--c: #f7f5ef"><b>Workbench</b><span>#F7F5EF</span></div>
+            <div class="swatch" style="--c: #fffefa"><b>Surface</b><span>#FFFEFA</span></div>
+            <div class="swatch" style="--c: #2d2a24; --t: #fffefa"><b>Primary</b><span>#2D2A24</span></div>
+            <div class="swatch" style="--c: #8b7658; --t: #fffefa"><b>Inscription Copper</b><span>#8B7658</span></div>
+            <div class="swatch" style="--c: #3f6f8f; --t: #fffefa"><b>Generation Blue</b><span>#3F6F8F</span></div>
+            <div class="swatch" style="--c: #657963; --t: #fffefa"><b>Complete Green</b><span>#657963</span></div>
+            <div class="swatch" style="--c: #9b5148; --t: #fffefa"><b>Review Red</b><span>#9B5148</span></div>
+            <div class="swatch" style="--c: #ded8ca"><b>Structure Line</b><span>#DED8CA</span></div>
+          </div>
+          <div class="type-card">
+            <p class="display">Decks with judgment.</p>
+            <div class="type-samples">
+              <div><b>Brand / Product</b><span>PPT God · 古希腊掌管 PPT 的神</span></div>
+              <div><b>UI Chinese</b><span>确认内容，请视觉总监</span></div>
+              <div><b>State Copy</b><span>正在生成样张，先检查 3 页效果</span></div>
+              <div><b>Rule</b><span>大标题少，界面字小而清楚；不要装饰性口号堆叠。</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">02B / Wordmark In UI</div>
+            <h2>把 PPT GOD 放进真实产品界面。</h2>
+          </div>
+          <p>从这一版开始，PPT GOD 英文字标就是 logo 本身。图形符号退出主系统，只保留少量纹理和铜色线条辅助品牌气质。</p>
+        </div>
+        <div class="wordmark-apps">
+          <article class="wordmark-app-card hero-card">
+            <div>
+              <img class="approved-wordmark brand-hero-img light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+            </div>
+            <div>
+              <h3>登录页 / 品牌页</h3>
+              <p>大尺寸使用完整 lockup：铭文英文在上，中文铜色副标在下。这里不放左侧图形，第一眼记住的是品牌名。</p>
+            </div>
+          </article>
+          <article class="wordmark-app-card topbar-demo">
+            <header>
+              <div class="brand-lockup wordmark-only">
+                <img class="approved-wordmark mini light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+              </div>
+              <nav aria-hidden="true"><i></i><i></i><i></i></nav>
+            </header>
+            <main>
+              <div class="status-bar"><b>视觉方案已确认</b><span>生成样张</span></div>
+              <div class="ui-panel-row">
+                <div class="ui-panel"><b>封面方向</b><span></span></div>
+                <div class="ui-panel"><b>正文页规则</b><span></span></div>
+              </div>
+              <div class="ui-panel-row">
+                <div class="ui-panel"><b>素材判断</b><span></span></div>
+                <div class="ui-panel"><b>导出检查</b><span></span></div>
+              </div>
+            </main>
+          </article>
+          <article class="wordmark-app-card dark-card">
+            <div>
+              <img class="approved-wordmark dark-placement-img" src="ppt-god-wordmark-approved-inscription.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+            </div>
+            <div>
+              <h3>封面 / 分享图</h3>
+              <p>深色场景也只保留字标和中文副标，古希腊感靠刻痕、字距和铜色完成，不再靠桂冠或图标。</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">03 / Product Screens</div>
+            <h2>登录页有品牌，工作台以效率为主。</h2>
+          </div>
+          <p>首屏可以讲“从资料到成稿”；进入产品后，视觉让位给项目、页面、Agent 决策和下一步动作。</p>
+        </div>
+        <div class="screens">
+          <article class="screen-card">
+            <div class="login-mock">
+              <div>
+                <div class="brand-lockup wordmark-only">
+                  <img class="approved-wordmark brand light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                </div>
+                <h3>从资料到可交付演示稿。</h3>
+                <p>整理叙事、确认方向、生成样张、导出 PPTX。每一步都围绕最终成稿，而不是只给你一段聊天回答。</p>
+              </div>
+              <div class="login-box">
+                <b>进入 PPT God</b>
+                <div class="fake-input"></div>
+                <div class="fake-button">进入工作台</div>
+              </div>
+            </div>
+          </article>
+
+          <article class="screen-card">
+            <div class="workbench-mock">
+              <aside class="mock-side">
+                <div class="mini-brand wordmark-mini">
+                  <img class="approved-wordmark mini light" src="ppt-god-wordmark-approved-inscription-alpha.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+                </div>
+                <div class="project-item active"><b>AI Strategy Deck</b><span>18 pages · visual</span></div>
+                <div class="project-item"><b>Roadshow</b><span>draft</span></div>
+                <div class="project-item"><b>Workshop</b><span>complete</span></div>
+              </aside>
+              <section class="board">
+                <div class="status-bar"><b>视觉方案已确认</b><span>生成样张</span></div>
+                <div class="slide-grid">
+                  <div class="mini-slide dark"><b>Market context</b><span></span></div>
+                  <div class="mini-slide"><b>Three strategic bets</b><span></span></div>
+                  <div class="mini-slide blue"><b>Adoption curve</b><span></span></div>
+                  <div class="mini-slide"><b>Execution path</b><span></span></div>
+                </div>
+              </section>
+              <aside class="mock-agent">
+                <div class="agent-tabs"><span>视觉总监</span><span>素材</span></div>
+                <div class="oracle-note"><b>判断</b><p>封面可更强，正文页应该降低装饰密度。</p></div>
+                <div class="oracle-note"><b>建议</b><p>先生成 3 张样张，再出整套。</p></div>
+              </aside>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">04 / Brand Applications</div>
+            <h2>品牌露出统一回到铭文字标。</h2>
+          </div>
+          <p>对外传播可以更有戏剧性，但 logo 仍然只用 PPT GOD 字标和中文副标题。古希腊元素退到材质、线条和字距里。</p>
+        </div>
+        <div class="applications">
+          <article class="application-card social-card">
+            <div class="brand-lockup wordmark-only">
+              <img class="approved-wordmark dark-placement-img" src="ppt-god-wordmark-approved-inscription.png" alt="PPT GOD 古希腊掌管 PPT 的神">
+            </div>
+            <h3>God mode for better decks.</h3>
+            <p>Use the drama here: launch banners, share cards, release notes, and pitch material.</p>
+          </article>
+          <article class="application-card deck-sample">
+            <div class="mini-slide dark"><b>Cover seed</b><span></span></div>
+            <div class="mini-slide"><b>Content page</b><span></span></div>
+            <div class="mini-slide blue"><b>Data page</b><span></span></div>
+          </article>
+          <article class="application-card token-card">
+            <div class="token-row"><b>Logo</b><span>PPT GOD inscription wordmark</span></div>
+            <div class="token-row"><b>Interface</b><span>Warm production desk</span></div>
+            <div class="token-row"><b>Primary action</b><span>Deep ink button</span></div>
+            <div class="token-row"><b>Generation state</b><span>Rational blue, not neon</span></div>
+            <div class="token-row"><b>Slide output</b><span>Dark seeds + readable inner pages</span></div>
+            <div class="token-row"><b>Do not do</b><span>图形主标、神像、皇冠、过度金色、神殿皮肤</span></div>
+          </article>
+        </div>
+      </section>
+
+      <p class="footer-note">
+        这是一版方向判断稿：先看铭文字标作为主 Logo 是否成立，以及它放进登录页、工作台、封面和品牌图后是否足够稳定。确认后，再拆成正式 VI spec、字体规范、真实 CSS token、登录页和工作台改版任务。
+      </p>
+    </main>
+  
+
+</body><div id="codex-browser-sidebar-comments-root" style="position: fixed; inset: 0px; pointer-events: none; z-index: 2147483000;"></div></html>

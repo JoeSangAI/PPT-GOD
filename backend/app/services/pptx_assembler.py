@@ -17,6 +17,22 @@ from app.services.text_region_detector import compute_safe_overlay_box
 logger = logging.getLogger(__name__)
 
 
+def _resolve_file_path(file_path: str) -> str:
+    """安全解析文件路径，兼容从不同工作目录启动的情况。"""
+    if not file_path:
+        return file_path
+    if os.path.exists(file_path):
+        return file_path
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidate = os.path.join(backend_dir, file_path)
+    if os.path.exists(candidate):
+        return candidate
+    abs_path = os.path.abspath(file_path)
+    if os.path.exists(abs_path):
+        return abs_path
+    return file_path
+
+
 def _logo_geometry(
     prs: Presentation,
     logo_path: str,
@@ -123,13 +139,16 @@ def assemble_pptx(
         for layer in overlay_layers:
             asset = (overlay_assets or {}).get(str(layer.get("asset_id")))
             asset_path = asset.get("file_path") if isinstance(asset, dict) else None
-            if not asset_path or not os.path.exists(asset_path):
+            resolved_asset_path = _resolve_file_path(asset_path)
+            if not resolved_asset_path or not os.path.exists(resolved_asset_path):
                 logger.warning(
-                    "Assembler: overlay asset missing for page %s asset=%s asset_exists=%s overlay_assets_count=%s",
+                    "Assembler: overlay asset missing for page %s asset=%s asset_exists=%s overlay_assets_count=%s path=%s resolved=%s",
                     slide_data.get("page_num"),
                     layer.get("asset_id"),
                     bool(asset),
                     len(overlay_assets or {}),
+                    asset_path,
+                    resolved_asset_path,
                 )
                 continue
             left, top, width, height = overlay_box(prs, str(layer.get("preset") or "right-card"))
@@ -151,7 +170,7 @@ def assemble_pptx(
                 card.line.width = Inches(0.008)
                 inset = int(min(width, height) * 0.055)
                 pic_left, pic_top, pic_width, pic_height = contained_picture_box(
-                    asset_path,
+                    resolved_asset_path,
                     left + inset,
                     top + inset,
                     max(1, width - inset * 2),
@@ -160,7 +179,7 @@ def assemble_pptx(
                 )
             else:
                 pic_left, pic_top, pic_width, pic_height = contained_picture_box(
-                    asset_path,
+                    resolved_asset_path,
                     left,
                     top,
                     width,
@@ -168,7 +187,7 @@ def assemble_pptx(
                     valign=str(layer.get("valign") or "bottom"),
                 )
             slide.shapes.add_picture(
-                asset_path,
+                resolved_asset_path,
                 left=pic_left,
                 top=pic_top,
                 width=pic_width,

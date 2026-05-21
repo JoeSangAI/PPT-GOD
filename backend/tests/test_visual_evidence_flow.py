@@ -1877,6 +1877,7 @@ def test_finetune_loads_project_product_asset_when_requested(tmp_path):
         asset_kind="product",
         asset_name="胡姬花花生油瓶",
         usage_note=None,
+        asset_analysis={"subject": "胡姬花古法花生油 5L 瓶装"},
     )
     project = SimpleNamespace(reference_images=[visual_asset], selected_template_recommendations=None)
     slide = SimpleNamespace(
@@ -1896,6 +1897,7 @@ def test_finetune_loads_project_product_asset_when_requested(tmp_path):
     assert [r["role"] for r in refs] == ["finetune_base", "visual_asset"]
     assert refs[1]["asset_name"] == "胡姬花花生油瓶"
     assert refs[1]["process_mode"] == "crop"
+    assert refs[1]["asset_analysis"]["subject"] == "胡姬花古法花生油 5L 瓶装"
 
 
 def test_direct_finetune_prompt_distinguishes_project_visual_assets():
@@ -1995,6 +1997,11 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
             "asset_kind": "product",
             "asset_name": "胡姬花花生油瓶",
             "file_path": "/tmp/uploads/huji-product.png",
+            "asset_analysis": {
+                "subject": "胡姬花古法花生油 5L 瓶装",
+                "identity_elements": ["红色瓶盖", "黄色油液", "正面品牌标签"],
+                "must_not_change": ["中文品牌名", "瓶身比例"],
+            },
             "image": Image.new("RGB", (8, 8), "white"),
         }
     ]
@@ -2007,9 +2014,13 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
     assert "second hidden refinement pass" in calls[0]["prompt"]
     assert calls[0]["reference_count"] == 1
     assert calls[1]["prompt"] == (
-        "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
-        "只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：/tmp/uploads/huji-product.png"
+        "第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。"
+        "请把第1张图中对应的产品/素材替换成第2张图，要求尽量1:1保留第2张图的所有可见细节。"
+        "不要改变第1张图中的其它任何画面元素、文字、版式、背景、人物、图表和装饰。"
+        "只输出修改后的完整PPT页面图片。"
     )
+    assert "胡姬花古法花生油" not in calls[1]["prompt"]
+    assert "/tmp/uploads/huji-product.png" not in calls[1]["prompt"]
     assert calls[1]["reference_count"] == 2
 
     final_img = Image.open(result["image_path"])
@@ -2088,10 +2099,15 @@ def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeyp
 
     assert result["error"] is None
     assert len(calls) == 2
-    assert calls[1]["prompt"] == (
-        "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
-        "只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：/tmp/uploads/product-a.png; /tmp/uploads/product-b.png"
-    )
+    assert "第2张图是要替换进去的产品/素材参考图" in calls[1]["prompt"]
+    assert "第3张" not in calls[1]["prompt"]
+    assert "产品 A" not in calls[1]["prompt"]
+    assert "产品 B" not in calls[1]["prompt"]
+    assert "/tmp/uploads/product-a.png" not in calls[1]["prompt"]
+    assert "/tmp/uploads/product-b.png" not in calls[1]["prompt"]
+    assert "油瓶" not in calls[1]["prompt"]
+    assert "瓶盖" not in calls[1]["prompt"]
+    assert "提手" not in calls[1]["prompt"]
     assert calls[1]["reference_count"] == 3
 
 
@@ -2121,7 +2137,8 @@ def test_double_blend_pass_accepts_page_reference_refs(tmp_path, monkeypatch):
     assert result["error"] is None
     assert len(calls) == 2
     assert "原 PPT 活动海报" in calls[0]["prompt"]
-    assert calls[1]["prompt"].startswith("用第2张及后续参考图校准第一张PPT图中的对应素材。")
+    assert calls[1]["prompt"].startswith("第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。")
+    assert "原 PPT 活动海报" not in calls[1]["prompt"]
     assert calls[1]["reference_count"] == 2
 
 

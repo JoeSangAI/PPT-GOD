@@ -87,6 +87,16 @@ assert.match(
 );
 assert.match(
   source,
+  /const slideProjectMaterialItems = visualAssetIdsForSlide\(slide\)[\s\S]*projectVisualAssetById\.get\(id\)[\s\S]*slideProjectMaterialItems\.length > 0[\s\S]*slideProjectMaterialItems\.map/,
+  "global slide cards must show project-level visual assets selected for the slide"
+);
+assert.match(
+  source,
+  /onImageClick=\{\(url\) => \{[\s\S]*visualAssetIdsForSlide\(editingSlide\)[\s\S]*projectVisualAssetById\.get\(id\)[\s\S]*setGalleryModal\(\{ urls: galleryUrls/,
+  "single-slide reference preview must include project-level visual assets selected for the slide"
+);
+assert.match(
+  source,
   /const clearLegacyChatStorageIfNeeded =?\s*function clearLegacyChatStorageIfNeeded|function clearLegacyChatStorageIfNeeded/,
   "chat storage schema handling must be centralized"
 );
@@ -142,7 +152,7 @@ assert.match(
 );
 assert.match(
   client,
-  /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\]\)[\s\S]*body\.attachment_ids = attachmentIds/,
+  /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\][^)]*\)[\s\S]*body\.attachment_ids = attachmentIds/,
   "content-plan API requests must support explicit attachment ids"
 );
 assert.match(

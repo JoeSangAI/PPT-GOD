@@ -26,12 +26,33 @@ from app.services.image_task_audit import append_image_generation_log, image_gen
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, should_show_logo, should_use_logo_as_scene_asset
-from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids, overlay_reservation_instruction
+from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import cleanup_generation_progress, finish_run, get_run, is_run_active, mark_run_running, update_run_progress
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_file_path(file_path: str) -> str:
+    """安全解析文件路径，兼容从不同工作目录启动的情况。
+    数据库中的路径可能是相对路径（如 ./uploads/...），而服务可能在
+    任意工作目录下运行，因此需要基于代码位置来解析。"""
+    if not file_path:
+        return file_path
+    if os.path.exists(file_path):
+        return file_path
+    # 基于当前文件位置推断项目根目录（app/services/ -> backend/）
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidate = os.path.join(backend_dir, file_path)
+    if os.path.exists(candidate):
+        return candidate
+    # 最后尝试标准 abspath（依赖当前工作目录）
+    abs_path = os.path.abspath(file_path)
+    if os.path.exists(abs_path):
+        return abs_path
+    return file_path
+
 
 redis_client = redis.from_url(
     settings.REDIS_URL or "redis://localhost:6379/0",
@@ -311,12 +332,24 @@ def _load_reference_images(
     # 1. 页面级参考图优先：Prompt 中的 Reference Image 1/2/3 必须与
     # 生图 API 的图片输入顺序一致，便于模型按用户意图使用这些图。
     already_loaded_paths = set()
+    skipped_overlay = 0
+    skipped_missing = 0
+    skipped_duplicate = 0
+    skipped_finetune = 0
+    loaded_count = 0
     if slide.reference_images:
         finetune_attachment_ids = set()
         if visual:
             finetune_attachment_ids = set(visual.get("finetune_attachment_ids") or [])
+        logger.info(
+            "Slide %s: 开始加载页面参考图，共 %s 张，overlay_asset_ids=%s",
+            slide.page_num,
+            len(slide.reference_images),
+            overlay_asset_ids,
+        )
         for idx, ref in enumerate(slide.reference_images, start=1):
             if str(getattr(ref, "id", "") or "") in overlay_asset_ids:
+                skipped_overlay += 1
                 logger.info(f"Slide {slide.page_num}: 页面参考图 {ref.id} 走精确粘贴，跳过生图参考输入")
                 continue
             if finetune_base_path:
@@ -324,64 +357,82 @@ def _load_reference_images(
                 # plus only the images uploaded for this chat turn. Long-lived page
                 # refs can contain people or products that make "this person/image"
                 # ambiguous for the image model.
-                if ref.role != "finetune_ref" or ref.id not in finetune_attachment_ids:
+                if ref.role != "finetune_ref" or str(ref.id) not in finetune_attachment_ids:
+                    skipped_finetune += 1
                     continue
             elif ref.role == "finetune_ref":
+                skipped_finetune += 1
                 continue
-            if ref.file_path in already_loaded_paths:
-                logger.info(f"Slide {slide.page_num}: 跳过重复页面参考图 {ref.file_path}")
+            resolved_path = _resolve_file_path(ref.file_path)
+            if resolved_path in already_loaded_paths:
+                skipped_duplicate += 1
+                logger.info(f"Slide {slide.page_num}: 跳过重复页面参考图 {resolved_path}")
                 continue
-            if os.path.exists(ref.file_path):
+            if os.path.exists(resolved_path):
                 try:
                     refs.append({
-                        "image": _open_reference_image(ref.file_path, ref.role),
+                        "image": _open_reference_image(resolved_path, ref.role),
                         "process_mode": ref.process_mode or "blend",
                         "role": ref.role,
                         "label": f"Reference Image {idx}",
-                        "file_path": ref.file_path,
+                        "file_path": resolved_path,
                         "id": getattr(ref, "id", None),
                         "asset_name": getattr(ref, "asset_name", None),
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
+                        "asset_analysis": getattr(ref, "asset_analysis", None),
                         "asset_route_mode": "double_blend" if (ref.process_mode or "blend") == "crop" else "blend",
                     })
-                    already_loaded_paths.add(ref.file_path)
+                    already_loaded_paths.add(resolved_path)
+                    loaded_count += 1
                 except Exception as e:
-                    logger.warning(f"无法加载页面参考图 {ref.file_path}: {e}")
+                    logger.warning(f"无法加载页面参考图 {resolved_path}: {e}")
             else:
-                logger.warning(f"页面参考图文件不存在: {ref.file_path}")
+                skipped_missing += 1
+                logger.warning(f"页面参考图文件不存在: {ref.file_path} (解析后: {resolved_path})")
+        logger.info(
+            "Slide %s: 页面参考图加载完成: 加载=%s, 跳过(精确粘贴)=%s, 跳过(微调过滤)=%s, 跳过(重复)=%s, 不存在=%s",
+            slide.page_num,
+            loaded_count,
+            skipped_overlay,
+            skipped_finetune,
+            skipped_duplicate,
+            skipped_missing,
+        )
 
     if finetune_base_path and finetune_visual_asset_ids and slide.project and slide.project.reference_images:
         selected_set = set(finetune_visual_asset_ids)
         project_assets = [
             ref for ref in slide.project.reference_images
-            if ref.role == "visual_asset" and ref.id in selected_set and not ref.slide_id
+            if ref.role == "visual_asset" and str(ref.id) in selected_set and not ref.slide_id
         ]
         project_assets.sort(
-            key=lambda ref: finetune_visual_asset_ids.index(ref.id)
-            if ref.id in finetune_visual_asset_ids else 999
+            key=lambda ref: finetune_visual_asset_ids.index(str(ref.id))
+            if str(ref.id) in finetune_visual_asset_ids else 999
         )
         for idx, ref in enumerate(project_assets, start=1):
             if len(refs) >= MAX_REFERENCE_INPUTS:
                 break
-            if os.path.exists(ref.file_path):
+            resolved = _resolve_file_path(ref.file_path)
+            if os.path.exists(resolved):
                 try:
                     refs.append({
-                        "image": _open_reference_image(ref.file_path, ref.role),
+                        "image": _open_reference_image(resolved, ref.role),
                         "process_mode": ref.process_mode or default_visual_asset_process_mode(getattr(ref, "asset_kind", None)),
                         "role": ref.role,
                         "label": f"Protected Project Visual Asset {idx}",
-                        "file_path": ref.file_path,
+                        "file_path": resolved,
                         "id": getattr(ref, "id", None),
                         "asset_name": getattr(ref, "asset_name", None),
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
+                        "asset_analysis": getattr(ref, "asset_analysis", None),
                     })
-                    logger.info(f"Slide {slide.page_num}: 微调模式加载项目视觉资产 {ref.file_path}")
+                    logger.info(f"Slide {slide.page_num}: 微调模式加载项目视觉资产 {resolved}")
                 except Exception as e:
-                    logger.warning(f"无法加载微调项目视觉资产 {ref.file_path}: {e}")
+                    logger.warning(f"无法加载微调项目视觉资产 {resolved}: {e}")
             else:
-                logger.warning(f"微调项目视觉资产文件不存在: {ref.file_path}")
+                logger.warning(f"微调项目视觉资产文件不存在: {ref.file_path} (解析后: {resolved})")
 
     if finetune_base_path:
         logger.info(f"Slide {slide.page_num}: 微调模式加载底图、本轮附件和项目资产，共 {len(refs)} 张参考图")
@@ -396,12 +447,13 @@ def _load_reference_images(
                 ref.role == "logo"
                 and is_logo_confirmed(ref)
                 and not ref.slide_id
-                and os.path.exists(ref.file_path)
+                and os.path.exists(_resolve_file_path(ref.file_path))
             )
         ]
         if logo_refs and any(should_use_logo_as_scene_asset(slide, ref) for ref in logo_refs):
             try:
-                logo_path = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) or prepare_logo_overlay_image(logo_refs[0].file_path)
+                resolved_logo_paths = [_resolve_file_path(ref.file_path) for ref in logo_refs]
+                logo_path = prepare_logo_lockup_image(resolved_logo_paths) or prepare_logo_overlay_image(resolved_logo_paths[0])
                 refs.append({
                     "image": _open_reference_image(logo_path, "logo"),
                     "process_mode": "blend",
@@ -436,18 +488,19 @@ def _load_reference_images(
         selected_set = set(selected_asset_ids)
         project_assets = [
             ref for ref in slide.project.reference_images
-            if ref.role == "visual_asset" and ref.id in selected_set and not ref.slide_id
+            if ref.role == "visual_asset" and str(ref.id) in selected_set and not ref.slide_id
         ]
-        project_assets.sort(key=lambda ref: selected_asset_ids.index(ref.id) if ref.id in selected_asset_ids else 999)
+        project_assets.sort(key=lambda ref: selected_asset_ids.index(str(ref.id)) if str(ref.id) in selected_asset_ids else 999)
         for idx, ref in enumerate(project_assets, start=1):
             if len(refs) >= MAX_REFERENCE_INPUTS:
                 break
-            if ref.file_path in already_loaded_paths:
-                logger.info(f"Slide {slide.page_num}: 跳过重复视觉资产 {ref.file_path}")
+            resolved = _resolve_file_path(ref.file_path)
+            if resolved in already_loaded_paths:
+                logger.info(f"Slide {slide.page_num}: 跳过重复视觉资产 {resolved}")
                 continue
-            if os.path.exists(ref.file_path):
+            if os.path.exists(resolved):
                 try:
-                    route_mode = asset_route_modes.get(ref.id) or (
+                    route_mode = asset_route_modes.get(str(ref.id)) or (
                         "double_blend"
                         if str(getattr(ref, "asset_kind", "") or "").lower() in {"product", "material"}
                         else "blend"
@@ -456,36 +509,37 @@ def _load_reference_images(
                         "original" if route_mode == "overlay" else "blend"
                     )
                     refs.append({
-                        "image": _open_reference_image(ref.file_path, ref.role),
+                        "image": _open_reference_image(resolved, ref.role),
                         "process_mode": effective_process_mode,
                         "asset_route_mode": route_mode,
                         "role": ref.role,
                         "label": f"Global Visual Asset {idx}",
-                        "file_path": ref.file_path,
+                        "file_path": resolved,
                         "id": getattr(ref, "id", None),
                         "asset_name": getattr(ref, "asset_name", None),
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
-                        "manual_pin": ref.id in manual_asset_ids,
+                        "asset_analysis": getattr(ref, "asset_analysis", None),
+                        "manual_pin": str(ref.id) in manual_asset_ids,
                     })
-                    already_loaded_paths.add(ref.file_path)
-                    logger.info(f"Slide {slide.page_num}: 加载视觉资产 {ref.file_path}")
+                    already_loaded_paths.add(resolved)
+                    logger.info(f"Slide {slide.page_num}: 加载视觉资产 {resolved}")
                 except Exception as e:
-                    logger.warning(f"无法加载视觉资产 {ref.file_path}: {e}")
+                    logger.warning(f"无法加载视觉资产 {resolved}: {e}")
             else:
-                logger.warning(f"视觉资产文件不存在: {ref.file_path}")
+                logger.warning(f"视觉资产文件不存在: {ref.file_path} (解析后: {resolved})")
 
     # 4. 同家族种子页：版式锚点。仅取最多 2 张，避免抢主体权重。
     seed_loaded = False
     use_seed_reference_images = bool(settings.IMAGE_USE_SEED_REFERENCE_IMAGES)
     seed_reference_limit = _seed_reference_limit(slide)
     if seed_image_paths and not use_seed_reference_images:
-        valid_seed_paths = [seed_path for seed_path in seed_image_paths[:seed_reference_limit] if seed_path and os.path.exists(seed_path)]
+        valid_seed_paths = [seed_path for seed_path in seed_image_paths[:seed_reference_limit] if seed_path and os.path.exists(_resolve_file_path(seed_path))]
         for seed_idx, seed_path in enumerate(valid_seed_paths, start=1):
             refs.append({
                 "role": "seed_ref_hint",
                 "label": f"Family Seed Layout {seed_idx}",
-                "file_path": seed_path,
+                "file_path": _resolve_file_path(seed_path),
             })
         seed_loaded = bool(valid_seed_paths)
         if seed_loaded:
@@ -497,19 +551,20 @@ def _load_reference_images(
         for seed_idx, seed_path in enumerate(seed_image_paths[:seed_reference_limit], start=1):
             if len(refs) >= MAX_REFERENCE_INPUTS:
                 break
-            if not seed_path or not os.path.exists(seed_path):
-                logger.warning(f"种子页文件不存在: {seed_path}")
+            resolved_seed = _resolve_file_path(seed_path)
+            if not resolved_seed or not os.path.exists(resolved_seed):
+                logger.warning(f"种子页文件不存在: {seed_path} (解析后: {resolved_seed})")
                 continue
             try:
                 refs.append({
-                    "image": _open_reference_image(seed_path, "seed_ref"),
+                    "image": _open_reference_image(resolved_seed, "seed_ref"),
                     "process_mode": "blend",
                     "role": "seed_ref",
                     "label": f"Family Seed Layout {seed_idx}",
-                    "file_path": seed_path,
+                    "file_path": resolved_seed,
                 })
                 seed_loaded = True
-                logger.info(f"Slide {slide.page_num}: 加载同家族种子页 {seed_path}")
+                logger.info(f"Slide {slide.page_num}: 加载同家族种子页 {resolved_seed}")
             except Exception as e:
                 logger.warning(f"无法加载种子页 {seed_path}: {e}")
 
@@ -701,17 +756,12 @@ def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
 
 
 def _product_refinement_prompt(slide: Slide, product_refs: List[Dict]) -> str:
-    paths = [
-        str(ref.get("file_path") or "").strip()
-        for ref in product_refs
-        if str(ref.get("file_path") or "").strip()
-    ]
-    if paths:
-        return (
-            "用第2张及后续参考图校准第一张PPT图中的对应素材。保留第一张图的整体版式、背景和文字结构，"
-            f"只增强这些参考素材的外观、图案、文字和关键细节。参考素材路径：{'; '.join(paths)}"
-        )
-    return "用第2张及后续参考图校准第一张PPT图中的对应素材。保留整体版式和文字结构，只增强参考素材细节。"
+    return (
+        "第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。"
+        "请把第1张图中对应的产品/素材替换成第2张图，要求尽量1:1保留第2张图的所有可见细节。"
+        "不要改变第1张图中的其它任何画面元素、文字、版式、背景、人物、图表和装饰。"
+        "只输出修改后的完整PPT页面图片。"
+    )
 
 
 def _generate_one_slide(
@@ -745,14 +795,6 @@ def _generate_one_slide(
         first_pass_ref_data = list(ref_data)
         ref_images = [r["image"] for r in first_pass_ref_data if r.get("image") is not None]
         prompt = slide.prompt_text
-
-        # 如果用户事后把参考图切换为精确粘贴（overlay），预生成的 prompt 可能仍包含该参考图的描述。
-        # 这里根据当前 slide.visual_json 中的 overlay_layers 动态追加留白指令，避免 AI 在背景中生成重叠内容。
-        current_visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
-        overlay_reservation = overlay_reservation_instruction(current_visual)
-        if overlay_reservation and overlay_reservation not in prompt:
-            prompt = prompt + f"\n\nExact Overlay Reservation:\n{overlay_reservation}"
-            logger.info(f"Slide {slide.page_num}: 动态追加 overlay reservation 到 prompt")
 
         # 当本页带有种子参考图时，在 prompt 末尾追加一行明确告知模型，
         # 让它把同家族种子页当作版式锚点 — 不复制内容、只复用视觉系统。
@@ -820,6 +862,7 @@ def _generate_one_slide(
                 suffix="_base",
             )
             refinement_images = [img] + [ref["image"] for ref in product_refs]
+            refinement_prompt = _product_refinement_prompt(slide, product_refs)
             refinement_paths = [
                 str(ref.get("file_path") or "").strip()
                 for ref in product_refs
@@ -830,9 +873,21 @@ def _generate_one_slide(
                     f"Pipeline: 第 {slide.page_num} 页产品二次生成参考素材路径: "
                     + " | ".join(refinement_paths)
                 )
+            append_image_generation_log(
+                project_id,
+                run_id,
+                "product_refinement_started",
+                page_num=slide.page_num,
+                slide_id=slide.id,
+                base_path=base_path,
+                product_ref_count=len(product_refs),
+                reference_count=len(refinement_images[:MAX_REFERENCE_INPUTS]),
+                references=_reference_audit(product_refs),
+                **_prompt_audit(refinement_prompt),
+            )
             try:
                 img = generate_slide_image(
-                    prompt=_product_refinement_prompt(slide, product_refs),
+                    prompt=refinement_prompt,
                     reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
                     resolution="4K",
                     aspect_ratio="16:9",
@@ -841,6 +896,15 @@ def _generate_one_slide(
                 logger.info(
                     f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
                     f"(base={base_path}, product_refs={len(product_refs)})"
+                )
+                append_image_generation_log(
+                    project_id,
+                    run_id,
+                    "product_refinement_finished",
+                    page_num=slide.page_num,
+                    slide_id=slide.id,
+                    base_path=base_path,
+                    product_ref_count=len(product_refs),
                 )
             except Exception as refine_error:
                 logger.warning(
@@ -1332,17 +1396,17 @@ def run_generation_pipeline(
 
                 logo_refs = [
                     ref for ref in project.reference_images or []
-                    if ref.role == "logo" and is_logo_confirmed(ref) and not ref.slide_id and os.path.exists(ref.file_path)
+                    if ref.role == "logo" and is_logo_confirmed(ref) and not ref.slide_id and os.path.exists(_resolve_file_path(ref.file_path))
                 ]
                 logo_config = (
                     {
-                        "file_paths": [ref.file_path for ref in logo_refs],
+                        "file_paths": [_resolve_file_path(ref.file_path) for ref in logo_refs],
                         "anchor": getattr(logo_refs[0], "logo_anchor", None) or "top-right",
                     }
                     if logo_refs else None
                 )
-                logo_path_for_overlay = prepare_logo_lockup_image([ref.file_path for ref in logo_refs]) if logo_refs else None
-                logo_symbol_path_for_overlay = prepare_logo_symbol_image(logo_refs[0].file_path) if len(logo_refs) == 1 else None
+                logo_path_for_overlay = prepare_logo_lockup_image([_resolve_file_path(ref.file_path) for ref in logo_refs]) if logo_refs else None
+                logo_symbol_path_for_overlay = prepare_logo_symbol_image(_resolve_file_path(logo_refs[0].file_path)) if len(logo_refs) == 1 else None
                 if logo_path_for_overlay and logo_config:
                     slides_by_page = {s.page_num: s for s in slides}
                     for slide_data in all_completed_images:
@@ -1371,15 +1435,20 @@ def run_generation_pipeline(
                             slide_model.visual_json = visual
                             flag_modified(slide_model, "visual_json")
                     db.commit()
-                overlay_assets = {
-                    ref.id: {
-                        "file_path": ref.file_path,
-                        "asset_name": ref.asset_name,
-                        "asset_kind": ref.asset_kind,
-                    }
-                    for ref in project.reference_images or []
-                    if os.path.exists(ref.file_path)
-                }
+                overlay_assets = {}
+                for ref in project.reference_images or []:
+                    resolved = _resolve_file_path(ref.file_path)
+                    if os.path.exists(resolved):
+                        overlay_assets[str(ref.id)] = {
+                            "file_path": resolved,
+                            "asset_name": ref.asset_name,
+                            "asset_kind": ref.asset_kind,
+                        }
+                    else:
+                        logger.warning(
+                            "Pipeline: overlay asset %s file not found: %s (resolved: %s)",
+                            ref.id, ref.file_path, resolved,
+                        )
                 if overlay_assets:
                     logger.info(
                         "Pipeline: overlay_assets 构建完成，共 %s 个素材: %s",

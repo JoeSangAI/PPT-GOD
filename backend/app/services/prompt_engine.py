@@ -2,7 +2,10 @@ import logging
 import re
 from typing import Dict, List, Optional
 
-from app.services.overlay_layers import overlay_reservation_instruction
+from app.services.overlay_layers import (
+    enabled_overlay_layers,
+    overlay_reservation_instruction,
+)
 from app.services.visual_directives import (
     extract_visual_directives,
     normalize_visual_requirements,
@@ -334,6 +337,7 @@ def _compact_layout_intent(
     visual_desc = _strip_absent_text_slot_clauses(visual_desc, content_text)
     if len(visual_desc) > 260:
         visual_desc = visual_desc[:260].rstrip() + "..."
+
     if visual_desc:
         return f"Layout: {layout}. {visual_desc}"
     return f"Layout: {layout}. Arrange text and visual evidence with clear hierarchy and strong readability."
@@ -666,6 +670,7 @@ def generate_prompt_for_page(
         else ""
     )
     style_block = _compact_style_pack(style_text)
+    overlay_layers = enabled_overlay_layers(page_intent)
     visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text, content_text)
     layout_intent = _compact_layout_intent(page_intent, reference_images, style_text, content_text)
     refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
