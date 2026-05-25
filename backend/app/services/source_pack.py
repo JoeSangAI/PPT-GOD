@@ -1,0 +1,675 @@
+import hashlib
+import json
+import os
+import re
+from io import BytesIO
+from typing import Callable
+
+
+LOW_TEXT_CHAR_THRESHOLD = 80
+
+FRONT_MATTER_ROLE_TERMS = {
+    "preface": ("译者序", "前言", "序言", "preface"),
+    "intro": ("绪论", "序论", "导论", "引言", "introduction"),
+    "guide": ("阅读指南", "reading guide"),
+}
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative planning-budget estimate; exact tokenizer is unnecessary here."""
+    cleaned = re.sub(r"\s+", "", text or "")
+    if not cleaned:
+        return 0
+    ascii_words = re.findall(r"[A-Za-z0-9_]+", cleaned)
+    non_ascii_chars = len(re.sub(r"[A-Za-z0-9_]", "", cleaned))
+    return max(1, int(len(ascii_words) * 1.3 + non_ascii_chars))
+
+
+def _document_kind(filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext == ".pdf":
+        return "pdf"
+    if ext in {".md", ".markdown"}:
+        return "markdown"
+    if ext in {".txt", ".json", ".csv", ".html", ".htm"}:
+        return "text"
+    if ext in {".docx", ".doc"}:
+        return "docx"
+    if ext in {".pptx", ".ppt"}:
+        return "pptx"
+    return "text"
+
+
+def _safe_decode(file_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def _safe_asset_filename(filename: str, page_num: int, xref: int, ext: str, payload: bytes) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(filename)[0]).strip("_") or "source"
+    digest = hashlib.sha1(payload).hexdigest()[:12]
+    safe_ext = re.sub(r"[^A-Za-z0-9]+", "", ext or "png") or "png"
+    return f"{stem}_p{page_num}_x{xref}_{digest}.{safe_ext}"
+
+
+def _text_preview(text: str, limit: int = 260) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    return cleaned[:limit]
+
+
+def _bbox_metrics(bbox: list[float]) -> tuple[float, float, float]:
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return 0.0, 0.0, 0.0
+    try:
+        width = max(0.0, float(bbox[2]) - float(bbox[0]))
+        height = max(0.0, float(bbox[3]) - float(bbox[1]))
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0
+    return width, height, width * height
+
+
+def _pdf_figure_role(width: int, height: int, bbox: list[float]) -> tuple[str, str]:
+    bbox_width, bbox_height, bbox_area = _bbox_metrics(bbox)
+    pixel_area = max(0, int(width or 0)) * max(0, int(height or 0))
+    large_pixels = pixel_area >= 40_000 and min(width or 0, height or 0) >= 90
+    large_bbox = bbox_area >= 20_000 and min(bbox_width, bbox_height) >= 80
+    tiny_pixels = pixel_area > 0 and (pixel_area < 12_000 or min(width or 0, height or 0) < 45)
+    tiny_bbox = bbox_area > 0 and (bbox_area < 3_000 or min(bbox_width, bbox_height) < 32)
+    if large_pixels or large_bbox:
+        return "content", "high"
+    if tiny_pixels or tiny_bbox:
+        return "auxiliary", "low"
+    return "content", "medium"
+
+
+def _looks_like_toc_line(line: str) -> bool:
+    text = line.strip()
+    if re.search(r"(?:\.{2,}|…{2,}|·{2,}|_{2,})\s*\d+\s*$", text):
+        return True
+    if re.search(r"\s+\d{1,4}\s*$", text) and len(text) > 18:
+        return True
+    return False
+
+
+def _normalize_chapter_title(raw: str) -> str:
+    title = re.sub(r"^\s{0,3}#{1,6}\s*", "", raw or "").strip()
+    title = re.sub(r"\s+", " ", title)
+    return title
+
+
+def _heading_from_line(line: str) -> str:
+    text = _normalize_chapter_title(line)
+    if not text or _looks_like_toc_line(text):
+        return ""
+    markdown_match = re.match(r"^\s{0,3}#{1,6}\s+(.+)$", line or "")
+    if markdown_match:
+        return _normalize_chapter_title(markdown_match.group(1))
+    if re.match(r"^第\s*[0-9一二三四五六七八九十百]+\s*[章节部篇讲课](?:\s+|[:：、.\-]).+", text):
+        return text
+    if re.match(r"^(?:第\s*)?[0-9一二三四五六七八九十百]+\s*部分(?:\s+|[:：、.\-]).+", text):
+        return text
+    if re.match(r"^[一二三四五六七八九十]+[、.]\s*.+", text):
+        return text
+    return ""
+
+
+def _line_starts_section_term(raw: str, term: str) -> bool:
+    text = re.sub(r"\s+", " ", str(raw or "").strip()).lower()
+    clean_term = re.sub(r"\s+", " ", term or "").strip().lower()
+    if not text or not clean_term:
+        return False
+    if text == clean_term:
+        return True
+    return bool(re.match(rf"^{re.escape(clean_term)}(?:\s+|[:：、.\-]).+", text))
+
+
+def front_matter_role_for_title(title: str, roles: set[str] | None = None) -> tuple[str, str] | None:
+    allowed_roles = roles or set(FRONT_MATTER_ROLE_TERMS)
+    clean = _normalize_chapter_title(title)
+    if not clean or _looks_like_toc_line(clean):
+        return None
+    for role in allowed_roles:
+        for term in FRONT_MATTER_ROLE_TERMS.get(role, ()):
+            if _line_starts_section_term(clean, term) and len(clean) <= 36:
+                return role, term
+    return None
+
+
+def front_matter_role_for_text(text: str, roles: set[str] | None = None) -> tuple[str, str] | None:
+    for raw_line in str(text or "").splitlines()[:8]:
+        raw = str(raw_line or "").strip()
+        if not raw or _looks_like_toc_line(raw):
+            continue
+        match = front_matter_role_for_title(raw, roles)
+        if match:
+            return match
+    return None
+
+
+def _chapters_from_pages(pages: list[dict], *, pdf_toc: list | None = None) -> list[dict]:
+    candidates: list[dict] = []
+    if pdf_toc:
+        for item in pdf_toc:
+            try:
+                level, title, page_num = item[:3]
+                page_num = int(page_num)
+            except (TypeError, ValueError):
+                continue
+            if int(level or 1) > 2 or page_num <= 0:
+                continue
+            title = _normalize_chapter_title(str(title or ""))
+            if title:
+                candidates.append({"title": title, "start_page": page_num})
+
+    if not candidates:
+        for page in pages:
+            for line in str(page.get("text") or "").splitlines()[:12]:
+                title = _heading_from_line(line)
+                if title:
+                    candidates.append({"title": title, "start_page": int(page.get("page_num") or 1)})
+
+    deduped: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for item in sorted(candidates, key=lambda c: int(c.get("start_page") or 0)):
+        key = (str(item.get("title") or ""), int(item.get("start_page") or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    max_page = max((int(page.get("page_num") or 0) for page in pages), default=0)
+    chapters: list[dict] = []
+    for idx, item in enumerate(deduped):
+        start = int(item.get("start_page") or 1)
+        next_start = int(deduped[idx + 1].get("start_page") or max_page + 1) if idx + 1 < len(deduped) else max_page + 1
+        chapters.append({
+            "chapter_id": f"c{idx + 1}",
+            "title": str(item.get("title") or "").strip(),
+            "start_page": start,
+            "end_page": max(start, next_start - 1),
+        })
+    return chapters
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _page_num(page: dict) -> int:
+    return _safe_int(page.get("page_num"))
+
+
+def _source_section_record(
+    *,
+    section_id: str,
+    section_role: str,
+    title: str,
+    start_page: int,
+    end_page: int,
+    source: str,
+    chapter_id: str = "",
+) -> dict:
+    record = {
+        "section_id": section_id,
+        "section_role": section_role,
+        "title": title,
+        "start_page": start_page,
+        "end_page": max(start_page, end_page),
+        "source": source,
+    }
+    if chapter_id:
+        record["chapter_id"] = chapter_id
+    return record
+
+
+def _source_structure_from_pages(pages: list[dict], chapters: list[dict]) -> list[dict]:
+    sorted_pages = sorted([page for page in pages if isinstance(page, dict)], key=_page_num)
+    max_page = max((_page_num(page) for page in sorted_pages), default=0)
+    sections: list[dict] = []
+
+    for idx, chapter in enumerate(chapters or [], start=1):
+        if not isinstance(chapter, dict):
+            continue
+        start_page = _safe_int(chapter.get("start_page"))
+        end_page = _safe_int(chapter.get("end_page"), start_page)
+        title = _normalize_chapter_title(str(chapter.get("title") or ""))
+        if start_page <= 0 or not title:
+            continue
+        front_role = front_matter_role_for_title(title)
+        if front_role:
+            role, canonical_title = front_role
+            sections.append(_source_section_record(
+                section_id=f"front-{role}-{start_page}",
+                section_role=role,
+                title=canonical_title,
+                start_page=start_page,
+                end_page=end_page,
+                source="chapter_outline",
+                chapter_id=str(chapter.get("chapter_id") or ""),
+            ))
+        else:
+            sections.append(_source_section_record(
+                section_id=str(chapter.get("chapter_id") or f"c{idx}"),
+                section_role="chapter",
+                title=title,
+                start_page=start_page,
+                end_page=end_page,
+                source="chapter_outline",
+                chapter_id=str(chapter.get("chapter_id") or f"c{idx}"),
+            ))
+
+    existing_starts = {
+        (_safe_int(section.get("start_page")), str(section.get("section_role") or ""))
+        for section in sections
+    }
+    page_front_starts: list[tuple[int, str, str]] = []
+    for page in sorted_pages:
+        page_num = _page_num(page)
+        if page_num <= 0:
+            continue
+        match = front_matter_role_for_text(str(page.get("text") or ""))
+        if not match:
+            continue
+        role, title = match
+        if (page_num, role) in existing_starts:
+            continue
+        page_front_starts.append((page_num, role, title))
+
+    body_chapter_starts = sorted(
+        _safe_int(section.get("start_page"))
+        for section in sections
+        if str(section.get("section_role") or "") == "chapter" and _safe_int(section.get("start_page")) > 0
+    )
+    front_start_pages = [start for start, _role, _title in page_front_starts]
+    boundaries = sorted({*body_chapter_starts, *front_start_pages, max_page + 1})
+    for start_page, role, title in page_front_starts:
+        next_boundaries = [page_num for page_num in boundaries if page_num > start_page]
+        end_page = (min(next_boundaries) - 1) if next_boundaries else max_page
+        sections.append(_source_section_record(
+            section_id=f"front-{role}-{start_page}",
+            section_role=role,
+            title=title,
+            start_page=start_page,
+            end_page=end_page,
+            source="page_heading",
+        ))
+
+    if not sections and sorted_pages:
+        first_page = _page_num(sorted_pages[0])
+        last_page = _page_num(sorted_pages[-1])
+        sections.append(_source_section_record(
+            section_id="document",
+            section_role="document",
+            title="全文",
+            start_page=first_page,
+            end_page=last_page,
+            source="document",
+        ))
+
+    deduped: list[dict] = []
+    seen: set[tuple[int, str, str]] = set()
+    for section in sorted(sections, key=lambda item: (_safe_int(item.get("start_page")), str(item.get("section_id") or ""))):
+        key = (
+            _safe_int(section.get("start_page")),
+            str(section.get("section_role") or ""),
+            str(section.get("title") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(section)
+    return deduped
+
+
+def _section_for_page(sections: list[dict], page_num: int) -> dict | None:
+    matches = [
+        section for section in sections
+        if _safe_int(section.get("start_page")) <= page_num <= _safe_int(section.get("end_page"), page_num)
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda section: _safe_int(section.get("start_page")), reverse=True)[0]
+
+
+def _apply_source_structure(pages: list[dict], images: list[dict], sections: list[dict]) -> None:
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        section = _section_for_page(sections, _page_num(page))
+        if not section:
+            continue
+        page["source_section_id"] = section.get("section_id")
+        page["source_section_role"] = section.get("section_role")
+        page["source_section_title"] = section.get("title")
+        page["source_section_start_page"] = section.get("start_page")
+        page["source_section_end_page"] = section.get("end_page")
+
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        page_num = _safe_int(image.get("source_page_num") or image.get("pdf_source_page_num"))
+        section = _section_for_page(sections, page_num)
+        if not section:
+            continue
+        image["source_section_id"] = section.get("section_id")
+        image["source_section_role"] = section.get("section_role")
+        image["source_section_title"] = section.get("title")
+
+
+def _base_pack(filename: str, kind: str, pages: list[dict], chapters: list[dict], images: list[dict]) -> dict:
+    source_structure = _source_structure_from_pages(pages, chapters)
+    _apply_source_structure(pages, images, source_structure)
+    text_chars = sum(int(page.get("text_chars") or len(str(page.get("text") or ""))) for page in pages)
+    estimated = sum(int(page.get("estimated_tokens") or estimate_tokens(str(page.get("text") or ""))) for page in pages)
+    return {
+        "schema_version": 1,
+        "document": {
+            "filename": filename,
+            "kind": kind,
+        },
+        "parse_status": {
+            "status": "completed",
+        },
+        "stats": {
+            "pages": len(pages),
+            "chapters": len(chapters),
+            "images": len(images),
+            "text_chars": text_chars,
+            "estimated_tokens": estimated,
+        },
+        "pages": pages,
+        "chapters": chapters,
+        "source_structure": source_structure,
+        "images": images,
+    }
+
+
+def _build_text_pack(file_bytes: bytes, filename: str, kind: str) -> dict:
+    text = _safe_decode(file_bytes).strip()
+    page = {
+        "page_num": 1,
+        "text": text,
+        "text_chars": len(text),
+        "estimated_tokens": estimate_tokens(text),
+        "ocr_status": "not_applicable",
+    }
+    chapters = _chapters_from_pages([page])
+    return _base_pack(filename, kind, [page], chapters, [])
+
+
+def _build_docx_pack(file_bytes: bytes, filename: str) -> dict:
+    try:
+        from docx import Document
+
+        doc = Document(BytesIO(file_bytes))
+        text = "\n\n".join(p.text.strip() for p in doc.paragraphs if p.text and p.text.strip())
+    except Exception:
+        text = _safe_decode(file_bytes)
+    page = {
+        "page_num": 1,
+        "text": text.strip(),
+        "text_chars": len(text.strip()),
+        "estimated_tokens": estimate_tokens(text),
+        "ocr_status": "not_applicable",
+    }
+    chapters = _chapters_from_pages([page])
+    return _base_pack(filename, "docx", [page], chapters, [])
+
+
+def _append_unique_text(parts: list[str], text: str) -> None:
+    cleaned = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    if cleaned and cleaned not in parts:
+        parts.append(cleaned)
+
+
+def _extract_pptx_shape_texts(shapes, shape_type_enum) -> list[str]:
+    from pptx.enum.shapes import PP_PLACEHOLDER
+
+    texts: list[str] = []
+    for shape in shapes:
+        if getattr(shape, "shape_type", None) == shape_type_enum.GROUP:
+            for text in _extract_pptx_shape_texts(shape.shapes, shape_type_enum):
+                _append_unique_text(texts, text)
+            continue
+
+        if getattr(shape, "is_placeholder", False):
+            ph_type = getattr(getattr(shape, "placeholder_format", None), "type", None)
+            if ph_type in {PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.HEADER, PP_PLACEHOLDER.SLIDE_NUMBER}:
+                continue
+
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                cells = []
+                for cell in row.cells:
+                    cell_text = re.sub(r"\s+", " ", cell.text or "").strip()
+                    if cell_text:
+                        cells.append(cell_text)
+                if cells:
+                    _append_unique_text(texts, " | ".join(cells))
+            continue
+
+        if getattr(shape, "has_chart", False):
+            chart_title = getattr(getattr(shape.chart, "chart_title", None), "text_frame", None)
+            if chart_title is not None:
+                _append_unique_text(texts, chart_title.text)
+
+        if hasattr(shape, "text"):
+            _append_unique_text(texts, shape.text)
+    return texts
+
+
+def _extract_pptx_notes(slide) -> str:
+    try:
+        if not getattr(slide, "has_notes_slide", False):
+            return ""
+        notes = []
+        for shape in slide.notes_slide.notes_text_frame.paragraphs:
+            line = "".join(run.text for run in shape.runs).strip()
+            if line:
+                notes.append(line)
+        return "\n".join(notes).strip()
+    except Exception:
+        return ""
+
+
+def _build_pptx_pack(file_bytes: bytes, filename: str) -> dict:
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        prs = Presentation(BytesIO(file_bytes))
+        pages: list[dict] = []
+        for page_num, slide in enumerate(prs.slides, start=1):
+            slide_texts = _extract_pptx_shape_texts(slide.shapes, MSO_SHAPE_TYPE)
+            notes = _extract_pptx_notes(slide)
+            if notes:
+                slide_texts.append("【备注】\n" + notes)
+            body = "\n".join(slide_texts).strip()
+            pages.append({
+                "page_num": page_num,
+                "text": body,
+                "text_chars": len(body),
+                "estimated_tokens": estimate_tokens(body),
+                "ocr_status": "not_applicable",
+            })
+    except Exception:
+        body = _safe_decode(file_bytes).strip()
+        pages = [{
+            "page_num": 1,
+            "text": body,
+            "text_chars": len(body),
+            "estimated_tokens": estimate_tokens(body),
+            "ocr_status": "not_applicable",
+        }]
+    chapters = _chapters_from_pages(pages)
+    return _base_pack(filename, "pptx", pages, chapters, [])
+
+
+def _build_pdf_pack(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    asset_output_dir: str | None = None,
+    ocr_reader: Callable[[object], str] | None = None,
+) -> dict:
+    import fitz
+
+    pages: list[dict] = []
+    images: list[dict] = []
+    os.makedirs(asset_output_dir, exist_ok=True) if asset_output_dir else None
+    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+        toc = doc.get_toc(simple=True)
+        for index, page in enumerate(doc, start=1):
+            text = (page.get_text("text") or "").strip()
+            ocr_status = "not_needed"
+            if len(text) < LOW_TEXT_CHAR_THRESHOLD:
+                if ocr_reader:
+                    try:
+                        ocr_text = (ocr_reader(page) or "").strip()
+                    except Exception:
+                        ocr_text = ""
+                    if ocr_text:
+                        text = "\n\n".join(part for part in [text, ocr_text] if part)
+                        ocr_status = "completed"
+                    else:
+                        ocr_status = "needed"
+                else:
+                    ocr_status = "needed"
+            page_record = {
+                "page_num": index,
+                "text": text,
+                "text_chars": len(text),
+                "estimated_tokens": estimate_tokens(text),
+                "ocr_status": ocr_status,
+            }
+            pages.append(page_record)
+
+            for image_info in page.get_images(full=True):
+                xref = int(image_info[0])
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    extracted = {}
+                payload = extracted.get("image") if isinstance(extracted, dict) else None
+                if not payload:
+                    continue
+                ext = str(extracted.get("ext") or "png")
+                try:
+                    image_width = int(extracted.get("width") or 0)
+                    image_height = int(extracted.get("height") or 0)
+                except (TypeError, ValueError):
+                    image_width = 0
+                    image_height = 0
+                rects = []
+                try:
+                    rects = page.get_image_rects(xref)
+                except Exception:
+                    rects = []
+                if not rects:
+                    rects = [page.rect]
+                for rect_idx, rect in enumerate(rects, start=1):
+                    file_path = ""
+                    if asset_output_dir:
+                        asset_filename = _safe_asset_filename(filename, index, xref, ext, payload)
+                        if rect_idx > 1:
+                            stem, suffix = os.path.splitext(asset_filename)
+                            asset_filename = f"{stem}_{rect_idx}{suffix}"
+                        file_path = os.path.join(asset_output_dir, asset_filename)
+                        if not os.path.exists(file_path):
+                            with open(file_path, "wb") as f:
+                                f.write(payload)
+                    bbox = [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+                    bbox_width, bbox_height, bbox_area = _bbox_metrics(bbox)
+                    figure_role, content_significance = _pdf_figure_role(image_width, image_height, bbox)
+                    images.append({
+                        "id": f"{filename}:p{index}:x{xref}:{rect_idx}",
+                        "source_type": "pdf",
+                        "source_document": filename,
+                        "source_page_num": index,
+                        "pdf_source_page_num": index,
+                        "chapter_id": "",
+                        "bbox": bbox,
+                        "bbox_width": bbox_width,
+                        "bbox_height": bbox_height,
+                        "bbox_area": bbox_area,
+                        "image_width": image_width,
+                        "image_height": image_height,
+                        "pixel_area": max(0, image_width) * max(0, image_height),
+                        "figure_role": figure_role,
+                        "content_significance": content_significance,
+                        "nearby_text": _text_preview(text),
+                        "file_path": file_path,
+                        "image_sha1": hashlib.sha1(payload).hexdigest(),
+                        "asset_kind": "document_image",
+                    })
+        chapters = _chapters_from_pages(pages, pdf_toc=toc)
+
+    for image in images:
+        page_num = int(image.get("source_page_num") or 0)
+        chapter = next((c for c in chapters if int(c.get("start_page") or 0) <= page_num <= int(c.get("end_page") or 0)), None)
+        if chapter:
+            image["chapter_id"] = chapter.get("chapter_id") or ""
+    return _base_pack(filename, "pdf", pages, chapters, images)
+
+
+def build_source_pack(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    asset_output_dir: str | None = None,
+    ocr_reader: Callable[[object], str] | None = None,
+) -> dict:
+    kind = _document_kind(filename)
+    if kind == "pdf":
+        return _build_pdf_pack(file_bytes, filename, asset_output_dir=asset_output_dir, ocr_reader=ocr_reader)
+    if kind == "docx":
+        return _build_docx_pack(file_bytes, filename)
+    if kind == "pptx":
+        return _build_pptx_pack(file_bytes, filename)
+    return _build_text_pack(file_bytes, filename, kind)
+
+
+def source_pack_to_text(pack: dict) -> str:
+    filename = str((pack.get("document") or {}).get("filename") or "")
+    kind = str((pack.get("document") or {}).get("kind") or "")
+    lines = [f'--- SOURCE filename="{filename}" kind="{kind}" ---']
+    chapter_by_page: dict[int, dict] = {}
+    for chapter in pack.get("chapters") or []:
+        try:
+            start = int(chapter.get("start_page") or 0)
+            end = int(chapter.get("end_page") or start)
+        except (TypeError, ValueError):
+            continue
+        for page_num in range(start, end + 1):
+            chapter_by_page[page_num] = chapter
+    for page in pack.get("pages") or []:
+        if not isinstance(page, dict):
+            continue
+        page_num = int(page.get("page_num") or 1)
+        chapter = chapter_by_page.get(page_num) or {}
+        chapter_text = f' chapter="{chapter.get("title")}"' if chapter.get("title") else ""
+        lines.append(f'--- PAGE {page_num}{chapter_text} ---')
+        lines.append(str(page.get("text") or "").strip())
+    return "\n".join(lines).strip()
+
+
+def read_source_pack(path: str) -> dict | None:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_source_pack(path: str, pack: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(pack, f, ensure_ascii=False, indent=2)

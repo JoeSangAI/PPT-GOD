@@ -159,7 +159,7 @@ def _build_message(
         else:
             lines.append("交付前还有问题需要处理。请先处理下面的红色事项，再导出最终 PPTX。")
         lines.extend(["", "**下一步**"])
-        lines.extend(_next_step_lines(remaining_count=remaining_count, has_pptx=has_pptx))
+        lines.extend(_next_step_lines(remaining_count=remaining_count, has_pptx=has_pptx, project_status=project.status))
     elif warnings:
         lines.append("✅ **可以导出最终稿，建议复核后交付**")
         lines.append("")
@@ -196,14 +196,19 @@ def _build_message(
         lines.append("ℹ️ 需要品牌露出时，可在导出的 PPT 里手动添加，或下次生成前上传 Logo。")
 
     if project.status == "prototype_ready":
-        lines.append("ℹ️ 当前是打样文件，确认样张后再生成全部页面。")
+        lines.append("ℹ️ 当前是打样文件，确认样张后再补齐剩余页面。")
     return "\n".join(lines)
 
 
-def _next_step_lines(*, remaining_count: int, has_pptx: bool) -> list[str]:
+def _next_step_lines(*, remaining_count: int, has_pptx: bool, project_status: str | None = None) -> list[str]:
     if remaining_count > 0:
+        if project_status == "prototype_ready":
+            return [
+                "1. 点击状态卡里的「样张满意，生成全部」补齐剩余页",
+                "2. 等页面全部完成后，点击「导出 PPTX」",
+            ]
         return [
-            "1. 点击「生成全部页面」或重试未完成页",
+            "1. 点击状态卡里的「继续生成剩余页」或重试未完成页",
             "2. 等页面全部完成后，点击「导出 PPTX」",
         ]
     if not has_pptx:

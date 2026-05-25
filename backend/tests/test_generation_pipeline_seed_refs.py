@@ -1,6 +1,6 @@
 from PIL import Image
 
-from app.models.models import Slide
+from app.models.models import ReferenceImage, Slide
 from app.services import generation_pipeline
 
 
@@ -90,3 +90,72 @@ def test_non_section_pages_can_still_use_two_seed_images(monkeypatch, tmp_path):
     refs = generation_pipeline._load_reference_images(slide, seed_image_paths=[str(seed_a), str(seed_b)])
 
     assert [ref["file_path"] for ref in refs if ref.get("role") == "seed_ref"] == [str(seed_a), str(seed_b)]
+
+
+def test_pptx_parallel_page_refs_upgrade_stale_blend_to_crop(tmp_path):
+    ref_path = tmp_path / "p14-ref.png"
+    Image.new("RGB", (120, 80), "white").save(ref_path)
+    slide = Slide(page_num=14, type="content", visual_json={})
+    slide.reference_images = [
+        ReferenceImage(
+            project_id="project",
+            file_path=str(ref_path),
+            role="content_ref",
+            process_mode="blend",
+            asset_kind="other",
+            asset_analysis={
+                "source_document": "F1.pptx",
+                "asset_group_role": "parallel_page_reference_set",
+                "asset_group_index": 1,
+                "asset_group_size": 6,
+                "detected_kind": "other",
+            },
+        )
+    ]
+
+    refs = generation_pipeline._load_reference_images(slide)
+
+    assert refs[0]["process_mode"] == "crop"
+
+
+def test_crop_page_refs_add_fidelity_override_to_generation_prompt(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_generate_slide_image(*, prompt, **kwargs):
+        captured["prompt"] = prompt
+        return Image.new("RGB", (1792, 1024), "white")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    slide = Slide(
+        id="slide-14",
+        project_id="project",
+        page_num=14,
+        type="content",
+        prompt_text="Layout says blend mode and extract the main visual style.",
+        visual_json={},
+    )
+    ref_image = Image.new("RGB", (120, 80), "white")
+    generation_pipeline._generate_one_slide(
+        slide,
+        project_id="project",
+        output_dir=str(tmp_path),
+        preloaded_ref_data=[
+            {
+                "image": ref_image,
+                "process_mode": "crop",
+                "role": "content_ref",
+                "label": "Reference Image 1",
+                "file_path": str(tmp_path / "p14-ref.png"),
+                "asset_analysis": {
+                    "asset_group_role": "parallel_page_reference_set",
+                    "asset_group_index": 1,
+                    "asset_group_size": 6,
+                },
+            }
+        ],
+        run_id="run",
+    )
+
+    assert "PAGE REFERENCE FIDELITY" in captured["prompt"]
+    assert "Do not replace these references with invented people" in captured["prompt"]

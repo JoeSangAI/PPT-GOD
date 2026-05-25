@@ -55,6 +55,10 @@ body {
   margin-bottom: 0.5rem;
 }
 
+.pg-slide-body-preview p {
+  white-space: pre-wrap;
+}
+
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -6766,7 +6770,7 @@ body {
 }
 
 .pg-progress-overview--empty {
-  margin: 16px auto 0;
+  margin: 0 auto;
   max-width: 480px;
 }
 
@@ -6776,8 +6780,10 @@ body {
 
 .pg-progress-overview--agent {
   width: 100%;
-  border-radius: 12px;
-  padding: 9px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
   box-shadow: none;
 }
 

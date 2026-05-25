@@ -108,6 +108,17 @@ export interface WorkflowProgressDisclosure {
   status?: string | null;
 }
 
+export type WorkflowProgressOverviewVariant = "drawer" | "empty" | "agent";
+
+export interface WorkflowProgressOverviewDisplay {
+  showHeaderCopy: boolean;
+  metrics: WorkflowProgressMetric[];
+  showSteps: boolean;
+  showStandaloneTitle: boolean;
+  showFooterSummary: boolean;
+  showAgentCopy: boolean;
+}
+
 export interface WorkflowState {
   projectStatus: string;
   statusLabel: string;
@@ -588,7 +599,8 @@ export function buildWorkflowProgressDisclosure(
   const startedAt = activeRun?.started_at || null;
   const updatedAt = progress?.updated_at || activeRun?.updated_at || null;
   const elapsed = startedAt ? formatWorkflowDuration(secondsSinceIsoAt(startedAt, nowMs)) : "";
-  const recentDuration = updatedAt ? formatWorkflowDuration(secondsSinceIsoAt(updatedAt, nowMs)) : "";
+  const recentSeconds = updatedAt ? secondsSinceIsoAt(updatedAt, nowMs) : 0;
+  const recentDuration = updatedAt ? formatWorkflowDuration(recentSeconds) : "";
   const recent = recentDuration ? (recentDuration === "刚刚" ? "刚刚" : `${recentDuration}前`) : "";
   const hasTotal = total > 0;
   const progressValue = hasTotal ? `${current} / ${total} ${unit}` : current > 0 ? `${current} ${unit}` : "";
@@ -613,7 +625,7 @@ export function buildWorkflowProgressDisclosure(
   if (failed > 0) metrics.push({ label: "失败", value: `${failed} ${unit}` });
   if (targetText) metrics.push({ label: "处理范围", value: targetText });
   if (elapsed) metrics.push({ label: status === "queued" ? "已等待" : "已运行", value: elapsed });
-  if (recent) metrics.push({ label: "最近更新", value: recent });
+  if (recent && recentSeconds >= 30) metrics.push({ label: "最近更新", value: recent });
 
   return {
     headline: copy.headline,
@@ -629,6 +641,40 @@ export function buildWorkflowProgressDisclosure(
     activePageNums,
     targetPageNums,
     status,
+  };
+}
+
+export function getWorkflowProgressOverviewDisplay(
+  disclosure: WorkflowProgressDisclosure,
+  variant: WorkflowProgressOverviewVariant = "drawer"
+): WorkflowProgressOverviewDisplay {
+  if (variant === "agent") {
+    return {
+      showHeaderCopy: false,
+      metrics: [],
+      showSteps: false,
+      showStandaloneTitle: false,
+      showFooterSummary: false,
+      showAgentCopy: false,
+    };
+  }
+  if (variant === "empty") {
+    return {
+      showHeaderCopy: true,
+      metrics: disclosure.metrics.slice(0, 5),
+      showSteps: true,
+      showStandaloneTitle: false,
+      showFooterSummary: false,
+      showAgentCopy: false,
+    };
+  }
+  return {
+    showHeaderCopy: true,
+    metrics: disclosure.metrics.slice(0, 5),
+    showSteps: true,
+    showStandaloneTitle: false,
+    showFooterSummary: false,
+    showAgentCopy: true,
   };
 }
 
@@ -717,7 +763,7 @@ export function getGuidanceText(state: WorkflowState) {
     case "prototype":
       return "样张正在生成中，请稍候";
     case "prototype_ready":
-      return "样张已生成，请检查效果；满意后生成全部页面";
+      return "样张已生成，请检查效果；满意后点击「样张满意，生成全部」";
     case "generating":
       return "正在批量生成所有页面";
     case "completed":
@@ -902,6 +948,21 @@ export interface StatusCardInput {
   canStartFullGeneration?: boolean;
 }
 
+function compactActiveRunTitle(kind?: string | null, status?: string | null) {
+  const noun: Record<string, string> = {
+    content_plan: "内容规划",
+    style_proposal: "视觉方向",
+    visual_prompts: "画面方案",
+    prototype_generation: "样张生成",
+    batch_generation: "批量生成",
+    page_generation: "单页生成",
+    retry_failed: "失败页重试",
+    finetune: "单页微调",
+  };
+  const label = noun[String(kind || "")] || "任务";
+  return status === "queued" ? `${label}排队中` : `${label}中`;
+}
+
 export function getStatusCard(input: StatusCardInput): StatusCardData | null {
   const {
     workflowState: w,
@@ -925,8 +986,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     const unit = disc?.unit || "页";
     return {
       tone: "running",
-      title: disc?.headline || "任务进行中",
-      description: disc?.summary || "任务进行中,请稍候",
+      title: compactActiveRunTitle(w.activeRun.kind, disc?.status || w.activeRun.status),
       progress: total > 0 ? { current, total, percent: disc?.percent || 0, unit } : undefined,
       primary: {
         key: "stop",
@@ -957,7 +1017,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
 
   // 优先级 3:有未完成的页(可以继续生成)——仅在中断续跑场景显示
   // 条件:已可生图 + 至少已有部分页完成过(避免全新状态抢 start-prototype)
-  const canContinueGeneration = ["prompt_ready", "prototype_ready", "completed"].includes(w.projectStatus);
+  const canContinueGeneration = ["prompt_ready", "completed"].includes(w.projectStatus);
   const hasPartiallyCompleted = completedSlideCount > 0;
   if (!w.activeRun && canContinueGeneration && hasPartiallyCompleted && incompletePageNums.length > 0) {
     const pageText = formatWorkflowPageNumsForUser(incompletePageNums);
@@ -1015,11 +1075,11 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
         ? `样张已生成 · ${scopeText}${totalSuffix}`
         : "样张已生成",
       description: resamplePageNums.length > 0
-        ? `已勾选 ${resamplePageNums.length} 页重打;不勾选则全部满意,可生成全部`
-        : "满意 → 生成全部页面;不满意 → 在画布勾选页面后重打",
+        ? `当前样张范围为 ${resamplePageNums.length} 页;满意可生成全部,不满意可重打这些样张页`
+        : "满意 → 点击「样张满意，生成全部」;不满意 → 在画布勾选页面后重打",
       primary: {
         key: "confirm-prototype",
-        label: "样张满意,生成全部",
+        label: "样张满意，生成全部",
         variant: "primary",
       },
       secondary: resamplePageNums.length > 0

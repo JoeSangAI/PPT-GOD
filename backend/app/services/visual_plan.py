@@ -757,7 +757,14 @@ def _fallback_visual_plan(
 ) -> List[Dict]:
     """Build a deterministic visual draft for explicit tests/tools; production LLM failures should surface."""
     visual_plan = []
-    style_pack_snapshot = style_pack_snapshot or derive_style_pack_from_content(content_plan)
+    style_pack_snapshot = style_pack_snapshot or (
+        "Style: 内容自适应\n"
+        "Palette: 由页面内容主题和受众自然推导\n"
+        "Mood: 贴合内容气质\n"
+        "Typography: 由风格气质决定字体搭配\n"
+        "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
+        "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
+    )
     visual_strategy = _visual_strategy_from_style_text(style_pack_snapshot)
     for page in content_plan:
         page_type = page.get("type", "content")

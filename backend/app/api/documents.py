@@ -11,12 +11,17 @@ from app.models.base import SessionLocal, get_db
 from app.models.models import Project, ReferenceImage, Slide
 from app.core.config import settings
 from app.services.pptx_asset_extractor import PptxImageAsset, extract_pptx_image_assets
+from app.services.source_pack import build_source_pack, write_source_pack as write_source_pack_file
 from app.utils.project_docs import (
     document_parse_status_path,
+    document_source_pack_path,
     document_text_path,
     extract_document_text,
     get_project_docs_dir,
+    get_project_source_assets_dir,
     iter_project_document_filenames,
+    read_document_source_pack,
+    read_document_source_status,
     read_document_parse_status,
     write_document_parse_status,
 )
@@ -117,6 +122,10 @@ def _asset_analysis(asset: PptxImageAsset) -> dict:
     return {
         **asset.metadata,
         **logo_review,
+        "source_type": "pptx",
+        "source_document": asset.metadata.get("source_document") or "",
+        "source_page_num": asset.source_page_num,
+        "pptx_source_page_num": asset.source_page_num,
         "detected_kind": asset.asset_kind or "other",
         "subject": asset.asset_name,
         "description": asset.usage_note,
@@ -132,12 +141,31 @@ def _asset_analysis(asset: PptxImageAsset) -> dict:
 
 def _pptx_page_ref_key_from_analysis(analysis: dict, file_path: str | None = None) -> tuple[str, int | None, str]:
     source_document = str(analysis.get("source_document") or "")
-    source_page_num = analysis.get("pptx_source_page_num")
+    source_page_num = _source_page_num_from_analysis(analysis)
+    digest = str(analysis.get("pptx_image_sha1") or analysis.get("image_sha1") or file_path or "")
+    return source_document, source_page_num, digest
+
+
+def _source_page_num_from_analysis(analysis: dict) -> int | None:
+    for key in ("source_page_num", "pptx_source_page_num", "pdf_source_page_num"):
+        source_page_num = analysis.get(key)
+        try:
+            value = int(source_page_num) if source_page_num is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _source_page_ref_key_from_analysis(analysis: dict, file_path: str | None = None) -> tuple[str, int | None, str]:
+    source_document = str(analysis.get("source_document") or "")
+    source_page_num = _source_page_num_from_analysis(analysis)
     try:
-        source_page_num = int(source_page_num) if source_page_num is not None else None
+        bbox_key = json.dumps(analysis.get("bbox") or "", ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
-        source_page_num = None
-    digest = str(analysis.get("pptx_image_sha1") or file_path or "")
+        bbox_key = ""
+    digest = str(analysis.get("pptx_image_sha1") or analysis.get("image_sha1") or file_path or bbox_key)
     return source_document, source_page_num, digest
 
 
@@ -259,6 +287,123 @@ def _attach_extracted_pptx_assets(
     return stats
 
 
+def _pdf_asset_analysis(image: dict) -> dict:
+    source_page_num = _source_page_num_from_analysis(image)
+    source_document = str(image.get("source_document") or "")
+    nearby_text = str(image.get("nearby_text") or "")
+    return {
+        **image,
+        "source_type": "pdf",
+        "source_document": source_document,
+        "source_page_num": source_page_num,
+        "pdf_source_page_num": source_page_num,
+        "detected_kind": image.get("asset_kind") or "document_image",
+        "subject": f"「{source_document}」第{source_page_num}页原图" if source_document and source_page_num else "PDF 原图",
+        "description": nearby_text,
+        "recommended_usage": "作为原文页附近内容的参考配图，优先挂接到引用相同来源页的 PPT 页面。",
+        "suggested_keywords": [
+            "PDF原图",
+            "原文配图",
+            f"第{source_page_num}页" if source_page_num else "",
+            str(image.get("chapter_id") or ""),
+        ],
+        "analysis_status": "completed",
+    }
+
+
+def _attach_extracted_pdf_assets(project: Project, source_pack: dict, db: Session) -> dict:
+    images = source_pack.get("images") if isinstance(source_pack.get("images"), list) else []
+    if not images:
+        return {"logos": 0, "page_refs": 0, "visual_assets": 0}
+
+    existing_page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+    existing_page_ref_keys = {
+        _source_page_ref_key_from_analysis(ref.asset_analysis, ref.file_path)
+        for ref in existing_page_refs
+        if isinstance(ref.asset_analysis, dict)
+    }
+    stats = {"logos": 0, "page_refs": 0, "visual_assets": 0}
+
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        file_path = str(image.get("file_path") or "")
+        if not file_path or not os.path.exists(file_path):
+            continue
+        analysis = _pdf_asset_analysis(image)
+        page_ref_key = _source_page_ref_key_from_analysis(analysis, file_path)
+        if page_ref_key in existing_page_ref_keys:
+            continue
+        existing_page_ref_keys.add(page_ref_key)
+        db.add(ReferenceImage(
+            project_id=project.id,
+            slide_id=None,
+            file_path=file_path,
+            role="content_ref",
+            process_mode="blend",
+            asset_name=analysis.get("subject"),
+            asset_kind=analysis.get("detected_kind") or "document_image",
+            usage_note=analysis.get("recommended_usage"),
+            asset_analysis=analysis,
+        ))
+        stats["page_refs"] += 1
+    return stats
+
+
+def _extract_pdf_assets_for_document(
+    project_id: str,
+    source_path: str,
+    source_filename: str,
+    db: Session | None = None,
+) -> dict:
+    owns_session = db is None
+    db = db or SessionLocal()
+    started_at = time.perf_counter()
+    try:
+        _write_asset_status(project_id, source_filename, "running")
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            logger.warning("PDF asset extraction skipped: project not found project=%s", project_id)
+            return {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0, "status": "not_found"}
+        source_pack = read_document_source_pack(project_id, source_filename)
+        if not source_pack:
+            with open(source_path, "rb") as f:
+                file_bytes = f.read()
+            source_pack = build_source_pack(
+                file_bytes,
+                source_filename,
+                asset_output_dir=get_project_source_assets_dir(project_id, create=True),
+            )
+            write_source_pack_file(document_source_pack_path(project_id, source_filename), source_pack)
+        stats = _attach_extracted_pdf_assets(project, source_pack, db)
+        db.commit()
+        total = len(source_pack.get("images") or [])
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "PDF asset extraction completed: project=%s file=%s total=%s stats=%s elapsed=%.2fs",
+            project_id,
+            source_filename,
+            total,
+            stats,
+            elapsed,
+        )
+        completed = {"total": total, **stats, "status": "completed"}
+        _write_asset_status(project_id, source_filename, "completed", stats=completed)
+        return completed
+    except Exception as e:
+        db.rollback()
+        logger.warning("PDF 图片素材拆解失败: project=%s file=%s error=%s", project_id, source_filename, e)
+        failed = {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0, "status": "failed", "error": str(e)}
+        _write_asset_status(project_id, source_filename, "failed", stats=failed, error=str(e))
+        return failed
+    finally:
+        if owns_session:
+            db.close()
+
+
 def _extract_pptx_assets_for_document(
     project_id: str,
     source_path: str,
@@ -331,6 +476,12 @@ def _submit_document_task(label: str, fn, *args) -> None:
 def _dispatch_document_processing(project_id: str, source_path: str, source_filename: str, ext: str) -> None:
     """Kick off independent document processing tasks without gating upload."""
     _submit_document_task("text_parse", extract_document_text, project_id, source_path, source_filename)
+    if ext == ".pdf":
+        status = _read_asset_status(project_id, source_filename).get("status")
+        if status in {"running", "completed"}:
+            return
+        _write_asset_status(project_id, source_filename, "queued")
+        _submit_document_task("pdf_asset_extract", _extract_pdf_assets_for_document, project_id, source_path, source_filename)
     if ext == ".pptx":
         status = _read_asset_status(project_id, source_filename).get("status")
         if status in {"running", "completed"}:
@@ -370,7 +521,11 @@ def upload_document(
     with open(original_path, "wb") as f:
         f.write(file_bytes)
 
-    for stale_path in [document_text_path(project_id, file.filename), _asset_status_path(project_id, file.filename)]:
+    for stale_path in [
+        document_text_path(project_id, file.filename),
+        document_source_pack_path(project_id, file.filename),
+        _asset_status_path(project_id, file.filename),
+    ]:
         if os.path.exists(stale_path):
             try:
                 os.remove(stale_path)
@@ -380,7 +535,7 @@ def upload_document(
     extracted_stats = {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0}
     asset_extraction_status = "not_applicable"
     write_document_parse_status(project_id, file.filename, "queued")
-    if ext == ".pptx":
+    if ext in {".pdf", ".pptx"}:
         _write_asset_status(project_id, file.filename, "queued")
         asset_extraction_status = "queued"
 
@@ -392,6 +547,8 @@ def upload_document(
         "char_count": 0,
         "text_parse_status": "queued",
         "text_preview": "",
+        "source_parse_status": "queued",
+        "source_stats": {"pages": 0, "chapters": 0, "images": 0, "text_chars": 0, "estimated_tokens": 0},
         "asset_extraction_status": asset_extraction_status,
         "extracted_assets": {
             **extracted_stats,
@@ -413,12 +570,15 @@ def list_documents(project_id: str, db: Session = Depends(get_db)):
     documents = []
     for filename in iter_project_document_filenames(project_id):
         parse_status = read_document_parse_status(project_id, filename)
+        source_status = read_document_source_status(project_id, filename)
         asset_status = _read_asset_status(project_id, filename)
         documents.append({
             "filename": filename,
             "char_count": parse_status.get("char_count", 0),
             "text_parse_status": parse_status.get("status"),
             "text_preview": parse_status.get("text_preview", ""),
+            "source_parse_status": source_status.get("status"),
+            "source_stats": source_status.get("stats") or {},
             "asset_extraction_status": asset_status.get("status"),
             "extracted_assets": asset_status.get("stats") or {},
         })
@@ -445,10 +605,11 @@ def delete_document(
     original_path = os.path.join(docs_dir, filename)
     text_path = os.path.join(docs_dir, f"{filename}.extracted.txt")
     parse_status_path = document_parse_status_path(project_id, filename)
+    source_pack_path = document_source_pack_path(project_id, filename)
     asset_status_path = _asset_status_path(project_id, filename)
 
     deleted = False
-    for path in [original_path, text_path, parse_status_path, asset_status_path]:
+    for path in [original_path, text_path, parse_status_path, source_pack_path, asset_status_path]:
         if os.path.exists(path):
             os.remove(path)
             deleted = True

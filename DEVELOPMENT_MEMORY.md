@@ -19,6 +19,29 @@ PPT God is an Agent-driven PPT tool. The highest product contract is: understand
 - Do not let chat copy get ahead of system state. User-facing wording should say "正在..." before the action succeeds and only claim completion after the state actually changes.
 - Stage boundaries are implementation details. If a request belongs to a later stage, acknowledge it now, carry it forward as context, and surface the next action that will apply it.
 
+## Content Director Principle
+
+Recorded 2026-05-23 from user direction after the long-manuscript content-planning incident.
+
+- Treat a user request as a task contract, not as a bag of trigger words. For serious content work, the system must infer the user's desired fidelity, coverage, compression, depth, page-budget logic, and source-use policy before generating artifacts.
+- Put user-intent understanding in an Agent-like "content director" layer that produces a structured contract. Engineering code should execute that contract and enforce stable quality boundaries; it should not grow by accumulating scenario-specific keyword branches.
+- Long prompts, short prompts, long documents, books, manuscripts, PPT sources, and mixed materials should enter the same content pipeline. Differences belong in the content director contract and source profile, not in separate ad hoc pipelines.
+- Use deterministic code for objective facts and safety rails: explicit page counts, source page counts, document structure, invalid output types, empty visible content, markdown leakage, project isolation, and pre-persistence contract violations.
+- If a heuristic is added to stop an urgent failure, treat it as a temporary guardrail. Follow up by migrating the behavior into the content director contract and covering the generalized behavior with tests.
+- Prefer model understanding plus compact structured schemas over larger prompts and more rules. The goal is for the product to behave like a capable content lead who understands the user's job, not like a page-count calculator.
+
+## Product Architecture Taste
+
+Recorded 2026-05-24 from user direction.
+
+- Prefer one elegant underlying principle over separate rules for every input scale. Short prompts, long manuscripts, PDFs, books, PPT sources, and follow-up edits should feel like different expressions of the same product contract, not unrelated pipelines.
+- If a capability is meant to generalize, implement it through non-hardcoded intent understanding, source structure, contracts, and reusable policies. Do not solve broad user-intent problems with project-specific examples, fixed page numbers, demo filenames, or one-off keyword patches.
+- Keep pipelines simple and legible. Add a new entity only when it removes real complexity, clarifies ownership, or gives the Agent better context; do not add layers just to patch a symptom.
+- Be skeptical of fallback. Hidden fallback that silently lowers quality is usually worse than a clear preflight decision, scope request, or visible failure. Fallback is acceptable only when it remains source-grounded, quality-preserving, and explicit in status.
+- Put quality responsibility before generation when possible. The system should understand scope, source coverage, and feasibility before it spends model calls, not save weak artifacts and hope later validators repair them.
+- Use model intelligence for intent and judgment, and deterministic code for objective boundaries. The product should behave like a serious content director who understands the user's job, while code enforces page refs, source metadata, empty-body rejection, and persistence rules.
+- The highest bar is not "the system returns something"; it is "the artifact respects the user's serious intent and is worth using."
+
 ## Simplicity Principle
 
 Recorded 2026-05-12 from user direction.
@@ -31,10 +54,23 @@ Recorded 2026-05-12 from user direction.
 
 Recorded 2026-05-14 from user direction.
 
+- For every serious defect, trace the root cause and fix it at the source. Do not stop at symptom cleanup, downstream normalization, UI wording, or case-specific guards when the upstream intent, source parsing, state transition, or prompt contract is wrong.
 - Always eliminate failures at the source; do not treat post-hoc checking, filtering, or validation as the primary solution when the source can be made clean.
+- Design workflows so bad intermediate artifacts cannot enter the next generation step in the first place. For generation bugs, fix input eligibility, prompt construction, state transitions, and source-of-truth boundaries before adding result cleanup.
 - General generation paths must not contain project-specific, demo-specific, or stale business-context defaults. Prompt inputs and deterministic drafts should come only from the current user intent, current project state, uploaded materials, and intentionally global templates.
 - Use downstream checks only as defense-in-depth or diagnostics. If a check catches an issue, follow it back to the contaminated source and remove that source instead of normalizing the symptom.
 - For cross-project contamination, stale defaults, or unintended domain bias, the fix is to remove the upstream contamination path, not to add a final-stage blocker.
+
+## Fallback Quality Gate Principle
+
+Recorded 2026-05-22 from user direction after the Darwin content-plan incident.
+
+- Fallback is a last-resort protection mechanism, not a normal generation strategy. Prefer source-level fixes, clearer contracts, and continuation of real partial model output before introducing or expanding fallback paths.
+- Decide whether fallback is eligible before it is used as model input, saved state, or user-visible output. Low-quality fallback must not enter prompts and then rely on later validators to clean it up.
+- A fallback that lowers artifact quality must not be silently marked as a successful generation result. It must either fail visibly, continue from the usable partial output, or mark affected pages/items as `needs_review`.
+- Empty skeletons, placeholder copy, mock images, and generic editable drafts are not acceptable final PPT artifacts. They may exist only as transient scaffolding or explicit development/test output.
+- Source-driven deterministic paths are acceptable only when they are grounded in current user materials, uploaded documents, selected templates, reference images, or confirmed project state. Treat these as explicit source paths, not as generic fallback.
+- Any fallback used in prompts or generation inputs must be labeled by confidence/status so downstream models do not mistake incomplete analysis, queued analysis, or placeholder summaries for high-quality evidence.
 
 ## Project Isolation Principle
 

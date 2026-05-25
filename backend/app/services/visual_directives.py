@@ -49,6 +49,10 @@ _DIRECTIVE_PATTERNS = (
 )
 _LEADING_MARKDOWN_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)、]\s+|>\s+)?")
 _LABEL_SPLIT_RE = re.compile(r"\s*(?:、|，|,|；|;|/|\||→|->|=>|＋|\+)\s*")
+_NEGATED_DIRECTIVE_CUE_RE = re.compile(
+    r"(?:不要|别|避免|禁止|无需|不用|不需要|不是要|并非要|并不是要|不是|并非)"
+)
+_CLAUSE_BOUNDARY_RE = re.compile(r"[。；;，,!?！？\n]")
 
 
 def extract_visual_directives(markdown: str) -> dict[str, Any]:
@@ -198,8 +202,19 @@ def _directive_match(text: str) -> re.Match[str] | None:
     for pattern in _DIRECTIVE_PATTERNS:
         match = pattern.search(text)
         if match:
+            if _has_negated_directive_context(text, match):
+                continue
             return match
     return None
+
+
+def _has_negated_directive_context(text: str, match: re.Match[str]) -> bool:
+    prefix = str(text or "")[:match.start()]
+    clause_start = 0
+    for boundary in _CLAUSE_BOUNDARY_RE.finditer(prefix):
+        clause_start = boundary.end()
+    clause_prefix = prefix[clause_start:]
+    return bool(_NEGATED_DIRECTIVE_CUE_RE.search(clause_prefix))
 
 
 def _labels_after_match(text: str, match_end: int) -> tuple[str, int]:

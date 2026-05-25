@@ -82,6 +82,26 @@ assert.match(
 );
 assert.match(
   source,
+  /function getAgentStatusMessageKey[\s\S]*message\.runId && !message\.loading[\s\S]*content-plan-ready[\s\S]*style-ready[\s\S]*visual-prompts-ready[\s\S]*generation-result/,
+  "Agent status replies must have generic semantic keys across content and visual stages"
+);
+assert.match(
+  source,
+  /function upsertAgentStatusMessage[\s\S]*message\.runId && item\.loading && item\.runId === message\.runId[\s\S]*getAgentStatusMessageKey\(item\) !== key/,
+  "Agent status replies must replace stale status rows instead of stacking duplicates"
+);
+assert.match(
+  source,
+  /locallyHandledRunIdsRef\.current\.add\(String\(result\.run\.id\)\)[\s\S]*!activeContentPlan && contentPlanSucceeded[\s\S]*upsertAgentStatusMessage/,
+  "content-plan polling must own its run completion and only announce completion after the backend run succeeds"
+);
+assert.match(
+  source,
+  /locallyHandledRunIdsRef\.current\.has\(prevRun\.runId\)[\s\S]*!\(m\.loading && m\.runId === prevRun\.runId\)/,
+  "locally handled run cleanup must remove loading rows without deleting the final completion reply"
+);
+assert.match(
+  source,
   /const pageReferenceRoute = \(ref: any\): AssetRoute => \{[\s\S]*mode === "original"[\s\S]*return "overlay"/,
   "page reference assets saved as original must reopen as precise paste instead of defaulting to smart blend"
 );
@@ -222,6 +242,16 @@ assert.match(
 );
 assert.match(
   source,
+  /function isQualityReportChatMessage[\s\S]*quality-report-[\s\S]*还不能交付最终稿[\s\S]*可以交付最终稿[\s\S]*updateProjectChatMessages\(projectId, "visual"[\s\S]*filter\(\(m\) => !isQualityReportChatMessage\(m\)\)/,
+  "new quality reports must replace stale quality reports so the Agent panel does not show contradictory delivery guidance"
+);
+assert.match(
+  source,
+  /function replaceMarkdownOpeningTag[\s\S]*new RegExp\(`<\$\{tag\}\\\\b\[\^>\]\*>`[\s\S]*replaceMarkdownOpeningTag\(html, "strong"/,
+  "chat markdown styling must replace the whole opening tag so styled Markdown does not render stray > characters"
+);
+assert.match(
+  source,
   /interface GateActionResult[\s\S]*ok: boolean[\s\S]*reason\?:/,
   "gate actions must return an execution result instead of failing silently"
 );
@@ -257,8 +287,28 @@ assert.match(
 );
 assert.match(
   source,
-  /if \(currentSlides\.length > 0 && currentSlideIds !== previousSlideIds\) \{[\s\S]*options\?\.onStarted\?\.\(\);[\s\S]*setContentPlanSnapshot/,
-  "Brief Studio draft should only be cleared after new content-plan slides actually exist"
+  /const deferContentPlanPoll = \(message: string\)[\s\S]*内容规划仍在后台生成：/,
+  "content-plan polling timeouts must not be presented as generation failures when the backend may still finish"
+);
+assert.match(
+  source,
+  /pg-slide-body-preview markdown-body[\s\S]*renderMarkdown\(text\.body\)/,
+  "slide-card body previews must preserve generated line breaks instead of collapsing agenda items"
+);
+assert.match(
+  css,
+  /\.pg-slide-body-preview p[\s\S]*white-space: pre-wrap/,
+  "slide-card Markdown paragraphs must preserve line breaks from content planning"
+);
+assert.doesNotMatch(
+  source,
+  /failContentPlanPoll\("前端等待超时/,
+  "content-plan frontend wait timeouts must not use the failure path"
+);
+assert.match(
+  source,
+  /if \(currentSlides\.length > 0 && currentSlideIds !== previousSlideIds && !activeContentPlan && contentPlanSucceeded\) \{[\s\S]*options\?\.onStarted\?\.\(\);[\s\S]*setContentPlanSnapshot/,
+  "Brief Studio draft should only be cleared after new content-plan slides exist and the backend run has succeeded"
 );
 assert.match(
   source,
@@ -411,9 +461,9 @@ assert.match(
   "the Agent status panel must render its primary next action instead of burying it in state"
 );
 assert.match(
-  source,
-  /if \(actionKey === "start-prototype"\)[\s\S]*disabled: isBusy \|\| chatLoading \|\| !canStartPrototypeGeneration/,
-  "the process-bar sample action must use prototype readiness, not full-deck readiness"
+  workflow,
+  /key: "start-prototype"[\s\S]*disabled: !canStartPrototypeGeneration \|\| prototypePromptTargetCount === 0/,
+  "the sample status-card action must use prototype readiness, not full-deck readiness"
 );
 assert.match(
   source,

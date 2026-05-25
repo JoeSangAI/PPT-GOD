@@ -28,7 +28,7 @@ from app.core.provider_credentials import (
     provider_credentials_context,
     store_current_provider_credentials,
 )
-from app.utils.project_docs import load_project_documents
+from app.utils.project_docs import load_project_documents, load_project_source_packs
 from app.utils.text_cleaning import normalize_markdown_content, normalize_markdown_emphasis
 from app.utils.reference_image import (
     default_visual_asset_process_mode,
@@ -73,6 +73,11 @@ from app.services.content_plan import (
     should_generate_incremental_long_deck,
     _fallback_deck_blueprint,
     _auto_reclassify_page_type,
+)
+from app.services.source_context import (
+    DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET,
+    SourceScopeRequired,
+    build_source_context,
 )
 from app.services.source_intent import (
     infer_intent_contract,
@@ -575,8 +580,27 @@ def _asset_source_document(ref: ReferenceImage) -> str:
 
 def _asset_source_page_num(ref: ReferenceImage) -> int | None:
     analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
-    page_num = analysis.get("pptx_source_page_num")
-    return page_num if isinstance(page_num, int) else None
+    for key in ("source_page_num", "pptx_source_page_num", "pdf_source_page_num"):
+        page_num = analysis.get(key)
+        try:
+            value = int(page_num) if page_num is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _source_ref_type(source_doc: str, source_type: str | None = None) -> str:
+    kind = str(source_type or "").strip().lower()
+    if kind:
+        return kind
+    lower_doc = str(source_doc or "").strip().lower()
+    if lower_doc.endswith(".pdf"):
+        return "pdf"
+    if lower_doc.endswith((".pptx", ".ppt")):
+        return "pptx_slide"
+    return ""
 
 
 def _reference_image_sort_key(ref: ReferenceImage) -> tuple:
@@ -966,11 +990,13 @@ def _visual_asset_summary(ref: ReferenceImage) -> str:
     keywords = analysis.get("suggested_keywords")
     if isinstance(keywords, list) and keywords:
         parts.append("keywords=" + "、".join(str(x) for x in keywords[:16]))
-    source_page = analysis.get("pptx_source_page_num")
+    source_page = _asset_source_page_num(ref)
     source_doc = analysis.get("source_document")
     if source_doc and source_page:
-        parts.append(f"source=来自上传 PPT「{source_doc}」第{source_page}页")
-    source_text = analysis.get("source_slide_text")
+        source_type = str(analysis.get("source_type") or "").upper()
+        source_label = "PDF" if source_type == "PDF" else "PPT"
+        parts.append(f"source=来自上传 {source_label}「{source_doc}」第{source_page}页")
+    source_text = analysis.get("source_slide_text") or analysis.get("nearby_text")
     if isinstance(source_text, str) and source_text.strip():
         parts.append(f"source_slide_text={source_text[:240]}")
     tags = analysis.get("asset_tags")
@@ -1902,9 +1928,11 @@ def _format_pptx_reference_analysis(ref: ReferenceImage) -> str | None:
     if ref.asset_name:
         parts.append(f"asset={ref.asset_name}")
     source_doc = analysis.get("source_document")
-    source_page = analysis.get("pptx_source_page_num")
+    source_page = _asset_source_page_num(ref)
     if source_doc and source_page:
-        parts.append(f"source=来自上传PPT「{source_doc}」第{source_page}页")
+        source_type = str(analysis.get("source_type") or "").upper()
+        source_label = "PDF" if source_type == "PDF" else "PPT"
+        parts.append(f"source=来自上传{source_label}「{source_doc}」第{source_page}页")
     if analysis.get("classification"):
         parts.append(f"classification={analysis['classification']}")
     if analysis.get("asset_group_role") == "parallel_page_reference_set":
@@ -1917,7 +1945,7 @@ def _format_pptx_reference_analysis(ref: ReferenceImage) -> str | None:
     tags = analysis.get("asset_tags") or analysis.get("suggested_keywords")
     if isinstance(tags, list) and tags:
         parts.append("tags=" + "、".join(str(x) for x in tags[:12]))
-    source_text = analysis.get("source_slide_text")
+    source_text = analysis.get("source_slide_text") or analysis.get("nearby_text")
     if isinstance(source_text, str) and source_text.strip():
         parts.append(f"source_slide_text={source_text[:240]}")
     if ref.usage_note:
@@ -2011,14 +2039,16 @@ def _build_slide_reference_contexts(
 
 
 def _link_pending_pptx_page_refs(project_id: str, db: Session) -> int:
-    """Attach PPT-extracted page refs uploaded before slides existed."""
+    """Attach source-extracted page refs uploaded before slides existed."""
     slides = db.query(Slide).filter(Slide.project_id == project_id).all()
     slide_by_page = {slide.page_num: slide for slide in slides}
     slide_by_source: dict[tuple[str, int], Slide] = {}
+    slide_by_figure: dict[tuple[str, int, str], list[Slide]] = {}
     for slide in slides:
         content = slide.content_json if isinstance(slide.content_json, dict) else {}
         source_refs = content.get("source_refs") if isinstance(content.get("source_refs"), list) else []
-        for item in source_refs:
+        figure_refs = content.get("figure_refs") if isinstance(content.get("figure_refs"), list) else []
+        for item in [*source_refs, *figure_refs]:
             if not isinstance(item, dict):
                 continue
             source_doc = str(item.get("source_document") or "").strip()
@@ -2027,7 +2057,12 @@ def _link_pending_pptx_page_refs(project_id: str, db: Session) -> int:
             except (TypeError, ValueError):
                 source_page = 0
             if source_doc and source_page > 0:
-                slide_by_source.setdefault((source_doc, source_page), slide)
+                source_kind = _source_ref_type(source_doc, str(item.get("source_type") or ""))
+                figure_id = str(item.get("figure_id") or item.get("id") or "").strip()
+                if figure_id:
+                    slide_by_figure.setdefault((source_doc, source_page, figure_id), []).append(slide)
+                if source_kind != "pdf":
+                    slide_by_source.setdefault((source_doc, source_page), slide)
     if not slide_by_page:
         return 0
 
@@ -2036,15 +2071,62 @@ def _link_pending_pptx_page_refs(project_id: str, db: Session) -> int:
         ReferenceImage.slide_id.is_(None),
         ReferenceImage.role == "content_ref",
     ).all()
+    existing_linked_keys: set[tuple[str, int, str, str]] = set()
+    linked_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project_id,
+        ReferenceImage.slide_id.isnot(None),
+        ReferenceImage.role == "content_ref",
+    ).all()
+    for linked_ref in linked_refs:
+        analysis = linked_ref.asset_analysis if isinstance(linked_ref.asset_analysis, dict) else {}
+        source_doc = str(analysis.get("source_document") or "").strip()
+        page_num = _asset_source_page_num(linked_ref)
+        figure_id = str(analysis.get("id") or analysis.get("figure_id") or "").strip()
+        if source_doc and isinstance(page_num, int) and page_num > 0 and figure_id and linked_ref.slide_id:
+            existing_linked_keys.add((source_doc, page_num, figure_id, linked_ref.slide_id))
     linked = 0
     for ref in pending_refs:
         analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
-        page_num = analysis.get("pptx_source_page_num")
+        page_num = _asset_source_page_num(ref)
         if not isinstance(page_num, int):
             continue
         source_doc = str(analysis.get("source_document") or "").strip()
-        slide = slide_by_source.get((source_doc, page_num)) if source_doc else None
-        if not slide:
+        asset_source_type = _source_ref_type(source_doc, str(analysis.get("source_type") or ""))
+        figure_id = str(analysis.get("id") or analysis.get("figure_id") or "").strip()
+        figure_slides = (
+            slide_by_figure.get((source_doc, page_num, figure_id), [])
+            if source_doc and figure_id
+            else []
+        )
+        if figure_slides:
+            first_linked = False
+            for slide in figure_slides:
+                key = (source_doc, page_num, figure_id, slide.id)
+                if key in existing_linked_keys:
+                    continue
+                if not first_linked and ref.slide_id is None:
+                    ref.slide_id = slide.id
+                    first_linked = True
+                else:
+                    db.add(ReferenceImage(
+                        project_id=ref.project_id,
+                        slide_id=slide.id,
+                        file_path=ref.file_path,
+                        role=ref.role,
+                        process_mode=ref.process_mode,
+                        asset_name=ref.asset_name,
+                        asset_kind=ref.asset_kind,
+                        usage_note=ref.usage_note,
+                        asset_analysis=copy.deepcopy(analysis),
+                        logo_anchor=ref.logo_anchor,
+                    ))
+                existing_linked_keys.add(key)
+                linked += 1
+            continue
+        slide = None
+        if not slide and asset_source_type != "pdf":
+            slide = slide_by_source.get((source_doc, page_num)) if source_doc else None
+        if not slide and asset_source_type in {"", "pptx", "pptx_slide"}:
             slide = slide_by_page.get(page_num)
         if not slide:
             continue
@@ -2158,8 +2240,7 @@ def _upsert_content_plan_pages(
             ReferenceImage.role == "content_ref",
         ).all()
         for ref in pptx_refs:
-            analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
-            if isinstance(analysis.get("pptx_source_page_num"), int):
+            if _asset_source_page_num(ref):
                 ref.slide_id = None
         db.flush()
         db.query(Slide).filter(Slide.project_id == project_id).delete()
@@ -2456,14 +2537,56 @@ def _generate_content_plan_bg(
         except ValueError:
             document_wait_seconds = 900.0
 
-        documents = load_project_documents(
+        source_packs = load_project_source_packs(
             project_id,
             parse_missing=True,
-            text_limit=PAGE_MAP_DOCUMENT_LIMIT,
-            preserve_ppt_sources=True,
             running_wait_seconds=document_wait_seconds,
             progress_callback=report_document_progress,
         )
+        try:
+            source_context = build_source_context(
+                topic,
+                source_packs,
+                token_budget=DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET,
+            )
+            documents = source_context.text
+        except SourceScopeRequired as exc:
+            payload = exc.payload
+            message = payload.get("reason") or "上传材料过长，需要先选择范围后再生成。"
+            update_run_progress(
+                db,
+                run_id,
+                stage="needs_scope",
+                message=message,
+                total_count=0,
+                completed_count=0,
+            )
+            finish_run(
+                db,
+                run_id,
+                status="failed",
+                message=message,
+                error_msg=json.dumps(payload, ensure_ascii=False)[:500],
+            )
+            db.commit()
+            _update_progress(project_id, {
+                "stage": "needs_scope",
+                "status": "needs_scope",
+                "message": message,
+                "reason": message,
+                "suggested_scopes": payload.get("suggested_scopes") or [],
+                "source_stats": payload.get("source_stats") or {},
+            }, run_id)
+            return
+        if not documents:
+            documents = load_project_documents(
+                project_id,
+                parse_missing=True,
+                text_limit=PAGE_MAP_DOCUMENT_LIMIT,
+                preserve_ppt_sources=True,
+                running_wait_seconds=document_wait_seconds,
+                progress_callback=report_document_progress,
+            )
         explicit_attachment_context = _content_plan_attachment_context(db, project_id, attachment_ids)
         if explicit_attachment_context:
             documents = "\n\n".join(
@@ -2484,7 +2607,7 @@ def _generate_content_plan_bg(
             if str(ref.id) in explicit_attachment_ids:
                 continue
             analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
-            if analysis.get("pptx_source_page_num"):
+            if _asset_source_page_num(ref):
                 continue
             if not ref.file_path or not os.path.exists(ref.file_path):
                 continue
@@ -2560,7 +2683,7 @@ def _generate_content_plan_bg(
         ).all()
         for ref in pptx_refs:
             analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
-            if isinstance(analysis.get("pptx_source_page_num"), int):
+            if _asset_source_page_num(ref):
                 ref.slide_id = None
         db.flush()
         # 删除旧的 slides（如果存在）

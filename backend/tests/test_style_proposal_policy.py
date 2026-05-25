@@ -623,8 +623,8 @@ def test_selected_style_pack_preserves_light_information_pages_for_mixed_style()
     assert "品牌金仅作低占比品牌点缀" in style_pack
 
 
-def test_prompt_uses_selected_style_visual_strategy_as_is():
-    """Code no longer rewrites visual_strategy; prompt uses LLM output directly."""
+def test_prompt_omits_internal_visual_strategy_fields():
+    """Final image prompts should not expose planning-only style protocol fields."""
     selected_style = {
         "name": "柔紫暖白",
         "palette": [
@@ -637,6 +637,7 @@ def test_prompt_uses_selected_style_visual_strategy_as_is():
         "visual_strategy": {"base_tone": "dark", "summary": "整体以深色视觉基底为主。"},
     }
     style_pack = style_pack_from_selected_style(selected_style)
+    assert "Visual strategy: base_tone=dark" in style_pack
 
     prompt = generate_prompt_for_page(
         page_intent={
@@ -650,8 +651,11 @@ def test_prompt_uses_selected_style_visual_strategy_as_is():
         style_text_override=style_pack,
     )
 
-    # visual_strategy from selected style is used as-is
-    assert "Visual strategy: base_tone=dark" in prompt
+    assert "柔紫" in prompt
+    assert "Visual strategy:" not in prompt
+    assert "base_tone=" not in prompt
+    assert "Page type adaptation:" not in prompt
+    assert "Reference usage:" not in prompt
 
 
 def test_visual_chat_confirmation_is_passed_to_llm_not_enforced_in_code():
@@ -814,6 +818,9 @@ def test_compact_style_pack_preserves_visual_rhythm_before_cosmetic_details():
 
     assert "Visual rhythm:" in compact
     assert "斗兽场" in compact
+    assert "Visual strategy:" not in compact
+    assert "base_tone=" not in compact
+    assert "Page type adaptation:" not in compact
     assert "Reference usage:" not in compact
 
 
