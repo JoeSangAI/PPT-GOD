@@ -19,7 +19,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_TRUSTED_HOST=mirrors.aliyun.com \
     PIP_DEFAULT_TIMEOUT=120
 
-RUN apt-get update \
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i \
+            -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+            -e 's|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+            /etc/apt/sources.list.d/debian.sources; \
+       else \
+        sed -i \
+            -e 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' \
+            -e 's|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' \
+            /etc/apt/sources.list; \
+       fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         libreoffice-impress \
         fonts-noto-cjk \
