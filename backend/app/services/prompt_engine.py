@@ -91,7 +91,7 @@ def _image_typography_line(line: str) -> str:
     return "Typography: " + ", ".join(unique_cues) + "; do not render or spell out font family names."
 
 
-def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 1100) -> str:
+def _compact_style_pack(style_text: str, max_lines: int = 6, max_chars: int = 760) -> str:
     """Keep the global style useful but short so page evidence stays dominant."""
     if not style_text:
         return (
@@ -99,7 +99,6 @@ def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 11
             "Palette: 由主题和场景自然选择\n"
             "Mood: 贴合当前页面内容气质\n"
             "Typography: 由风格气质决定字体搭配\n"
-            "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
             "Visual rhythm: 每页由文案决定画面证据"
         )
     lines = [line.strip() for line in style_text.splitlines() if line.strip()]
@@ -107,9 +106,8 @@ def _compact_style_pack(style_text: str, max_lines: int = 8, max_chars: int = 11
     # Keep the semantic contract before cosmetic details. Visual rhythm is where
     # topic-specific subject anchors usually live, so it must survive compaction.
     keywords = (
-        "Style:", "Palette:", "Mood:", "Visual strategy:",
-        "Page type adaptation:", "Visual rhythm:",
-        "Texture/material:", "Typography:", "Reference usage:",
+        "Style:", "Palette:", "Mood:", "Visual rhythm:",
+        "Texture/material:", "Typography:",
     )
     for line in lines:
         for keyword in keywords:
@@ -207,6 +205,30 @@ _MICROCOPY_MARKERS = (
     "microcopy", "decorative text", "placeholder text", "lorem ipsum",
 )
 
+_REFERENCE_METADATA_MARKERS = (
+    "asset=", "source=", "classification=", "area_ratio=", "source_slide_text=",
+    "tags=", "usage=", "group=", "ppt_page_", ".pptx", "AI参考", "AI 参考",
+)
+
+
+def _looks_like_internal_reference_metadata(clause: str) -> bool:
+    compact = re.sub(r"\s+", "", str(clause or "")).lower()
+    if re.search(r"参考图\d+", compact):
+        return True
+    return any(marker.lower().replace(" ", "") in compact for marker in _REFERENCE_METADATA_MARKERS)
+
+
+def _strip_internal_reference_metadata(text: str) -> str:
+    """Remove pipeline/PPT reference bookkeeping before sending text to image models."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    clauses = _split_clauses(raw)
+    if not clauses:
+        return raw
+    kept = [clause for clause in clauses if not _looks_like_internal_reference_metadata(clause)]
+    return "；".join(kept).strip()
+
 
 def _remove_microcopy_clauses(text: str) -> str:
     clauses = _split_clauses(text)
@@ -302,6 +324,7 @@ def _sanitize_product_reference_text(text: str) -> str:
 
 def _compact_visual_evidence(page_intent: Dict, reference_images: Optional[List[Dict]] = None) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
+    visual_evidence = _strip_internal_reference_metadata(visual_evidence)
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
@@ -315,6 +338,7 @@ def _compact_visual_evidence_with_style(
     content_text: Optional[Dict] = None,
 ) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
+    visual_evidence = _strip_internal_reference_metadata(visual_evidence)
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
@@ -330,6 +354,7 @@ def _compact_layout_intent(
 ) -> str:
     layout = page_intent.get("layout") or page_intent.get("type", "content")
     visual_desc = " ".join(str(page_intent.get("visual_description", "")).split())
+    visual_desc = _strip_internal_reference_metadata(visual_desc)
     visual_desc = _remove_negative_clauses(visual_desc)
     if _has_product_ref(reference_images):
         visual_desc = _sanitize_product_reference_text(visual_desc)
@@ -348,6 +373,11 @@ def _compact_reference_text(text: str, max_chars: int = 260) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def _reference_context_text(text: str, max_chars: int = 180) -> str:
+    cleaned = _strip_internal_reference_metadata(text)
+    return _compact_reference_text(cleaned, max_chars) if cleaned else ""
 
 
 def _content_visual_contract(content_text: Dict) -> tuple[Dict, list[str], list[str]]:
@@ -474,9 +504,10 @@ def _reference_descriptions_for_prompt(
     reference_descriptions: list[str] = []
     ref_context = (content_text or {}).get("reference_context") or (page_intent or {}).get("reference_context")
     if ref_context:
+        detail = _reference_context_text(ref_context, 220)
         reference_descriptions.append(
-            "Page reference: follow this uploaded visual. "
-            + str(ref_context)
+            "Page reference: follow this uploaded visual."
+            + (f" Context: {detail}" if detail else "")
         )
 
     if reference_images:
@@ -493,13 +524,13 @@ def _reference_descriptions_for_prompt(
                     "Uploaded identity asset: use only when explicitly requested as a scene object."
                 )
             elif role == "content_ref":
-                detail = _compact_reference_text(desc, 180) if desc else ""
+                detail = _reference_context_text(desc, 180) if desc else ""
                 reference_descriptions.append(
                     "Page reference: use this uploaded image as the page visual source."
                     + (f" Context: {detail}" if detail else "")
                 )
             elif role == "chart_ref":
-                detail = _compact_reference_text(desc, 180) if desc else ""
+                detail = _reference_context_text(desc, 180) if desc else ""
                 reference_descriptions.append(
                     "Chart/data reference: follow this uploaded chart for the chart area. "
                     "Preserve its core structure, node labels, arrows, and table relationships."
@@ -581,7 +612,6 @@ def generate_prompt_for_page(
             "Palette: 由主题和场景自然选择\n"
             "Mood: 贴合当前页面内容气质\n"
             "Typography: 由风格气质决定字体搭配\n"
-            "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
             "Visual rhythm: 每页由文案决定画面证据"
         )
 
@@ -627,7 +657,10 @@ def generate_prompt_for_page(
             text_directives.append(f'Diagram label: "{cleaned}"')
 
     if text_directives:
-        text_directives.append("Visible text rule: render only quoted strings from this section; no labels, headers, color codes, invented copy, lorem ipsum, or decorative microtext.")
+        text_directives.append(
+            "Visible text rule: render the quoted strings in this section as required slide copy; "
+            "do not render prompt labels, section headers, color codes, invented copy, lorem ipsum, or decorative microtext."
+        )
     if visual_intents or diagram_labels:
         text_directives.append("Do not render visual intent phrases as text.")
         text_directives.append("Render diagram labels as visible labels inside the diagram.")

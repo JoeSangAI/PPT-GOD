@@ -208,6 +208,41 @@ def _reference_input_priority(ref: Dict) -> int:
     return 9
 
 
+def _is_parallel_page_reference_analysis(analysis) -> bool:
+    return isinstance(analysis, dict) and analysis.get("asset_group_role") == "parallel_page_reference_set"
+
+
+def _effective_slide_reference_process_mode(ref) -> str:
+    mode = str(getattr(ref, "process_mode", None) or "blend").lower()
+    if (
+        getattr(ref, "role", None) in {"content_ref", "chart_ref"}
+        and mode == "blend"
+        and _is_parallel_page_reference_analysis(getattr(ref, "asset_analysis", None))
+    ):
+        return "crop"
+    return mode
+
+
+def _page_reference_fidelity_instruction(ref_data: List[Dict]) -> str:
+    page_refs = [
+        ref for ref in ref_data
+        if ref.get("role") in {"content_ref", "chart_ref"}
+        and str(ref.get("process_mode") or "").lower() in {"crop", "original"}
+    ]
+    if not page_refs:
+        return ""
+    labels = [
+        str(ref.get("label") or f"Reference Image {index}")
+        for index, ref in enumerate(page_refs, start=1)
+    ]
+    label_text = ", ".join(labels[:6])
+    return (
+        f"\n\nPAGE REFERENCE FIDELITY: {label_text} are source visuals, not style mood boards. "
+        "Preserve their depicted people, objects, layout relationships, and recognizable scene evidence. "
+        "Do not replace these references with invented people, new scenes, or unrelated stock imagery."
+    )
+
+
 def _slide_text_content(slide: Slide) -> Dict:
     content = slide.content_json if isinstance(slide.content_json, dict) else {}
     text = content.get("text_content")
@@ -370,9 +405,10 @@ def _load_reference_images(
                 continue
             if os.path.exists(resolved_path):
                 try:
+                    process_mode = _effective_slide_reference_process_mode(ref)
                     refs.append({
                         "image": _open_reference_image(resolved_path, ref.role),
-                        "process_mode": ref.process_mode or "blend",
+                        "process_mode": process_mode,
                         "role": ref.role,
                         "label": f"Reference Image {idx}",
                         "file_path": resolved_path,
@@ -381,7 +417,7 @@ def _load_reference_images(
                         "asset_kind": getattr(ref, "asset_kind", None),
                         "usage_note": getattr(ref, "usage_note", None),
                         "asset_analysis": getattr(ref, "asset_analysis", None),
-                        "asset_route_mode": "double_blend" if (ref.process_mode or "blend") == "crop" else "blend",
+                        "asset_route_mode": "double_blend" if process_mode == "crop" else "blend",
                     })
                     already_loaded_paths.add(resolved_path)
                     loaded_count += 1
@@ -729,14 +765,12 @@ def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
     for ref in ref_data:
         if not ref.get("image"):
             continue
+        if not _is_product_or_material_ref(ref):
+            continue
         route_mode = str(ref.get("asset_route_mode") or "").lower()
         if route_mode == "blend":
             continue
-        if route_mode == "double_blend":
-            refs.append(ref)
-            continue
-        if _is_product_or_material_ref(ref):
-            refs.append(ref)
+        refs.append(ref)
     return refs
 
 
@@ -750,8 +784,10 @@ def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
     return (
         prompt
         + "\n\nFIRST PASS: generate the complete slide using the supplied reference material, including "
-        f"{ref_label}. Exact fidelity can be approximate in this first pass; a second hidden refinement "
-        "pass will strengthen the reference-material details using the same uploaded reference image."
+        f"{ref_label}. Use the uploaded product/material image as the source for the corresponding object. "
+        "Preserve the object shape, color blocks, visible text, labels, logos, and small markings as much "
+        "as possible already in this pass. Do not invent a different object or reduce it to generic shapes. "
+        "A second hidden refinement pass will further strengthen the same reference-material details."
     )
 
 
@@ -802,30 +838,29 @@ def _generate_one_slide(
         seed_hint_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref_hint")
         seed_count = seed_image_count + seed_hint_count
         template_ref_count = sum(1 for r in first_pass_ref_data if r.get("role") == "template")
+        page_reference_fidelity = _page_reference_fidelity_instruction(first_pass_ref_data)
         if seed_image_count > 0:
             seed_instruction = _seed_base_edit_instruction(slide, seed_image_count) or (
-                f"\n\nIMPORTANT — SAME-FAMILY LAYOUT REFERENCE: "
-                f"{seed_image_count} of the attached reference images are previously generated slides from the same page family in this deck. "
-                f"They are LAYOUT ANCHORS only: reuse their typography choices, color palette, ornament language, grid system, and hierarchy. "
-                f"DO NOT copy any of their text content, headlines, body, photographs, illustrations, or scene subjects. "
-                f"DO NOT copy a logo from the seed unless this slide also has the uploaded logo attached as its own reference. "
-                f"Render this slide's own text and visual evidence in the SAME design DNA so the deck feels visually consistent."
+                "\n\nSAME-FAMILY LAYOUT REFERENCE: Attached seed slide(s) are layout anchors only. "
+                "Reuse grid, hierarchy, palette rhythm, typography scale, and ornament language. "
+                "Do not copy seed text, photos, scene subjects, product shots, or logos. "
+                "Render this slide's own visible text and visual evidence in the same deck DNA."
             )
             prompt = prompt + seed_instruction
         elif seed_hint_count > 0:
             prompt = prompt + (
-                "\n\nIMPORTANT — SAME-FAMILY VISUAL CONTINUITY: Previously generated seed slides exist for this page family, "
-                "but they are not attached as image inputs to keep generation reliable. Follow the deck's selected style pack, "
-                "typography, palette, ornament language, grid system, and hierarchy closely so this slide feels like the same design system. "
-                "Do not change the requested slide text or visual evidence."
+                "\n\nSAME-FAMILY VISUAL CONTINUITY: Seed slides exist but are not attached. "
+                "Follow the selected style pack's grid, hierarchy, palette, typography scale, and ornament language. "
+                "Keep this slide's own text and visual evidence."
             )
         elif template_ref_count > 0:
             prompt = prompt + (
-                "\n\nIMPORTANT — TEMPLATE LAYOUT REFERENCE: Attached template reference images provide layout DNA only: "
-                "grid, spacing, hierarchy, typography rhythm, ornament language, and palette relationship. "
-                "Do not copy any template text, old body imagery, old product shots, or old logos. "
-                "Render this slide's own content and keep brand marks reserved for the uploaded project logo."
+                "\n\nTEMPLATE LAYOUT REFERENCE: Attached template image(s) are layout/style anchors only. "
+                "Reuse grid, spacing, hierarchy, palette relationship, typography rhythm, and ornament language. "
+                "Do not copy old text, images, products, or logos."
             )
+        if page_reference_fidelity:
+            prompt = prompt + page_reference_fidelity
 
         if use_product_refinement:
             prompt = _background_pass_prompt(prompt, product_refs)

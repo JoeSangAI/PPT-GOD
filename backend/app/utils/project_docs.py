@@ -6,13 +6,19 @@ from typing import Callable
 
 from app.core.config import settings
 from app.services.document_parser import extract_text_preview, parse_document
+from app.services.source_pack import (
+    build_source_pack,
+    read_source_pack as read_source_pack_file,
+    write_source_pack as write_source_pack_file,
+)
 
 logger = logging.getLogger(__name__)
 
 EXTRACTED_TEXT_SUFFIX = ".extracted.txt"
 PARSE_STATUS_SUFFIX = ".parse.json"
 ASSET_STATUS_SUFFIX = ".assets.json"
-DOCUMENT_METADATA_SUFFIXES = (EXTRACTED_TEXT_SUFFIX, PARSE_STATUS_SUFFIX, ASSET_STATUS_SUFFIX)
+SOURCE_PACK_SUFFIX = ".source.json"
+DOCUMENT_METADATA_SUFFIXES = (EXTRACTED_TEXT_SUFFIX, PARSE_STATUS_SUFFIX, ASSET_STATUS_SUFFIX, SOURCE_PACK_SUFFIX)
 DOCUMENT_PARSE_STALE_SECONDS = 90
 DocumentProgressCallback = Callable[[dict], None]
 
@@ -34,6 +40,21 @@ def document_text_path(project_id: str, filename: str) -> str:
 
 def document_parse_status_path(project_id: str, filename: str) -> str:
     return os.path.join(get_project_docs_dir(project_id, create=True), f"{filename}{PARSE_STATUS_SUFFIX}")
+
+
+def document_source_pack_path(project_id: str, filename: str) -> str:
+    return os.path.join(get_project_docs_dir(project_id, create=True), f"{filename}{SOURCE_PACK_SUFFIX}")
+
+
+def get_project_source_assets_dir(project_id: str, *, create: bool = False) -> str:
+    upload_dir = settings.UPLOAD_DIR
+    if not os.path.isabs(upload_dir):
+        backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        upload_dir = os.path.join(backend_dir, upload_dir)
+    assets_dir = os.path.join(upload_dir, project_id, "source_assets")
+    if create:
+        os.makedirs(assets_dir, exist_ok=True)
+    return assets_dir
 
 
 def write_document_parse_status(
@@ -105,6 +126,37 @@ def read_document_parse_status(project_id: str, filename: str) -> dict:
     return {"status": "not_found", "char_count": 0, "text_preview": ""}
 
 
+def read_document_source_pack(project_id: str, filename: str) -> dict | None:
+    return read_source_pack_file(document_source_pack_path(project_id, filename))
+
+
+def read_document_source_status(project_id: str, filename: str) -> dict:
+    pack = read_document_source_pack(project_id, filename)
+    if pack:
+        stats = pack.get("stats") if isinstance(pack.get("stats"), dict) else {}
+        return {
+            "status": "completed",
+            "stats": {
+                "pages": int(stats.get("pages") or 0),
+                "chapters": int(stats.get("chapters") or 0),
+                "images": int(stats.get("images") or 0),
+                "text_chars": int(stats.get("text_chars") or 0),
+                "estimated_tokens": int(stats.get("estimated_tokens") or 0),
+            },
+        }
+    parse_status = read_document_parse_status(project_id, filename)
+    status = parse_status.get("status") or "unknown"
+    if status in {"queued", "running", "stale", "failed", "not_found"}:
+        return {
+            "status": status,
+            "stats": {"pages": 0, "chapters": 0, "images": 0, "text_chars": 0, "estimated_tokens": 0},
+        }
+    return {
+        "status": "queued",
+        "stats": {"pages": 0, "chapters": 0, "images": 0, "text_chars": 0, "estimated_tokens": 0},
+    }
+
+
 def _parse_status_is_stale(status: dict, *, stale_seconds: float = DOCUMENT_PARSE_STALE_SECONDS) -> bool:
     try:
         updated_at = float(status.get("updated_at") or 0)
@@ -172,6 +224,15 @@ def extract_document_text(
     try:
         with open(source_path, "rb") as f:
             file_bytes = f.read()
+        try:
+            source_pack = build_source_pack(
+                file_bytes,
+                filename,
+                asset_output_dir=get_project_source_assets_dir(project_id, create=True),
+            )
+            write_source_pack_file(document_source_pack_path(project_id, filename), source_pack)
+        except Exception as exc:
+            logger.warning("SourcePack build failed: project=%s file=%s error=%s", project_id, filename, exc)
         text = parse_document(file_bytes, filename, progress_callback=report_progress)
         text_path = document_text_path(project_id, filename)
         with open(text_path, "w", encoding="utf-8") as f:
@@ -203,6 +264,85 @@ def extract_document_text(
             "text": "",
             "error": str(exc),
         }
+
+
+def _wait_for_source_pack(
+    project_id: str,
+    filename: str,
+    *,
+    timeout_seconds: float = 4.0,
+    progress_callback: DocumentProgressCallback | None = None,
+) -> dict | None:
+    deadline = time.time() + timeout_seconds
+    last_progress_emit = 0.0
+    while time.time() < deadline:
+        pack = read_document_source_pack(project_id, filename)
+        if pack:
+            return pack
+        status = read_document_parse_status(project_id, filename)
+        now = time.time()
+        if progress_callback and status.get("status") in {"running", "completed", "failed", "stale"} and now - last_progress_emit >= 1.0:
+            last_progress_emit = now
+            try:
+                progress_callback({
+                    "filename": filename,
+                    "status": status.get("status"),
+                    "current_page": status.get("current_page"),
+                    "total_pages": status.get("total_pages"),
+                    "message": status.get("message") or "正在读取上传材料...",
+                    "char_count": status.get("char_count", 0),
+                })
+            except Exception:
+                pass
+        if status.get("status") in {"failed", "stale"}:
+            return None
+        time.sleep(1.0)
+    return None
+
+
+def load_project_source_packs(
+    project_id: str,
+    *,
+    parse_missing: bool = False,
+    running_wait_seconds: float = 4.0,
+    progress_callback: DocumentProgressCallback | None = None,
+) -> list[dict]:
+    """Load persistent SourcePacks for all uploaded documents."""
+    docs_dir = get_project_docs_dir(project_id)
+    if not os.path.exists(docs_dir):
+        return []
+
+    packs: list[dict] = []
+    for filename in iter_project_document_filenames(project_id):
+        try:
+            pack = read_document_source_pack(project_id, filename)
+            if not pack and parse_missing:
+                source_path = os.path.join(docs_dir, filename)
+                if not os.path.exists(source_path):
+                    continue
+                parse_status = read_document_parse_status(project_id, filename)
+                if parse_status.get("status") == "running":
+                    pack = _wait_for_source_pack(
+                        project_id,
+                        filename,
+                        timeout_seconds=running_wait_seconds,
+                        progress_callback=progress_callback,
+                    )
+                if not pack:
+                    if parse_status.get("status") == "running":
+                        continue
+                    extract_document_text(
+                        project_id,
+                        source_path,
+                        filename,
+                        progress_callback=progress_callback,
+                    )
+                    pack = read_document_source_pack(project_id, filename)
+            if pack:
+                packs.append(pack)
+        except Exception:
+            continue
+    return packs
 
 
 def _read_extracted_text(project_id: str, filename: str) -> str:

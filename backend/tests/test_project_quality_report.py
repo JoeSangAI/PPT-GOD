@@ -55,7 +55,7 @@ def test_project_quality_report_message_is_grouped_readable_markdown(tmp_path):
     assert "目前只完成了 **1 / 2 页**，还有 **1 页**没有生成完成。" in message
     assert "请先补齐剩余页面，完成后再导出最终 PPTX。" in message
     assert "**下一步**" in message
-    assert "1. 点击「生成全部页面」或重试未完成页" in message
+    assert "1. 点击状态卡里的「继续生成剩余页」或重试未完成页" in message
     assert "2. 等页面全部完成后，点击「导出 PPTX」" in message
     assert "**需要处理**" in message
     assert "🔴 **未完成页面**" in message
@@ -69,3 +69,33 @@ def test_project_quality_report_message_is_grouped_readable_markdown(tmp_path):
     assert "ℹ️ 章节页和金句页可以不放 Logo；内容页会保留品牌 Logo。" in message
     assert "\n>" not in message
     assert "- >" not in message
+
+
+def test_project_quality_report_names_prototype_full_generation_cta():
+    project = Project(id="p1", title="Deck", status="prototype_ready")
+    slides = [
+        Slide(
+            id="s1",
+            project_id="p1",
+            page_num=1,
+            type="cover",
+            status="completed",
+            image_path="/tmp/slide-1.png",
+            content_json={"title": "样张"},
+        ),
+        Slide(
+            id="s2",
+            project_id="p1",
+            page_num=2,
+            type="content",
+            status="prompt_ready",
+            content_json={"title": "剩余页"},
+        ),
+    ]
+
+    report = build_project_quality_report(project, slides, has_pptx=False)
+
+    assert report is not None
+    message = report["message"]
+    assert "1. 点击状态卡里的「样张满意，生成全部」补齐剩余页" in message
+    assert "生成全部页面" not in message

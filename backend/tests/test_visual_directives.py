@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api import slides as slides_api
 from app.models.base import Base
 from app.models.models import Project, Slide
+from app.services.visual_directives import extract_visual_directives
 from app.services import prompt_engine
 from app.services.content_plan import _normalize_content_markdown
 
@@ -60,6 +61,20 @@ def test_prompt_keeps_non_directive_growth_flywheel_copy_visible():
     assert "Visual Intent:" not in prompt
 
 
+def test_visual_directive_extraction_keeps_negated_chart_instruction_visible():
+    result = extract_visual_directives("不要画成流程图；这里要保留原文判断。")
+
+    assert result["suggestions"] == []
+    assert result["cleaned_markdown"] == "不要画成流程图；这里要保留原文判断。"
+
+
+def test_visual_directive_extraction_keeps_negated_matrix_reference_visible():
+    result = extract_visual_directives("这不是要做成矩阵，而是在解释矩阵组织的弊端。")
+
+    assert result["suggestions"] == []
+    assert result["cleaned_markdown"] == "这不是要做成矩阵，而是在解释矩阵组织的弊端。"
+
+
 def test_prompt_does_not_invite_rendering_prompt_metadata_as_slide_text():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
@@ -84,6 +99,103 @@ def test_prompt_does_not_invite_rendering_prompt_metadata_as_slide_text():
     assert "Source Han Sans" not in prompt
     assert "Inter Bold" not in prompt
     assert "font family names" in prompt
+
+
+def test_prompt_strips_internal_ppt_reference_metadata_from_visual_description():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 1,
+            "type": "cover",
+            "layout": "cover",
+            "visual_evidence": (
+                "F1 赛车与父亲节礼盒；参考图1（AI 参考）：asset=F1 p1 image；"
+                "source=来自上传PPT「F1.pptx」第1页；classification=useful；"
+                "area_ratio=0.10819；tags=原PPT素材；source_slide_text=父亲节；"
+                "usage=参考原页面视觉关系"
+            ),
+            "visual_description": (
+                "深色赛道背景，父亲节礼盒与赛车速度感同框。"
+                "参考图1（AI 参考）：asset=F1 p1 image；"
+                "source=来自上传PPT「F1.pptx」第1页；classification=useful；"
+                "area_ratio=0.10819；tags=原PPT素材；source_slide_text=父亲节；"
+                "usage=参考原页面视觉关系"
+            ),
+        },
+        content_text={"headline": "父亲节竞速礼遇"},
+        style_text_override="Style: 高端赛车商务风\nPalette: #050B14, #C8FF2E, #FFFFFF",
+    )
+
+    assert "F1 赛车与父亲节礼盒" in prompt
+    assert "深色赛道背景" in prompt
+    for leaked in [
+        "参考图1",
+        "AI 参考",
+        "asset=",
+        "source=来自上传PPT",
+        "classification=",
+        "area_ratio=",
+        "tags=",
+        "source_slide_text=",
+        "F1.pptx",
+    ]:
+        assert leaked not in prompt
+
+
+def test_prompt_sanitizes_content_reference_descriptions():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 14,
+            "type": "content",
+            "layout": "image_grid",
+            "visual_evidence": "六张活动现场图组成整齐图墙",
+            "visual_description": "用多图网格呈现活动现场氛围，文字区保持清晰。",
+        },
+        content_text={"headline": "线下触点"},
+        reference_images=[
+            {
+                "role": "content_ref",
+                "description": (
+                    "asset=F1 p14 image; source=来自上传PPT「F1.pptx」第14页; "
+                    "classification=useful; group=同页并列图片组 1/6; "
+                    "area_ratio=0.08296; tags=原PPT素材; source_slide_text=活动现场; "
+                    "usage=作为图墙素材参考"
+                ),
+            }
+        ],
+        style_text_override="Style: 高端赛车商务风\nPalette: #050B14, #C8FF2E, #FFFFFF",
+    )
+
+    assert "Page reference: use this uploaded image as the page visual source." in prompt
+    for leaked in [
+        "asset=",
+        "source=来自上传PPT",
+        "classification=",
+        "group=同页并列图片组",
+        "area_ratio=",
+        "tags=",
+        "source_slide_text=",
+        "F1.pptx",
+    ]:
+        assert leaked not in prompt
+
+
+def test_visible_text_rule_does_not_forbid_layout_diagram_labels():
+    prompt = prompt_engine.generate_prompt_for_page(
+        page_intent={
+            "page_num": 10,
+            "type": "content",
+            "layout": "process_diagram",
+            "visual_evidence": "三段流程图：对话、沉淀、复用",
+            "visual_description": "流程节点可标注「对话→产出」「沉淀→知识库」「调用→复用」。",
+        },
+        content_text={"headline": "把 AI 变成团队资产"},
+        style_text_override="Style: 清晰商务\nPalette: #111111, #FFFFFF",
+    )
+
+    assert 'Headline: "把 AI 变成团队资产"' in prompt
+    assert "render only quoted strings from this section" not in prompt
+    assert "invented copy" in prompt
+    assert "decorative microtext" in prompt
 
 
 def test_prompt_drops_absent_text_slots_from_visual_description():

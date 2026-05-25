@@ -71,6 +71,19 @@ def txt_upload(name="brief.txt", text="开学季绿色营销推广方案"):
     return SimpleNamespace(filename=name, file=io.BytesIO(text.encode("utf-8")), content_type="text/plain")
 
 
+def pdf_upload_with_picture(name="source.pdf"):
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "第1章 创新使命\n图示展示创新飞轮", fontsize=12, fontname="china-s")
+    image_buf = io.BytesIO()
+    Image.new("RGB", (120, 80), "white").save(image_buf, "PNG")
+    page.insert_image(fitz.Rect(72, 140, 220, 240), stream=image_buf.getvalue())
+    out = io.BytesIO(doc.tobytes())
+    return SimpleNamespace(filename=name, file=out, content_type="application/pdf")
+
+
 def pptx_upload_with_picture(name="source.pptx"):
     image_buf = io.BytesIO()
     img = Image.new("RGB", (240, 140), "white")
@@ -724,6 +737,11 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missin
 
     monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
     monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
 
     with pytest.raises(VisualPlanGenerationError, match="missing visual_evidence"):
         _do_generate_visual_plan(
@@ -782,8 +800,9 @@ def test_prompt_includes_exact_overlay_reservation():
     )
 
     assert "Exact Overlay Reservation" in prompt
-    assert "right-side card media slot" in prompt
-    assert "Do not place required text" in prompt
+    assert "right side (approximately 34% width, center vertically)" in prompt
+    assert "right-side card media slot" not in prompt
+    assert "Place ALL visible text" in prompt
 
 
 def test_prompt_skips_exact_overlay_reservation_when_asset_unavailable():
@@ -2011,7 +2030,10 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
     assert result["error"] is None
     assert len(calls) == 2
     assert "FIRST PASS" in calls[0]["prompt"]
-    assert "second hidden refinement pass" in calls[0]["prompt"]
+    assert "Use the uploaded product/material image as the source" in calls[0]["prompt"]
+    assert "visible text, labels, logos, and small markings" in calls[0]["prompt"]
+    assert "fidelity can be approximate" not in calls[0]["prompt"]
+    assert "simplify it into a generic placeholder" not in calls[0]["prompt"]
     assert calls[0]["reference_count"] == 1
     assert calls[1]["prompt"] == (
         "第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。"
@@ -2111,7 +2133,7 @@ def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeyp
     assert calls[1]["reference_count"] == 3
 
 
-def test_double_blend_pass_accepts_page_reference_refs(tmp_path, monkeypatch):
+def test_double_blend_pass_ignores_page_reference_refs(tmp_path, monkeypatch):
     calls = []
 
     def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
@@ -2135,11 +2157,9 @@ def test_double_blend_pass_accepts_page_reference_refs(tmp_path, monkeypatch):
     result = _generate_one_slide(slide, "project-3", str(tmp_path), ref_data)
 
     assert result["error"] is None
-    assert len(calls) == 2
-    assert "原 PPT 活动海报" in calls[0]["prompt"]
-    assert calls[1]["prompt"].startswith("第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。")
-    assert "原 PPT 活动海报" not in calls[1]["prompt"]
-    assert calls[1]["reference_count"] == 2
+    assert len(calls) == 1
+    assert calls[0]["prompt"] == "draft prompt"
+    assert calls[0]["reference_count"] == 1
 
 
 def test_image_cache_key_includes_reference_image_content():
@@ -3004,6 +3024,49 @@ def test_pptx_asset_extraction_is_idempotent_for_page_refs(tmp_path, monkeypatch
     assert page_refs[0].slide_id == slide.id
 
 
+def test_pdf_document_upload_extracts_source_pack_and_page_ref_images(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PDF upload", status="planning")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    result = documents_api.upload_document(
+        project.id,
+        pdf_upload_with_picture("book.pdf"),
+        db=db,
+    )
+    assert result["text_parse_status"] == "queued"
+    assert result["source_parse_status"] == "queued"
+    assert result["asset_extraction_status"] == "queued"
+
+    stats = documents_api._extract_pdf_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "book.pdf"),
+        "book.pdf",
+        db=db,
+    )
+
+    assert stats["page_refs"] == 1
+    page_ref = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    assert page_ref.asset_analysis["source_type"] == "pdf"
+    assert page_ref.asset_analysis["source_document"] == "book.pdf"
+    assert page_ref.asset_analysis["source_page_num"] == 1
+    assert page_ref.asset_analysis["pdf_source_page_num"] == 1
+    assert page_ref.asset_analysis["bbox"]
+    assert page_ref.asset_analysis["nearby_text"]
+
+    docs = documents_api.list_documents(project.id, db=db)
+    assert docs[0]["source_parse_status"] == "completed"
+    assert docs[0]["source_stats"]["pages"] == 1
+    assert docs[0]["source_stats"]["images"] == 1
+    assert docs[0]["asset_extraction_status"] == "completed"
+
+
 def test_pptx_shape_fill_repeated_logo_goes_to_logo_library(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="PPT upload", status="planning")
@@ -3665,6 +3728,148 @@ def test_pending_pptx_page_refs_link_by_source_refs_when_pages_are_reordered(tmp
     assert linked == 1
     db.refresh(pending)
     assert pending.slide_id == slide.id
+
+
+def test_pending_pdf_page_refs_require_explicit_figure_refs(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PDF source refs", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(project.id, pdf_upload_with_picture("book.pdf"), db=db)
+    documents_api._extract_pdf_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "book.pdf"),
+        "book.pdf",
+        db=db,
+    )
+    pending = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    assert pending.slide_id is None
+
+    slide = Slide(
+        project_id=project.id,
+        page_num=5,
+        status="pending",
+        content_json={
+            "page_num": 5,
+            "source_refs": [{"source_document": "book.pdf", "source_page_num": 1, "source_type": "pdf"}],
+        },
+    )
+    db.add(slide)
+    db.commit()
+
+    linked = slides_api._link_pending_pptx_page_refs(project.id, db)
+    db.commit()
+
+    assert linked == 0
+    db.refresh(pending)
+    assert pending.slide_id is None
+
+
+def test_pending_pdf_page_refs_link_by_figure_refs(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PDF figure refs", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(project.id, pdf_upload_with_picture("book.pdf"), db=db)
+    documents_api._extract_pdf_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "book.pdf"),
+        "book.pdf",
+        db=db,
+    )
+    pending = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    figure_id = pending.asset_analysis["id"]
+
+    slide = Slide(
+        project_id=project.id,
+        page_num=9,
+        status="pending",
+        content_json={
+            "page_num": 9,
+            "figure_refs": [{
+                "source_document": "book.pdf",
+                "source_page_num": 1,
+                "source_type": "pdf",
+                "figure_id": figure_id,
+            }],
+        },
+    )
+    db.add(slide)
+    db.commit()
+
+    linked = slides_api._link_pending_pptx_page_refs(project.id, db)
+    db.commit()
+
+    assert linked == 1
+    db.refresh(pending)
+    assert pending.slide_id == slide.id
+
+
+def test_pending_pdf_page_refs_clone_when_same_content_figure_is_used_on_multiple_slides(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Repeated PDF figure refs", status="draft")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(project.id, pdf_upload_with_picture("book.pdf"), db=db)
+    documents_api._extract_pdf_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "book.pdf"),
+        "book.pdf",
+        db=db,
+    )
+    pending = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).one()
+    figure_id = pending.asset_analysis["id"]
+
+    slides = [
+        Slide(
+            project_id=project.id,
+            page_num=page_num,
+            status="pending",
+            content_json={
+                "page_num": page_num,
+                "figure_refs": [{
+                    "source_document": "book.pdf",
+                    "source_page_num": 1,
+                    "source_type": "pdf",
+                    "figure_id": figure_id,
+                }],
+            },
+        )
+        for page_num in (5, 6)
+    ]
+    db.add_all(slides)
+    db.commit()
+
+    linked = slides_api._link_pending_pptx_page_refs(project.id, db)
+    db.commit()
+
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).order_by(ReferenceImage.slide_id).all()
+    assert linked == 2
+    assert len(refs) == 2
+    assert {ref.slide_id for ref in refs} == {slide.id for slide in slides}
+    assert {ref.file_path for ref in refs} == {pending.file_path}
+    assert {ref.asset_analysis["id"] for ref in refs} == {figure_id}
 
 
 def test_delete_visual_asset_cleans_slide_selection_and_invalidates_outputs(tmp_path):

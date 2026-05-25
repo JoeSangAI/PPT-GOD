@@ -41,27 +41,31 @@ const normalizeMarkdownEmphasis = (md: string): string => {
     .join("\n");
 };
 
+function replaceMarkdownOpeningTag(html: string, tag: string, attrs: string): string {
+  return html.replace(new RegExp(`<${tag}\\b[^>]*>`, "g"), `<${tag} ${attrs}>`);
+}
+
 const renderMarkdown = (md: string, chatStyle = false): string => {
   const normalized = normalizeMarkdownEmphasis(md || "");
   let html = (marked.parse(normalized, { async: false }) as string) || "";
   html = fixMarkedBoldHtml(html);
   if (chatStyle) {
-    html = html.replace(/<p\b/g, '<p class="mb-2 last:mb-0" style="white-space:pre-wrap"');
-    html = html.replace(/<ul\b/g, '<ul class="list-disc pl-4 mb-2">');
-    html = html.replace(/<ol\b/g, '<ol class="list-decimal pl-4 mb-2">');
-    html = html.replace(/<li\b/g, '<li class="mb-1">');
-    html = html.replace(/<strong\b/g, '<strong class="font-semibold text-gray-900">');
-    html = html.replace(/<h1\b/g, '<h1 class="text-base font-bold mb-2 mt-1">');
-    html = html.replace(/<h2\b/g, '<h2 class="text-sm font-bold mb-2 mt-1">');
-    html = html.replace(/<h3\b/g, '<h3 class="text-sm font-semibold mb-1 mt-1">');
-    html = html.replace(/<code\b/g, '<code class="bg-gray-200 px-1 py-0.5 rounded text-xs font-mono">');
-    html = html.replace(/<pre\b/g, '<pre class="bg-gray-200 p-2 rounded text-xs overflow-auto mb-2">');
+    html = replaceMarkdownOpeningTag(html, "p", 'class="mb-2 last:mb-0" style="white-space:pre-wrap"');
+    html = replaceMarkdownOpeningTag(html, "ul", 'class="list-disc pl-4 mb-2"');
+    html = replaceMarkdownOpeningTag(html, "ol", 'class="list-decimal pl-4 mb-2"');
+    html = replaceMarkdownOpeningTag(html, "li", 'class="mb-1"');
+    html = replaceMarkdownOpeningTag(html, "strong", 'class="font-semibold text-gray-900"');
+    html = replaceMarkdownOpeningTag(html, "h1", 'class="text-base font-bold mb-2 mt-1"');
+    html = replaceMarkdownOpeningTag(html, "h2", 'class="text-sm font-bold mb-2 mt-1"');
+    html = replaceMarkdownOpeningTag(html, "h3", 'class="text-sm font-semibold mb-1 mt-1"');
+    html = replaceMarkdownOpeningTag(html, "code", 'class="bg-gray-200 px-1 py-0.5 rounded text-xs font-mono"');
+    html = replaceMarkdownOpeningTag(html, "pre", 'class="bg-gray-200 p-2 rounded text-xs overflow-auto mb-2"');
   } else {
     // 非聊天模式：给表格加 Tailwind 基础样式（display / border-collapse / 字体大小）
-    html = html.replace(/<table\b/g, '<table class="table-auto w-full text-xs border border-slate-300"');
-    html = html.replace(/<thead\b/g, '<thead class="bg-slate-100"');
-    html = html.replace(/<th\b/g, '<th class="border border-slate-300 px-2 py-1 text-left font-medium"');
-    html = html.replace(/<td\b/g, '<td class="border border-slate-300 px-2 py-1"');
+    html = replaceMarkdownOpeningTag(html, "table", 'class="table-auto w-full text-xs border border-slate-300"');
+    html = replaceMarkdownOpeningTag(html, "thead", 'class="bg-slate-100"');
+    html = replaceMarkdownOpeningTag(html, "th", 'class="border border-slate-300 px-2 py-1 text-left font-medium"');
+    html = replaceMarkdownOpeningTag(html, "td", 'class="border border-slate-300 px-2 py-1"');
   }
   // 消毒 HTML，防止 XSS（保留允许的样式类和标签）
   return DOMPurify.sanitize(html, {
@@ -85,6 +89,7 @@ import {
   buildWorkflowState,
   evaluateImageGenerationOutcome,
   formatWorkflowPageNumsForUser,
+  getWorkflowProgressOverviewDisplay,
   getPrimaryActionKey,
   getSecondaryActionKeys,
   getStatusCard,
@@ -399,6 +404,7 @@ interface ChatMessage {
   loading?: boolean;
   id?: string;
   runId?: string;
+  statusKey?: string;
   hasStyleProposal?: boolean;
   styleProposals?: StyleProposal[];
   attachments?: ChatAttachment[];
@@ -421,6 +427,66 @@ interface RunCompletionFollowup {
   agentRole: "content" | "visual";
   content: string;
   nextAction?: AgentNextAction;
+  statusKey?: string;
+}
+
+function contentPlanCompletionText(totalSlides?: number) {
+  const count = Math.max(0, Number(totalSlides || 0));
+  return `✅ 内容规划已完成${count ? `，共 ${count} 页` : ""}。请检查标题和顺序，确认后进入下一步。`;
+}
+
+function isContentPlanCompletionMessage(message: ChatMessage) {
+  const content = (message.content || "").trim();
+  return (
+    message.role === "agent" &&
+    message.agentRole === "content" &&
+    /^✅?\s*内容规划已完成(?:，共\s*\d+\s*页)?。请检查标题和顺序，确认后进入下一步。$/.test(content)
+  );
+}
+
+function getAgentStatusMessageKey(message: ChatMessage) {
+  if (message.role !== "agent") return null;
+  const agentRole = message.agentRole || "content";
+  if (message.runId && !message.loading) return `run:${agentRole}:${message.runId}`;
+  if (message.statusKey && !message.loading) return `status:${agentRole}:${message.statusKey}`;
+  if (isQualityReportChatMessage(message)) return `status:${agentRole}:quality-report`;
+
+  const content = (message.content || "")
+    .replace(/^(?:✅|⚠️|⚠|❌|🚀|⏳|👉|\s)+/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!content) return null;
+  if (isContentPlanCompletionMessage(message)) return "status:content:content-plan-ready";
+  if (/^(?:视觉方向已生成|视觉方案阶段已就绪|已进入视觉方案阶段)/.test(content)) return "status:visual:style-ready";
+  if (/^(?:每页的设计描述已生成|视觉方向已确认|页面状态已更新)/.test(content)) return "status:visual:visual-prompts-ready";
+  if (/^样张已生成/.test(content)) return "status:visual:prototype-ready";
+  if (/^(?:全量生成已完成|全部页面生成完成|图片生成任务已结束)/.test(content)) return "status:visual:generation-result";
+  const problemMatch = content.match(/^(内容规划|视觉方向|画面方案|样张生成|图片生成)未完成/);
+  if (problemMatch) return `status:${agentRole}:${problemMatch[1]}-problem`;
+  return null;
+}
+
+function dedupeAgentStatusMessages(messages: ChatMessage[]) {
+  return messages.reduce<ChatMessage[]>((acc, message) => {
+    const key = getAgentStatusMessageKey(message);
+    if (key) {
+      const existingIndex = acc.findIndex((item) => getAgentStatusMessageKey(item) === key);
+      if (existingIndex >= 0) acc.splice(existingIndex, 1);
+    }
+    acc.push(message);
+    return acc;
+  }, []);
+}
+
+function upsertAgentStatusMessage(messages: ChatMessage[], message: ChatMessage) {
+  const key = getAgentStatusMessageKey(message);
+  return [
+    ...messages.filter((item) => {
+      if (message.runId && item.loading && item.runId === message.runId) return false;
+      return !key || getAgentStatusMessageKey(item) !== key;
+    }),
+    message,
+  ];
 }
 
 function getBriefSubmissionDisplayContent(content: string, explicitDisplayContent?: string) {
@@ -513,13 +579,15 @@ function buildRunCompletionFollowup({
       agentRole: runKind === "content_plan" ? "content" : "visual",
       content: `⚠️ ${scopeLabel}未完成${scopedFailed ? `（${scopedFailed} 页失败）` : ""}。${errorLine}${canRetryFailedPages ? "可点击状态栏「重试失败页」继续。" : "请检查页面状态后重新发起。"}`,
       nextAction: canRetryFailedPages ? { type: "retry_failed", label: "一键重试失败页", confirm: true } : undefined,
+      statusKey: `${runKind || "run"}-problem`,
     };
   }
   if (runKind === "content_plan") {
     return {
       agentRole: "content",
-      content: "✅ 内容规划已完成。请检查标题和顺序，确认后进入下一步。",
+      content: contentPlanCompletionText(totalSlides),
       nextAction: { type: "switch_to_visual", label: "确认内容，请视觉总监" },
+      statusKey: "content-plan-ready",
     };
   }
   if (runKind === "style_proposal") {
@@ -527,12 +595,14 @@ function buildRunCompletionFollowup({
       return {
         agentRole: "visual",
         content: `✅ 视觉方向已生成，共 ${styleProposalCount} 套。\n\n👉 下一步：在作品画布选择一套方向，点击「确认并生成画面方案」。`,
+        statusKey: "style-ready",
       };
     }
     return {
       agentRole: "visual",
       content: "✅ 已进入视觉方案阶段。\n\n👉 下一步：先在「项目素材」补充 Logo、参考图或模板；没有素材也可以直接点击「生成视觉方向」。",
       nextAction: { type: "generate_style_proposals", label: "生成视觉方向" },
+      statusKey: "style-ready",
     };
   }
   if (runKind === "visual_prompts") {
@@ -540,13 +610,15 @@ function buildRunCompletionFollowup({
       agentRole: "visual",
       content: "✅ 每页的设计描述已生成。先生成几页样张看看效果，满意后再出全部页面。",
       nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
+      statusKey: "visual-prompts-ready",
     };
   }
   if (projectStatus === "prototype_ready") {
     return {
       agentRole: "visual",
-      content: "✅ 样张已生成。满意就点击「生成全部」，不满意可以勾选页面重打。",
+      content: "✅ 样张已生成。满意就点击「样张满意，生成全部」，不满意可以勾选页面重打。",
       nextAction: { type: "confirm_prototype", label: "样张满意，生成全部", confirm: true },
+      statusKey: "prototype-ready",
     };
   }
   if (runKind === "batch_generation" || runKind === "page_generation" || runKind === "retry_failed") {
@@ -554,6 +626,7 @@ function buildRunCompletionFollowup({
       return {
         agentRole: "visual",
         content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。`,
+        statusKey: "generation-result",
       };
     }
     if (projectStatus === "failed") {
@@ -561,11 +634,13 @@ function buildRunCompletionFollowup({
         agentRole: "visual",
         content: `⚠️ 图片生成任务已结束，当前已有 ${completedCount} / ${totalSlides || completedCount} 页完成。\n\n👉 下一步：点击「一键重试失败页」继续补齐。`,
         nextAction: { type: "retry_failed", label: "一键重试失败页", confirm: true },
+        statusKey: "generation-result",
       };
     }
     return {
       agentRole: "visual",
       content: `✅ 图片生成任务已结束，当前已有 ${completedCount} / ${totalSlides || completedCount} 页完成。\n\n👉 下一步：检查失败页并重试，或继续调整需要修改的页面。`,
+      statusKey: "generation-result",
     };
   }
   if (projectStatus === "visual_ready" && !hasSelectedStyle) {
@@ -573,12 +648,14 @@ function buildRunCompletionFollowup({
       return {
         agentRole: "visual",
         content: "✅ 视觉方案阶段已就绪。\n\n👉 下一步：在作品画布选择一套视觉方向，点击「确认并生成画面方案」。",
+        statusKey: "style-ready",
       };
     }
     return {
       agentRole: "visual",
       content: "✅ 视觉方案阶段已就绪。\n\n👉 下一步：先在「项目素材」补充 Logo、参考图或模板；没有素材也可以直接点击「生成视觉方向」。",
       nextAction: { type: "generate_style_proposals", label: "生成视觉方向" },
+      statusKey: "style-ready",
     };
   }
   if (projectStatus === "visual_ready" && hasSelectedStyle && !hasPrompt) {
@@ -586,6 +663,7 @@ function buildRunCompletionFollowup({
       agentRole: "visual",
       content: "✅ 视觉方向已确认。\n\n👉 下一步：生成每页画面方案和生图 Prompt，然后生成样张。",
       nextAction: { type: "generate_visual_prompts", label: "生成画面方案" },
+      statusKey: "visual-prompts-ready",
     };
   }
   if (projectStatus === "prompt_ready" || (hasSelectedStyle && hasPrompt)) {
@@ -593,11 +671,13 @@ function buildRunCompletionFollowup({
       agentRole: "visual",
       content: "✅ 页面状态已更新。\n\n👉 下一步：检查每页画面方案，然后点击「生成样张」。",
       nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
+      statusKey: "visual-prompts-ready",
     };
   }
   return {
     agentRole: "visual",
     content: `✅ 当前任务已结束，页面状态已更新为「${status}」。\n\n👉 下一步：请查看作品画布里的当前阶段操作按钮，或直接告诉我你想继续怎么改。`,
+    statusKey: "stage-updated",
   };
 }
 
@@ -663,8 +743,19 @@ function isWorkflowTransitionMessage(message: ChatMessage) {
   return /^(?:⏪\s*)?已(?:回退到|回到)「.+?」/.test(content);
 }
 
+function isQualityReportChatMessage(message: ChatMessage) {
+  const content = (message.content || "").trim();
+  if (String(message.id || "").startsWith("quality-report-")) return true;
+  if (message.agentRole !== "visual") return false;
+  return (
+    content.startsWith("⚠️ **还不能交付最终稿**") ||
+    content.startsWith("✅ **可以导出最终稿**") ||
+    content.startsWith("✅ **可以交付最终稿**")
+  );
+}
+
 function sanitizeChatHistory(messages: ChatMessage[]) {
-  return (messages || []).filter((m) => !isTransientRunMessage(m));
+  return dedupeAgentStatusMessages((messages || []).filter((m) => !isTransientRunMessage(m)));
 }
 
 function normalizeProjectChatHistory(
@@ -2587,7 +2678,9 @@ function App() {
       const previousSlideIds = previousSlides.map((s: any) => s.id).sort().join(",");
       updateLoadingMsg("正在向后台提交内容规划任务...");
       const result = await generateContentPlan(projectId, topic, pageCount, options?.attachmentIds, options?.chatContext);
+      const contentPlanRunId = result?.run?.id ? String(result.run.id) : null;
       if (result?.run?.id) {
+        locallyHandledRunIdsRef.current.add(String(result.run.id));
         updateLoadingMsg(runProgressText(result.run));
       }
       await loadStatus(projectId);
@@ -2621,12 +2714,24 @@ function App() {
           },
         ]);
       };
+      const deferContentPlanPoll = (message: string) => {
+        pollCompleted = true;
+        cleanupContentPlanPoll();
+        updateProjectChatMessages(projectId, "content", (prev) => [
+          ...prev,
+          {
+            role: "agent",
+            content: "内容规划仍在后台生成：" + message,
+            agentRole: "content",
+          },
+        ]);
+      };
 
       progressInterval = setInterval(async () => {
         if (pollCompleted) return;
         try {
           if (Date.now() - startedAt > CONTENT_PLAN_TIMEOUT_MS) {
-            failContentPlanPoll("前端等待超时，但后台可能仍在运行。请稍后刷新页面查看结果，不要重复点击。");
+            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，请稍后刷新页面查看结果，不要重复点击。");
             return;
           }
           const workflow = await fetchWorkflowStatus(projectId);
@@ -2665,30 +2770,42 @@ function App() {
         if (pollCompleted) return;
         try {
           if (Date.now() - startedAt > CONTENT_PLAN_TIMEOUT_MS) {
-            failContentPlanPoll("前端等待超时，但后台可能仍在运行。请稍后刷新页面查看结果，不要重复点击。");
+            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，请稍后刷新页面查看结果，不要重复点击。");
             return;
           }
           const currentSlides = await loadSlides(projectId);
           if (pollCompleted) return;
           await loadProjects();
-          await loadStatus(projectId);
+          const workflow = await fetchWorkflowStatus(projectId);
+          if (selectedProjectIdRef.current === projectId) {
+            setProjectStatus(workflow?.project_id === projectId ? workflow : null);
+          }
           if (pollCompleted) return;
           const currentSlideIds = currentSlides.map((s: any) => s.id).sort().join(",");
+          const activeContentPlan =
+            workflow?.active_run?.kind === "content_plan" &&
+            (!contentPlanRunId || String(workflow.active_run.id) === contentPlanRunId) &&
+            isRunActive(workflow.active_run);
+          const contentPlanSucceeded =
+            !contentPlanRunId ||
+            (workflow?.last_run?.id === contentPlanRunId && String(workflow.last_run.status || "") === "succeeded");
           // 必须有 slides，且 ID 集合与旧内容不同（说明是新生成的），才认为完成
-          if (currentSlides.length > 0 && currentSlideIds !== previousSlideIds) {
+          if (currentSlides.length > 0 && currentSlideIds !== previousSlideIds && !activeContentPlan && contentPlanSucceeded) {
             pollCompleted = true;
             cleanupContentPlanPoll();
-            updateProjectChatMessages(projectId, "content", (prev) => [
-              ...prev,
-              {
+            const latestGateContext = gateContextRef.current || gateContext;
+            updateProjectChatMessages(projectId, "content", (prev) =>
+              upsertAgentStatusMessage(prev, {
                 role: "agent",
-                content: `✅ 内容规划已完成，共 ${currentSlides.length} 页。请检查标题和顺序，确认后进入下一步。`,
+                content: contentPlanCompletionText(currentSlides.length),
                 agentRole: "content",
                 nextAction: { type: "switch_to_visual", label: "确认内容，请视觉总监" },
-                gate: gateContext.gate,
-                gateRevision: gateContext.gateRevision,
-              },
-            ]);
+                gate: latestGateContext.gate,
+                gateRevision: latestGateContext.gateRevision,
+                runId: contentPlanRunId || undefined,
+                statusKey: "content-plan-ready",
+              })
+            );
             options?.onStarted?.();
             setContentPlanSnapshot(currentSlides);
             const currentEditingSlide = editingSlideRef.current;
@@ -3024,7 +3141,10 @@ function App() {
         const loadingId = generationLoadingIdRef.current;
         generationLoadingIdRef.current = null;
         if (pid) {
-          updateProjectChatMessages(pid, "visual", (prevMsgs) => prevMsgs.filter((m) => m.id !== loadingId && m.runId !== prevRun.runId));
+          const targetAgent = prevRun.kind === "content_plan" ? "content" : "visual";
+          updateProjectChatMessages(pid, targetAgent, (prevMsgs) =>
+            prevMsgs.filter((m) => m.id !== loadingId && !(m.loading && m.runId === prevRun.runId))
+          );
         }
         prevProjectStatusRef.current = { projectId: pid, status: currentStatus };
         prevActiveRunRef.current = { projectId: pid, runId: activeRunId, kind: activeRun?.kind || null };
@@ -3077,17 +3197,20 @@ function App() {
             styleProposalCount: refreshedProject?.style_proposal?.proposals?.length || 0,
           });
           const latestGateContext = gateContextRef.current || gateContext;
-          updateProjectChatMessages(pid, followup.agentRole, (prevMsgs) => [
-            ...prevMsgs.filter((m) => m.id !== loadingId && m.runId !== finishedRunId),
-            {
+          updateProjectChatMessages(pid, followup.agentRole, (prevMsgs) => {
+            const nextMessage: ChatMessage = {
               role: "agent",
               content: followup.content,
               agentRole: followup.agentRole,
               nextAction: followup.nextAction,
               gate: followup.nextAction ? latestGateContext.gate : undefined,
               gateRevision: followup.nextAction ? latestGateContext.gateRevision : undefined,
-            },
-          ]);
+              runId: finishedRunId || undefined,
+              statusKey: followup.statusKey,
+            };
+            const baseMessages = prevMsgs.filter((m) => m.id !== loadingId && m.runId !== finishedRunId);
+            return upsertAgentStatusMessage(baseMessages, nextMessage);
+          });
         })();
       }
     }
@@ -3136,16 +3259,13 @@ function App() {
     if (!projectId || !signature || !content || currentProjectStatus?.active_run) return;
 
     const scopedSignature = `${projectId}:${signature}`;
-    if (postedQualityReportSignaturesRef.current.has(scopedSignature)) return;
     postedQualityReportSignaturesRef.current.add(scopedSignature);
 
     const messageId = `quality-report-${signature}`;
     updateProjectChatMessages(projectId, "visual", (prevMsgs) => {
-      if (prevMsgs.some((m) => m.id === messageId || (m.agentRole === "visual" && m.content === content))) {
-        return prevMsgs;
-      }
+      const baseMessages = prevMsgs.filter((m) => !isQualityReportChatMessage(m));
       return [
-        ...prevMsgs,
+        ...baseMessages,
         {
           id: messageId,
           role: "agent",
@@ -3521,20 +3641,21 @@ function App() {
       });
 
       showToast("生图方案生成完成", "success");
-      updateProjectChatMessages(projectId, "visual", (prev) => [
-        ...prev.filter((m) => m.id !== loadingId),
-        {
+      updateProjectChatMessages(projectId, "visual", (prev) =>
+        upsertAgentStatusMessage(prev.filter((m) => m.id !== loadingId), {
           role: "agent",
           content: buildChangeReceipt({
             status: "applied",
             subject: "画面设计已完成：每页画面描述和生图提示词已生成",
             change: prototype && selectedPages.size > 0 ? `已处理${formatPageNumsForReceipt(Array.from(selectedPages))}` : `已处理整套 ${slides.length || "全部"} 页`,
-            next: "先生成几页样张看效果；满意后再生成全部页面。也可以直接全量生成。",
+            next: "先生成几页样张看效果；满意后点击「样张满意，生成全部」。",
           }),
           agentRole: "visual",
           nextAction: { type: "start_prototype", label: "生成样张", confirm: true },
-        },
-      ]);
+          runId: visualPromptRunId || undefined,
+          statusKey: "visual-prompts-ready",
+        })
+      );
     } catch (err: any) {
       showToast("生成生图方案失败：" + (err.message || "未知错误"), "error");
       const message = err.message || "未知错误";
@@ -3607,9 +3728,8 @@ function App() {
       });
       targetsClearForGeneration(pageNums);
       generationLoadingIdRef.current = null;
-      updateProjectChatMessages(projectId, "visual", (prev) => [
-        ...prev.filter((m) => m.id !== loadingId),
-        {
+      updateProjectChatMessages(projectId, "visual", (prev) =>
+        upsertAgentStatusMessage(prev.filter((m) => m.id !== loadingId), {
           role: "agent",
           content: generationOutcome.isSuccess
             ? `✅ ${generationOutcome.message}\n\n👉 下一步：${
@@ -3626,8 +3746,10 @@ function App() {
           nextAction: generationOutcome.canConfirmPrototype
             ? { type: "confirm_prototype", label: "样张满意，生成全部", confirm: true }
             : undefined,
-        },
-      ]);
+          runId: generationRunId || undefined,
+          statusKey: prototype ? "prototype-ready" : "generation-result",
+        })
+      );
     } catch (err: any) {
       if (generationRunId) {
         locallyHandledRunIdsRef.current.delete(generationRunId);
@@ -3729,16 +3851,17 @@ function App() {
         run: finalRun || (generationRunId ? { status: "stale", message: "没有找到本次生成任务的完成记录" } : null),
       });
       generationLoadingIdRef.current = null;
-      updateProjectChatMessages(projectId, "visual", (prev) => [
-        ...prev.filter((m) => m.id !== loadingId),
-        {
+      updateProjectChatMessages(projectId, "visual", (prev) =>
+        upsertAgentStatusMessage(prev.filter((m) => m.id !== loadingId), {
           role: "agent",
           content: generationOutcome.isSuccess
             ? "✅ 全部页面生成完成。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。"
             : `⚠️ ${generationOutcome.message}\n\n👉 下一步：检查失败页后重试，或选中页面单独重新生成。`,
           agentRole: "visual",
-        },
-      ]);
+          runId: generationRunId || undefined,
+          statusKey: "generation-result",
+        })
+      );
     } catch (err: any) {
       if (generationRunId) {
         locallyHandledRunIdsRef.current.delete(generationRunId);
@@ -6123,9 +6246,8 @@ function App() {
               if (selectedProjectIdRef.current === requestProjectId) {
                 setStyleProposalsInChat(proposals);
               }
-              updateProjectChatMessages(requestProjectId, "visual", (prev) => [
-                ...prev.filter((m) => m.id !== styleLoadingId),
-                {
+              updateProjectChatMessages(requestProjectId, "visual", (prev) =>
+                upsertAgentStatusMessage(prev.filter((m) => m.id !== styleLoadingId), {
                   role: "agent",
                   content: isAdjust
                     ? buildChangeReceipt({
@@ -6144,12 +6266,13 @@ function App() {
                   styleProposals: proposals,
                   gate: gateContext.gate,
                   gateRevision: gateContext.gateRevision,
-                },
-              ]);
+                  runId: styleRunId || undefined,
+                  statusKey: "style-ready",
+                })
+              );
             } else {
-              updateProjectChatMessages(requestProjectId, "visual", (prev) => [
-                ...prev.filter((m) => m.id !== styleLoadingId),
-                {
+              updateProjectChatMessages(requestProjectId, "visual", (prev) =>
+                upsertAgentStatusMessage(prev.filter((m) => m.id !== styleLoadingId), {
                   role: "agent",
                   content: buildChangeReceipt({
                     status: "applied",
@@ -6157,9 +6280,11 @@ function App() {
                     next: "从三套方案中选择最喜欢的一套，或直接告诉我你的偏好。",
                   }),
                   agentRole: "visual",
-                },
-                      ]);
-                    }
+                  runId: styleRunId || undefined,
+                  statusKey: "style-ready",
+                })
+              );
+            }
                   } catch (err: any) {
                     if (styleRunId) {
                       locallyHandledRunIdsRef.current.delete(styleRunId);
@@ -6613,9 +6738,8 @@ function App() {
               const proposals = updated?.style_proposal?.proposals || styleResult.proposals || [];
               if (proposals.length > 0) {
                 if (selectedProjectIdRef.current === currentProject.id) setStyleProposalsInChat(proposals);
-                updateProjectChatMessages(currentProject.id, "visual", (prev) => [
-                  ...prev.filter((message) => message.id !== styleLoadingId),
-                  {
+                updateProjectChatMessages(currentProject.id, "visual", (prev) =>
+                  upsertAgentStatusMessage(prev.filter((message) => message.id !== styleLoadingId), {
                     role: "agent",
                     content: buildChangeReceipt({
                       status: "applied",
@@ -6627,12 +6751,13 @@ function App() {
                     styleProposals: proposals,
                     gate: gateContext.gate,
                     gateRevision: gateContext.gateRevision,
-                  },
-                ]);
+                    runId: styleRunId || undefined,
+                    statusKey: "style-ready",
+                  })
+                );
               } else {
-                updateProjectChatMessages(currentProject.id, "visual", (prev) => [
-                  ...prev.filter((message) => message.id !== styleLoadingId),
-                  {
+                updateProjectChatMessages(currentProject.id, "visual", (prev) =>
+                  upsertAgentStatusMessage(prev.filter((message) => message.id !== styleLoadingId), {
                     role: "agent",
                     content: buildChangeReceipt({
                       status: "applied",
@@ -6640,8 +6765,10 @@ function App() {
                       next: "选择一套方向后，我会保存风格并生成画面描述。",
                     }),
                     agentRole: "visual",
-                  },
-                ]);
+                    runId: styleRunId || undefined,
+                    statusKey: "style-ready",
+                  })
+                );
               }
             } catch (err: any) {
               if (styleRunId) locallyHandledRunIdsRef.current.delete(styleRunId);
@@ -7445,20 +7572,47 @@ function App() {
       }
     }
   };
+  const latestPrototypeProblemRun =
+    currentProjectStatus?.last_run?.kind === "prototype_generation" &&
+    ["failed", "stale", "cancelled"].includes(String(currentProjectStatus.last_run.status || ""))
+      ? currentProjectStatus.last_run
+      : null;
+  const latestPrototypeProblemOutcome = latestPrototypeProblemRun
+    ? evaluateImageGenerationOutcome({
+        prototype: true,
+        projectStatus: currentStatus,
+        run: latestPrototypeProblemRun,
+      })
+    : null;
+  const currentStageNudge =
+    latestPrototypeProblemOutcome && !latestPrototypeProblemOutcome.isSuccess
+      ? {
+          title: "上一轮打样未完成",
+          body: latestPrototypeProblemOutcome.message,
+          primary: {
+            label: "重打样张",
+            onClick: () => {
+              void dispatchGateAction(currentStatus === "prototype_ready" ? "resample_prototype" : "start_prototype");
+            },
+          },
+        }
+      : null;
   const renderProgressOverview = (variant: "drawer" | "empty" | "agent" = "drawer") => {
     if (!activeProgressDisclosure) return null;
-    const metricItems = activeProgressDisclosure.metrics.slice(0, variant === "agent" ? 2 : 5);
+    const overviewDisplay = getWorkflowProgressOverviewDisplay(activeProgressDisclosure, variant);
     return (
       <div className={`pg-progress-overview pg-progress-overview--${variant}`} aria-live="polite">
-        <div className="pg-progress-overview-head">
-          <div>
-            <b>{activeProgressDisclosure.headline}</b>
-            <span>{activeProgressDisclosure.detail}</span>
+        {overviewDisplay.showHeaderCopy && (
+          <div className="pg-progress-overview-head">
+            <div>
+              <b>{activeProgressDisclosure.headline}</b>
+              <span>{activeProgressDisclosure.detail}</span>
+            </div>
+            {activeProgressDisclosure.total > 0 && (
+              <em>{Math.round(activeProgressDisclosure.percent)}%</em>
+            )}
           </div>
-          {activeProgressDisclosure.total > 0 && (
-            <em>{Math.round(activeProgressDisclosure.percent)}%</em>
-          )}
-        </div>
+        )}
         <div
           className="pg-progress-overview-bar"
           role="progressbar"
@@ -7468,9 +7622,9 @@ function App() {
         >
           <i style={{ width: `${activeProgressDisclosure.percent}%` }} />
         </div>
-        {metricItems.length > 0 && (
+        {overviewDisplay.metrics.length > 0 && (
           <div className="pg-progress-metrics">
-            {metricItems.map((item) => (
+            {overviewDisplay.metrics.map((item) => (
               <span key={`${item.label}-${item.value}`}>
                 <b>{item.label}</b>
                 <em>{item.value}</em>
@@ -7478,7 +7632,7 @@ function App() {
             ))}
           </div>
         )}
-        {variant !== "agent" && (
+        {overviewDisplay.showSteps && (
           <div className="pg-progress-steps" aria-label="处理路径">
             {activeProgressDisclosure.steps.map((step) => (
               <span key={step.label} className={`is-${step.status}`}>
@@ -7491,6 +7645,12 @@ function App() {
       </div>
     );
   };
+  const emptyProgressDisplay = activeProgressDisclosure
+    ? getWorkflowProgressOverviewDisplay(activeProgressDisclosure, "empty")
+    : null;
+  const agentProgressDisplay = activeProgressDisclosure
+    ? getWorkflowProgressOverviewDisplay(activeProgressDisclosure, "agent")
+    : null;
   const activeProgressTargetPageSet = new Set(activeProgressDisclosure?.targetPageNums || []);
   const activeProgressActivePageSet = new Set(activeProgressDisclosure?.activePageNums || []);
   const activeProgressIsImageRun = isImageRunKind(activeRun?.kind || currentProjectStatus?.progress?.kind);
@@ -8065,27 +8225,33 @@ function App() {
           ) : shouldShowRunProgressEmptyState ? (
             <div className="pg-empty-state flex items-center justify-center h-full text-gray-500">
               <div className="pg-flow-empty text-center max-w-md">
-                <div className="pg-flow-title">{activeProgressLabel}</div>
+                {emptyProgressDisplay?.showStandaloneTitle && (
+                  <div className="pg-flow-title">{activeProgressLabel}</div>
+                )}
                 {renderProgressOverview("empty")}
-                <div className="pg-flow-copy mt-3">
-                  {activeProgressDisclosure?.summary ||
-                    (activeProgress.total > 0
-                      ? `${activeProgress.current} / ${activeProgress.total} ${activeProgress.unit}完成`
-                      : "正在同步最新进度，生成结果会直接出现在这里。")}
-                  {activeProgress.failed > 0 ? `，${activeProgress.failed} ${activeProgress.unit}失败` : ""}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setRightCollapsed(false);
-                    setCurrentAgentRole(activeRun?.kind === "content_plan" ? "content" : "visual");
-                    chatAutoScrollRef.current = true;
-                    requestAnimationFrame(scrollChatToBottom);
-                  }}
-                  className="pg-action pg-action-secondary mt-4 bg-white text-slate-700 border border-slate-200 px-3 py-1.5 rounded-lg text-sm hover:bg-slate-50"
-                >
-                  查看最新消息
-                </button>
+                {emptyProgressDisplay?.showFooterSummary && (
+                  <div className="pg-flow-copy mt-3">
+                    {activeProgressDisclosure?.summary ||
+                      (activeProgress.total > 0
+                        ? `${activeProgress.current} / ${activeProgress.total} ${activeProgress.unit}完成`
+                        : "正在同步最新进度，生成结果会直接出现在这里。")}
+                    {activeProgress.failed > 0 ? `，${activeProgress.failed} ${activeProgress.unit}失败` : ""}
+                  </div>
+                )}
+                {rightCollapsed && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRightCollapsed(false);
+                      setCurrentAgentRole(activeRun?.kind === "content_plan" ? "content" : "visual");
+                      chatAutoScrollRef.current = true;
+                      requestAnimationFrame(scrollChatToBottom);
+                    }}
+                    className="pg-action pg-action-secondary mt-4 bg-white text-slate-700 border border-slate-200 px-3 py-1.5 rounded-lg text-sm hover:bg-slate-50"
+                  >
+                    查看处理记录
+                  </button>
+                )}
               </div>
             </div>
           ) : slides.length === 0 ? (
@@ -8655,7 +8821,7 @@ function App() {
                         (Array.isArray(text.body) && text.body.length > 0)
                       ) && (
                         <div
-                          className="flex-1 min-h-0 overflow-y-auto text-xs text-slate-500 leading-relaxed"
+                          className="pg-slide-body-preview markdown-body flex-1 min-h-0 overflow-y-auto text-xs text-slate-500 leading-relaxed"
                         >
                           {typeof text.body === "string" ? (
                             <div dangerouslySetInnerHTML={{ __html: renderMarkdown(text.body) }} />
@@ -9576,6 +9742,22 @@ function App() {
               </div>
             </div>
           )}
+          {selectedProject && currentAgentRole === "visual" && currentStageNudge && (
+            <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50/90 p-3 shadow-sm">
+              <div className="text-sm font-semibold text-amber-900">{currentStageNudge.title}</div>
+              <p className="mt-1 text-xs leading-relaxed text-amber-800">{currentStageNudge.body}</p>
+              {currentStageNudge.primary && (
+                <button
+                  type="button"
+                  onClick={currentStageNudge.primary.onClick}
+                  disabled={isBusy || chatLoading}
+                  className="pg-action pg-action-primary mt-3 w-full rounded-lg bg-amber-600 px-3 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+                >
+                  {currentStageNudge.primary.label}
+                </button>
+              )}
+            </div>
+          )}
 
           {/* 隐藏的文件输入框：由项目素材条触发（始终渲染，确保 ref 可用） */}
           <input
@@ -9812,8 +9994,14 @@ function App() {
           {shouldShowAgentRunControl ? (
             <div className="pg-agent-run-control">
               <div className="pg-agent-run-copy">
-                <span className="pg-agent-run-kicker">{activeProgressDisclosure?.headline || activeProgressLabel}</span>
-                <span>{activeProgressDisclosure?.summary || activeProgressStatusText || "当前任务正在处理；需要取消可以停止生成。"}</span>
+                {agentProgressDisplay?.showAgentCopy ? (
+                  <>
+                    <span className="pg-agent-run-kicker">{activeProgressDisclosure?.headline || activeProgressLabel}</span>
+                    <span>{activeProgressDisclosure?.summary || activeProgressStatusText || "当前任务正在处理；需要取消可以停止生成。"}</span>
+                  </>
+                ) : (
+                  <span className="pg-agent-run-kicker">后台处理中</span>
+                )}
                 {renderProgressOverview("agent")}
               </div>
               <button

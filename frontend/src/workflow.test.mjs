@@ -28,6 +28,7 @@ const {
   buildWorkflowState,
   buildWorkflowProgressDisclosure,
   evaluateImageGenerationOutcome,
+  getWorkflowProgressOverviewDisplay,
   getPrimaryActionKey,
   getStatusCard,
   planStaleSlideAction,
@@ -115,7 +116,6 @@ assert.deepEqual(
     ["进度", "1 / 3 页"],
     ["处理范围", "第 2、3、4 页"],
     ["已运行", "1 分 30 秒"],
-    ["最近更新", "10 秒前"],
   ]
 );
 assert.deepEqual(
@@ -125,6 +125,30 @@ assert.deepEqual(
     ["生成图片", "current"],
     ["写入画布", "pending"],
   ]
+);
+assert.deepEqual(
+  plain(getWorkflowProgressOverviewDisplay(runningImageDisclosure, "agent")),
+  {
+    showHeaderCopy: false,
+    metrics: [],
+    showSteps: false,
+    showStandaloneTitle: false,
+    showFooterSummary: false,
+    showAgentCopy: false,
+  },
+  "agent progress overview should stay compact and keep only the bar"
+);
+assert.deepEqual(
+  plain(getWorkflowProgressOverviewDisplay(runningImageDisclosure, "empty")),
+  {
+    showHeaderCopy: true,
+    metrics: plain(runningImageDisclosure.metrics),
+    showSteps: true,
+    showStandaloneTitle: false,
+    showFooterSummary: false,
+    showAgentCopy: false,
+  },
+  "main empty progress state should rely on the progress card instead of repeating the title and summary outside it"
 );
 
 const queuedDisclosure = buildWorkflowProgressDisclosure({
@@ -170,8 +194,22 @@ assert.deepEqual(
   [
     ["进度", "21 / 26 页"],
     ["已运行", "2 分 7 秒"],
-    ["最近更新", "刚刚"],
   ]
+);
+
+const staleUpdateDisclosure = buildWorkflowProgressDisclosure({
+  active_run: {
+    kind: "content_plan",
+    status: "running",
+    started_at: "2026-05-14T05:00:00.000Z",
+    updated_at: "2026-05-14T05:01:00.000Z",
+    total_count: 30,
+    completed_count: 15,
+  },
+}, Date.parse("2026-05-14T05:01:42.000Z"));
+assert.ok(
+  staleUpdateDisclosure.metrics.some((item) => item.label === "最近更新" && item.value === "42 秒前"),
+  "recent update should only appear once the backend has been quiet long enough to matter"
 );
 
 const content = context({
@@ -236,6 +274,96 @@ assert.equal(getPrimaryActionKey(buildWorkflowState({
   hasSelectedStyle: true,
 })), "start-prototype");
 
+const gateDispatchedStatusActions = {
+  "retry-failed": "retry_failed",
+  "continue-generation": "start_generation",
+  "confirm-prototype": "confirm_prototype",
+  "resample-prototype": "resample_prototype",
+  "start-prototype": "start_prototype",
+  "generate-style": "generate_style_proposals",
+  "generate-visual-prompts": "generate_visual_prompts",
+  "switch-to-visual": "switch_to_visual",
+  "start-generation": "start_generation",
+  download: "download",
+};
+
+for (const { name, input, cardInput } of [
+  {
+    name: "prompt-ready partial deck can continue remaining pages",
+    input: {
+      projectStatus: "prompt_ready",
+      slides: [
+        { page_num: 1, status: "completed", image_path: "./outputs/1.png", prompt_text: "prompt" },
+        { page_num: 2, status: "prompt_ready", prompt_text: "prompt" },
+      ],
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+    },
+    cardInput: { incompletePageNums: [2], completedSlideCount: 1, totalSlideCount: 2 },
+  },
+  {
+    name: "prototype-ready deck can confirm sample",
+    input: {
+      projectStatus: "prototype_ready",
+      slides: [{ page_num: 1, status: "completed", image_path: "./outputs/1.png", prompt_text: "prompt" }],
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+    },
+    cardInput: { visiblePrototypePageNums: [1], completedSlideCount: 1, totalSlideCount: 1 },
+  },
+  {
+    name: "visual stage can generate style",
+    input: {
+      projectStatus: "visual_ready",
+      slides: [{ page_num: 1, status: "pending" }],
+      contentPlanConfirmed: true,
+      hasSelectedStyle: false,
+    },
+    cardInput: { totalSlideCount: 1 },
+  },
+  {
+    name: "selected style stage can generate visual prompts",
+    input: {
+      projectStatus: "visual_ready",
+      slides: [{ page_num: 1, status: "pending" }],
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+    },
+    cardInput: { totalSlideCount: 1 },
+  },
+  {
+    name: "completed deck can download",
+    input: {
+      projectStatus: "completed",
+      slides: [{ page_num: 1, status: "completed", image_path: "./outputs/1.png", prompt_text: "prompt" }],
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+    },
+    cardInput: { completedSlideCount: 1, totalSlideCount: 1 },
+  },
+]) {
+  const state = buildWorkflowState(input);
+  const card = getStatusCard({
+    workflowState: state,
+    staleActionPlan: planStaleSlideAction([]),
+    failedPageNums: [],
+    incompletePageNums: [],
+    visiblePrototypePageNums: [],
+    resamplePageNums: [],
+    prototypePromptTargetCount: 1,
+    completedSlideCount: 0,
+    totalSlideCount: 0,
+    ...cardInput,
+  });
+  const action = gateDispatchedStatusActions[card?.primary?.key];
+  if (action) {
+    assert.ok(
+      buildGateContext(state).allowedActions.includes(action),
+      `${name}: visible status-card action ${card.primary.key} must be allowed by the current gate`
+    );
+  }
+}
+
 const imageOnlyStaleAction = planStaleSlideAction([
   { slide: { id: "s1", page_num: 1 }, stale: { image: true } },
   { slide: { id: "s2", page_num: 2 }, stale: { image: true } },
@@ -264,6 +392,60 @@ assert.equal(prototype.mainStageMode, "deck_prototype");
 assert.equal(
   JSON.stringify(prototype.allowedActions.filter((action) => action === "resample_prototype" || action === "confirm_prototype").sort()),
   JSON.stringify(["confirm_prototype", "resample_prototype"])
+);
+
+const prototypeWithRemainingPagesState = buildWorkflowState({
+  projectStatus: "prototype_ready",
+  slides: [
+    { status: "completed", image_path: "./outputs/1.png", prompt_text: "prompt" },
+    { status: "completed", image_path: "./outputs/2.png", prompt_text: "prompt" },
+    { status: "completed", image_path: "./outputs/3.png", prompt_text: "prompt" },
+    { page_num: 4, status: "prompt_ready", prompt_text: "prompt" },
+    { page_num: 5, status: "prompt_ready", prompt_text: "prompt" },
+  ],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: true,
+});
+const prototypeWithRemainingPagesCard = getStatusCard({
+  workflowState: prototypeWithRemainingPagesState,
+  staleActionPlan: planStaleSlideAction([]),
+  failedPageNums: [],
+  incompletePageNums: [4, 5],
+  visiblePrototypePageNums: [1, 2, 3],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 3,
+  completedSlideCount: 3,
+  totalSlideCount: 5,
+});
+assert.equal(
+  prototypeWithRemainingPagesCard.primary.key,
+  "confirm-prototype",
+  "prototype-ready decks with remaining pages must confirm the sample before full generation instead of using interruption resume"
+);
+assert.doesNotMatch(
+  getStatusCard({
+    workflowState: prototypeWithRemainingPagesState,
+    staleActionPlan: planStaleSlideAction([]),
+    failedPageNums: [],
+    incompletePageNums: [4, 5],
+    visiblePrototypePageNums: [1, 2, 3],
+    resamplePageNums: [1, 2, 3],
+    prototypePromptTargetCount: 3,
+    completedSlideCount: 3,
+    totalSlideCount: 5,
+  }).description,
+  /已勾选.*重打|不勾选/,
+  "prototype-ready copy must not imply the user already selected pages to reroll just because sample pages are visible"
+);
+assert.match(
+  prototypeWithRemainingPagesCard.description,
+  /样张满意/,
+  "prototype-ready guidance should name the visible full-generation CTA"
+);
+assert.doesNotMatch(
+  prototypeWithRemainingPagesCard.description,
+  /生成全部页面/,
+  "prototype-ready guidance should not point to a generic button that is not visible"
 );
 
 const cancelledPrototypeOutcome = evaluateImageGenerationOutcome({
@@ -692,8 +874,19 @@ const runningCard = getStatusCard({
   prototypePromptTargetCount: 0,
   completedSlideCount: 1,
   totalSlideCount: 2,
+  progressDisclosure: buildWorkflowProgressDisclosure({
+    active_run: {
+      kind: "batch_generation",
+      status: "running",
+      total_count: 2,
+      completed_count: 1,
+    },
+  }),
 });
 assert.equal(runningCard.primary.key, "stop");
+assert.equal(runningCard.title, "批量生成中");
+assert.equal(runningCard.description, undefined);
+assert.deepEqual(plain(runningCard.progress), { current: 1, total: 2, percent: 50, unit: "页" });
 
 const noIncompleteCard = getStatusCard({
   workflowState: allDoneState,
