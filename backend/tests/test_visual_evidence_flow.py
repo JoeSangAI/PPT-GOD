@@ -1801,8 +1801,9 @@ def test_generation_loads_selected_visual_assets_without_signature_logo(tmp_path
 
     refs = _load_reference_images(slide)
 
-    assert [r["role"] for r in refs] == ["visual_asset", "content_ref", "template"]
+    assert [r["role"] for r in refs] == ["visual_asset", "content_ref", "template_hint"]
     assert refs[0]["process_mode"] == "crop"
+    assert "image" not in refs[2]
 
 
 def test_generation_can_load_logo_as_scene_asset_on_cover_when_blend(tmp_path):
@@ -2335,6 +2336,11 @@ def test_visual_plan_auto_adds_recalled_product_asset_when_llm_misses(monkeypatc
 
     monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
     monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
 
     plan = _do_generate_visual_plan(
         content_plan=[
@@ -2393,6 +2399,11 @@ def test_visual_plan_forces_logo_policy_off_when_project_has_no_logo(monkeypatch
 
     monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
     monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
 
     plan = _do_generate_visual_plan(
         content_plan=[
@@ -2439,6 +2450,11 @@ def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypa
 
     monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
     monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
 
     plan = _do_generate_visual_plan(
         content_plan=[

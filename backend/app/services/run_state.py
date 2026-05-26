@@ -587,34 +587,19 @@ def enforce_project_invariants(project: Project, slides: list[Slide]) -> str:
         return project.status
 
     current_deps = dependency_signature(project, slides)
-    invalidated_any = False
     for slide in slides:
         visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
         meta = artifact_meta(visual)
         deps = meta.get("dependencies") if isinstance(meta.get("dependencies"), dict) else {}
-        # Content edits are page-local stale state; preserving old images avoids
-        # turning a small text change into a whole-deck rollback.
+        # Reconciliation runs from read/status endpoints, so it must not delete
+        # generated artifacts. Explicit write paths mark stale outputs when
+        # content, style, or assets change; here we only repair legacy metadata
+        # that was stamped before the final project/style dependencies settled.
         if deps and any(deps.get(key) != current_deps.get(key) for key in ("style_assets", "visual_assets", "selected_style")):
-            preserved = {
-                key: value
-                for key, value in visual.items()
-                if key in {"manual_visual_asset_ids", "manual_visual_asset_usage", "overlay_layers", "asset_route_modes"}
-            }
-            if preserved:
-                preserved[ARTIFACT_META_KEY] = {
-                    "invalidated_from": meta,
-                    "invalidated_reason": "upstream_changed",
-                }
-            slide.visual_json = preserved
-            slide.prompt_text = None
-            slide.image_path = None
-            slide.error_msg = None
-            slide.status = "pending"
-            invalidated_any = True
-
-    if invalidated_any:
-        project.status = "visual_ready"
-        return project.status
+            repaired_meta = {**meta, "dependencies": current_deps}
+            if isinstance(meta.get("prompt_dependencies"), dict):
+                repaired_meta["prompt_dependencies"] = current_deps
+            slide.visual_json = {**visual, ARTIFACT_META_KEY: repaired_meta}
 
     if any(s.status == "completed" and s.image_path for s in slides):
         if project.status not in {"prototype_ready", "completed", "failed"}:

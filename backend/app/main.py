@@ -27,25 +27,78 @@ models.Base.metadata.create_all(bind=engine)
 def _ensure_runtime_mvp_schema() -> None:
     """Keep local SQLite/Postgres dev DBs usable when create_all cannot add columns."""
     inspector = inspect(engine)
-    if "projects" not in inspector.get_table_names():
+    table_names = set(inspector.get_table_names())
+    if "projects" not in table_names:
         return
-    project_columns = {col["name"] for col in inspector.get_columns("projects")}
-    missing_tester_id = "tester_id" not in project_columns
-    missing_intent_contract = "intent_contract" not in project_columns
-    if not missing_tester_id and not missing_intent_contract:
-        return
+
+    dialect = engine.dialect.name
+
+    def column_type(kind: str) -> str:
+        if kind == "json":
+            return "JSON"
+        if kind == "bool":
+            return "BOOLEAN DEFAULT false" if dialect == "postgresql" else "BOOLEAN DEFAULT 0"
+        if kind == "text":
+            return "TEXT"
+        return "VARCHAR"
+
+    def add_missing_columns(table: str, desired: dict[str, str]) -> None:
+        if table not in table_names:
+            return
+        existing = {col["name"] for col in inspect(engine).get_columns(table)}
+        missing = [(name, kind) for name, kind in desired.items() if name not in existing]
+        if not missing:
+            return
+        with engine.begin() as conn:
+            for name, kind in missing:
+                exists_clause = "IF NOT EXISTS " if dialect == "postgresql" else ""
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {exists_clause}{name} {column_type(kind)}"))
+
+    add_missing_columns(
+        "projects",
+        {
+            "content_plan_confirmed": "bool",
+            "tester_id": "varchar",
+            "style_proposal": "json",
+            "selected_style": "json",
+            "selected_template_recommendations": "json",
+            "intent_contract": "json",
+            "has_unread_notification": "bool",
+            "unread_notification_message": "text",
+        },
+    )
+    add_missing_columns(
+        "slides",
+        {
+            "type": "varchar",
+            "type_locked": "bool",
+        },
+    )
+    add_missing_columns(
+        "reference_images",
+        {
+            "slide_id": "varchar",
+            "process_mode": "varchar",
+            "asset_name": "varchar",
+            "asset_kind": "varchar",
+            "usage_note": "text",
+            "asset_analysis": "json",
+            "logo_anchor": "varchar",
+        },
+    )
+
     with engine.begin() as conn:
-        dialect = engine.dialect.name
-        if missing_tester_id and dialect == "postgresql":
-            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS tester_id VARCHAR"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
-        elif missing_tester_id:
-            conn.execute(text("ALTER TABLE projects ADD COLUMN tester_id VARCHAR"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
-        if missing_intent_contract and dialect == "postgresql":
-            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS intent_contract JSON"))
-        elif missing_intent_contract:
-            conn.execute(text("ALTER TABLE projects ADD COLUMN intent_contract JSON"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_projects_tester_id ON projects (tester_id)"))
+        if "project_runs" in table_names:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_project_runs_project_status ON project_runs (project_id, status)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_project_runs_project_started ON project_runs (project_id, started_at)"))
+        if "slides" in table_names:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_slides_project_id_status ON slides (project_id, status)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_slides_project_id_page_num ON slides (project_id, page_num)"))
+        if "reference_images" in table_names:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_reference_images_project_slide_role ON reference_images (project_id, slide_id, role)"))
+        if "tester_users" in table_names:
+            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_tester_users_login_key ON tester_users (login_key)"))
 
 
 _ensure_runtime_mvp_schema()

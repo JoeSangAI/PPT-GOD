@@ -1103,13 +1103,18 @@ def _do_generate_visual_plan(
 
         if not effective_has_project_logo:
             if not visual_evidence:
-                raise VisualPlanGenerationError(
-                    f"Visual plan page {page_num} only produced logo placeholder evidence without a project logo"
+                logger.warning(
+                    "VisualPlan: page %s only produced logo placeholder evidence without a project logo; using page-grounded fallback",
+                    page_num,
                 )
+                visual_evidence = _fallback_visual_evidence(page)
+                visual_summary = visual_evidence
             if not visual_desc:
-                raise VisualPlanGenerationError(
-                    f"Visual plan page {page_num} only produced logo placeholder description without a project logo"
+                logger.warning(
+                    "VisualPlan: page %s only produced logo placeholder description without a project logo; using page-grounded fallback",
+                    page_num,
                 )
+                visual_desc = _fallback_visual_description(page, visual_evidence)
         else:
             if not visual_evidence:
                 visual_evidence = _fallback_visual_evidence(page)

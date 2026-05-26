@@ -236,6 +236,59 @@ def test_reconcile_preserves_signed_visual_outputs_when_content_changes():
     assert slide.visual_json["layout"] == "old"
 
 
+def test_reconcile_keeps_completed_prototype_when_dependency_metadata_lags():
+    db = make_session()
+    project = Project(
+        title="Completed prototype",
+        status="prototype_ready",
+        content_plan_confirmed=True,
+    )
+    db.add(project)
+    db.flush()
+    sample = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        content_json={"page_num": 1},
+        visual_json={"layout": "sample"},
+        prompt_text="sample prompt",
+        image_path="/tmp/sample.png",
+    )
+    remaining = Slide(
+        project_id=project.id,
+        page_num=2,
+        status="prompt_ready",
+        content_json={"page_num": 2},
+        visual_json={"layout": "remaining"},
+        prompt_text="remaining prompt",
+    )
+    db.add_all([sample, remaining])
+    db.flush()
+    old_deps = dependency_signature(project, [sample, remaining])
+    sample.visual_json = with_artifact_meta(sample.visual_json, kind="visual_plan", dependencies=old_deps)
+    remaining.visual_json = with_artifact_meta(remaining.visual_json, kind="visual_plan", dependencies=old_deps)
+    project.selected_style = {"name": "Brand"}
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "succeeded"
+    db.flush()
+
+    reconcile_project_state(project, [sample, remaining], run)
+
+    assert project.status == "prototype_ready"
+    assert sample.status == "completed"
+    assert sample.prompt_text == "sample prompt"
+    assert sample.image_path == "/tmp/sample.png"
+    assert remaining.status == "prompt_ready"
+    assert remaining.prompt_text == "remaining prompt"
+
+
 def test_cancelled_prototype_with_preserved_old_image_returns_to_prompt_ready():
     db = make_session()
     project = Project(

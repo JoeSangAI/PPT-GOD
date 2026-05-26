@@ -203,7 +203,7 @@ def _reference_input_priority(ref: Dict) -> int:
         return 3
     if role in {"seed_ref", "seed_ref_hint"}:
         return 4
-    if role == "template":
+    if role in {"template", "template_hint"}:
         return 5
     return 9
 
@@ -604,7 +604,7 @@ def _load_reference_images(
             except Exception as e:
                 logger.warning(f"无法加载种子页 {seed_path}: {e}")
 
-    # 5. 模板级参考图（仅在没有种子页时使用，作为兜底）
+    # 5. 模板级参考（仅作为文字化版式/风格 hint，不上传原始模板整页）
     if not seed_loaded and slide.project and slide.project.selected_template_recommendations:
         recommendations = slide.project.selected_template_recommendations
         slide_type = slide.type or "content"
@@ -612,20 +612,22 @@ def _load_reference_images(
         tmpl = recommendations.get(template_key)
         if tmpl and isinstance(tmpl, dict) and tmpl.get("file_path"):
             tmpl_path = tmpl.get("layout_file_path") or tmpl.get("file_path")
-            if os.path.exists(tmpl_path) and len(refs) < MAX_REFERENCE_INPUTS:
-                try:
-                    refs.append({
-                        "image": _open_reference_image(tmpl_path, "template"),
-                        "process_mode": "blend",
-                        "role": "template",
-                        "label": "Template Reference",
-                        "file_path": tmpl_path,
-                        "template_key": template_key,
-                        "application_strength": tmpl.get("application_strength") or "standard",
-                    })
-                    logger.info(f"Slide {slide.page_num}: 加载模板参考图 {tmpl_path} (type={slide_type} -> key={template_key})")
-                except Exception as e:
-                    logger.warning(f"无法加载模板参考图 {tmpl_path}: {e}")
+            if os.path.exists(tmpl_path):
+                refs.append({
+                    "process_mode": "text_only",
+                    "role": "template_hint",
+                    "label": "Template Layout Hint",
+                    "file_path": tmpl_path,
+                    "template_key": template_key,
+                    "application_strength": tmpl.get("application_strength") or "standard",
+                })
+                logger.info(
+                    "Slide %s: 使用模板文字化参考 hint %s (type=%s -> key=%s)，不上传原始模板页",
+                    slide.page_num,
+                    tmpl_path,
+                    slide_type,
+                    template_key,
+                )
 
     refs = sorted(refs, key=_reference_input_priority)
     image_ref_count = sum(1 for ref in refs if ref.get("image") is not None)
@@ -838,6 +840,7 @@ def _generate_one_slide(
         seed_hint_count = sum(1 for r in first_pass_ref_data if r.get("role") == "seed_ref_hint")
         seed_count = seed_image_count + seed_hint_count
         template_ref_count = sum(1 for r in first_pass_ref_data if r.get("role") == "template")
+        template_hint_count = sum(1 for r in first_pass_ref_data if r.get("role") == "template_hint")
         page_reference_fidelity = _page_reference_fidelity_instruction(first_pass_ref_data)
         if seed_image_count > 0:
             seed_instruction = _seed_base_edit_instruction(slide, seed_image_count) or (
@@ -859,6 +862,12 @@ def _generate_one_slide(
                 "Reuse grid, spacing, hierarchy, palette relationship, typography rhythm, and ornament language. "
                 "Do not copy old text, images, products, or logos."
             )
+        elif template_hint_count > 0:
+            prompt = prompt + (
+                "\n\nTEMPLATE STYLE MEMORY: Use only the template-derived layout, spacing, hierarchy, "
+                "palette relationship, typography rhythm, and ornament language already summarized in the prompt. "
+                "Do not copy old template text, images, products, logos, portraits, people, or scene subjects."
+            )
         if page_reference_fidelity:
             prompt = prompt + page_reference_fidelity
 
@@ -875,7 +884,9 @@ def _generate_one_slide(
             reference_count=len(ref_images),
             references=_reference_audit(first_pass_ref_data),
             seed_reference_count=seed_count,
-            template_reference_count=template_ref_count,
+            template_reference_count=template_ref_count + template_hint_count,
+            template_uploaded_reference_count=template_ref_count,
+            template_hint_count=template_hint_count,
             product_refinement=use_product_refinement,
             **_prompt_audit(prompt),
         )
