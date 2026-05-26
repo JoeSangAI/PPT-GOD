@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from PIL import Image
 
 from app.models.models import ReferenceImage, Slide
@@ -15,6 +17,34 @@ def test_seed_images_default_to_prompt_hints(monkeypatch, tmp_path):
 
     assert refs[0]["role"] == "seed_ref_hint"
     assert "image" not in refs[0]
+
+
+def test_template_references_default_to_text_hints_not_uploaded_images(tmp_path):
+    template_path = tmp_path / "template.png"
+    Image.new("RGB", (32, 18), "white").save(template_path)
+    slide = SimpleNamespace(
+        page_num=4,
+        type="content",
+        visual_json={},
+        reference_images=[],
+        project=SimpleNamespace(
+            reference_images=[],
+            selected_template_recommendations={
+                "content": {
+                    "file_path": str(template_path),
+                    "layout_file_path": str(template_path),
+                    "application_strength": "strong",
+                }
+            },
+        ),
+    )
+
+    refs = generation_pipeline._load_reference_images(slide)
+
+    assert refs[0]["role"] == "template_hint"
+    assert refs[0]["file_path"] == str(template_path)
+    assert "image" not in refs[0]
+    assert [ref for ref in refs if ref.get("image") is not None] == []
 
 
 def test_seed_images_can_be_uploaded_when_enabled(monkeypatch, tmp_path):

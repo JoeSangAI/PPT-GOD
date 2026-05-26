@@ -28,6 +28,7 @@ export interface WorkflowRun {
   status?: string;
   stage?: string;
   message?: string | null;
+  error_msg?: string | null;
   target_page_nums?: number[] | null;
   total_count?: number;
   completed_count?: number;
@@ -946,6 +947,7 @@ export interface StatusCardInput {
   progressDisclosure?: WorkflowProgressDisclosure | null;
   canStartPrototypeGeneration?: boolean;
   canStartFullGeneration?: boolean;
+  latestProblemRun?: WorkflowRun | null;
 }
 
 function compactActiveRunTitle(kind?: string | null, status?: string | null) {
@@ -963,6 +965,19 @@ function compactActiveRunTitle(kind?: string | null, status?: string | null) {
   return status === "queued" ? `${label}排队中` : `${label}中`;
 }
 
+function isTerminalProblemRun(run?: WorkflowRun | null) {
+  return Boolean(run && ["failed", "stale", "cancelled"].includes(String(run.status || "")));
+}
+
+function visualPromptProblemMessage(run?: WorkflowRun | null) {
+  const raw = String(run?.error_msg || run?.message || "").trim();
+  if (/logo placeholder/i.test(raw)) {
+    const page = raw.match(/page\s+(\d+)/i)?.[1];
+    return `${page ? `第 ${page} 页` : "有页面"}只生成了 Logo 占位信息，未产出可用画面方案。请重试；如果仍失败，可补充 Logo 或说明不要使用 Logo。`;
+  }
+  return raw || "后台没有产出完整画面方案，请重试。";
+}
+
 export function getStatusCard(input: StatusCardInput): StatusCardData | null {
   const {
     workflowState: w,
@@ -976,6 +991,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     totalSlideCount,
     progressDisclosure,
     canStartPrototypeGeneration = true,
+    latestProblemRun = null,
   } = input;
 
   // 优先级 1:任务正在运行
@@ -992,6 +1008,29 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
         key: "stop",
         label: "停止",
         variant: "secondary",
+      },
+    };
+  }
+
+  if (
+    isTerminalProblemRun(latestProblemRun) &&
+    latestProblemRun?.kind === "visual_prompts" &&
+    (
+      !w.hasPrompt ||
+      incompletePageNums.length > 0 ||
+      staleActionPlan.contentOrVisualCount > 0 ||
+      Number(latestProblemRun.failed_count || 0) > 0 ||
+      Number(latestProblemRun.completed_count || 0) < Number(latestProblemRun.total_count || 0)
+    )
+  ) {
+    return {
+      tone: "danger",
+      title: "画面方案生成失败",
+      description: visualPromptProblemMessage(latestProblemRun),
+      primary: {
+        key: "generate-visual-prompts",
+        label: "重新生成画面方案",
+        variant: "danger",
       },
     };
   }
@@ -1037,8 +1076,22 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
     };
   }
 
+  const canSurfaceVisualStaleAction = w.hasSelectedStyle && [
+    "visual_ready",
+    "prompt_ready",
+    "prototype_ready",
+    "completed",
+    "failed",
+  ].includes(w.projectStatus);
+  const canSurfaceImageStaleAction = w.hasPrompt && [
+    "prompt_ready",
+    "prototype_ready",
+    "completed",
+    "failed",
+  ].includes(w.projectStatus);
+
   // 优先级 4:有过期画面(异常态独占)
-  if (staleActionPlan.primaryActionKey === "update_visual_plan") {
+  if (canSurfaceVisualStaleAction && staleActionPlan.primaryActionKey === "update_visual_plan") {
     return {
       tone: "warning",
       title: `${staleActionPlan.contentOrVisualCount} 页需要更新画面方案`,
@@ -1050,7 +1103,7 @@ export function getStatusCard(input: StatusCardInput): StatusCardData | null {
       },
     };
   }
-  if (staleActionPlan.primaryActionKey === "regenerate_images") {
+  if (canSurfaceImageStaleAction && staleActionPlan.primaryActionKey === "regenerate_images") {
     return {
       tone: "warning",
       title: `${staleActionPlan.imageOnlyCount} 页图片需要重新生成`,

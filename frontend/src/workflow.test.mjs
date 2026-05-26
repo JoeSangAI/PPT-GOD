@@ -924,6 +924,173 @@ const visualReadyCard = getStatusCard({
   totalSlideCount: 2,
 });
 assert.notEqual(visualReadyCard.primary.key, "continue-generation");
+assert.equal(visualReadyCard.primary.key, "generate-style");
+
+const visualReadyWithTemplateLocalStaleCard = getStatusCard({
+  workflowState: visualReadyState,
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { content: true } },
+    { slide: { id: "s2", page_num: 2 }, stale: { content: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.equal(
+  visualReadyWithTemplateLocalStaleCard.primary.key,
+  "generate-style",
+  "template uploads before style selection must not let local stale flags replace the visual-style CTA"
+);
+
+const failedVisualPromptRunCard = getStatusCard({
+  workflowState: buildWorkflowState({
+    projectStatus: "visual_ready",
+    slides: [
+      { page_num: 1, status: "pending" },
+      { page_num: 2, status: "pending" },
+    ],
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+  }),
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { content: true } },
+    { slide: { id: "s2", page_num: 2 }, stale: { content: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+  latestProblemRun: {
+    kind: "visual_prompts",
+    status: "failed",
+    message: "画面方案生成失败",
+    error_msg: "第 2 页缺少画面证据",
+  },
+});
+assert.equal(
+  failedVisualPromptRunCard.primary.key,
+  "generate-visual-prompts",
+  "failed visual prompt runs must stay visible instead of being hidden behind stale-update CTA"
+);
+assert.equal(failedVisualPromptRunCard.tone, "danger");
+assert.match(failedVisualPromptRunCard.title, /画面方案生成失败/);
+
+const partialFailedVisualPromptRunCard = getStatusCard({
+  workflowState: buildWorkflowState({
+    projectStatus: "visual_ready",
+    slides: [
+      { page_num: 1, status: "prompt_ready", prompt_text: "p1" },
+      { page_num: 2, status: "pending" },
+    ],
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+  }),
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s2", page_num: 2 }, stale: { content: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+  latestProblemRun: {
+    kind: "visual_prompts",
+    status: "failed",
+    message: "画面方案生成失败",
+    error_msg: "第 2 页缺少画面证据",
+    total_count: 2,
+    completed_count: 1,
+  },
+});
+assert.equal(
+  partialFailedVisualPromptRunCard.primary.key,
+  "generate-visual-prompts",
+  "partial prompt output must not hide the failed visual-prompts run behind stale-update CTA"
+);
+assert.equal(partialFailedVisualPromptRunCard.tone, "danger");
+
+const confirmedPlanningWithLocalStaleState = buildWorkflowState({
+  projectStatus: "planning",
+  slides: [
+    { page_num: 1, status: "pending" },
+    { page_num: 2, status: "pending" },
+  ],
+  contentPlanConfirmed: true,
+  hasSelectedStyle: false,
+});
+const confirmedPlanningWithLocalStaleCard = getStatusCard({
+  workflowState: confirmedPlanningWithLocalStaleState,
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { content: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.equal(
+  confirmedPlanningWithLocalStaleCard.primary.key,
+  "switch-to-visual",
+  "local stale flags before the visual stage must not hide the handoff to visual"
+);
+
+const selectedStyleWithStaleCard = getStatusCard({
+  workflowState: buildWorkflowState({
+    projectStatus: "visual_ready",
+    slides: [
+      { page_num: 1, status: "pending" },
+      { page_num: 2, status: "pending" },
+    ],
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+  }),
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { content: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.equal(
+  selectedStyleWithStaleCard.primary.key,
+  "update-stale-visual",
+  "after a style is selected, content/visual stale flags should still ask for updated page visual plans"
+);
+
+const visualReadyWithoutPromptImageStaleCard = getStatusCard({
+  workflowState: visualReadyState,
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { image: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [1, 2],
+  visiblePrototypePageNums: [],
+  resamplePageNums: [],
+  prototypePromptTargetCount: 0,
+  completedSlideCount: 0,
+  totalSlideCount: 2,
+});
+assert.equal(
+  visualReadyWithoutPromptImageStaleCard.primary.key,
+  "generate-style",
+  "image stale flags without prompts must not replace the required visual-style CTA"
+);
 
 // 全新 prompt_ready(0 completed)不应显示 continue-generation,应走 start-prototype
 const freshPromptReadyState = buildWorkflowState({

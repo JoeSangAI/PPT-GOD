@@ -527,8 +527,13 @@ assert.match(
 );
 assert.match(
   source,
-  /const handleRegenerateSlideFromEdits = async[\s\S]*generateVisualPlan\(projectId, pageNums, stageContext\)[\s\S]*generatePrompts\(projectId, pageNums, stageContext\)[\s\S]*startGeneration\(projectId, pageNums\)/,
-  "save-and-regenerate must refresh the page visual description and prompt before regenerating the page image"
+  /const handleRegenerateSlideFromEdits = async[\s\S]*generateVisualPrompts\(projectId, pageNums, stageContext\)[\s\S]*pollUntilStatusNotGenerating\(projectId\)[\s\S]*startGeneration\(projectId, pageNums\)/,
+  "save-and-regenerate must refresh page visual description and prompt through the unified visual-prompts run before regenerating the page image"
+);
+assert.doesNotMatch(
+  source.slice(source.indexOf("const handleRegenerateSlideFromEdits = async"), source.indexOf("// 更新画面方案：只更新画面描述/提示词", source.indexOf("const handleRegenerateSlideFromEdits = async"))),
+  /await generateVisualPlan\(projectId|await generatePrompts\(projectId/,
+  "save-and-regenerate must not use legacy synchronous visual-plan or prompt endpoints"
 );
 assert.match(
   source,
@@ -549,6 +554,25 @@ assert.match(
   source,
   /className="pg-agent-command-bar"/,
   "Agent composer guidance must be a compact command bar instead of a full task-card form"
+);
+assert.match(
+  source,
+  /if \(currentProjectStatus\?\.active_run\) \{\s*updateProjectChatMessages\(projectId,\s*"visual",\s*\(prevMsgs\) => \{[\s\S]*return prevMsgs\.filter\(\(m\) => !isQualityReportChatMessage\(m\)\);[\s\S]*\}\);\s*return;\s*\}/,
+  "active workflow runs must remove stale quality-report next-step guidance from the Agent panel"
+);
+const updateStaleStart = source.indexOf("const handleUpdateStaleSlides = async");
+const updateStaleEnd = source.indexOf("// 用户确认后，重新生成 image 标记的页面。", updateStaleStart);
+assert.ok(updateStaleStart >= 0 && updateStaleEnd > updateStaleStart, "must find stale visual update handler");
+const updateStaleSource = source.slice(updateStaleStart, updateStaleEnd);
+assert.match(
+  updateStaleSource,
+  /generateVisualPrompts\(projectId,\s*pageNumsForPrompt,\s*buildCrossStageContext\("visual"\)\)/,
+  "stale visual updates must use the unified visual-prompts run so the main progress card can show page-by-page progress"
+);
+assert.doesNotMatch(
+  updateStaleSource,
+  /await generateVisualPlan\(projectId/,
+  "stale visual updates must not use the legacy synchronous visual-plan endpoint without active_run progress"
 );
 assert.doesNotMatch(
   source,

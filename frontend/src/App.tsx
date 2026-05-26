@@ -126,8 +126,6 @@ import {
   createProject,
   generateContentPlan,
   generateVisualPrompts,
-  generatePrompts,
-  generateVisualPlan,
   fetchSlides,
   startGeneration,
   stopGeneration,
@@ -917,6 +915,10 @@ function userFacingGenerationError(message?: string) {
   }
   if (text.includes("图片接口上传超时")) {
     return "参考图上传超时：已停止自动重试，避免重复消耗额度。可把必须完整保留的图片改为「精确粘贴」，或稍后重试。";
+  }
+  if (/logo placeholder/i.test(text)) {
+    const page = text.match(/page\s+(\d+)/i)?.[1];
+    return `${page ? `第 ${page} 页` : "有页面"}只生成了 Logo 占位信息，未产出可用画面方案。系统已停止本轮生成，避免继续产出不可用页面。请重试；如果仍失败，可补充 Logo 或说明不要使用 Logo。`;
   }
   if (/429|rate limit|too many requests/i.test(text)) {
     return "生图接口当前限流或繁忙。系统会按接口返回的等待时间重试；如果仍失败，请稍后重试失败页。";
@@ -3253,10 +3255,19 @@ function App() {
   // 最终态补充一份交付前检查，不阻塞生成完成提示和导出动作。
   useEffect(() => {
     const projectId = selectedProject?.id;
+    if (!projectId) return;
+    if (currentProjectStatus?.active_run) {
+      updateProjectChatMessages(projectId, "visual", (prevMsgs) => {
+        if (!prevMsgs.some(isQualityReportChatMessage)) return prevMsgs;
+        return prevMsgs.filter((m) => !isQualityReportChatMessage(m));
+      });
+      return;
+    }
+
     const report = currentProjectStatus?.quality_report;
     const signature = String(report?.signature || "").trim();
     const content = String(report?.message || "").trim();
-    if (!projectId || !signature || !content || currentProjectStatus?.active_run) return;
+    if (!signature || !content) return;
 
     const scopedSignature = `${projectId}:${signature}`;
     postedQualityReportSignaturesRef.current.add(scopedSignature);
@@ -3562,6 +3573,21 @@ function App() {
             }
             const projectStage = projectData?.project_status;
             const generationStatus = isRunActive(projectData?.active_run) ? "running" : "idle";
+            const terminalVisualPromptRun = visualPromptRunId
+              ? [projectData?.last_run, projectData?.active_run].find(
+                  (run) =>
+                    run?.id === visualPromptRunId &&
+                    ["failed", "stale", "cancelled"].includes(String(run.status || ""))
+                )
+              : null;
+            if (terminalVisualPromptRun) {
+              if (visualPromptIntervalRef.current) {
+                clearInterval(visualPromptIntervalRef.current);
+                visualPromptIntervalRef.current = null;
+              }
+              reject(new Error(userFacingGenerationError(terminalVisualPromptRun.error_msg || terminalVisualPromptRun.message || "画面方案生成失败")));
+              return;
+            }
 
             // 实时更新进度到 Agent 面板
             const totalPages = Number(progressData?.total ?? progressData?.total_pages ?? 0);
@@ -3946,18 +3972,26 @@ function App() {
 	    };
 	    updateSinglePageRunMessage(`正在保存修改并重新生成第 ${slide.page_num} 页...`);
 	    setOperatingProjectId(projectId);
+	    let visualPromptRunId: string | null = null;
 	    let generationRunId: string | null = null;
 	    try {
-	      if (needsVisualPlan) {
-	        updateSinglePageRunMessage(`正在更新第 ${slide.page_num} 页画面描述...`);
-	        showToast(`正在更新第 ${slide.page_num} 页画面描述...`, "info");
-	        await generateVisualPlan(projectId, pageNums, stageContext);
-	        clearSlideStale(slideId, "content");
-	      }
 	      if (needsPrompt) {
-	        updateSinglePageRunMessage(`正在更新第 ${slide.page_num} 页生图 Prompt...`);
-	        showToast(`正在更新第 ${slide.page_num} 页生图 Prompt...`, "info");
-	        await generatePrompts(projectId, pageNums, stageContext);
+	        updateSinglePageRunMessage(`正在更新第 ${slide.page_num} 页画面方案...`);
+	        showToast(`正在更新第 ${slide.page_num} 页画面方案...`, "info");
+	        const visualPromptResult = await generateVisualPrompts(projectId, pageNums, stageContext);
+	        visualPromptRunId = visualPromptResult?.run?.id ? String(visualPromptResult.run.id) : null;
+	        if (visualPromptRunId) {
+	          locallyHandledRunIdsRef.current.add(visualPromptRunId);
+	          updateSinglePageRunMessage(runProgressText(visualPromptResult.run), { runId: visualPromptRunId });
+	        }
+	        const visualPromptWorkflow = await pollUntilStatusNotGenerating(projectId);
+	        const visualPromptRun = visualPromptRunId && visualPromptWorkflow?.last_run?.id === visualPromptRunId
+	          ? visualPromptWorkflow.last_run
+	          : null;
+	        if (visualPromptRun && String(visualPromptRun.status || "") !== "succeeded") {
+	          throw new Error(userFacingGenerationError(visualPromptRun.error_msg || visualPromptRun.message || "画面方案生成失败"));
+	        }
+	        clearSlideStale(slideId, "content");
 	        clearSlideStale(slideId, "visual");
 	      }
 	      updateSinglePageRunMessage(`正在启动第 ${slide.page_num} 页图片生成...`);
@@ -3999,6 +4033,9 @@ function App() {
 	      ]);
 	      addSystemLog(`用户保存并重新生成了第 ${slide.page_num} 页`);
 	    } catch (err: any) {
+	      if (visualPromptRunId) {
+	        locallyHandledRunIdsRef.current.delete(visualPromptRunId);
+	      }
 	      if (generationRunId) {
 	        locallyHandledRunIdsRef.current.delete(generationRunId);
 	      }
@@ -4049,21 +4086,31 @@ function App() {
     if (!options?.local) {
       setOperatingProjectId(projectId);
     }
+    let visualPromptRunId: string | null = null;
     try {
       const needsFullPlan = targets.filter((x) => x.stale.content);
       const needsPrompt = targets.filter((x) => x.stale.content || x.stale.visual);
       const pageNumsForPrompt = Array.from(new Set(needsPrompt.map((x) => x.slide.page_num)));
       const updatedSlideIds = new Set(needsPrompt.map((x) => x.slide.id));
 
-      if (needsFullPlan.length > 0) {
-        showToast(`正在更新 ${needsFullPlan.length} 页的画面描述...`, "info");
-        const pageNums = needsFullPlan.map((x) => x.slide.page_num);
-        await generateVisualPlan(projectId, pageNums, buildCrossStageContext("visual"));
-      }
-
       if (pageNumsForPrompt.length > 0) {
-        showToast(`正在更新 ${pageNumsForPrompt.length} 页的生图提示词...`, "info");
-        await generatePrompts(projectId, pageNumsForPrompt, buildCrossStageContext("visual"));
+        showToast(`正在更新 ${pageNumsForPrompt.length} 页的画面方案...`, "info");
+        const startResult = await generateVisualPrompts(projectId, pageNumsForPrompt, buildCrossStageContext("visual"));
+        if (startResult?.run?.id) {
+          visualPromptRunId = String(startResult.run.id);
+          locallyHandledRunIdsRef.current.add(visualPromptRunId);
+          const startedWorkflow = await fetchWorkflowStatus(projectId);
+          if (startedWorkflow?.project_id === projectId && selectedProjectIdRef.current === projectId) {
+            setProjectStatus(startedWorkflow);
+          }
+        }
+        const finalWorkflow = await pollUntilStatusNotGenerating(projectId);
+        const finalRun = visualPromptRunId && finalWorkflow?.last_run?.id === visualPromptRunId
+          ? finalWorkflow.last_run
+          : null;
+        if (finalRun && String(finalRun.status || "") !== "succeeded") {
+          throw new Error(userFacingGenerationError(finalRun.error_msg || finalRun.message || "画面方案生成失败"));
+        }
       }
 
       const freshSlides = await loadSlides(projectId);
@@ -7506,6 +7553,11 @@ function App() {
     .filter((s) => s.status !== "completed" && s.status !== "failed")
     .map((s) => s.page_num)
     .filter((n) => Number.isFinite(n));
+  const latestVisualPromptProblemRun =
+    currentProjectStatus?.last_run?.kind === "visual_prompts" &&
+    ["failed", "stale", "cancelled"].includes(String(currentProjectStatus.last_run.status || ""))
+      ? currentProjectStatus.last_run
+      : null;
   const statusCard: StatusCardData | null = selectedProject
     ? getStatusCard({
         workflowState,
@@ -7520,6 +7572,7 @@ function App() {
         progressDisclosure: activeProgressDisclosure,
         canStartPrototypeGeneration,
         canStartFullGeneration,
+        latestProblemRun: latestVisualPromptProblemRun,
       })
     : null;
   const statusCardActionDispatch = (key: StatusActionKey) => {
