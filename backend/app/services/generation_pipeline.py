@@ -29,6 +29,7 @@ from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, sh
 from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import cleanup_generation_progress, finish_run, get_run, is_run_active, mark_run_running, update_run_progress
+from app.services.section_text import should_render_section_title
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,6 @@ redis_client = redis.from_url(
     health_check_interval=30,
 )
 MAX_REFERENCE_INPUTS = max(1, min(14, int(settings.IMAGE_MAX_REFERENCE_INPUTS or 14)))
-_MODULE_MARKER_RE = re.compile(r"模块\s*([一二三四五六七八九十百千万0-9]+)")
 MAX_VERSIONS_PER_SLIDE = 10
 
 
@@ -249,19 +249,6 @@ def _slide_text_content(slide: Slide) -> Dict:
     return text if isinstance(text, dict) else {}
 
 
-def _module_marker_from_slide(slide: Slide) -> str:
-    text = _slide_text_content(slide)
-    candidates = [
-        str(text.get("headline") or ""),
-        str((slide.content_json or {}).get("section_title") or "") if isinstance(slide.content_json, dict) else "",
-    ]
-    for value in candidates:
-        match = _MODULE_MARKER_RE.search(value)
-        if match:
-            return match.group(1)
-    return ""
-
-
 def _uses_seed_base_edit_contract(slide: Slide) -> bool:
     return (slide.type or "").lower() == "section"
 
@@ -279,13 +266,10 @@ def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
     section_title = str(content.get("section_title") or "").strip()
     headline = str(text.get("headline") or "").strip()
     subhead = str(text.get("subhead") or "").strip()
-    marker = _module_marker_from_slide(slide)
 
     targets = []
-    if marker:
-        targets.append(f"module marker 「{marker}」")
-    if section_title:
-        targets.append(f"main title 「{section_title}」")
+    if should_render_section_title(section_title, text):
+        targets.append(f"chapter label 「{section_title}」")
     if headline:
         targets.append(f"headline 「{headline}」")
     if subhead:
@@ -295,11 +279,11 @@ def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
     return (
         "\n\nDIRECT SEED IMAGE EDIT CONTRACT: Use Reference Image 1 as the base slide image. "
         "Keep its background, texture, ornament placement, left-right composition, typography scale, "
-        "spacing, and alignment as unchanged as possible. Only update the visible chapter marker and "
-        f"chapter text to: {target_text}. Remove old seed chapter text. Do not copy the seed's old "
-        "module marker or title. Do not add Arabic numerals such as 03 unless they already exist in "
-        "the base image. This contract overrides any earlier layout or composition wording that conflicts "
-        "with the base image."
+        "spacing, and alignment as unchanged as possible. Only update the visible chapter text to: "
+        f"{target_text}. Remove old seed chapter text, standalone chapter-number badges, and old module "
+        "markers/titles. Do not create any extra standalone chapter-number badge, module marker, module "
+        "title, or Arabic numeral unless it appears inside the quoted target text. This contract overrides "
+        "any earlier layout or composition wording that conflicts with the base image."
     )
 
 
