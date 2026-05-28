@@ -522,6 +522,42 @@ def test_section_prompt_requires_chapter_label_from_section_title():
     assert 'Headline: "我们是谁？"' in prompt
 
 
+def test_section_prompt_does_not_duplicate_chapter_number_channels():
+    prompts = prompt_engine.generate_prompts_for_all_pages(
+        visual_plan=[{
+            "page_num": 18,
+            "type": "section",
+            "layout": "section",
+            "visual_evidence": "章节标题/编号/转场氛围",
+            "visual_description": (
+                "页面中央以白色无衬线粗体呈现章节编号「06」与主标题「创意概念」，"
+                "下方以较小字号标注副标题「Part 6 — 《拿不准时刻》系列」。"
+            ),
+        }],
+        content_plan=[{
+            "page_num": 18,
+            "type": "section",
+            "section_title": "模块六",
+            "text_content": {
+                "headline": "创意概念",
+                "subhead": "Part 6 — 《拿不准时刻》系列",
+                "body": "",
+            },
+        }],
+        style_text_override="Style: 红白活力\nPalette: #FF2442, #FFFFFF",
+    )
+
+    prompt = prompts[0]["prompt"]
+    assert 'Headline: "创意概念"' in prompt
+    assert 'Subhead: "Part 6 — 《拿不准时刻》系列"' in prompt
+    assert 'Chapter label: "模块六"' not in prompt
+    assert "模块六" not in prompt
+    assert "章节编号" not in prompt
+    assert "编号" not in prompt
+    assert "「06」" not in prompt
+    assert prompt.count("Part 6") == 1
+
+
 def test_fallback_visual_plan_uses_concrete_visual_evidence():
     plan = _fallback_visual_plan(
         [

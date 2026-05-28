@@ -80,12 +80,36 @@ def test_section_seed_base_edit_contract_is_compact():
 
     assert "DIRECT SEED IMAGE EDIT CONTRACT" in instruction
     assert "Use Reference Image 1 as the base slide image" in instruction
-    assert "module marker 「三」" in instruction
-    assert "main title 「术」" in instruction
     assert "headline 「模块三：术」" in instruction
     assert "subhead 「企业怎么布局」" in instruction
+    assert "module marker 「三」" not in instruction
+    assert "main title 「术」" not in instruction
+    assert "standalone chapter-number badge" in instruction
     assert "overrides any earlier layout or composition wording" in instruction
     assert len(instruction) < 1000
+
+
+def test_section_seed_base_edit_contract_uses_single_visible_number_source():
+    slide = Slide(
+        page_num=18,
+        type="section",
+        content_json={
+            "section_title": "模块六",
+            "text_content": {
+                "headline": "创意概念",
+                "subhead": "Part 6 — 《拿不准时刻》系列",
+            },
+        },
+    )
+
+    instruction = generation_pipeline._seed_base_edit_instruction(slide, 1)
+
+    assert "DIRECT SEED IMAGE EDIT CONTRACT" in instruction
+    assert "headline 「创意概念」" in instruction
+    assert "subhead 「Part 6 — 《拿不准时刻》系列」" in instruction
+    assert "module marker 「六」" not in instruction
+    assert "main title 「模块六」" not in instruction
+    assert "standalone chapter-number badge" in instruction
 
 
 def test_seed_base_edit_contract_does_not_affect_content_pages():

@@ -6,6 +6,7 @@ from app.services.overlay_layers import (
     enabled_overlay_layers,
     overlay_reservation_instruction,
 )
+from app.services.section_text import sanitize_section_visual_numbering, should_render_section_title
 from app.services.visual_directives import (
     extract_visual_directives,
     normalize_visual_requirements,
@@ -343,6 +344,8 @@ def _compact_visual_evidence_with_style(
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
     visual_evidence = _strip_absent_text_slot_clauses(visual_evidence, content_text)
+    if str((page_intent or {}).get("type") or "").strip().lower() == "section":
+        visual_evidence = sanitize_section_visual_numbering(visual_evidence)
     return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
 
 
@@ -360,6 +363,8 @@ def _compact_layout_intent(
         visual_desc = _sanitize_product_reference_text(visual_desc)
     visual_desc = _remove_brand_mark_drawing_language(visual_desc)
     visual_desc = _strip_absent_text_slot_clauses(visual_desc, content_text)
+    if str((page_intent or {}).get("type") or "").strip().lower() == "section":
+        visual_desc = sanitize_section_visual_numbering(visual_desc)
     if len(visual_desc) > 260:
         visual_desc = visual_desc[:260].rstrip() + "..."
 
@@ -628,7 +633,7 @@ def generate_prompt_for_page(
     is_punchline_page = _is_punchline_page(page_intent)
     page_type = str((page_intent or {}).get("type") or "").strip().lower()
     section_title = str((content_text or {}).get("section_title") or "").strip()
-    if page_type == "section" and section_title:
+    if page_type == "section" and should_render_section_title(section_title, content_text):
         label = _escape(_strip_markdown(section_title))
         if label:
             text_directives.append(f'Chapter label: "{label}"')
