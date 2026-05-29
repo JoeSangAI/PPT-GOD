@@ -109,6 +109,56 @@ def test_source_context_includes_only_figures_inside_selected_scope():
     assert "第二章内的客户反馈图" not in context.text
 
 
+def test_source_context_keeps_content_figures_when_source_page_refs_are_present():
+    pack = _pack(
+        "deck.pdf",
+        [{"chapter_id": "c1", "title": "整份材料", "start_page": 1, "end_page": 30}],
+        token_count=5000,
+    )
+    pack["images"] = [
+        {
+            "id": f"deck.pdf:p{page_num}:page",
+            "source_type": "pdf",
+            "source_document": "deck.pdf",
+            "source_page_num": page_num,
+            "pdf_source_page_num": page_num,
+            "chapter_id": "c1",
+            "figure_role": "source_page",
+            "content_significance": "high",
+            "asset_kind": "source_page_image",
+            "is_full_page_reference": True,
+            "bbox": [0, 0, 960, 540],
+            "bbox_area": 518400,
+            "nearby_text": f"第{page_num}页整页原图",
+        }
+        for page_num in range(1, 31)
+    ]
+    pack["images"].append({
+        "id": "deck.pdf:p30:x1:1",
+        "source_type": "pdf",
+        "source_document": "deck.pdf",
+        "source_page_num": 30,
+        "pdf_source_page_num": 30,
+        "chapter_id": "c1",
+        "figure_role": "content",
+        "content_significance": "high",
+        "asset_kind": "document_image",
+        "bbox": [100, 100, 700, 420],
+        "bbox_area": 192000,
+        "nearby_text": "第30页关键产品截图",
+    })
+    pack["stats"]["images"] = len(pack["images"])
+
+    context = build_source_context(
+        brief="按材料整理，不是1:1复刻",
+        source_packs=[pack],
+        token_budget=120_000,
+    )
+
+    assert 'figure_id="deck.pdf:p30:page"' in context.text
+    assert 'figure_id="deck.pdf:p30:x1:1"' in context.text
+
+
 def test_source_context_includes_requested_intro_with_first_chapter_and_figures():
     pack = _pack(
         "创新.pdf",

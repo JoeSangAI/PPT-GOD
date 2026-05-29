@@ -293,6 +293,25 @@ export function getDownloadUrl(projectId: string, prototype?: boolean) {
   return url.toString();
 }
 
+export type EditablePptxMode = "standard" | "enhanced" | "aggressive";
+
+export async function startEditablePptx(projectId: string, restoreMode: EditablePptxMode = "standard") {
+  const res = await apiFetch(`${API_BASE}/projects/${projectId}/editable-pptx`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ restore_mode: restoreMode }),
+  });
+  return (await checkRes(res)).json();
+}
+
+export function getEditableDownloadUrl(projectId: string, restoreMode: EditablePptxMode = "standard") {
+  const url = makeApiUrl(`/projects/${projectId}/download-editable`);
+  url.searchParams.set("restore_mode", restoreMode);
+  const testerId = getStoredAuth()?.testerId;
+  if (testerId) url.searchParams.set("tester_id", testerId);
+  return url.toString();
+}
+
 export function getContentPlanMarkdownUrl(projectId: string) {
   const url = makeApiUrl(`/projects/${projectId}/slides/export-markdown`);
   const testerId = getStoredAuth()?.testerId;

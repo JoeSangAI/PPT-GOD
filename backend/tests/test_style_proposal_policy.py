@@ -162,6 +162,55 @@ def test_user_style_description_overrides_reference_clone_shortcut(monkeypatch):
     assert "聊天要求优先级" in captured["prompt"]
 
 
+def test_asset_based_style_proposal_normalizes_bare_hex_palette(monkeypatch):
+    class _BareHexCompletions:
+        def create(self, **kwargs):
+            proposal = {
+                "name": "琥珀暖调都会",
+                "palette": [
+                    {"name": "温暖深棕", "hex": "4A3728", "role": "品牌主色/章节页主色"},
+                    {"name": "琥珀金", "hex": "C9924A", "role": "强调色/数据高亮/编号"},
+                    {"name": "暖白米", "hex": "FBF8F3", "role": "内容页基底/正文区"},
+                    {"name": "深炭灰", "hex": "3A3A3A", "role": "正文/数据文字"},
+                ],
+                "mood": "温暖专业",
+                "font": "现代无衬线",
+                "description": "以温润深棕为品牌主色，琥珀金作为强调色，内容页以暖白米为底并保持正文可读。",
+                "source": "asset_based",
+            }
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposal, ensure_ascii=False)))]
+            )
+
+    class _BareHexClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=_BareHexCompletions())
+
+    monkeypatch.setattr(style_proposal, "get_llm_client", lambda: _BareHexClient())
+    monkeypatch.setattr(style_proposal, "get_minimax_llm_model", lambda: "fake-model")
+    monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
+
+    proposals = style_proposal.generate_style_proposals(
+        [{"type": "cover", "text_content": {"headline": "Botlife.AI", "body": "AI 社交平台"}}],
+        assets={
+            "user_description": "重新生成一个更暖、更商务的视觉方向。",
+            "reference_analysis": {
+                "description": "温暖商务参考图",
+                "colors": {"primary": "#4A3728"},
+                "dominant_palette": [{"hex": "#4A3728", "share": 0.4}],
+            },
+        },
+    )
+
+    assert [color["hex"] for color in proposals[0]["palette"]] == [
+        "#4A3728",
+        "#C9924A",
+        "#FBF8F3",
+        "#3A3A3A",
+    ]
+    assert "主色 4A3728" not in proposals[0]["page_type_adaptation"]
+
+
 def test_template_only_style_proposal_is_deterministic(monkeypatch):
     monkeypatch.setattr(style_proposal, "_load_style_library", lambda: [])
     monkeypatch.setattr(

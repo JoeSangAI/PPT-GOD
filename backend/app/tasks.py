@@ -10,6 +10,7 @@ from app.core.provider_credentials import load_task_provider_credentials, provid
 from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.artifact_versions import content_signature, style_asset_signature
+from app.services.editable_pptx_export import build_editable_pptx, build_project_slide_images, normalize_editable_pptx_restore_mode
 from app.services.generation_pipeline import run_generation_pipeline
 from app.services.image_generation import clear_reference_upload_cache
 from app.services.image_task_audit import append_image_generation_log
@@ -89,6 +90,20 @@ def _resolve_target_pages(project_id: str, page_nums: list = None) -> list:
         return [s.page_num for s in slides if s.prompt_text]
     finally:
         db.close()
+
+
+def _resolve_task_file_path(path: str | None) -> str | None:
+    if not path:
+        return None
+    if os.path.exists(path):
+        return path
+    output_dir = settings.OUTPUT_DIR or "./outputs"
+    if str(path).startswith("./outputs"):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(output_dir)), str(path)[2:])
+        if os.path.exists(candidate):
+            return candidate
+    abs_path = os.path.abspath(str(path))
+    return abs_path if os.path.exists(abs_path) else path
 
 
 def _image_task_page_chunk_size() -> int:
@@ -398,6 +413,134 @@ def _generate_slides_task_inner(
         except Exception as exc:
             logger.warning("Failed to delete generation task tracking keys for project %s: %s", project_id, exc)
         clear_reference_upload_cache()
+        db.close()
+
+
+@celery_app.task
+def generate_editable_pptx_task(
+    project_id: str,
+    run_id: str = None,
+    credential_id: str = None,
+    restore_mode: str = "standard",
+    **legacy_kwargs,
+):
+    """Celery task: build an optional editable PPTX from the completed image deck."""
+    if legacy_kwargs:
+        logger.info("Ignoring legacy editable PPTX task kwargs: %s", sorted(legacy_kwargs.keys()))
+    try:
+        credentials = load_task_provider_credentials(redis_client, credential_id)
+    except RuntimeError as exc:
+        message = "任务凭据读取失败，请重新准备可编辑版。"
+        logger.error("Editable PPTX task credential failure: project=%s run=%s error=%s", project_id, run_id, exc)
+        _finish_run_for_credential_error(run_id, message, exc)
+        return {"project_id": project_id, "status": "failed", "error": message}
+    with provider_credentials_context(credentials):
+        return _generate_editable_pptx_task_inner(project_id, run_id=run_id, restore_mode=restore_mode)
+
+
+def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, restore_mode: str = "standard"):
+    mode = normalize_editable_pptx_restore_mode(restore_mode)
+    db = SessionLocal()
+    try:
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            finish_run(db, run_id, status="failed", message="项目不存在", error_msg="project_not_found")
+            db.commit()
+            return {"project_id": project_id, "status": "not_found"}
+
+        slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
+        if not slides:
+            finish_run(db, run_id, status="failed", message="没有可处理的页面", error_msg="no_slides")
+            db.commit()
+            return {"project_id": project_id, "status": "no_slides"}
+
+        slide_images = build_project_slide_images(slides)
+        for slide_data in slide_images:
+            resolved = _resolve_task_file_path(slide_data.get("image_path"))
+            slide_data["image_path"] = resolved or ""
+        missing_pages = [
+            int(slide.page_num)
+            for slide in slides
+            if slide.status != "completed" or not _resolve_task_file_path(slide.image_path) or not os.path.exists(str(_resolve_task_file_path(slide.image_path)))
+        ]
+        if missing_pages:
+            message = f"第 {', '.join(map(str, missing_pages))} 页还没有完整生成，暂时不能准备可编辑版。"
+            finish_run(db, run_id, status="failed", message=message, error_msg="missing_slide_images")
+            db.commit()
+            return {"project_id": project_id, "status": "failed", "error": message}
+
+        output_dir = os.path.join(settings.OUTPUT_DIR or "./outputs", project_id)
+        output_filename = "editable_presentation.pptx" if mode == "standard" else f"editable_presentation_{mode}.pptx"
+        output_path = os.path.join(output_dir, output_filename)
+        work_dir = os.path.join(output_dir, ".editable_pptx_assets", mode)
+
+        mark_run_running(db, run_id, stage="editable_pptx", message="正在准备可编辑版...")
+        db.commit()
+
+        def report_progress(completed: int, total: int, message: str):
+            update_run_progress(
+                db,
+                run_id,
+                stage="editable_pptx",
+                completed_count=completed,
+                total_count=total,
+                message=message,
+            )
+            db.commit()
+
+        result = build_editable_pptx(
+            slide_images=slide_images,
+            output_path=output_path,
+            progress_callback=report_progress,
+            work_dir=work_dir,
+            restore_mode=mode,
+            reuse_ocr_cache=False,
+        )
+        failed_count = len(result.ocr_failed_pages)
+        if failed_count:
+            message = f"可编辑版已生成，{failed_count} 页保留为图片"
+        else:
+            message = "可编辑版已生成"
+        finish_run(
+            db,
+            run_id,
+            status="succeeded",
+            message=message,
+            completed_count=result.slide_count,
+            failed_count=failed_count,
+        )
+        project.has_unread_notification = True
+        project.unread_notification_message = "可编辑版已准备好"
+        db.commit()
+        logger.info(
+            "Editable PPTX task completed: project=%s slides=%s text_boxes=%s visual_assets=%s failed_pages=%s",
+            project_id,
+            result.slide_count,
+            result.text_box_count,
+            result.visual_asset_count,
+            result.ocr_failed_pages,
+        )
+        return {
+            "project_id": project_id,
+            "status": "completed",
+            "restore_mode": mode,
+            "output_path": result.output_path,
+            "slide_count": result.slide_count,
+            "text_box_count": result.text_box_count,
+            "visual_asset_count": result.visual_asset_count,
+            "ocr_failed_pages": result.ocr_failed_pages,
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Editable PPTX task failed: project=%s", project_id)
+        try:
+            finish_run(db, run_id, status="failed", message="可编辑版生成失败", error_msg=str(exc)[:500])
+            db.commit()
+        except Exception as cleanup_exc:
+            db.rollback()
+            logger.warning("Failed to mark editable PPTX run failed: %s", cleanup_exc)
+        return {"project_id": project_id, "status": "failed", "error": str(exc)}
+    finally:
         db.close()
 
 

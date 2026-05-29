@@ -344,6 +344,10 @@ def _has_page_count_context(text: str, start: int, end: int) -> bool:
     return bool(PAGE_COUNT_CONTEXT_RE.search(snippet))
 
 
+def _number_is_percent(text: str, end: int) -> bool:
+    return bool(re.match(r"\s*[％%]", text[end:end + 3]))
+
+
 def infer_page_count_range_from_topic(topic: str) -> tuple[int, int] | None:
     """Infer an explicit page-count range from user-facing brief text."""
     text = _normalize_page_count_digits(topic or "")
@@ -360,6 +364,8 @@ def infer_page_count_range_from_topic(topic: str) -> tuple[int, int] | None:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             if _looks_like_slide_reference(text, match.start(1)):
                 continue
+            if _number_is_percent(text, match.end(1)) or _number_is_percent(text, match.end(2)):
+                continue
             start = _coerce_requested_page_count(match.group(1))
             end = _coerce_requested_page_count(match.group(2))
             if start and end and (min(start, end) >= 20 or _has_page_count_context(text, match.start(1), match.end(2))):
@@ -369,6 +375,8 @@ def infer_page_count_range_from_topic(topic: str) -> tuple[int, int] | None:
     )
     for pattern in upper_bound_patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            if _number_is_percent(text, match.end(1)):
+                continue
             page_count = _coerce_requested_page_count(match.group(1))
             if page_count:
                 return (1, page_count)
@@ -392,6 +400,8 @@ def infer_page_count_from_topic(topic: str) -> int | None:
     for pattern in exact_patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             if _looks_like_slide_reference(text, match.start(1)):
+                continue
+            if _number_is_percent(text, match.end(1)):
                 continue
             page_count = _coerce_requested_page_count(match.group(1))
             if page_count and _has_page_count_context(text, match.start(1), match.end(1)):
@@ -561,7 +571,7 @@ def _effective_intent_contract(topic: str, documents: str, intent_contract: dict
 
     legacy_contract = None
     legacy_director_contract = None
-    if detect_ppt_sources(documents):
+    if detect_ppt_sources(documents) or _single_source_context_page_source(documents):
         legacy_contract = infer_legacy_intent_contract(
             topic,
             source_diagnostics=source_diagnostics_from_documents(documents),
@@ -703,6 +713,59 @@ def sanitize_ppt_recovery_text_for_content(documents: str) -> str:
     return re.sub(r"\n{4,}", "\n\n\n", text).strip()
 
 
+_SOURCE_LINE_SENTENCE_END_RE = re.compile(r"[。！？!?；;：:]$")
+_SOURCE_LINE_LIST_START_RE = re.compile(
+    r"^(?:[•·*▪▫◦]\s*|[-–—]\s+|\d+[.)、．]\s*|[一二三四五六七八九十]+[、.)．]\s*)"
+)
+_SOURCE_LINE_CONTINUATION_PUNCT_RE = re.compile(r"^[，,、；;：:）)\]}】]")
+_SOURCE_LINE_SPLIT_TOKEN_RE = re.compile(r"^[A-Za-z\u4e00-\u9fff][、，,；;：:]")
+
+
+def _source_line_is_wrapped_continuation(previous: str, current: str) -> bool:
+    previous = str(previous or "").rstrip()
+    current = str(current or "").lstrip()
+    if not previous or not current:
+        return False
+    if _SOURCE_LINE_SENTENCE_END_RE.search(previous):
+        return False
+    if _SOURCE_LINE_LIST_START_RE.match(current):
+        return False
+    if previous.endswith("-"):
+        return True
+    return bool(
+        _SOURCE_LINE_CONTINUATION_PUNCT_RE.match(current)
+        or _SOURCE_LINE_SPLIT_TOKEN_RE.match(current)
+    )
+
+
+def _join_wrapped_source_line(previous: str, current: str) -> str:
+    previous = str(previous or "").rstrip()
+    current = str(current or "").lstrip()
+    if previous.endswith("-"):
+        return previous[:-1] + current
+    if re.search(r"[\u4e00-\u9fff]$", previous) or re.match(r"^[\u4e00-\u9fff，,、；;：:]", current):
+        return previous + current
+    return previous + " " + current
+
+
+_LEADING_NUMERIC_LIST_MARKER_RE = re.compile(r"^\s*(\d+)([.)、．])(\s*)(.*)$")
+
+
+def _strip_leading_list_marker(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^\s*[-*+]\s*", "", text).strip()
+    match = _LEADING_NUMERIC_LIST_MARKER_RE.match(text)
+    if not match:
+        return text
+    _number, delimiter, spacing, rest = match.groups()
+    # Preserve decimals and timeline dates such as 2023.8 or 3.14.
+    if delimiter in {".", "．"} and not spacing and rest[:1].isdigit():
+        return text
+    return rest.strip() if rest else text
+
+
 def _clean_ppt_source_page_lines(lines: list[str]) -> list[str]:
     cleaned: list[str] = []
     for line in lines:
@@ -710,6 +773,9 @@ def _clean_ppt_source_page_lines(lines: list[str]) -> list[str]:
         if not value or value in _PPT_SOURCE_TEXT_MARKERS:
             continue
         if value.startswith("【页面意图】") or value.startswith("【识别置信度】"):
+            continue
+        if cleaned and _source_line_is_wrapped_continuation(cleaned[-1], value):
+            cleaned[-1] = _join_wrapped_source_line(cleaned[-1], value)
             continue
         cleaned.append(value)
     return cleaned
@@ -767,17 +833,297 @@ def _parse_ppt_source_pages(documents: str) -> list[dict]:
     return pages
 
 
+PAGE_SOURCE_KINDS = {"pdf", "pptx", "ppt"}
+
+
+def _canonical_page_source_kind(kind: str) -> str:
+    value = str(kind or "").strip().lower()
+    if value in {"application/pdf"}:
+        return "pdf"
+    if value in {"application/vnd.openxmlformats-officedocument.presentationml.presentation", "powerpoint"}:
+        return "pptx"
+    return value
+
+
+def _outline_source_type(kind: str) -> str:
+    canonical = _canonical_page_source_kind(kind)
+    if canonical in {"pptx", "ppt"}:
+        return "pptx_slide"
+    return canonical or "pdf"
+
+
+def _source_context_page_sources(documents: str) -> list[dict]:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for page in _extract_source_context_pages(documents):
+        source_document = str(page.get("source_document") or "").strip()
+        source_type = _canonical_page_source_kind(str(page.get("source_type") or ""))
+        if not source_document or source_type not in PAGE_SOURCE_KINDS:
+            continue
+        try:
+            page_num = int(page.get("page_num") or 0)
+        except (TypeError, ValueError):
+            page_num = 0
+        if page_num <= 0:
+            continue
+        grouped.setdefault((source_document, source_type), []).append(page)
+
+    sources: list[dict] = []
+    for (source_document, source_type), pages in grouped.items():
+        page_by_num: dict[int, dict] = {}
+        for page in pages:
+            page_num = int(page.get("page_num") or 0)
+            page_by_num.setdefault(page_num, page)
+        ordered_pages = [page_by_num[page_num] for page_num in sorted(page_by_num)]
+        sources.append({
+            "filename": source_document,
+            "kind": source_type,
+            "pages": ordered_pages,
+            "page_count": len(ordered_pages),
+        })
+    return sorted(sources, key=lambda item: str(item.get("filename") or ""))
+
+
+def _single_source_context_page_source(documents: str) -> dict | None:
+    sources = _source_context_page_sources(documents)
+    return sources[0] if len(sources) == 1 else None
+
+
+def _figure_refs_for_source_page(
+    documents: str,
+    source_document: str,
+    source_type: str,
+    page_num: int,
+    reason: str,
+    page_text: str = "",
+) -> list[dict]:
+    by_page = _source_context_figures_by_page(documents)
+    figures = by_page.get((source_document, page_num), [])
+    if not figures:
+        return []
+    page_for_scoring = {
+        "section_title": "",
+        "headline": page_text,
+        "subhead": "",
+        "bullets": [],
+        "speaker_notes": "",
+        "visual_suggestion": "",
+    }
+    candidates: list[tuple[float, dict]] = []
+    for figure in figures:
+        figure_id = str(figure.get("figure_id") or "").strip()
+        if not figure_id or _figure_is_source_page_reference(figure):
+            continue
+        if not _figure_is_content_bearing(figure):
+            continue
+        candidates.append((_figure_selection_score(page_for_scoring, figure), {
+            "source_document": str(figure.get("source_document") or source_document).strip(),
+            "source_page_num": page_num,
+            "source_type": _outline_source_type(str(figure.get("source_type") or source_type)),
+            "figure_id": figure_id,
+            "reason": reason,
+        }))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [ref for _score, ref in candidates[:8]]
+
+
+def _source_context_page_source_count(documents: str) -> int | None:
+    source = _single_source_context_page_source(documents)
+    if not source:
+        return None
+    page_count = int(source.get("page_count") or 0)
+    return page_count if page_count > 0 else None
+
+
+def _ppt_page_is_cover_like(page_num: int, lines: list[str]) -> bool:
+    if page_num != 1:
+        return False
+    clean_lines = [str(line).strip() for line in lines if str(line).strip()]
+    if not clean_lines:
+        return True
+    total_chars = sum(len(line) for line in clean_lines)
+    if len(clean_lines) >= 4:
+        return False
+    if total_chars > 160:
+        return False
+    if len(clean_lines) == 1:
+        return True
+    if len(clean_lines) == 2:
+        return total_chars <= 120
+    return total_chars <= 120
+
+
+def _ppt_page_is_ending_like(page_num: int, total_pages: int, lines: list[str]) -> bool:
+    if total_pages <= 1 or page_num != total_pages:
+        return False
+    clean_lines = [str(line).strip() for line in lines if str(line).strip()]
+    if not clean_lines:
+        return True
+    total_chars = sum(len(line) for line in clean_lines)
+    compact = re.sub(r"\s+", "", "\n".join(clean_lines)).lower()
+    ending_terms = (
+        "谢谢",
+        "感谢",
+        "thankyou",
+        "thanks",
+        "q&a",
+        "qa",
+        "theend",
+        "联系我们",
+        "联系方式",
+    )
+    if not any(term in compact for term in ending_terms):
+        return False
+    signal_re = re.compile(
+        r"(谢谢|感谢|thank\s*you|thanks|q\s*&\s*a|the\s*end|联系我们|联系方式|扫码|二维码|"
+        r"电话|邮箱|邮件|email|wechat|微信|联系人|https?://|www\.|@)",
+        flags=re.IGNORECASE,
+    )
+    content_lines = [line for line in clean_lines if not signal_re.search(line)]
+    content_chars = sum(len(line) for line in content_lines)
+    if not content_lines and len(clean_lines) <= 4 and total_chars <= 160:
+        return True
+    if len(clean_lines) <= 2 and total_chars <= 100 and content_chars <= 32:
+        return True
+    if len(clean_lines) <= 3 and total_chars <= 120 and content_chars <= 24:
+        return True
+    return False
+
+
 def _ppt_page_type(page_num: int, total_pages: int, lines: list[str]) -> str:
-    if page_num == 1:
+    if _ppt_page_is_cover_like(page_num, lines):
         return "cover"
-    if total_pages > 1 and page_num == total_pages:
+    if _ppt_page_is_ending_like(page_num, total_pages, lines):
         return "ending"
     if len(lines) <= 2 and sum(len(line) for line in lines) <= 80:
         return "section"
     return "content"
 
 
+_SOURCE_TIMELINE_DATE_RE = re.compile(r"\b(20\d{2})[./．](\d{1,2})\b")
+_SOURCE_TIMELINE_CONTEXT_RE = re.compile(
+    r"(发展规划|路线图|时间轴|里程碑|阶段规划|roadmap|timeline|milestone)",
+    flags=re.IGNORECASE,
+)
+_SOURCE_TIMELINE_METRIC_RE = re.compile(
+    r"(?:MAU|MRR|ARR|GMV|DAU|营收|收入|用户|付费|金额|美金|美元|万元|万|亿|\$)",
+    flags=re.IGNORECASE,
+)
+_SOURCE_TIMELINE_STAGE_RE = re.compile(
+    r"(?:版本|开发|测试|公测|上线|发布|商业化|启动|完成|阶段|alpha|beta|release)",
+    flags=re.IGNORECASE,
+)
+
+
+def _timeline_date_key(value: str) -> tuple[int, int] | None:
+    match = _SOURCE_TIMELINE_DATE_RE.search(str(value or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2))
+    except ValueError:
+        return None
+
+
+def _format_timeline_date(key: tuple[int, int]) -> str:
+    return f"{key[0]}.{key[1]}"
+
+
+def _strip_timeline_dates(value: str) -> str:
+    return re.sub(_SOURCE_TIMELINE_DATE_RE, "", str(value or "")).strip(" \t-–—:：,，、")
+
+
+def _timeline_metric_sort_value(value: str) -> float | None:
+    text = str(value or "")
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*(亿|万)?", text)
+    if not matches:
+        return None
+    best = 0.0
+    for raw_number, unit in matches:
+        try:
+            number = float(raw_number)
+        except ValueError:
+            continue
+        if unit == "亿":
+            number *= 10000
+        best = max(best, number)
+    return best or None
+
+
+def _normalize_timeline_source_lines(lines: list[str]) -> list[str]:
+    clean_lines = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if len(clean_lines) < 5:
+        return lines
+
+    context_text = "\n".join(clean_lines[:4])
+    if not _SOURCE_TIMELINE_CONTEXT_RE.search(context_text):
+        return lines
+
+    date_keys: list[tuple[int, int]] = []
+    body_start = 2 if len(clean_lines) >= 3 else 1
+    if not any(_SOURCE_TIMELINE_CONTEXT_RE.search(line) for line in clean_lines[:body_start]):
+        body_start = 1
+
+    stage_lines: list[str] = []
+    metric_lines: list[str] = []
+    leftover_lines: list[str] = []
+    for line in clean_lines[body_start:]:
+        line_has_date = bool(_SOURCE_TIMELINE_DATE_RE.search(line))
+        for match in _SOURCE_TIMELINE_DATE_RE.finditer(line):
+            try:
+                date_keys.append((int(match.group(1)), int(match.group(2))))
+            except ValueError:
+                continue
+        text_without_dates = _strip_timeline_dates(line) if line_has_date else line
+        if not text_without_dates:
+            continue
+        if _SOURCE_TIMELINE_METRIC_RE.search(text_without_dates):
+            metric_lines.append(text_without_dates)
+        elif _SOURCE_TIMELINE_STAGE_RE.search(text_without_dates):
+            stage_lines.append(text_without_dates)
+        else:
+            leftover_lines.append(text_without_dates)
+
+    unique_dates = sorted(set(date_keys))
+    if len(unique_dates) < 3 or len(stage_lines) + len(metric_lines) < 2:
+        return lines
+
+    ordered_metrics = list(metric_lines)
+    metric_values = [_timeline_metric_sort_value(line) for line in ordered_metrics]
+    if len(ordered_metrics) >= 2 and all(value is not None for value in metric_values):
+        ordered_metrics = [
+            line
+            for _value, line in sorted(
+                zip(metric_values, ordered_metrics),
+                key=lambda item: float(item[0] or 0),
+            )
+        ]
+
+    normalized_body: list[str] = []
+    cursor = 0
+    for stage in stage_lines:
+        if cursor >= len(unique_dates):
+            break
+        normalized_body.append(f"{_format_timeline_date(unique_dates[cursor])} {stage}")
+        cursor += 1
+    for metric in ordered_metrics:
+        if cursor >= len(unique_dates):
+            break
+        normalized_body.append(f"{_format_timeline_date(unique_dates[cursor])} {metric}")
+        cursor += 1
+
+    used_values = set(stage_lines) | set(metric_lines)
+    normalized_body.extend(line for line in leftover_lines if line not in used_values)
+    if cursor < len(unique_dates):
+        normalized_body.extend(_format_timeline_date(key) for key in unique_dates[cursor:])
+
+    if len(normalized_body) < 3:
+        return lines
+    return clean_lines[:body_start] + normalized_body
+
+
 def _ppt_page_text_content(page_num: int, lines: list[str]) -> dict[str, str]:
+    lines = _normalize_timeline_source_lines(lines)
+
     if not lines:
         return {
             "headline": f"原 PPT 第{page_num}页",
@@ -882,7 +1228,8 @@ def _is_direct_replicate_request(
 ) -> bool:
     """Detect if the user is requesting a 1:1 PPT replication."""
     sources = detect_ppt_sources(documents)
-    if len(sources) != 1:
+    page_source = _single_source_context_page_source(documents)
+    if len(sources) != 1 and not page_source:
         return False
     policy = _planning_policy(topic, documents, intent_contract)
     return bool(policy.get("allow_direct_ppt_replicate"))
@@ -960,6 +1307,92 @@ def build_direct_ppt_replicate_outline(
     return outline
 
 
+def build_source_context_page_preserve_outline(
+    documents: str,
+    topic: str = "",
+    intent_contract: dict | None = None,
+) -> list[dict]:
+    """Build a deterministic page-by-page draft from a single PDF/PPT-like source context."""
+    documents = sanitize_ppt_recovery_text_for_content(documents)
+    source = _single_source_context_page_source(documents)
+    if not source:
+        return []
+
+    policy = _planning_policy(topic, documents, intent_contract)
+    if not (policy["preserve_source_page_order"] and policy["preserve_source_page_count"]):
+        return []
+    if policy["task_type"] == "template_reference":
+        return []
+
+    filename = str(source.get("filename") or "").strip()
+    source_kind = _canonical_page_source_kind(str(source.get("kind") or ""))
+    source_type = _outline_source_type(source_kind)
+    pages = source.get("pages") if isinstance(source.get("pages"), list) else []
+    total_pages = int(source.get("page_count") or len(pages) or 0)
+    if not filename or not pages:
+        return []
+
+    is_direct = bool(policy.get("allow_direct_ppt_replicate"))
+    reason = "direct_replicate" if is_direct else "single_ppt_page_polish"
+    source_label = "PDF" if source_kind == "pdf" else "PPT"
+    section_title = f"原 {source_label} 逐页复刻" if is_direct else f"原 {source_label} 逐页整理"
+    mode = f"direct_{source_kind}_replicate" if is_direct else f"single_{source_kind}_page_polish"
+    outline: list[dict] = []
+
+    for idx, page in enumerate(pages, start=1):
+        try:
+            page_num = int(page.get("page_num") or idx)
+        except (TypeError, ValueError):
+            page_num = idx
+        lines = _clean_ppt_source_page_lines([
+            str(line).strip()
+            for line in str(page.get("text") or "").splitlines()
+            if str(line).strip()
+        ])
+        text_content = _ppt_page_text_content(page_num, lines)
+        outline.append({
+            "page_num": page_num,
+            "type": _ppt_page_type(page_num, total_pages or len(pages), lines),
+            "section_title": section_title,
+            "text_content": text_content,
+            "speaker_notes": "",
+            "source_facts": {
+                "mode": mode,
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_total_pages": total_pages or len(pages),
+                "source_type": source_type,
+                "source_line_count": len(lines),
+            },
+            "visual_suggestion": (
+                f"按原 {source_label} 第{page_num}页的整页原图、图片位置、背景和信息层级复刻；"
+                "内容规划阶段只做逐页承接，不改写成新叙事。"
+            ),
+            "source_refs": [{
+                "source_document": filename,
+                "source_page_num": page_num,
+                "source_type": source_type,
+                "reason": reason,
+            }],
+            "figure_refs": _figure_refs_for_source_page(
+                documents,
+                filename,
+                source_type,
+                page_num,
+                reason,
+                page_text="\n".join(lines),
+            ),
+            "generation_status": f"{source_kind}_direct" if is_direct else f"{source_kind}_preserve_source",
+        })
+
+    outline.sort(key=lambda page: int(page.get("page_num") or 0))
+    for idx, page in enumerate(outline, start=1):
+        page["page_num"] = idx
+        if isinstance(page.get("source_facts"), dict):
+            page["source_facts"]["source_page_num"] = idx
+    return _normalize_content_markdown(outline)
+
+
 def build_ppt_page_preserve_source_draft(
     documents: str,
     topic: str = "",
@@ -969,7 +1402,11 @@ def build_ppt_page_preserve_source_draft(
     documents = sanitize_ppt_recovery_text_for_content(documents)
     sources = detect_ppt_sources(documents)
     if len(sources) != 1:
-        return []
+        return build_source_context_page_preserve_outline(
+            documents,
+            topic,
+            intent_contract=intent_contract,
+        )
 
     policy = _planning_policy(topic, documents, intent_contract)
     if not (policy["preserve_source_page_order"] and policy["preserve_source_page_count"]):
@@ -1031,18 +1468,18 @@ def infer_page_count_from_single_ppt(
     topic: str = "",
     intent_contract: dict | None = None,
 ) -> int | None:
-    sources = detect_ppt_sources(documents)
-    if len(sources) != 1:
-        return None
     if not _planning_policy(topic, documents, intent_contract)["preserve_source_page_count"]:
         return None
+    sources = detect_ppt_sources(documents)
+    if len(sources) != 1:
+        return _source_context_page_source_count(documents)
     pages = int(sources[0].get("pages") or 0)
     return pages if pages > 0 else None
 
 
 def _source_context_documents(documents: str) -> dict[str, str]:
     sources: dict[str, str] = {}
-    for match in re.finditer(r'---\s*SOURCE\s+filename="([^"]+)"\s+kind="([^"]+)"\s*---', documents or ""):
+    for match in re.finditer(r'---\s*SOURCE\s+filename="([^"]+)"\s+kind="([^"]+)".*?---', documents or ""):
         sources[match.group(1)] = match.group(2)
     for source in detect_ppt_sources(documents):
         filename = str(source.get("filename") or "").strip()
@@ -1284,6 +1721,8 @@ def _source_context_figure_index(source_context: str | None) -> dict[str, dict]:
             "figure_role": attrs.get("figure_role", "").strip(),
             "content_significance": attrs.get("content_significance", "").strip(),
             "nearby_text": attrs.get("nearby_text", "").strip(),
+            "asset_kind": attrs.get("asset_kind", "").strip(),
+            "is_full_page_reference": attrs.get("is_full_page_reference", "").strip(),
         }
     return figures
 
@@ -1521,14 +1960,95 @@ def _figure_is_content_bearing(figure: dict) -> bool:
     return True
 
 
-def _source_context_figures_for_source_refs(source_refs: list, source_figures: dict[str, dict]) -> list[dict]:
+def _figure_is_source_page_reference(figure: dict) -> bool:
+    figure_id = str(figure.get("figure_id") or "").strip()
+    role = str(figure.get("figure_role") or "").strip().lower()
+    asset_kind = str(figure.get("asset_kind") or "").strip().lower()
+    full_page = str(figure.get("is_full_page_reference") or "").strip().lower()
+    return (
+        role == "source_page"
+        or asset_kind == "source_page_image"
+        or full_page in {"1", "true", "yes"}
+        or figure_id.endswith(":page")
+    )
+
+
+def _figure_role_priority(figure: dict) -> float:
+    role = str(figure.get("figure_role") or "").strip().lower()
+    asset_kind = str(figure.get("asset_kind") or "").strip().lower()
+    if _figure_is_source_page_reference(figure):
+        return -50.0
+    if role in {"chart", "table", "diagram"}:
+        return 36.0
+    if role in {"content", "content_figure", "evidence"}:
+        return 30.0
+    if asset_kind in {"product", "screenshot", "material"}:
+        return 28.0
+    if role in {"auxiliary", "decorative", "ornament", "icon", "logo"}:
+        return -100.0
+    return 12.0
+
+
+def _figure_size_score(figure: dict) -> float:
+    width = _figure_float(figure.get("image_width"))
+    height = _figure_float(figure.get("image_height"))
+    pixel_area = max(0.0, width) * max(0.0, height)
+    bbox_area = _figure_float(figure.get("bbox_area"))
+    _bbox_width, _bbox_height, inferred_bbox_area = _figure_bbox_metrics(figure.get("bbox"))
+    if not bbox_area:
+        bbox_area = inferred_bbox_area
+    area = max(pixel_area, bbox_area)
+    if area >= 150_000:
+        return 10.0
+    if area >= 40_000:
+        return 6.0
+    if area >= 12_000:
+        return 2.0
+    return -12.0
+
+
+def _figure_text_relevance_score(page: dict | None, figure: dict) -> float:
+    if not page:
+        return 0.0
+    page_terms = _relevance_terms(_page_map_text_for_relevance(page))
+    figure_terms = _relevance_terms(str(figure.get("nearby_text") or ""))
+    if not page_terms or not figure_terms:
+        return 0.0
+    shared = page_terms & figure_terms
+    overlap_ratio = len(shared) / max(1, min(len(page_terms), len(figure_terms)))
+    return min(30.0, len(shared) * 4.0 + overlap_ratio * 12.0)
+
+
+def _allows_source_page_auto_selection(page: dict | None, source_refs: list) -> bool:
+    text = _page_map_text_for_relevance(page or {})
+    ref_reasons = " ".join(str(ref.get("reason") or "") for ref in source_refs if isinstance(ref, dict))
+    combined = f"{text}\n{ref_reasons}"
+    return bool(re.search(r"(整页(?:截图|原图)?(?:作为|当作)?(?:本页)?素材|whole[- ]page image asset)", combined, flags=re.IGNORECASE))
+
+
+def _figure_selection_score(page: dict | None, figure: dict) -> float:
+    significance = str(figure.get("content_significance") or "").strip().lower()
+    significance_score = {"high": 8.0, "medium": 4.0, "low": -8.0}.get(significance, 0.0)
+    return (
+        _figure_role_priority(figure)
+        + significance_score
+        + _figure_size_score(figure)
+        + _figure_text_relevance_score(page, figure)
+    )
+
+
+def _source_context_figures_for_source_refs(source_refs: list, source_figures: dict[str, dict], page: dict | None = None) -> list[dict]:
     if not source_refs or not source_figures:
         return []
-    refs: list[dict] = []
+    candidates: list[tuple[float, dict, dict]] = []
     seen: set[str] = set()
+    allow_source_page = _allows_source_page_auto_selection(page, source_refs)
     for figure in source_figures.values():
         figure_id = str(figure.get("figure_id") or "").strip()
         if not _is_valid_figure_id(figure_id) or figure_id in seen:
+            continue
+        is_source_page = _figure_is_source_page_reference(figure)
+        if is_source_page and not allow_source_page:
             continue
         if not _figure_is_content_bearing(figure):
             continue
@@ -1550,15 +2070,21 @@ def _source_context_figures_for_source_refs(source_refs: list, source_figures: d
             if ref_page != figure_page or not _source_doc_matches(ref_doc, figure_doc):
                 continue
             seen.add(figure_id)
-            refs.append({
+            ref = {
                 "source_document": figure_doc,
                 "source_page_num": figure_page,
                 "source_type": str(figure.get("source_type") or source_ref.get("source_type") or "pdf"),
                 "figure_id": figure_id,
                 "reason": str(figure.get("nearby_text") or source_ref.get("reason") or "source_figure").strip(),
-            })
+            }
+            candidates.append((_figure_selection_score(page, figure), ref, figure))
             break
-    return refs[:8]
+    candidates.sort(key=lambda item: (
+        item[0],
+        _figure_float(item[2].get("bbox_area")),
+        _figure_float(item[2].get("image_width")) * _figure_float(item[2].get("image_height")),
+    ), reverse=True)
+    return [ref for _score, ref, _figure in candidates[:8]]
 
 
 def _source_refs_from_figure_refs(figure_refs: list[dict]) -> list[dict]:
@@ -1712,9 +2238,15 @@ def _normalize_outline_page_count(outline: List[Dict], page_count: int, strict_p
             page["page_num"] = idx
             page_type = str(page.get("type") or "content").strip().lower() or "content"
             if idx == 1:
-                page["type"] = "cover"
+                if page_type != "cover" and _page_map_preserves_source_page_type(page):
+                    page["type"] = page_type if page_type != "ending" else "content"
+                else:
+                    page["type"] = "cover"
             elif idx == len(outline) and len(outline) > 1:
-                page["type"] = "ending"
+                if page_type != "ending" and _page_map_preserves_source_page_type(page):
+                    page["type"] = page_type if page_type != "cover" else "section"
+                else:
+                    page["type"] = "ending"
             elif page_type == "cover":
                 page["type"] = "section"
             elif page_type == "ending":
@@ -1880,6 +2412,38 @@ def _resolve_soft_range_target(
     return max(1, min(upper_bound, natural_count))
 
 
+def _single_page_source_count(documents: str) -> int | None:
+    sources = detect_ppt_sources(documents)
+    if len(sources) == 1:
+        try:
+            pages = int(sources[0].get("pages") or 0)
+        except (TypeError, ValueError):
+            pages = 0
+        if pages > 0:
+            return pages
+    return _source_context_page_source_count(documents)
+
+
+def _same_source_page_count_for_contract(
+    topic: str,
+    documents: str,
+    intent_contract: dict | None = None,
+) -> int | None:
+    if not documents.strip() or intent_contract is None:
+        return None
+    contract = (
+        normalize_content_director_contract(intent_contract)
+        if is_content_director_contract(intent_contract)
+        else _director_contract_from_legacy_intent(intent_contract)
+    )
+    if (
+        contract.get("page_budget_policy") == "same_as_source"
+        and contract.get("structure_policy") == "preserve_order"
+    ):
+        return _single_page_source_count(documents)
+    return None
+
+
 def resolve_content_plan_page_target(
     topic: str,
     page_count: int | None,
@@ -1890,6 +2454,9 @@ def resolve_content_plan_page_target(
     documents = sanitize_ppt_recovery_text_for_content(documents)
     requested_page_range = infer_page_count_range_from_topic(topic)
     explicit_page_count = page_count or infer_page_count_from_topic(topic)
+    same_source_page_count = _same_source_page_count_for_contract(topic, documents, intent_contract)
+    if same_source_page_count and not requested_page_range:
+        return same_source_page_count, same_source_page_count, same_source_page_count
     contract = normalize_content_director_contract(intent_contract) if is_content_director_contract(intent_contract) else None
     uses_source_capacity = bool(
         contract
@@ -3247,10 +3814,11 @@ def _outline_to_page_map(outline: list[dict], *, status: str = "page_map_source"
             continue
         source_status = str(page.get("generation_status") or "").strip()
         page_status = source_status if source_status in LOW_CONTENT_DRAFT_STATUSES else status
+        bullet_limit = _page_map_bullet_limit(page_status)
         text_content = page.get("text_content") if isinstance(page.get("text_content"), dict) else {}
         body = str(text_content.get("body") or "").strip()
         bullets = [
-            re.sub(r"^\s*(?:[-*]|\d+[.)、])\s*", "", line).strip()
+            _strip_leading_list_marker(line)
             for line in body.splitlines()
             if str(line).strip()
         ]
@@ -3261,7 +3829,7 @@ def _outline_to_page_map(outline: list[dict], *, status: str = "page_map_source"
             "section_title": _normalize_section_title(str(page.get("section_title") or "").strip()),
             "headline": str(text_content.get("headline") or "").strip() or f"第 {idx} 页",
             "subhead": str(text_content.get("subhead") or "").strip(),
-            "bullets": bullets[:5],
+            "bullets": bullets[:bullet_limit],
             "speaker_notes": str(page.get("speaker_notes") or "").strip(),
             "visual_suggestion": str(page.get("visual_suggestion") or "").strip(),
             "source_refs": page.get("source_refs") if isinstance(page.get("source_refs"), list) else [],
@@ -3411,11 +3979,25 @@ def parse_page_map_markdown(markdown: str) -> list[dict]:
     return _normalize_page_map(pages)
 
 
+def _page_map_bullet_limit(status: str) -> int:
+    status_value = str(status or "").strip()
+    if (
+        status_value == "page_map_source"
+        or status_value.endswith("_direct")
+        or status_value.endswith("_preserve_source")
+        or "source_body" in status_value
+    ):
+        return 32
+    return 5
+
+
 def _normalize_page_map(page_map: list[dict]) -> list[dict]:
     normalized: list[dict] = []
     for page in sorted([p for p in page_map if isinstance(p, dict)], key=lambda item: int(item.get("page_num") or 10**6)):
         page_num = len(normalized) + 1
         page_type = _canonical_content_plan_type(str(page.get("type") or "content").strip().lower() or "content")
+        generation_status = str(page.get("generation_status") or "page_map_model")
+        bullet_limit = _page_map_bullet_limit(generation_status)
         raw_bullets = page.get("bullets") if isinstance(page.get("bullets"), list) else []
         bullets = [
             _clean_visible_page_map_text(str(item))
@@ -3433,12 +4015,12 @@ def _normalize_page_map(page_map: list[dict]) -> list[dict]:
             "section_title": section_title,
             "headline": headline or f"第 {page_num} 页",
             "subhead": subhead,
-            "bullets": bullets[:5],
+            "bullets": bullets[:bullet_limit],
             "speaker_notes": speaker_notes,
             "visual_suggestion": visual_suggestion,
             "source_refs": _clean_page_map_source_ref_values(page.get("source_refs")),
             "figure_refs": page.get("figure_refs") if isinstance(page.get("figure_refs"), list) else [],
-            "generation_status": str(page.get("generation_status") or "page_map_model"),
+            "generation_status": generation_status,
         })
     return normalized
 
@@ -3603,6 +4185,43 @@ def _source_draft_figures_by_source_page(source_draft: list[dict]) -> dict[tuple
     return {key: _dedupe_figure_refs(refs) for key, refs in by_source_page.items()}
 
 
+_SOURCE_FACT_TOKEN_RE = re.compile(
+    r"\d{4}\.\d{1,2}|"
+    r"(?:MAU|MRR)[:：]?\s*[^\s\n]+|"
+    r"\d+(?:\.\d+)?\s*[％%]|"
+    r"[A-Za-z][A-Za-z0-9./_-]{2,}",
+    flags=re.IGNORECASE,
+)
+
+
+def _source_fact_tokens(value: str) -> set[str]:
+    text = str(value or "")
+    tokens: set[str] = set()
+    for match in _SOURCE_FACT_TOKEN_RE.finditer(text):
+        token = re.sub(r"\s+", "", match.group(0))
+        if token:
+            tokens.add(token.lower())
+    return tokens
+
+
+def _page_map_loses_source_facts(page_bullets: list, source_bullets: list) -> bool:
+    source_text = "\n".join(str(item or "") for item in source_bullets)
+    page_text = "\n".join(str(item or "") for item in page_bullets)
+    source_tokens = _source_fact_tokens(source_text)
+    if not source_tokens:
+        return False
+    page_tokens = _source_fact_tokens(page_text)
+    return bool(source_tokens - page_tokens)
+
+
+def _same_source_page(page: dict, source_draft_page: dict | None) -> bool:
+    if not isinstance(source_draft_page, dict):
+        return False
+    page_keys = _page_source_page_keys(page)
+    source_keys = _page_source_page_keys(source_draft_page)
+    return bool(page_keys and source_keys and page_keys.intersection(source_keys))
+
+
 def _matching_source_draft_figure_refs(
     page: dict,
     source_draft_page: dict | None,
@@ -3639,7 +4258,13 @@ def _merge_page_map_with_source_draft(page_map: list[dict], source_draft: list[d
                 and not source_draft_is_placeholder
                 else []
             )
-            if _page_map_requires_body_bullets(page) and not bullets and source_draft_bullets:
+            should_restore_source_bullets = (
+                bool(bullets)
+                and bool(source_draft_bullets)
+                and _same_source_page(page, source_draft_page)
+                and _page_map_loses_source_facts(bullets, source_draft_bullets)
+            )
+            if _page_map_requires_body_bullets(page) and source_draft_bullets and (not bullets or should_restore_source_bullets):
                 page["bullets"] = list(source_draft_bullets)
                 if not str(page.get("subhead") or "").strip():
                     page["subhead"] = str(source_draft_page.get("subhead") or "").strip()
@@ -3878,6 +4503,10 @@ def generate_content_page_map(
         max_pages=max_pages,
         intent_contract=intent_contract,
     )
+    if mode == "direct_replicate" and source_draft and not detect_ppt_sources(documents):
+        logger.info("ContentPlan: using deterministic source page map for direct replicate, pages=%s", len(source_draft))
+        return _normalize_page_map(source_draft)
+
     source_page_map_markdown = render_page_map_markdown(source_draft)
     if len(source_page_map_markdown) > PAGE_MAP_SOURCE_DRAFT_LIMIT:
         source_page_map_markdown = _document_excerpt_for_extension(
@@ -3930,6 +4559,24 @@ def generate_content_page_map(
     raise ValueError("Content plan generation failed before producing usable pages.")
 
 
+def _page_map_preserves_source_page_type(page: dict) -> bool:
+    status = str(page.get("generation_status") or "").strip()
+    if status == "page_map_source" or status.endswith("_direct") or status.endswith("_preserve_source"):
+        return True
+    refs = page.get("source_refs") if isinstance(page.get("source_refs"), list) else []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        reason = str(ref.get("reason") or "").strip().lower()
+        if reason in {"direct_replicate", "single_pdf_page_polish", "single_ppt_page_polish"}:
+            return True
+    return False
+
+
+def _page_map_preserves_source_first_page_type(page: dict) -> bool:
+    return _page_map_preserves_source_page_type(page)
+
+
 def content_plan_from_page_map(
     page_map: list[dict],
     *,
@@ -3943,11 +4590,17 @@ def content_plan_from_page_map(
     for idx, page in enumerate(normalized_map, start=1):
         page_type = str(page.get("type") or "content").strip().lower() or "content"
         if idx == 1:
-            page_type = "cover"
+            if page_type != "cover" and _page_map_preserves_source_page_type(page):
+                page_type = page_type if page_type != "ending" else "content"
+            else:
+                page_type = "cover"
         elif page_type == "cover":
             page_type = "section"
         elif idx == total and total > 1:
-            page_type = "ending"
+            if page_type != "ending" and _page_map_preserves_source_page_type(page):
+                page_type = page_type if page_type != "cover" else "section"
+            else:
+                page_type = "ending"
         elif page_type == "ending":
             page_type = "section"
         bullets = page.get("bullets") if isinstance(page.get("bullets"), list) else []
@@ -3961,7 +4614,7 @@ def content_plan_from_page_map(
             source_figures=source_figures,
         )
         if not figure_refs and not requested_figure_refs:
-            figure_refs = _source_context_figures_for_source_refs(source_refs, source_figures)
+            figure_refs = _source_context_figures_for_source_refs(source_refs, source_figures, page=page)
             figure_refs = _filter_figure_refs_for_page(
                 figure_refs,
                 page=page,
@@ -4612,9 +5265,15 @@ def _enforce_requested_page_range(outline: List[Dict], requested_page_range: tup
             page["page_num"] = idx
             page_type = str(page.get("type") or "content").strip().lower() or "content"
             if idx == 1:
-                page["type"] = "cover"
+                if page_type != "cover" and _page_map_preserves_source_page_type(page):
+                    page["type"] = page_type if page_type != "ending" else "content"
+                else:
+                    page["type"] = "cover"
             elif idx == len(outline) and len(outline) > 1:
-                page["type"] = "ending"
+                if page_type != "ending" and _page_map_preserves_source_page_type(page):
+                    page["type"] = page_type if page_type != "cover" else "section"
+                else:
+                    page["type"] = "ending"
             elif page_type == "cover":
                 page["type"] = "section"
             elif page_type == "ending":
@@ -4684,7 +5343,7 @@ def _extract_headline_from_text_content(value: str) -> tuple[str, str]:
     first_idx = next((idx for idx, line in enumerate(lines) if line), -1)
     if first_idx < 0:
         return "", text
-    first_line = re.sub(r"^\s*(?:[-*]|\d+[.)、])\s*", "", lines[first_idx]).strip()
+    first_line = _strip_leading_list_marker(lines[first_idx])
     bracket_match = re.match(r"^【(.{2,60})】$", first_line)
     if bracket_match:
         headline = _clean_markdown_inline(bracket_match.group(1)).strip()
@@ -5042,7 +5701,7 @@ def _first_text_line(value) -> str:
     else:
         candidates = str(value or "").splitlines()
     for line in candidates:
-        cleaned = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", str(line)).strip()
+        cleaned = _strip_leading_list_marker(str(line))
         cleaned = normalize_markdown_emphasis(cleaned).strip()
         if cleaned:
             return cleaned
@@ -5214,17 +5873,18 @@ def _finalize_generated_content_plan(
     outline = _normalize_outline_page_count(outline, job.page_count, strict_page_count=job.strict_page_count)
     outline = _enforce_requested_page_range(outline, job.requested_page_range)
     outline = _normalize_content_markdown(outline, topic=job.topic)
-    empty_body_pages = _empty_required_content_body_pages(outline)
-    if empty_body_pages:
-        raise ValueError("内容规划质量不足，以下正文页缺少具体正文：" + "、".join(f"P{page}" for page in empty_body_pages))
-    duplicate_headlines = _duplicate_content_headline_pages(outline)
-    if duplicate_headlines:
-        duplicate = duplicate_headlines[0]
-        raise ValueError(
-            "内容规划质量不足，内容页标题重复："
-            + "、".join(f"P{page}" for page in duplicate["pages"])
-            + f"「{duplicate['headline']}」"
-        )
+    if job.mode != "direct_replicate":
+        empty_body_pages = _empty_required_content_body_pages(outline)
+        if empty_body_pages:
+            raise ValueError("内容规划质量不足，以下正文页缺少具体正文：" + "、".join(f"P{page}" for page in empty_body_pages))
+        duplicate_headlines = _duplicate_content_headline_pages(outline)
+        if duplicate_headlines:
+            duplicate = duplicate_headlines[0]
+            raise ValueError(
+                "内容规划质量不足，内容页标题重复："
+                + "、".join(f"P{page}" for page in duplicate["pages"])
+                + f"「{duplicate['headline']}」"
+            )
     outline = _annotate_ppt_source_refs(outline, job.documents, job.topic, job.intent_contract)
     _emit_content_plan_saved(on_progress, outline)
     return outline

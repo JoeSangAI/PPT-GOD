@@ -6538,6 +6538,12 @@ body {
   padding: 0 22px;
 }
 
+.pg-topbar.pg-project-header {
+  position: relative;
+  z-index: 80;
+  overflow: visible;
+}
+
 .pg-project-header .pg-project-title {
   min-width: 0;
   overflow: hidden;
@@ -6556,6 +6562,91 @@ body {
   gap: 8px;
 }
 
+.pg-editable-export {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+}
+
+.pg-editable-export-menu {
+  position: relative;
+}
+
+.pg-editable-export-menu > summary {
+  list-style: none;
+}
+
+.pg-editable-export-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pg-editable-export-trigger {
+  cursor: pointer;
+  gap: 5px;
+}
+
+.pg-editable-export-caret {
+  color: #667085;
+  font-size: 13px;
+  line-height: 1;
+  margin-top: -1px;
+}
+
+.pg-editable-export-options {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 40;
+  display: grid;
+  width: 286px;
+  gap: 4px;
+  border: 1px solid #d7dde8;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.14);
+  padding: 8px;
+}
+
+.pg-editable-export-help {
+  border-bottom: 1px solid #eef2f7;
+  color: #667085;
+  font-size: 11.5px;
+  font-weight: 640;
+  line-height: 1.45;
+  margin: 0 2px 2px;
+  padding: 2px 2px 7px;
+}
+
+.pg-editable-export-option {
+  display: grid;
+  gap: 3px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #111827;
+  cursor: pointer;
+  font-family: inherit;
+  padding: 8px 9px;
+  text-align: left;
+}
+
+.pg-editable-export-option:hover {
+  background: #f4f7fb;
+}
+
+.pg-editable-export-option-title {
+  font-size: 12.5px;
+  font-weight: 780;
+  line-height: 1.2;
+}
+
+.pg-editable-export-option-hint {
+  color: #667085;
+  font-size: 11.5px;
+  font-weight: 560;
+  line-height: 1.35;
+}
+
 .pg-project-export-link {
   display: inline-flex;
   min-height: 30px;
@@ -6572,13 +6663,19 @@ body {
   white-space: nowrap;
 }
 
+button.pg-project-export-link {
+  cursor: pointer;
+  font-family: inherit;
+}
+
 .pg-project-export-link:hover {
   border-color: #aab4c2;
   background: #f8fafc;
   color: #111827;
 }
 
-.pg-project-export-link.is-disabled {
+.pg-project-export-link.is-disabled,
+button.pg-project-export-link:disabled {
   color: #a3acba;
   cursor: not-allowed;
   pointer-events: none;
@@ -8063,6 +8160,12 @@ body {
 
   .pg-project-exports {
     width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .pg-editable-export {
+    flex-wrap: wrap;
     justify-content: flex-end;
   }
 
@@ -9026,4 +9129,13 @@ body {
 
 .pg-auth-v2 .pg-login-submit:hover {
   background: linear-gradient(135deg, #171615 0%, #2b2925 58%, #755735 100%) !important;
+}
+
+.pg-project-export-link.is-disabled,
+button.pg-project-export-link:disabled {
+  color: #a3acba !important;
+  cursor: not-allowed;
+  pointer-events: none;
+  box-shadow: none !important;
+  opacity: 0.72;
 }

@@ -7,6 +7,45 @@ from typing import Callable
 
 
 LOW_TEXT_CHAR_THRESHOLD = 80
+PDF_PAGE_REFERENCE_MAX_PAGES = 120
+SLIDE_LIKE_ASPECT_RATIO_MIN = 1.45
+SLIDE_LIKE_ASPECT_RATIO_MAX = 1.95
+PDF_PAGE_REFERENCE_TARGET_WIDTH = 1920
+REPEATED_PAGE_ELEMENT_MIN_PAGES = 3
+REPEATED_PAGE_ELEMENT_MAX_HEIGHT = 90
+REPEATED_PAGE_ELEMENT_TOP_BAND = 90
+PDF_REPEATED_LOGO_MIN_AREA_RATIO = 0.00015
+PDF_REPEATED_LOGO_MAX_AREA_RATIO = 0.035
+PDF_REPEATED_LOGO_POSITION_TOLERANCE = 0.04
+PDF_DOCUMENT_LOGO_MIN_AREA_RATIO = 0.002
+PDF_DOCUMENT_LOGO_MAX_AREA_RATIO = 0.04
+PDF_DOCUMENT_LOGO_MIN_WIDTH_RATIO = 0.08
+PDF_DOCUMENT_LOGO_MAX_WIDTH_RATIO = 0.36
+PDF_DOCUMENT_LOGO_MAX_HEIGHT_RATIO = 0.18
+PDF_DOCUMENT_LOGO_MIN_ASPECT = 1.55
+PDF_DOCUMENT_LOGO_MAX_ASPECT = 8.0
+PDF_DOCUMENT_LOGO_EDGE_BAND = 0.18
+PDF_DOCUMENT_LOGO_TERMINAL_PAGES = 2
+PDF_DOCUMENT_LOGO_KEYWORDS = (
+    "logo",
+    "brand",
+    "capital",
+    "financial advisor",
+    "financial adviser",
+    "advisor",
+    "adviser",
+    "ventures",
+    "partners",
+    "品牌",
+    "标识",
+    "资本",
+    "投资",
+    "基金",
+    "财务顾问",
+)
+PDF_TEXT_INLINE_LABEL_MAX_CHARS = 14
+PDF_TEXT_INLINE_LABEL_GAP_MAX = 80.0
+PDF_TEXT_ROW_CENTER_TOLERANCE = 20.0
 
 FRONT_MATTER_ROLE_TERMS = {
     "preface": ("译者序", "前言", "序言", "preface"),
@@ -56,6 +95,12 @@ def _safe_asset_filename(filename: str, page_num: int, xref: int, ext: str, payl
     return f"{stem}_p{page_num}_x{xref}_{digest}.{safe_ext}"
 
 
+def _safe_page_reference_filename(filename: str, page_num: int, payload: bytes) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(filename)[0]).strip("_") or "source"
+    digest = hashlib.sha1(payload).hexdigest()[:12]
+    return f"{stem}_p{page_num:03d}_page_{digest}.png"
+
+
 def _text_preview(text: str, limit: int = 260) -> str:
     cleaned = re.sub(r"\s+", " ", text or "").strip()
     return cleaned[:limit]
@@ -74,16 +119,557 @@ def _bbox_metrics(bbox: list[float]) -> tuple[float, float, float]:
 
 def _pdf_figure_role(width: int, height: int, bbox: list[float]) -> tuple[str, str]:
     bbox_width, bbox_height, bbox_area = _bbox_metrics(bbox)
+    try:
+        y0 = float(bbox[1])
+    except (TypeError, ValueError, IndexError):
+        y0 = 10_000.0
     pixel_area = max(0, int(width or 0)) * max(0, int(height or 0))
     large_pixels = pixel_area >= 40_000 and min(width or 0, height or 0) >= 90
     large_bbox = bbox_area >= 20_000 and min(bbox_width, bbox_height) >= 80
     tiny_pixels = pixel_area > 0 and (pixel_area < 12_000 or min(width or 0, height or 0) < 45)
     tiny_bbox = bbox_area > 0 and (bbox_area < 3_000 or min(bbox_width, bbox_height) < 32)
+    top_header_like = y0 <= REPEATED_PAGE_ELEMENT_TOP_BAND and 0 < bbox_height <= REPEATED_PAGE_ELEMENT_MAX_HEIGHT
+    if top_header_like:
+        return "auxiliary", "low"
     if large_pixels or large_bbox:
         return "content", "high"
     if tiny_pixels or tiny_bbox:
         return "auxiliary", "low"
     return "content", "medium"
+
+
+def _pdf_page_aspect_ratio(page) -> float:
+    try:
+        width = float(page.rect.width)
+        height = float(page.rect.height)
+    except Exception:
+        return 0.0
+    if width <= 0 or height <= 0:
+        return 0.0
+    return width / height
+
+
+def _is_slide_like_pdf_page(page) -> bool:
+    ratio = _pdf_page_aspect_ratio(page)
+    return SLIDE_LIKE_ASPECT_RATIO_MIN <= ratio <= SLIDE_LIKE_ASPECT_RATIO_MAX
+
+
+_PDF_TEXT_LINE_LIST_START_RE = re.compile(
+    r"^(?:[•·*▪▫◦]\s*|[-–—]\s+|\d+[.)、．]\s*|[一二三四五六七八九十]+[、.)．]\s*)"
+)
+_PDF_TEXT_HEADING_RE = re.compile(
+    r"^(?:目录|前言|序言|绪论|序论|导论|阅读指南|第\s*[0-9一二三四五六七八九十百]+\s*[章节部篇讲课](?:\s+|[:：、.\-]).*)$",
+    flags=re.IGNORECASE,
+)
+def _pdf_text_span_needs_separator(previous: dict, current: dict) -> bool:
+    previous_text = re.sub(r"\s+", "", str(previous.get("text") or ""))
+    current_text = re.sub(r"\s+", "", str(current.get("text") or ""))
+    if not previous_text or not current_text:
+        return False
+    if len(previous_text) > PDF_TEXT_INLINE_LABEL_MAX_CHARS or len(current_text) < 8:
+        return False
+    try:
+        previous_x0, previous_y0, previous_x1, _previous_y1 = [float(value) for value in previous.get("bbox")[:4]]
+        current_x0, current_y0, _current_x1, _current_y1 = [float(value) for value in current.get("bbox")[:4]]
+        previous_size = float(previous.get("size") or 0.0)
+        current_size = float(current.get("size") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    starts_after_label = current_x0 >= previous_x0 + max(16.0, previous_size * 1.1)
+    visually_distinct = abs(current_y0 - previous_y0) >= 3.0 or abs(current_size - previous_size) >= 0.5
+    boundary_is_text = bool(re.search(r"[\w\u4e00-\u9fff]$", previous_text) and re.match(r"^[\w\u4e00-\u9fff]", current_text))
+    return bool(starts_after_label and visually_distinct and boundary_is_text)
+
+
+def _pdf_text_line_from_spans(line: dict) -> str:
+    parts: list[str] = []
+    previous_span: dict | None = None
+    for span in line.get("spans") or []:
+        text = str(span.get("text") or "")
+        if not text:
+            continue
+        if previous_span and _pdf_text_span_needs_separator(previous_span, span):
+            parts.append(" ")
+        parts.append(text)
+        previous_span = span
+    return "".join(parts).strip()
+
+
+def _pdf_text_is_heading_line(line: str) -> bool:
+    text = str(line or "").strip()
+    if not text:
+        return False
+    if _PDF_TEXT_HEADING_RE.match(text):
+        return True
+    return len(text) <= 12 and bool(re.search(r"(章|节|团队|目录|融资|优势|路线图|策略|计划|介绍)$", text))
+
+
+def _pdf_join_wrapped_text(left: str, right: str) -> str:
+    left = str(left or "").rstrip()
+    right = str(right or "").lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if left.endswith("-"):
+        return left[:-1] + right
+    if re.search(r"[，,、；;：:。！？!?）)\]}】]$", left):
+        return left + right
+    if re.search(r"[\u4e00-\u9fff]$", left) or re.match(r"^[\u4e00-\u9fff，,、；;：:。！？!?）)\]}】]", right):
+        return left + right
+    if re.search(r"[A-Za-z]{2,}$", left) and re.match(r"^[A-Za-z]{1,8}[\u4e00-\u9fff]", right):
+        return left + right
+    return left + " " + right
+
+
+def _pdf_join_text_block_lines(lines: list[str]) -> str:
+    clean_lines = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not clean_lines:
+        return ""
+    if len(clean_lines) == 1:
+        return clean_lines[0]
+
+    output: list[str] = []
+    for line in clean_lines:
+        starts_list = bool(_PDF_TEXT_LINE_LIST_START_RE.match(line))
+        if not output or starts_list or _pdf_text_is_heading_line(output[-1]) or _pdf_text_is_heading_line(line):
+            output.append(line)
+        else:
+            output[-1] = _pdf_join_wrapped_text(output[-1], line)
+    return "\n".join(output)
+
+
+def _pdf_text_block_height(block: dict) -> float:
+    return max(0.0, float(block.get("y1") or 0.0) - float(block.get("y0") or 0.0))
+
+
+def _pdf_text_block_overlaps_row(block: dict, row: dict) -> bool:
+    y0 = float(block.get("y0") or 0.0)
+    y1 = float(block.get("y1") or 0.0)
+    row_y0 = float(row.get("y0") or 0.0)
+    row_y1 = float(row.get("y1") or 0.0)
+    if _pdf_text_row_is_label_only(row):
+        vertical_gap = y0 - row_y1
+        if 0.0 <= vertical_gap <= 18.0:
+            return True
+    overlap = min(y1, row_y1) - max(y0, row_y0)
+    if overlap > 0:
+        min_height = max(1.0, min(y1 - y0, row_y1 - row_y0))
+        return overlap / min_height >= 0.25
+    center = (y0 + y1) / 2.0
+    row_center = (row_y0 + row_y1) / 2.0
+    return abs(center - row_center) <= PDF_TEXT_ROW_CENTER_TOLERANCE
+
+
+def _pdf_text_row_is_label_only(row: dict) -> bool:
+    blocks = row.get("blocks") if isinstance(row.get("blocks"), list) else []
+    if not blocks:
+        return False
+    for block in blocks:
+        text = str(block.get("text") or "").strip()
+        if not text or "\n" in text or len(re.sub(r"\s+", "", text)) > PDF_TEXT_INLINE_LABEL_MAX_CHARS:
+            return False
+    return True
+
+
+def _pdf_text_rows(blocks: list[dict]) -> list[list[dict]]:
+    rows: list[dict] = []
+    for block in sorted(blocks, key=lambda item: (float(item.get("y0") or 0.0), float(item.get("x0") or 0.0))):
+        matched = None
+        for row in rows:
+            if _pdf_text_block_overlaps_row(block, row):
+                matched = row
+                break
+        if not matched:
+            matched = {
+                "y0": float(block.get("y0") or 0.0),
+                "y1": float(block.get("y1") or 0.0),
+                "blocks": [],
+            }
+            rows.append(matched)
+        matched["blocks"].append(block)
+        matched["y0"] = min(float(matched["y0"]), float(block.get("y0") or 0.0))
+        matched["y1"] = max(float(matched["y1"]), float(block.get("y1") or 0.0))
+    return [
+        sorted(row["blocks"], key=lambda item: (float(item.get("x0") or 0.0), float(item.get("y0") or 0.0)))
+        for row in sorted(rows, key=lambda item: (float(item.get("y0") or 0.0), float(item.get("y1") or 0.0)))
+    ]
+
+
+def _pdf_text_is_inline_label(block: dict, next_block: dict) -> bool:
+    text = re.sub(r"\s+", "", str(block.get("text") or ""))
+    if not text or "\n" in str(block.get("text") or ""):
+        return False
+    if len(text) > PDF_TEXT_INLINE_LABEL_MAX_CHARS:
+        return False
+    gap = float(next_block.get("x0") or 0.0) - float(block.get("x1") or 0.0)
+    if gap < -2.0 or gap > PDF_TEXT_INLINE_LABEL_GAP_MAX:
+        return False
+    next_text = str(next_block.get("text") or "").strip()
+    if len(next_text) < 18:
+        return False
+    if _pdf_text_block_height(next_block) < max(1.0, _pdf_text_block_height(block)) * 1.2:
+        return False
+    label_center = (float(block.get("y0") or 0.0) + float(block.get("y1") or 0.0)) / 2.0
+    return float(next_block.get("y0") or 0.0) - 18.0 <= label_center <= float(next_block.get("y1") or 0.0) + 18.0
+
+
+def _pdf_text_row_text(blocks: list[dict]) -> str:
+    units: list[str] = []
+    idx = 0
+    while idx < len(blocks):
+        block = blocks[idx]
+        text = str(block.get("text") or "").strip()
+        if not text:
+            idx += 1
+            continue
+        if idx + 1 < len(blocks) and _pdf_text_is_inline_label(block, blocks[idx + 1]):
+            units.append(f"{text} {str(blocks[idx + 1].get('text') or '').strip()}")
+            idx += 2
+            continue
+        units.append(text)
+        idx += 1
+    if not units:
+        return ""
+    row_y1 = max(float(block.get("y1") or 0.0) for block in blocks)
+    if row_y1 <= 70.0 and len(units) > 1 and all("\n" not in unit and len(unit) <= 32 for unit in units):
+        return " ".join(units)
+    return "\n".join(units)
+
+
+def _pdf_page_layout_text(page) -> str:
+    try:
+        payload = page.get_text("dict")
+    except Exception:
+        return ""
+    blocks: list[dict] = []
+    for block in payload.get("blocks") or []:
+        if block.get("type") != 0:
+            continue
+        lines = [
+            line_text
+            for line in block.get("lines") or []
+            if (line_text := _pdf_text_line_from_spans(line))
+        ]
+        text = _pdf_join_text_block_lines(lines)
+        if not text:
+            continue
+        try:
+            x0, y0, x1, y1 = [float(value) for value in block.get("bbox")[:4]]
+        except (TypeError, ValueError):
+            continue
+        blocks.append({
+            "text": text,
+            "x0": x0,
+            "y0": y0,
+            "x1": x1,
+            "y1": y1,
+        })
+    row_texts = [
+        row_text
+        for row in _pdf_text_rows(blocks)
+        if (row_text := _pdf_text_row_text(row))
+    ]
+    return "\n".join(row_texts).strip()
+
+
+def _pdf_page_text(page) -> str:
+    layout_text = _pdf_page_layout_text(page)
+    if layout_text:
+        return layout_text
+    try:
+        return (page.get_text("text", sort=True) or "").strip()
+    except TypeError:
+        return (page.get_text("text") or "").strip()
+
+
+def _should_add_pdf_page_references(doc) -> bool:
+    page_count = len(doc)
+    if page_count <= 0 or page_count > PDF_PAGE_REFERENCE_MAX_PAGES:
+        return False
+    checked = 0
+    slide_like = 0
+    for page in doc:
+        checked += 1
+        if _is_slide_like_pdf_page(page):
+            slide_like += 1
+        if checked >= min(page_count, 12):
+            break
+    return checked > 0 and slide_like / checked >= 0.8
+
+
+def _render_pdf_page_reference(page, *, filename: str, page_num: int, text: str, asset_output_dir: str | None) -> dict:
+    width = max(float(page.rect.width), 1.0)
+    zoom = max(1.0, min(3.0, PDF_PAGE_REFERENCE_TARGET_WIDTH / width))
+    pix = page.get_pixmap(matrix=__import__("fitz").Matrix(zoom, zoom), alpha=False)
+    payload = pix.tobytes("png")
+    file_path = ""
+    if asset_output_dir:
+        asset_filename = _safe_page_reference_filename(filename, page_num, payload)
+        file_path = os.path.join(asset_output_dir, asset_filename)
+        if not os.path.exists(file_path):
+            with open(file_path, "wb") as f:
+                f.write(payload)
+    bbox = [float(page.rect.x0), float(page.rect.y0), float(page.rect.x1), float(page.rect.y1)]
+    bbox_width, bbox_height, bbox_area = _bbox_metrics(bbox)
+    return {
+        "id": f"{filename}:p{page_num}:page",
+        "source_type": "pdf",
+        "source_document": filename,
+        "source_page_num": page_num,
+        "pdf_source_page_num": page_num,
+        "chapter_id": "",
+        "bbox": bbox,
+        "bbox_width": bbox_width,
+        "bbox_height": bbox_height,
+        "bbox_area": bbox_area,
+        "page_width": float(page.rect.width),
+        "page_height": float(page.rect.height),
+        "image_width": pix.width,
+        "image_height": pix.height,
+        "pixel_area": max(0, pix.width) * max(0, pix.height),
+        "figure_role": "source_page",
+        "content_significance": "high",
+        "nearby_text": _text_preview(text),
+        "file_path": file_path,
+        "image_sha1": hashlib.sha1(payload).hexdigest(),
+        "asset_kind": "source_page_image",
+        "is_full_page_reference": True,
+    }
+
+
+def _image_bbox_edges(image: dict) -> tuple[float, float, float, float]:
+    bbox = image.get("bbox") if isinstance(image.get("bbox"), list) else []
+    try:
+        x0, y0, x1, y1 = [float(value) for value in bbox[:4]]
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0, 0.0
+    return x0, y0, x1, y1
+
+
+def _image_page_size(image: dict) -> tuple[float, float]:
+    try:
+        page_width = float(image.get("page_width") or 0.0)
+        page_height = float(image.get("page_height") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    return max(0.0, page_width), max(0.0, page_height)
+
+
+def _image_bbox_norm(image: dict) -> tuple[float, float, float, float]:
+    page_width, page_height = _image_page_size(image)
+    if page_width <= 0 or page_height <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    x0, y0, x1, y1 = _image_bbox_edges(image)
+    return (
+        x0 / page_width,
+        y0 / page_height,
+        max(0.0, x1 - x0) / page_width,
+        max(0.0, y1 - y0) / page_height,
+    )
+
+
+def _pdf_logo_anchor_from_image(image: dict) -> str:
+    left, top, width, height = _image_bbox_norm(image)
+    cx = left + width / 2
+    cy = top + height / 2
+    horizontal = "left" if cx < 0.5 else "right"
+    vertical = "top" if cy < 0.5 else "bottom"
+    return f"{vertical}-{horizontal}"
+
+
+def _looks_like_repeated_pdf_logo(siblings: list[dict], pages: set[int]) -> bool:
+    if len(pages) < REPEATED_PAGE_ELEMENT_MIN_PAGES:
+        return False
+    bounds: list[tuple[float, float, float, float]] = []
+    for image in siblings:
+        if image.get("asset_kind") == "source_page_image" or image.get("figure_role") == "source_page":
+            return False
+        if not _looks_like_repeated_page_element(image):
+            return False
+        left, top, width, height = _image_bbox_norm(image)
+        if width <= 0 or height <= 0:
+            return False
+        area_ratio = width * height
+        if area_ratio < PDF_REPEATED_LOGO_MIN_AREA_RATIO or area_ratio > PDF_REPEATED_LOGO_MAX_AREA_RATIO:
+            return False
+        aspect = width / max(height, 0.0001)
+        if aspect > 12 or aspect < 0.1:
+            return False
+        if width > 0.32 or height > 0.16:
+            return False
+        cx = left + width / 2
+        cy = top + height / 2
+        in_brand_zone = cy <= 0.18 or cy >= 0.82 or cx <= 0.18 or cx >= 0.82
+        if not in_brand_zone:
+            return False
+        bounds.append((left, top, width, height))
+    if not bounds:
+        return False
+    lefts = [bound[0] for bound in bounds]
+    tops = [bound[1] for bound in bounds]
+    widths = [bound[2] for bound in bounds]
+    heights = [bound[3] for bound in bounds]
+    return (
+        max(lefts) - min(lefts) <= PDF_REPEATED_LOGO_POSITION_TOLERANCE
+        and max(tops) - min(tops) <= PDF_REPEATED_LOGO_POSITION_TOLERANCE
+        and max(widths) - min(widths) <= PDF_REPEATED_LOGO_POSITION_TOLERANCE
+        and max(heights) - min(heights) <= PDF_REPEATED_LOGO_POSITION_TOLERANCE
+    )
+
+
+def _looks_like_repeated_page_element(image: dict) -> bool:
+    if image.get("asset_kind") == "source_page_image" or image.get("figure_role") == "source_page":
+        return False
+    _x0, y0, _x1, y1 = _image_bbox_edges(image)
+    try:
+        bbox_height = float(image.get("bbox_height") or 0)
+    except (TypeError, ValueError):
+        bbox_height = 0.0
+    if not bbox_height:
+        bbox_height = max(0.0, y1 - y0)
+    return y0 <= REPEATED_PAGE_ELEMENT_TOP_BAND or bbox_height <= REPEATED_PAGE_ELEMENT_MAX_HEIGHT
+
+
+def _mark_repeated_page_elements(images: list[dict]) -> None:
+    by_hash: dict[str, list[dict]] = {}
+    for image in images:
+        image_hash = str(image.get("image_sha1") or "").strip()
+        if not image_hash:
+            continue
+        by_hash.setdefault(image_hash, []).append(image)
+
+    for siblings in by_hash.values():
+        pages: set[int] = set()
+        for image in siblings:
+            try:
+                page_num = int(image.get("source_page_num") or 0)
+            except (TypeError, ValueError):
+                page_num = 0
+            if page_num > 0:
+                pages.add(page_num)
+        if len(pages) < REPEATED_PAGE_ELEMENT_MIN_PAGES:
+            continue
+        if not any(_looks_like_repeated_page_element(image) for image in siblings):
+            continue
+        is_logo = _looks_like_repeated_pdf_logo(siblings, pages)
+        for image in siblings:
+            if image.get("asset_kind") == "source_page_image":
+                continue
+            if is_logo:
+                image["asset_kind"] = "pdf_logo"
+                image["figure_role"] = "logo"
+                image["content_significance"] = "high"
+                image["classification"] = "pdf_repeated_logo"
+                image["logo_anchor"] = _pdf_logo_anchor_from_image(image)
+            else:
+                image["asset_kind"] = "repeated_page_element"
+                image["figure_role"] = "decorative"
+                image["content_significance"] = "low"
+            image["repeated_page_count"] = len(pages)
+
+
+def _pdf_document_page_count(pages: list[dict]) -> int:
+    page_nums: list[int] = []
+    for page in pages:
+        try:
+            page_nums.append(int(page.get("page_num") or 0))
+        except (TypeError, ValueError):
+            continue
+    return max(page_nums) if page_nums else 0
+
+
+def _pdf_image_source_page_num(image: dict) -> int:
+    try:
+        return int(image.get("source_page_num") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pdf_text_has_brand_signal(text: str) -> bool:
+    cleaned = str(text or "").strip().lower()
+    if not cleaned:
+        return False
+    return any(keyword.lower() in cleaned for keyword in PDF_DOCUMENT_LOGO_KEYWORDS)
+
+
+def _is_terminal_pdf_page(page_num: int, total_pages: int) -> bool:
+    if page_num <= 0 or total_pages <= 0:
+        return False
+    return (
+        page_num <= PDF_DOCUMENT_LOGO_TERMINAL_PAGES
+        or page_num >= max(1, total_pages - PDF_DOCUMENT_LOGO_TERMINAL_PAGES + 1)
+    )
+
+
+def _looks_like_pdf_document_logo_candidate(image: dict, total_pages: int) -> bool:
+    if image.get("asset_kind") in {"source_page_image", "repeated_page_element", "pdf_logo"}:
+        return False
+    if image.get("figure_role") == "source_page":
+        return False
+    page_num = _pdf_image_source_page_num(image)
+    if not _is_terminal_pdf_page(page_num, total_pages):
+        return False
+    if not _pdf_text_has_brand_signal(str(image.get("nearby_text") or "")):
+        return False
+    left, top, width, height = _image_bbox_norm(image)
+    if width <= 0 or height <= 0:
+        return False
+    area_ratio = width * height
+    if area_ratio < PDF_DOCUMENT_LOGO_MIN_AREA_RATIO or area_ratio > PDF_DOCUMENT_LOGO_MAX_AREA_RATIO:
+        return False
+    if width < PDF_DOCUMENT_LOGO_MIN_WIDTH_RATIO or width > PDF_DOCUMENT_LOGO_MAX_WIDTH_RATIO:
+        return False
+    if height > PDF_DOCUMENT_LOGO_MAX_HEIGHT_RATIO:
+        return False
+    aspect = width / max(height, 0.0001)
+    if aspect < PDF_DOCUMENT_LOGO_MIN_ASPECT or aspect > PDF_DOCUMENT_LOGO_MAX_ASPECT:
+        return False
+    center_x = left + width / 2
+    center_y = top + height / 2
+    in_brand_zone = (
+        center_y <= PDF_DOCUMENT_LOGO_EDGE_BAND
+        or center_y >= 1 - PDF_DOCUMENT_LOGO_EDGE_BAND
+        or center_x <= PDF_DOCUMENT_LOGO_EDGE_BAND
+        or center_x >= 1 - PDF_DOCUMENT_LOGO_EDGE_BAND
+    )
+    return bool(in_brand_zone)
+
+
+def _pdf_document_logo_score(image: dict, total_pages: int) -> float:
+    left, top, width, height = _image_bbox_norm(image)
+    page_num = _pdf_image_source_page_num(image)
+    score = 0.0
+    if page_num in {1, total_pages}:
+        score += 2.0
+    elif _is_terminal_pdf_page(page_num, total_pages):
+        score += 1.0
+    if top <= PDF_DOCUMENT_LOGO_EDGE_BAND:
+        score += 1.0
+    if left <= PDF_DOCUMENT_LOGO_EDGE_BAND or left + width >= 1 - PDF_DOCUMENT_LOGO_EDGE_BAND:
+        score += 1.0
+    score += min(width / 0.24, 1.0)
+    score += min((width * height) / 0.022, 1.0)
+    return score
+
+
+def _mark_pdf_document_logo_candidates(images: list[dict], pages: list[dict]) -> None:
+    if any(image.get("asset_kind") == "pdf_logo" or image.get("classification") == "pdf_repeated_logo" for image in images):
+        return
+    total_pages = _pdf_document_page_count(pages)
+    candidates = [
+        image for image in images
+        if _looks_like_pdf_document_logo_candidate(image, total_pages)
+    ]
+    if not candidates:
+        return
+    best = max(candidates, key=lambda image: _pdf_document_logo_score(image, total_pages))
+    best["asset_kind"] = "pdf_logo"
+    best["figure_role"] = "logo"
+    best["content_significance"] = "high"
+    best["classification"] = "pdf_document_logo"
+    best["logo_anchor"] = _pdf_logo_anchor_from_image(best)
+    best["logo_detection"] = "terminal_page_brand_lockup"
 
 
 def _looks_like_toc_line(line: str) -> bool:
@@ -526,8 +1112,9 @@ def _build_pdf_pack(
     os.makedirs(asset_output_dir, exist_ok=True) if asset_output_dir else None
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         toc = doc.get_toc(simple=True)
+        add_page_references = _should_add_pdf_page_references(doc)
         for index, page in enumerate(doc, start=1):
-            text = (page.get_text("text") or "").strip()
+            text = _pdf_page_text(page)
             ocr_status = "not_needed"
             if len(text) < LOW_TEXT_CHAR_THRESHOLD:
                 if ocr_reader:
@@ -550,6 +1137,15 @@ def _build_pdf_pack(
                 "ocr_status": ocr_status,
             }
             pages.append(page_record)
+
+            if add_page_references:
+                images.append(_render_pdf_page_reference(
+                    page,
+                    filename=filename,
+                    page_num=index,
+                    text=text,
+                    asset_output_dir=asset_output_dir,
+                ))
 
             for image_info in page.get_images(full=True):
                 xref = int(image_info[0])
@@ -599,6 +1195,8 @@ def _build_pdf_pack(
                         "bbox_width": bbox_width,
                         "bbox_height": bbox_height,
                         "bbox_area": bbox_area,
+                        "page_width": float(page.rect.width),
+                        "page_height": float(page.rect.height),
                         "image_width": image_width,
                         "image_height": image_height,
                         "pixel_area": max(0, image_width) * max(0, image_height),
@@ -609,6 +1207,8 @@ def _build_pdf_pack(
                         "image_sha1": hashlib.sha1(payload).hexdigest(),
                         "asset_kind": "document_image",
                     })
+        _mark_repeated_page_elements(images)
+        _mark_pdf_document_logo_candidates(images, pages)
         chapters = _chapters_from_pages(pages, pdf_toc=toc)
 
     for image in images:

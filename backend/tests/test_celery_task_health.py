@@ -2,6 +2,8 @@ from datetime import timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from PIL import Image
+from pptx import Presentation
 
 from app.api import slides as slides_api
 from app.celery_app import celery_app
@@ -25,8 +27,24 @@ def test_celery_routes_text_and_image_tasks_to_separate_queues():
 
     assert routes["app.tasks.generate_style_proposals_task"]["queue"] == settings.CELERY_TEXT_QUEUE
     assert routes["app.tasks.generate_style_proposals_task"]["routing_key"] == settings.CELERY_TEXT_QUEUE
+    assert routes["app.tasks.generate_editable_pptx_task"]["queue"] == settings.CELERY_TEXT_QUEUE
+    assert routes["app.tasks.generate_editable_pptx_task"]["routing_key"] == settings.CELERY_TEXT_QUEUE
     assert routes["app.tasks.generate_slides_task"]["queue"] == settings.CELERY_IMAGE_QUEUE
     assert routes["app.tasks.generate_slides_task"]["routing_key"] == settings.CELERY_IMAGE_QUEUE
+
+
+def test_editable_pptx_worker_check_targets_text_queue(monkeypatch):
+    captured = {}
+
+    def fake_ensure_worker(*, queue=None):
+        captured["queue"] = queue
+        return True
+
+    monkeypatch.setattr(slides_api, "ensure_celery_worker", fake_ensure_worker)
+
+    slides_api.ensure_editable_pptx_worker_ready()
+
+    assert captured["queue"] == settings.CELERY_TEXT_QUEUE
 
 
 def test_generation_worker_check_targets_image_queue(monkeypatch):
@@ -41,6 +59,56 @@ def test_generation_worker_check_targets_image_queue(monkeypatch):
     slides_api.ensure_generation_worker_ready()
 
     assert captured["queue"] == settings.CELERY_IMAGE_QUEUE
+
+
+def test_start_editable_pptx_export_queues_text_task(tmp_path, monkeypatch):
+    db = make_session()
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
+    project = Project(title="Editable export", status="completed", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    output_dir = tmp_path / project.id
+    output_dir.mkdir(parents=True)
+    Presentation().save(output_dir / "presentation.pptx")
+    Presentation().save(output_dir / "editable_presentation.pptx")
+    slide_path = output_dir / "slide_01.png"
+    Image.new("RGB", (1280, 720), "white").save(slide_path)
+    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
+    db.flush()
+
+    captured = {}
+
+    class FakeTask:
+        id = "editable-task-1"
+
+    class FakeEditablePptxTask:
+        def delay(self, project_id, run_id=None, credential_id=None, restore_mode=None):
+            captured.update(project_id=project_id, run_id=run_id, credential_id=credential_id, restore_mode=restore_mode)
+            return FakeTask()
+
+    class FakeRedis:
+        def set(self, key, value, ex=None):
+            captured.setdefault("redis_sets", []).append((key, value, ex))
+            return True
+
+    monkeypatch.setattr(slides_api, "ensure_editable_pptx_worker_ready", lambda: None)
+    monkeypatch.setattr(slides_api, "store_current_provider_credentials", lambda _redis: "credential-1")
+    monkeypatch.setattr(slides_api, "redis_client", FakeRedis())
+    monkeypatch.setattr(slides_api, "generate_editable_pptx_task", FakeEditablePptxTask())
+
+    result = slides_api.start_editable_pptx_export(
+        project.id,
+        request=slides_api.EditablePptxExportRequest(restore_mode="standard"),
+        db=db,
+    )
+
+    assert result["status"] == "generating"
+    assert result["run"]["kind"] == "editable_pptx"
+    assert captured["project_id"] == project.id
+    assert captured["run_id"] == result["run"]["id"]
+    assert captured["credential_id"] == "credential-1"
+    assert captured["restore_mode"] == "standard"
+    assert (f"project:{project.id}:task_id", "editable-task-1", 3600) in captured["redis_sets"]
 
 
 def test_stop_generation_releases_page_locks(monkeypatch):
@@ -277,7 +345,7 @@ def test_final_generation_chunk_finishes_shared_run(tmp_path, monkeypatch):
     assert assembled["count"] == 3
 
 
-def test_generation_retries_once_on_provider_gateway_cutoff_then_stops(monkeypatch):
+def test_generation_stops_on_provider_gateway_cutoff_without_extra_slide_retry(monkeypatch):
     db = make_session()
     project = Project(title="Provider outage", status="prompt_ready", content_plan_confirmed=True)
     db.add(project)
@@ -324,8 +392,9 @@ def test_generation_retries_once_on_provider_gateway_cutoff_then_stops(monkeypat
     refreshed_run = db.query(run.__class__).filter(run.__class__.id == run.id).one()
     refreshed_slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
 
-    # Gateway cutoff is transient -> retried once on page 1, then pipeline stops
-    assert calls == [1, 1]
+    # The image API already attempted the request and reported a gateway cutoff;
+    # do not add another slide-level retry that would risk duplicate image spend.
+    assert calls == [1]
     assert refreshed_run.status == "failed"
     assert refreshed_run.completed_count == 0
     assert refreshed_run.failed_count == 1

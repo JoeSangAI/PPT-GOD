@@ -162,6 +162,530 @@ def test_strategy_selector_preserves_uploaded_ppt_from_long_deck_route():
     assert content_plan_module._select_content_plan_strategy(job) == "page_map"
 
 
+def test_percent_fidelity_is_not_inferred_as_page_count():
+    assert content_plan_module.infer_page_count_from_topic("保持页数和里面的信息 100%一致性") is None
+
+
+def test_direct_replicate_pdf_source_uses_source_pages_without_model(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+封面标题
+封面副标题
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p1:page" source_document="deck.pdf" source_type="pdf" source_page_num="1" figure_role="source_page" content_significance="high"
+--- PAGE 2 ---
+核心结论
+证据 A
+证据 B
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p2:page" source_document="deck.pdf" source_type="pdf" source_page_num="2" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert len(outline) == 2
+    assert [page["text_content"]["headline"] for page in outline] == ["封面标题", "核心结论"]
+    assert outline[0]["source_refs"] == [{
+        "source_document": "deck.pdf",
+        "source_page_num": 1,
+        "source_type": "pdf",
+        "reason": "direct_replicate",
+    }]
+    assert outline[0]["figure_refs"] == []
+
+
+def test_direct_replicate_pdf_keeps_dense_first_page_as_content(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+本融资概要说明
+本融资概要仅为非凡资本为该项目准备的初步评估材料，不能作为出价基础、投资决策基础或达成任何交易的基础
+潜在购买方应完全依靠自身判断能力对公司进行考察和商业分析，并作出评估
+本概要包含基于公司管理层及行业信息渠道的声明、估计和预测，这些假设有可能被证明正确或错误
+本概要信息高度保密，未经书面同意不得复印、复制或散发
+请各潜在投资方在独立判断基础上进一步沟通
+所有资料应以尽职调查和正式交易文件为准
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p1:page" source_document="deck.pdf" source_type="pdf" source_page_num="1" figure_role="source_page" content_significance="high"
+--- PAGE 2 ---
+项目优势
+市场巨大
+技术优势
+专业团队
+运营优势
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p2:page" source_document="deck.pdf" source_type="pdf" source_page_num="2" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert outline[0]["type"] == "content"
+    assert outline[0]["text_content"]["headline"] == "本融资概要说明"
+    assert "潜在购买方应完全依靠自身判断能力" in outline[0]["text_content"]["body"]
+    assert "本概要信息高度保密" in outline[0]["text_content"]["body"]
+    assert "所有资料应以尽职调查和正式交易文件为准" in outline[0]["text_content"]["body"]
+
+
+def test_page_map_explicit_first_content_page_keeps_body():
+    page_map = [{
+        "page_num": 1,
+        "type": "content",
+        "section_title": "融资概要",
+        "headline": "本融资概要说明",
+        "subhead": "",
+        "bullets": [
+            "本融资概要仅为非凡资本为该项目准备的初步评估材料",
+            "潜在购买方应完全依靠自身判断能力对公司进行考察和商业分析",
+        ],
+        "generation_status": "page_map_source",
+    }]
+
+    outline = content_plan_from_page_map(page_map)
+
+    assert outline[0]["type"] == "content"
+    assert "潜在购买方应完全依靠自身判断能力" in outline[0]["text_content"]["body"]
+
+
+def test_direct_replicate_pdf_keeps_dense_last_page_as_content(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+封面标题
+封面副标题
+--- PAGE 2 ---
+核心优势
+市场巨大
+技术领先
+--- PAGE 3 ---
+本轮融资由非凡资本担任财务顾问
+非凡资本是产业互联网的创新服务平台，包括投资和投后两大服务版块
+旗下有母基金、跟投基金、融资顾问、研究咨询等产品及服务
+累计已投资和服务创业公司达数百家
+如需约见本项目或了解具体情况请扫码
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p3:page" source_document="deck.pdf" source_type="pdf" source_page_num="3" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert outline[-1]["type"] == "content"
+    assert outline[-1]["text_content"]["headline"] == "本轮融资由非凡资本担任财务顾问"
+    assert "累计已投资和服务创业公司达数百家" in outline[-1]["text_content"]["body"]
+
+
+def test_direct_replicate_pdf_keeps_dense_contact_last_page_as_content(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+封面标题
+封面副标题
+--- PAGE 2 ---
+联系方式与后续安排
+本页同时说明客户案例复盘、实施范围、交付节奏、风险清单、验收标准与下一步会议安排。
+请扫码预约后续沟通并确认材料清单。
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p2:page" source_document="deck.pdf" source_type="pdf" source_page_num="2" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert outline[-1]["type"] == "content"
+    rendered = "\n".join(outline[-1]["text_content"].values())
+    assert "实施范围" in rendered
+
+
+def test_direct_replicate_pdf_joins_wrapped_last_page_lines(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+封面标题
+封面副标题
+--- PAGE 2 ---
+核心优势
+市场巨大
+技术领先
+--- PAGE 3 ---
+本轮融资由非凡资本担任财务顾问
+非凡资本是产业互联网的创新服务平台，包括投资和投后两大服务版块，旗下有母基金、跟投基金、融资顾
+问、研究咨询等产品及服务，累计已投资和服务创业公司达数百家。
+如需约见本项目或了解具体情况请扫码
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p3:page" source_document="deck.pdf" source_type="pdf" source_page_num="3" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    rendered = "\n".join(outline[-1]["text_content"].values())
+
+    assert "融资顾问、研究咨询" in rendered
+    assert "\n问、研究咨询" not in rendered
+
+
+def test_page_map_explicit_last_content_page_keeps_type():
+    page_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "项目标题",
+            "bullets": [],
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "非凡资本",
+            "headline": "本轮融资由非凡资本担任财务顾问",
+            "subhead": "",
+            "bullets": [
+                "非凡资本是产业互联网的创新服务平台",
+                "累计已投资和服务创业公司达数百家",
+            ],
+            "generation_status": "page_map_source",
+        },
+    ]
+
+    outline = content_plan_from_page_map(page_map)
+
+    assert outline[-1]["type"] == "content"
+    assert "累计已投资和服务创业公司达数百家" in outline[-1]["text_content"]["body"]
+
+
+def test_direct_replicate_pdf_uses_content_figures_not_full_page_as_slide_material(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+产品界面
+多模态交互展示
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p1:page" source_document="deck.pdf" source_type="pdf" source_page_num="1" figure_role="source_page" content_significance="high" image_width="1920" image_height="1080" bbox_area="518400" nearby_text="整页原图"
+FIGURE figure_id="deck.pdf:p1:x5:1" source_document="deck.pdf" source_type="pdf" source_page_num="1" figure_role="content" content_significance="high" image_width="900" image_height="520" bbox_area="200000" nearby_text="产品界面 多模态交互 展示"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 智能复刻这个 pdf ppt，保持原文信息和主要视觉元素。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert outline[0]["figure_refs"] == [{
+        "source_document": "deck.pdf",
+        "source_page_num": 1,
+        "source_type": "pdf",
+        "figure_id": "deck.pdf:p1:x5:1",
+        "reason": "direct_replicate",
+    }]
+
+
+def test_direct_replicate_pdf_allows_repeated_source_headlines(monkeypatch):
+    page_blocks = []
+    for page_num, body in [
+        (1, "封面\n副标题"),
+        (2, "Botlife.AI\n这是一段足够长的原文说明，用于保留原页信息 A"),
+        (3, "Botlife.AI\n这是一段足够长的原文说明，用于保留原页信息 B"),
+        (4, "结束页\n感谢关注"),
+    ]:
+        page_blocks.append(f'''--- PAGE {page_num} ---
+{body}
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p{page_num}:page" source_document="deck.pdf" source_type="pdf" source_page_num="{page_num}" figure_role="source_page" content_significance="high"''')
+    documents = '--- SOURCE filename="deck.pdf" kind="pdf" ---\n' + "\n".join(page_blocks)
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    assert len(outline) == 4
+    assert outline[1]["text_content"]["headline"] == "Botlife.AI"
+    assert outline[2]["text_content"]["headline"] == "Botlife.AI"
+
+
+def test_direct_replicate_pdf_preserves_timeline_dates_and_terminal_milestone(monkeypatch):
+    documents = '''--- SOURCE filename="deck.pdf" kind="pdf" ---
+--- PAGE 1 ---
+封面标题
+封面副标题
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p1:page" source_document="deck.pdf" source_type="pdf" source_page_num="1" figure_role="source_page" content_significance="high"
+--- PAGE 2 ---
+Botlife.ai 新一代AI社交平台
+发展规划
+系统开发
+2023.8
+2023.11
+测试版本（完成）
+2024.3
+α版本（完成）
+2024.8
+商业化
+2024.12
+MAU：200万MRR：20万美金
+2025.12
+MAU：2500万MRR：180万美金
+2026.12
+MAU：3亿MRR：1500万美金
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p2:page" source_document="deck.pdf" source_type="pdf" source_page_num="2" figure_role="source_page" content_significance="high"
+'''
+
+    def fail_if_model_called(**_kwargs):
+        raise AssertionError("direct PDF replicate should use deterministic source pages")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fail_if_model_called)
+    outline = generate_content_plan(
+        topic="请 1:1 复刻这个 pdf ppt，保持页数和里面的信息 100%一致性。",
+        documents=documents,
+        intent_contract={
+            "task_type": "replicate",
+            "rewrite_level": "none",
+            "page_order_policy": "preserve",
+            "page_count_policy": "same",
+            "source_fidelity": "verbatim",
+            "visual_source_use": "page_reference",
+            "confidence": 0.9,
+            "evidence": ["1:1", "复刻"],
+        },
+    )
+
+    body = outline[1]["text_content"]["body"]
+    assert "2023.8 系统开发" in body
+    assert "2023.11 测试版本（完成）" in body
+    assert "2024.3 α版本（完成）" in body
+    assert "2024.8 商业化" in body
+    assert "2024.12 MAU：200万MRR：20万美金" in body
+    assert "2025.12 MAU：2500万MRR：180万美金" in body
+    assert "2026.12 MAU：3亿MRR：1500万美金" in body
+    assert "\n- 8\n" not in body
+    assert "\n- 12\n" not in body
+
+
+def test_page_map_merge_restores_source_bullets_when_model_loses_date_facts():
+    source_ref = {
+        "source_document": "deck.pdf",
+        "source_page_num": 13,
+        "source_type": "pdf",
+        "reason": "direct_replicate",
+    }
+    source_draft = [{
+        "page_num": 1,
+        "type": "content",
+        "section_title": "原 PDF 逐页复刻",
+        "headline": "Botlife.ai 新一代AI社交平台",
+        "subhead": "发展规划",
+        "bullets": [
+            "系统开发",
+            "2023.8",
+            "2023.11",
+            "测试版本（完成）",
+            "2024.3",
+            "α版本（完成）",
+            "2024.8",
+            "商业化",
+            "2024.12 MAU：200万MRR：20万美金",
+            "2025.12 MAU：2500万MRR：180万美金",
+            "2026.12 MAU：3亿MRR：1500万美金",
+        ],
+        "source_refs": [source_ref],
+        "generation_status": "page_map_source",
+    }]
+    lossy_model_map = [{
+        "page_num": 1,
+        "type": "content",
+        "section_title": "原 PDF 逐页复刻",
+        "headline": "Botlife.ai 新一代AI社交平台",
+        "subhead": "发展规划",
+        "bullets": [
+            "系统开发",
+            "8",
+            "11",
+            "测试版本（完成）",
+            "3",
+            "α版本（完成）",
+            "8",
+            "12 MAU：200万MRR：20万美金",
+            "12 MAU：2500万MRR：180万美金",
+            "12 MAU：3亿MRR：1500万美金",
+        ],
+        "source_refs": [source_ref],
+        "generation_status": "page_map_model",
+    }]
+
+    merged = content_plan_module._merge_page_map_with_source_draft(
+        lossy_model_map,
+        source_draft,
+        target_count=1,
+    )
+
+    assert "2023.8" in merged[0]["bullets"]
+    assert "2024.12 MAU：200万MRR：20万美金" in merged[0]["bullets"]
+    assert "商业化" in merged[0]["bullets"]
+    assert "8" not in merged[0]["bullets"]
+
+
+def test_auto_figure_selection_prefers_content_image_over_source_page_reference():
+    source_context = '''--- SOURCE filename="deck.pdf" kind="pdf" pages="1" ---
+--- PAGE 8 ---
+核心功能界面
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p8:page" source_document="deck.pdf" source_type="pdf" source_page_num="8" figure_role="source_page" content_significance="high" image_width="1920" image_height="1080" bbox_area="518400" nearby_text="整页画面"
+FIGURE figure_id="deck.pdf:p8:x57:1" source_document="deck.pdf" source_type="pdf" source_page_num="8" figure_role="content" content_significance="high" image_width="820" image_height="460" bbox_area="180000" nearby_text="Botlife 产品核心功能界面 多模态交互 用户体验"
+'''
+    page_map = [{
+        "page_num": 1,
+        "type": "content",
+        "section_title": "产品展示",
+        "headline": "核心功能界面",
+        "subhead": "",
+        "bullets": ["展示 Botlife 产品的多模态交互界面和用户体验"],
+        "source_refs": [{
+            "source_document": "deck.pdf",
+            "source_page_num": 8,
+            "source_type": "pdf",
+            "reason": "source_page",
+        }],
+    }]
+
+    outline = content_plan_module.content_plan_from_page_map(page_map, source_context=source_context)
+
+    assert outline[0]["figure_refs"][0]["figure_id"] == "deck.pdf:p8:x57:1"
+
+
+def test_auto_figure_selection_ranks_by_page_text_relevance():
+    source_context = '''--- SOURCE filename="deck.pdf" kind="pdf" pages="1" ---
+--- PAGE 15 ---
+用户增长策略
+--- AVAILABLE_FIGURES ---
+FIGURE figure_id="deck.pdf:p15:x1:1" source_document="deck.pdf" source_type="pdf" source_page_num="15" figure_role="content" content_significance="high" image_width="700" image_height="420" bbox_area="160000" nearby_text="三阶段收入结构 订阅 增值收费 API 广告"
+FIGURE figure_id="deck.pdf:p15:x2:1" source_document="deck.pdf" source_type="pdf" source_page_num="15" figure_role="content" content_significance="high" image_width="650" image_height="390" bbox_area="140000" nearby_text="用户增长 SEO SEM 社媒运营 KOL KOC 口碑传播 社区运营"
+'''
+    page_map = [{
+        "page_num": 1,
+        "type": "content",
+        "section_title": "增长策略",
+        "headline": "用户增长策略",
+        "subhead": "",
+        "bullets": ["SEO/SEM", "社媒运营", "KOL/KOC", "社区运营"],
+        "source_refs": [{
+            "source_document": "deck.pdf",
+            "source_page_num": 15,
+            "source_type": "pdf",
+            "reason": "source_page",
+        }],
+    }]
+
+    outline = content_plan_module.content_plan_from_page_map(page_map, source_context=source_context)
+
+    assert outline[0]["figure_refs"][0]["figure_id"] == "deck.pdf:p15:x2:1"
+
+
 def test_long_structured_deck_strategy_is_diagnostics_only(monkeypatch):
     job = content_plan_module._build_content_plan_job(
         topic="给企业家做一场 2 小时增长课程，生成 60 页左右的 PPT，内容要深入。",

@@ -749,6 +749,66 @@ def _generate_visual_plan_batch(
         return parsed
 
 
+def _generate_visual_plan_batch_with_recovery(
+    batch: List[Dict],
+    style: Dict,
+    batch_num: int,
+    total_batches: int,
+    global_visual_assets: Optional[List[Dict]],
+    provider_credentials,
+    has_project_logo: bool,
+) -> Dict:
+    try:
+        return _generate_visual_plan_batch(
+            batch,
+            style,
+            batch_num,
+            total_batches,
+            global_visual_assets,
+            provider_credentials,
+            has_project_logo,
+        )
+    except VisualPlanGenerationError as exc:
+        if len(batch) <= 1:
+            raise
+        logger.warning(
+            "VisualPlan: batch %s/%s failed (%s); retrying as %s single-page calls",
+            batch_num,
+            total_batches,
+            exc,
+            len(batch),
+        )
+        recovered: Dict[str, Dict] = {}
+        page_errors: list[str] = []
+        for page in batch:
+            page_num = page.get("page_num")
+            try:
+                recovered.update(_generate_visual_plan_batch(
+                    [page],
+                    style,
+                    batch_num,
+                    total_batches,
+                    global_visual_assets,
+                    provider_credentials,
+                    has_project_logo,
+                ))
+            except Exception as page_exc:
+                logger.error(
+                    "VisualPlan: batch %s/%s single-page retry failed for page %s: %s",
+                    batch_num,
+                    total_batches,
+                    page_num,
+                    page_exc,
+                )
+                page_errors.append(f"page {page_num}: {page_exc}")
+        if page_errors:
+            raise VisualPlanGenerationError(
+                f"VisualPlan batch {batch_num}/{total_batches} failed after single-page retry: "
+                + "; ".join(page_errors[:5])
+            ) from exc
+        return recovered
+
+
 def _fallback_visual_plan(
     content_plan: List[Dict],
     reference_image_ids: List[str],
@@ -894,7 +954,7 @@ def _do_generate_visual_plan(
         batch_results = []
         for _batch_idx, batch_num, batch in batches:
             try:
-                batch_results.append((batch_num, _generate_visual_plan_batch(
+                batch_results.append((batch_num, _generate_visual_plan_batch_with_recovery(
                     batch,
                     style,
                     batch_num,
@@ -921,7 +981,7 @@ def _do_generate_visual_plan(
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="visual-plan") as executor:
                 future_map = {
                     executor.submit(
-                        _generate_visual_plan_batch,
+                        _generate_visual_plan_batch_with_recovery,
                         batch,
                         style,
                         batch_num,

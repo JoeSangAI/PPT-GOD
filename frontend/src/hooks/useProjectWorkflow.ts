@@ -40,6 +40,8 @@ export interface WorkflowStatus {
   progress?: WorkflowProgress | null;
   has_pptx?: boolean;
   pptx_path?: string | null;
+  has_editable_pptx?: boolean;
+  editable_pptx_path?: string | null;
   quality_report?: {
     status?: string;
     signature?: string;

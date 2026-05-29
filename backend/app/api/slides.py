@@ -14,6 +14,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, StreamingResponse
 from PIL import Image as PILImage
+from pptx import Presentation
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -120,7 +121,8 @@ from app.services.visual_block_renderer import (
 from app.services.visual_directives import extract_visual_directives
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
 from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
-from app.tasks import generate_slides_task, redis_client
+from app.tasks import generate_editable_pptx_task, generate_slides_task, redis_client
+from app.services.editable_pptx_export import normalize_editable_pptx_restore_mode
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import (
     apply_project_rollback,
@@ -149,9 +151,18 @@ router = APIRouter(prefix="/projects", tags=["slides"])
 logger = logging.getLogger(__name__)
 
 
+class EditablePptxExportRequest(BaseModel):
+    restore_mode: str = "standard"
+
+
 def ensure_generation_worker_ready():
     if not ensure_celery_worker(queue=settings.CELERY_IMAGE_QUEUE):
         raise HTTPException(status_code=503, detail="图片生成服务未启动，任务没有开始。请启动 worker 后重试。")
+
+
+def ensure_editable_pptx_worker_ready():
+    if not ensure_celery_worker(queue=settings.CELERY_TEXT_QUEUE):
+        raise HTTPException(status_code=503, detail="可编辑版处理服务未启动，任务没有开始。请启动 worker 后重试。")
 
 
 def _enqueue_generation_task(
@@ -185,6 +196,103 @@ def _enqueue_generation_task(
         redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
     except Exception as exc:
         logger.warning("Redis 写入生成任务跟踪信息失败，不影响已分发任务: project=%s task=%s error=%s", project_id, task.id, exc)
+    return task
+
+
+def _project_output_dir(project_id: str) -> str:
+    return os.path.join(settings.OUTPUT_DIR or "./outputs", project_id)
+
+
+def _final_pptx_path(project_id: str) -> str:
+    return os.path.join(_project_output_dir(project_id), "presentation.pptx")
+
+
+def _editable_pptx_path(project_id: str, restore_mode: str | None = None) -> str:
+    mode = normalize_editable_pptx_restore_mode(restore_mode)
+    filename = "editable_presentation.pptx" if mode == "standard" else f"editable_presentation_{mode}.pptx"
+    return os.path.join(_project_output_dir(project_id), filename)
+
+
+def _pptx_slide_count(path: str) -> int | None:
+    try:
+        return len(Presentation(path).slides)
+    except Exception as exc:
+        logger.warning("Unable to inspect PPTX slide count: path=%s error=%s", path, exc)
+        return None
+
+
+def _completed_slide_image_count(slides: list[Slide]) -> int:
+    count = 0
+    for slide in slides:
+        image_path = _existing_output_path(slide.image_path)
+        if slide.status == "completed" and image_path and os.path.exists(image_path):
+            count += 1
+    return count
+
+
+def _final_pptx_matches_completed_slides(pptx_path: str, slides: list[Slide]) -> bool:
+    if not os.path.exists(pptx_path):
+        return False
+    if not slides:
+        return False
+    completed_count = _completed_slide_image_count(slides)
+    if completed_count != len(slides):
+        return False
+    return _pptx_slide_count(pptx_path) == completed_count
+
+
+def _has_current_editable_pptx(project_id: str, final_pptx_path: str, has_final_pptx: bool, restore_mode: str | None = None) -> tuple[bool, str]:
+    editable_path = _editable_pptx_path(project_id, restore_mode)
+    has_editable = (
+        has_final_pptx
+        and os.path.exists(editable_path)
+        and os.path.getmtime(editable_path) >= os.path.getmtime(final_pptx_path)
+    )
+    return has_editable, editable_path
+
+
+def _has_completed_final_pptx(project: Project, slides: list[Slide]) -> tuple[bool, str]:
+    pptx_path = _final_pptx_path(project.id)
+    has_pptx = (
+        project.status == "completed"
+        and bool(slides)
+        and _final_pptx_matches_completed_slides(pptx_path, slides)
+        and not _project_has_stale_artifacts(slides)
+    )
+    return has_pptx, pptx_path
+
+
+def _editable_export_missing_pages(slides: list[Slide]) -> list[int]:
+    missing_pages = []
+    for slide in slides:
+        image_path = _existing_output_path(slide.image_path)
+        if slide.status != "completed" or not image_path or not os.path.exists(image_path):
+            missing_pages.append(int(slide.page_num))
+    return missing_pages
+
+
+def _enqueue_editable_pptx_task(db: Session, project_id: str, *, run, restore_mode: str = "standard"):
+    try:
+        credential_id = store_current_provider_credentials(redis_client)
+        task = generate_editable_pptx_task.delay(
+            project_id,
+            run.id,
+            credential_id=credential_id,
+            restore_mode=restore_mode,
+        )
+        set_run_task(db, run.id, task.id)
+        db.commit()
+    except Exception as exc:
+        logger.exception("Failed to enqueue editable PPTX task for project %s", project_id)
+        message = "可编辑版处理队列暂时不可用。请确认后台服务正常运行后重试。"
+        finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
+        db.commit()
+        raise HTTPException(status_code=503, detail=message) from exc
+    try:
+        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
+        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
+    except Exception as exc:
+        logger.warning("Redis 写入可编辑版任务跟踪信息失败，不影响已分发任务: project=%s task=%s error=%s", project_id, task.id, exc)
     return task
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
@@ -606,18 +714,27 @@ def _source_ref_type(source_doc: str, source_type: str | None = None) -> str:
 def _reference_image_sort_key(ref: ReferenceImage) -> tuple:
     analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
     bounds = analysis.get("shape_bounds") if isinstance(analysis.get("shape_bounds"), dict) else {}
+    bbox = analysis.get("bbox")
     try:
         group_index = int(analysis.get("asset_group_index") or 9999)
     except (TypeError, ValueError):
         group_index = 9999
-    try:
-        top = float(bounds.get("top") or 0)
-    except (TypeError, ValueError):
-        top = 0.0
-    try:
-        left = float(bounds.get("left") or 0)
-    except (TypeError, ValueError):
-        left = 0.0
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        try:
+            left = float(bbox[0])
+            top = float(bbox[1])
+        except (TypeError, ValueError):
+            left = 0.0
+            top = 0.0
+    else:
+        try:
+            top = float(bounds.get("top") or 0)
+        except (TypeError, ValueError):
+            top = 0.0
+        try:
+            left = float(bounds.get("left") or 0)
+        except (TypeError, ValueError):
+            left = 0.0
     role_order = {
         "content_ref": 0,
         "chart_ref": 1,
@@ -683,6 +800,130 @@ def _merge_manual_pins_into_visual_json(visual_json: dict | None, existing_visua
     usage = visual.get("visual_asset_usage") if isinstance(visual.get("visual_asset_usage"), dict) else {}
     visual["visual_asset_usage"] = {**manual_usage, **{str(k): str(v) for k, v in usage.items() if k and v}}
     return visual
+
+
+EXACT_PAGE_REFERENCE_ROLES = {"content_ref", "chart_ref"}
+EXACT_PAGE_REFERENCE_EXCLUDED_KINDS = {"source_page_image"}
+EXACT_PAGE_REFERENCE_QR_TERMS = ("二维码", "扫码", "小程序码", "条码", "qr", "QR")
+EXACT_PAGE_REFERENCE_PRESETS = ("left-card", "right-card", "center-card", "bottom-band", "top-right-small", "bottom-right-small")
+
+
+def _page_reference_exact_overlay_ref(ref: ReferenceImage) -> bool:
+    if ref.role not in EXACT_PAGE_REFERENCE_ROLES:
+        return False
+    if not ref.slide_id:
+        return False
+    if str(ref.process_mode or "").lower() != "original":
+        return False
+    if str(ref.asset_kind or "").lower() in EXACT_PAGE_REFERENCE_EXCLUDED_KINDS:
+        return False
+    return bool(ref.file_path and os.path.exists(_resolve_file_path(ref.file_path)))
+
+
+def _page_reference_looks_like_qr(ref: ReferenceImage) -> bool:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    text = " ".join(
+        str(value or "")
+        for value in (
+            ref.asset_name,
+            ref.asset_kind,
+            ref.usage_note,
+            analysis.get("subject"),
+            analysis.get("nearby_text"),
+            analysis.get("source_slide_text"),
+            analysis.get("description"),
+        )
+    )
+    return any(term in text for term in EXACT_PAGE_REFERENCE_QR_TERMS)
+
+
+def _next_page_reference_overlay_preset(ref: ReferenceImage, used_presets: set[str]) -> str:
+    if _page_reference_looks_like_qr(ref) and "bottom-right-small" not in used_presets:
+        return "bottom-right-small"
+    for preset in EXACT_PAGE_REFERENCE_PRESETS:
+        if preset not in used_presets:
+            return preset
+    return "right-card"
+
+
+def _mark_reference_as_exact_overlay(ref: ReferenceImage) -> None:
+    analysis = ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}
+    ref.asset_analysis = {
+        **analysis,
+        "exact_overlay": True,
+        "exact_overlay_reason": "用户选择原样保留，最终页面会保留素材比例和细节。",
+    }
+
+
+def _clear_reference_exact_overlay_mark(ref: ReferenceImage) -> None:
+    if not isinstance(ref.asset_analysis, dict):
+        return
+    analysis = dict(ref.asset_analysis)
+    analysis.pop("exact_overlay", None)
+    analysis.pop("exact_overlay_reason", None)
+    ref.asset_analysis = analysis
+
+
+def _sync_exact_page_reference_overlay_layers(slide: Slide, refs: list[ReferenceImage] | None = None) -> bool:
+    """Keep page-level original refs on the deterministic exact-paste path."""
+    page_refs = sorted(refs or list(slide.reference_images or []), key=_reference_image_sort_key)
+    exact_refs = [ref for ref in page_refs if _page_reference_exact_overlay_ref(ref)]
+    visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
+    existing_layers = normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+    by_asset_id = {str(layer.get("asset_id")): layer for layer in existing_layers if layer.get("asset_id")}
+    used_presets = {str(layer.get("preset")) for layer in existing_layers if layer.get("preset")}
+    changed = False
+
+    for ref in exact_refs:
+        ref_id = str(ref.id)
+        _mark_reference_as_exact_overlay(ref)
+        if ref_id in by_asset_id:
+            continue
+        preset = _next_page_reference_overlay_preset(ref, used_presets)
+        used_presets.add(preset)
+        existing_layers.append({
+            "id": f"ov_{ref_id}",
+            "asset_id": ref_id,
+            "enabled": True,
+            "preset": preset,
+            "fit": "contain",
+            "mode": "exact_cutout",
+            "usage_note": f"{ref.asset_name or '本页素材'}：原图保留",
+        })
+        changed = True
+
+    normalized = normalize_overlay_layers(existing_layers, valid_asset_ids=None, strict_assets=False)
+    if changed or ("overlay_layers" in visual and visual.get("overlay_layers") != normalized):
+        visual["overlay_layers"] = normalized
+        slide.visual_json = visual
+        flag_modified(slide, "visual_json")
+        return True
+    return False
+
+
+def _load_page_reference_images_for_slides(db: Session, slides: list[Slide]) -> None:
+    slide_ids = [slide.id for slide in slides if slide.id]
+    if not slide_ids:
+        return
+    refs = db.query(ReferenceImage).filter(
+        ReferenceImage.slide_id.in_(slide_ids),
+        ReferenceImage.role != "finetune_ref",
+    ).all()
+    refs_by_slide: dict[str, list[ReferenceImage]] = {}
+    for ref in refs:
+        refs_by_slide.setdefault(ref.slide_id, []).append(ref)
+    for slide in slides:
+        slide.reference_images = sorted(refs_by_slide.get(slide.id, []), key=_reference_image_sort_key)
+
+
+def _sync_exact_page_reference_overlays_for_generation(db: Session, slides: list[Slide]) -> list[int]:
+    _load_page_reference_images_for_slides(db, slides)
+    synced_pages: list[int] = []
+    for slide in slides:
+        if _sync_exact_page_reference_overlay_layers(slide):
+            _mark_slide_artifacts_stale(slide, visual=True)
+            synced_pages.append(int(slide.page_num))
+    return synced_pages
 
 
 def _serialize_reference_image(
@@ -1121,17 +1362,21 @@ def _project_refs_for_prompt(
     refs = []
     wanted = set(visual_asset_ids or [])
     overlay_wanted = exact_overlay_asset_ids(page_intent or {})
-    wanted = {asset_id for asset_id in wanted if asset_id not in overlay_wanted}
     route_modes = (page_intent or {}).get("asset_route_modes") or {}
     if not isinstance(route_modes, dict):
         route_modes = {}
+    route_modes = {str(k): str(v).lower() for k, v in route_modes.items() if k and v}
+    wanted = {
+        asset_id for asset_id in wanted
+        if asset_id not in overlay_wanted and route_modes.get(str(asset_id)) != "overlay"
+    }
     if wanted:
         for img in project.reference_images or []:
             if img.role != "visual_asset" or img.id not in wanted:
                 continue
             if not img.file_path or not os.path.exists(img.file_path):
                 continue
-            route_mode = str(route_modes.get(img.id) or "").lower()
+            route_mode = str(route_modes.get(str(img.id)) or "").lower()
             if not route_mode:
                 route_mode = "double_blend" if str(img.asset_kind or "").lower() in {"product", "material"} else "blend"
             effective_process_mode = "crop" if route_mode == "double_blend" else (
@@ -1392,6 +1637,24 @@ def _assemble_partial_project_pptx(project: Project, slides: list[Slide], output
         overlay_assets=_project_export_overlay_assets(project),
     )
     return generated_count
+
+
+def _ensure_completed_final_pptx(project: Project, slides: list[Slide]) -> tuple[bool, str]:
+    pptx_path = _final_pptx_path(project.id)
+    if (
+        project.status != "completed"
+        or not slides
+        or _project_has_stale_artifacts(slides)
+        or _editable_export_missing_pages(slides)
+    ):
+        return False, pptx_path
+    if _final_pptx_matches_completed_slides(pptx_path, slides):
+        return True, pptx_path
+
+    generated_count = _assemble_partial_project_pptx(project, slides, pptx_path)
+    if generated_count != len(slides):
+        return False, pptx_path
+    return _final_pptx_matches_completed_slides(pptx_path, slides), pptx_path
 
 
 def _resolve_generation_page_nums(slides: list[Slide], requested_page_nums: list[int] | None, prototype: bool) -> list[int] | None:
@@ -1997,6 +2260,7 @@ def _build_slide_reference_contexts(
         hint_parts: list[str] = []
         ref_count = len(slide.reference_images or [])
         logger.info(f"RefContext: slide {slide.page_num} has {ref_count} reference_images")
+        _sync_exact_page_reference_overlay_layers(slide)
         overlay_asset_ids = exact_overlay_asset_ids(
             slide.visual_json if isinstance(slide.visual_json, dict) else {}
         )
@@ -2004,7 +2268,8 @@ def _build_slide_reference_contexts(
             if str(ref.id) in overlay_asset_ids:
                 logger.info(f"RefContext: slide {slide.page_num} ref {idx} skipped (overlay)")
                 continue
-            file_exists = os.path.exists(ref.file_path)
+            resolved_file = _resolve_file_path(ref.file_path)
+            file_exists = os.path.exists(resolved_file)
             logger.info(f"RefContext: slide {slide.page_num} ref {idx} file={ref.file_path} exists={file_exists} role={ref.role}")
             if not file_exists:
                 continue
@@ -3388,9 +3653,19 @@ async def _do_generate_visual_and_prompts(
         }, run_id)
 
         # 更新数据库：prompts
-        prompt_by_page = {p["page_num"]: p["prompt"] for p in prompts}
+        prompt_by_page = {
+            p["page_num"]: str(p.get("prompt") or "").strip()
+            for p in prompts
+            if isinstance(p, dict)
+        }
+        prompt_failures = {
+            int(p.get("page_num") or 0): str(p.get("error") or "生图 Prompt 为空").strip()
+            for p in prompts
+            if isinstance(p, dict) and not str(p.get("prompt") or "").strip()
+        }
+        prompt_failures = {page_num: reason for page_num, reason in prompt_failures.items() if page_num > 0}
         for slide in target_slides:
-            slide.prompt_text = prompt_by_page.get(slide.page_num)
+            slide.prompt_text = prompt_by_page.get(slide.page_num) or None
             if slide.prompt_text:
                 slide.visual_json = with_artifact_meta(
                     slide.visual_json,
@@ -3414,13 +3689,31 @@ async def _do_generate_visual_and_prompts(
         elif all(s.visual_json for s in slides):
             project.status = "visual_ready"
 
-        finish_run(
-            db,
-            run_id,
-            status="succeeded",
-            message=f"画面描述和生图 Prompt 已生成，共 {total_prompt_pages} 页",
-            completed_count=total_prompt_pages,
-        )
+        if prompt_failures:
+            failed_pages = sorted(prompt_failures)
+            failed_pages_text = "、".join(str(page_num) for page_num in failed_pages[:12])
+            if len(failed_pages) > 12:
+                failed_pages_text += " 等"
+            finish_run(
+                db,
+                run_id,
+                status="failed",
+                message=f"第 {failed_pages_text} 页生图 Prompt 生成失败，请重试缺失页。",
+                completed_count=max(0, total_prompt_pages - len(prompt_failures)),
+                failed_count=len(prompt_failures),
+                error_msg="; ".join(
+                    f"第 {page_num} 页: {reason[:120]}"
+                    for page_num, reason in sorted(prompt_failures.items())
+                )[:500],
+            )
+        else:
+            finish_run(
+                db,
+                run_id,
+                status="succeeded",
+                message=f"画面描述和生图 Prompt 已生成，共 {total_prompt_pages} 页",
+                completed_count=total_prompt_pages,
+            )
         db.commit()
         logger.info(f"Visual plan and prompts generated for project {project_id}")
     except asyncio.CancelledError:
@@ -3539,6 +3832,13 @@ def start_generation(
 
     # 记录本次生成的目标页码，供前端进度显示用
     target_slides = [s for s in slides if s.page_num in page_nums] if page_nums else slides
+    synced_exact_pages = _sync_exact_page_reference_overlays_for_generation(db, target_slides)
+    if synced_exact_pages:
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
+        )
     stale_plan_pages = [
         s.page_num
         for s in target_slides
@@ -3794,12 +4094,16 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         db.commit()
 
     pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
-    pptx_path = os.path.join(
-        settings.OUTPUT_DIR or "./outputs",
+    pptx_path = os.path.join(_project_output_dir(project_id), pptx_filename)
+    if project.status == "completed":
+        has_pptx, pptx_path = _has_completed_final_pptx(project, slides)
+    else:
+        has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
+    has_editable_pptx, editable_pptx_path = _has_current_editable_pptx(
         project_id,
-        pptx_filename,
+        pptx_path,
+        project.status == "completed" and has_pptx,
     )
-    has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
 
     target_count, target_completed, target_failed = target_counts(active_run, slides)
     progress = generation_progress.get(project_id, {})
@@ -3816,6 +4120,8 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         "active_run": serialize_run(active_run, slides),
         "has_pptx": has_pptx,
         "pptx_path": pptx_path if has_pptx else None,
+        "has_editable_pptx": has_editable_pptx,
+        "editable_pptx_path": editable_pptx_path if has_editable_pptx else None,
         "slides": slide_status,
     }
 
@@ -3848,12 +4154,16 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         db.commit()
 
     pptx_filename = "prototype.pptx" if project.status == "prototype_ready" else "presentation.pptx"
-    pptx_path = os.path.join(
-        settings.OUTPUT_DIR or "./outputs",
+    pptx_path = os.path.join(_project_output_dir(project_id), pptx_filename)
+    if project.status == "completed":
+        has_pptx, pptx_path = _has_completed_final_pptx(project, slides)
+    else:
+        has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
+    has_editable_pptx, editable_pptx_path = _has_current_editable_pptx(
         project_id,
-        pptx_filename,
+        pptx_path,
+        project.status == "completed" and has_pptx,
     )
-    has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
     quality_report = (
         build_project_quality_report(project, slides, has_pptx=has_pptx, pptx_path=pptx_path)
         if not active_run
@@ -3867,6 +4177,8 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         latest_run=latest_run,
         has_pptx=has_pptx,
         pptx_path=pptx_path,
+        has_editable_pptx=has_editable_pptx,
+        editable_pptx_path=editable_pptx_path,
         quality_report=quality_report,
     )
 
@@ -3932,8 +4244,8 @@ def download_pptx(project_id: str, prototype: bool = False, db: Session = Depend
         project_id,
     )
     if not prototype and project.status == "completed":
-        final_pptx_path = os.path.join(output_dir, "presentation.pptx")
-        if os.path.exists(final_pptx_path) and not _project_has_stale_artifacts(slides):
+        has_final_pptx, final_pptx_path = _ensure_completed_final_pptx(project, slides)
+        if has_final_pptx:
             display_name = f"{project.title}.pptx"
             return FileResponse(
                 path=final_pptx_path,
@@ -3951,6 +4263,78 @@ def download_pptx(project_id: str, prototype: bool = False, db: Session = Depend
     return FileResponse(
         path=pptx_path,
         filename=display_name,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+
+
+@router.post("/{project_id}/editable-pptx")
+def start_editable_pptx_export(
+    project_id: str,
+    request: EditablePptxExportRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    """启动可编辑版 PPTX 后处理。"""
+    restore_mode = normalize_editable_pptx_restore_mode(request.restore_mode if request else "standard")
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    stale_run = stale_inactive_run_if_needed(db, project_id)
+    if stale_run and stale_run.status == "stale":
+        db.commit()
+    active_run = get_active_run(db, project_id)
+    if active_run:
+        raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再下载可编辑版。")
+
+    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
+    has_final_pptx, final_pptx_path = _ensure_completed_final_pptx(project, slides)
+    if not has_final_pptx:
+        raise HTTPException(status_code=409, detail="请先完成全量 PPT 生成，再下载可编辑版。")
+
+    missing_pages = _editable_export_missing_pages(slides)
+    if missing_pages:
+        raise HTTPException(
+            status_code=409,
+            detail=f"第 {', '.join(map(str, missing_pages))} 页还没有完整生成，请先完成全量 PPT。",
+        )
+
+    ensure_editable_pptx_worker_ready()
+    run = create_project_run(
+        db,
+        project_id,
+        kind="editable_pptx",
+        stage="editable_pptx",
+        total_count=len(slides),
+        message="可编辑版已开始准备",
+    )
+    db.commit()
+    task = _enqueue_editable_pptx_task(db, project_id, run=run, restore_mode=restore_mode)
+
+    return {
+        "status": "generating",
+        "project_id": project_id,
+        "restore_mode": restore_mode,
+        "task_id": task.id,
+        "run": serialize_run(run, slides),
+    }
+
+
+@router.get("/{project_id}/download-editable")
+def download_editable_pptx(project_id: str, restore_mode: str = "standard", db: Session = Depends(get_db)):
+    """下载已生成的可编辑版 PPTX。"""
+    mode = normalize_editable_pptx_restore_mode(restore_mode)
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
+    has_final_pptx, final_pptx_path = _ensure_completed_final_pptx(project, slides)
+    has_editable, editable_path = _has_current_editable_pptx(project_id, final_pptx_path, has_final_pptx, mode)
+    if not has_editable:
+        raise HTTPException(status_code=404, detail="可编辑版还没有准备好，请先点击下载可编辑版。")
+
+    return FileResponse(
+        path=editable_path,
+        filename=f"{project.title}_可编辑版.pptx" if mode == "standard" else f"{project.title}_可编辑版_{mode}.pptx",
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
 
@@ -4501,6 +4885,17 @@ def update_reference_image(
         ref.process_mode = process_mode
         changed_visual_asset = ref.role == "visual_asset"
         changed_logo = ref.role == "logo"
+        if ref.slide_id and ref.role in EXACT_PAGE_REFERENCE_ROLES:
+            slide = db.query(Slide).filter(Slide.id == ref.slide_id, Slide.project_id == project_id).first()
+            if slide:
+                if process_mode == "original":
+                    _sync_exact_page_reference_overlay_layers(slide, [ref])
+                else:
+                    next_visual = remove_asset_from_overlay_layers(slide.visual_json, ref.id)
+                    if next_visual != (slide.visual_json if isinstance(slide.visual_json, dict) else {}):
+                        slide.visual_json = next_visual
+                        flag_modified(slide, "visual_json")
+                    _clear_reference_exact_overlay_mark(ref)
 
     if ref.role == "logo" and logo_anchor is not None:
         ref.logo_anchor = normalize_logo_anchor(logo_anchor)
@@ -4755,6 +5150,14 @@ def retry_failed_slides(
     if not failed_slides:
         raise HTTPException(status_code=400, detail="没有失败的页面需要重试")
 
+    synced_exact_pages = _sync_exact_page_reference_overlays_for_generation(db, failed_slides)
+    if synced_exact_pages:
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
+        )
+
     stale_plan_pages = [
         slide.page_num
         for slide in failed_slides
@@ -4820,6 +5223,14 @@ class RetryRequest(BaseModel):
 
 def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_feedback: str | None = None) -> str:
     """为单页重新生成 prompt_text，基于最新的 content_json 和 visual_json。"""
+    slide.reference_images = sorted(
+        db.query(ReferenceImage).filter(
+            ReferenceImage.slide_id == slide.id,
+            ReferenceImage.role != "finetune_ref",
+        ).all(),
+        key=_reference_image_sort_key,
+    )
+    _sync_exact_page_reference_overlay_layers(slide)
     content_json = slide.content_json or {}
     visual_json = slide.visual_json or {}
 
@@ -5110,6 +5521,14 @@ def retry_slide(
     # 如果要求重新生成 prompt，基于最新 content/visual 重新生成
     if body.regenerate_prompt:
         _regenerate_slide_prompt(slide, project, db, user_feedback=(body.user_feedback or "").strip() or None)
+    else:
+        synced_exact_pages = _sync_exact_page_reference_overlays_for_generation(db, [slide])
+        if synced_exact_pages:
+            db.commit()
+            raise HTTPException(
+                status_code=400,
+                detail="该页面有原样保留素材，请先重新生成画面描述以预留位置。",
+            )
 
     if has_stale_flags(slide.visual_json, "content", "visual"):
         raise HTTPException(status_code=400, detail="该页面有未应用的内容或画面修改，请先更新画面方案。")
@@ -5256,6 +5675,47 @@ def update_slide_visual(
     for key in allowed_fields:
         if key in new_visual:
             existing[key] = new_visual[key]
+
+    if "overlay_layers" in new_visual:
+        raw_layers = new_visual.get("overlay_layers") or []
+        if not isinstance(raw_layers, list):
+            raise HTTPException(status_code=400, detail="overlay_layers must be a list")
+        requested_asset_ids = {
+            str(layer.get("asset_id"))
+            for layer in raw_layers
+            if isinstance(layer, dict) and layer.get("asset_id")
+        }
+        valid_assets = []
+        if requested_asset_ids:
+            candidates = db.query(ReferenceImage).filter(
+                ReferenceImage.project_id == project_id,
+                ReferenceImage.id.in_(requested_asset_ids),
+            ).all()
+            valid_assets = [
+                asset for asset in candidates
+                if asset.file_path and os.path.exists(_resolve_file_path(asset.file_path))
+            ]
+        valid_ids = {str(asset.id) for asset in valid_assets}
+        missing = [asset_id for asset_id in requested_asset_ids if asset_id not in valid_ids]
+        if missing:
+            logger.warning(
+                "update_slide_visual: requested overlay asset_ids not found or missing file: %s",
+                missing,
+            )
+            raise HTTPException(status_code=400, detail=f"Invalid overlay asset ids: {', '.join(missing[:5])}")
+
+        normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
+        overlay_asset_ids = {str(layer.get("asset_id")) for layer in normalized_layers if layer.get("asset_id")}
+        for asset in valid_assets:
+            if str(asset.id) in overlay_asset_ids:
+                asset.process_mode = "original"
+                analysis = asset.asset_analysis if isinstance(asset.asset_analysis, dict) else {}
+                asset.asset_analysis = {
+                    **analysis,
+                    "exact_overlay": True,
+                    "exact_overlay_reason": "用户选择原样保留，最终页面会保留素材比例和细节。",
+                }
+        existing["overlay_layers"] = normalized_layers
 
     project_slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
     slide.visual_json = with_artifact_meta(

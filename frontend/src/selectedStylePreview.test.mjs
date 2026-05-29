@@ -96,6 +96,25 @@ for (const page of roleDirectedPreview.pages) {
   assert.equal(page.highlight, "#7C5CFF");
 }
 
+const bareHexPreview = buildSelectedStylePreview({
+  name: "琥珀暖调都会",
+  palette: [
+    { name: "温暖深棕", hex: "4A3728", role: "品牌主色/章节页主色" },
+    { name: "琥珀金", hex: "C9924A", role: "强调色/数据高亮/编号" },
+    { name: "暖白米", hex: "FBF8F3", role: "内容页基底/正文区" },
+    { name: "深炭灰", hex: "3A3A3A", role: "正文/数据文字" },
+  ],
+  visual_strategy: {
+    base_tone: "mixed",
+    summary: "按页面功能分组控制明暗；内容页以暖白米为底。",
+  },
+});
+
+assert.equal(bareHexPreview.palette[0].hex, "#4A3728");
+assert.equal(bareHexPreview.palette[1].hex, "#C9924A");
+assert.equal(bareHexPreview.pages.find((page) => page.key === "cover").background, "#4A3728");
+assert.equal(bareHexPreview.pages.find((page) => page.key === "content").background, "#FBF8F3");
+
 const darkInformationPagesPreview = buildSelectedStylePreview({
   name: "禅灰极简（金色点缀）",
   palette: [

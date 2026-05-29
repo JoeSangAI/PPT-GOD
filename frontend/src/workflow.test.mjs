@@ -197,6 +197,44 @@ assert.deepEqual(
   ]
 );
 
+const editableState = buildWorkflowState({
+  projectStatus: "completed",
+  slides: [{ status: "completed", image_path: "/slide-1.png", prompt_text: "page" }],
+  activeRun: {
+    kind: "editable_pptx",
+    status: "running",
+    total_count: 3,
+    completed_count: 1,
+  },
+});
+assert.equal(editableState.steps[editableState.steps.length - 1].label, "可编辑版");
+assert.equal(editableState.stepIndex, 5);
+assert.equal(editableState.stepStatuses[4], "done");
+assert.equal(editableState.stepStatuses[5], "current");
+
+const editableDisclosure = buildWorkflowProgressDisclosure({
+  active_run: {
+    kind: "editable_pptx",
+    status: "running",
+    started_at: "2026-05-14T05:00:00.000Z",
+    updated_at: "2026-05-14T05:01:05.000Z",
+    total_count: 58,
+    completed_count: 12,
+  },
+}, Date.parse("2026-05-14T05:01:20.000Z"));
+
+assert.equal(editableDisclosure.headline, "可编辑版生成进度");
+assert.equal(editableDisclosure.summary, "正在生成可编辑版：12 / 58 页完成");
+assert.equal(editableDisclosure.detail, "正在重新解析页面文字与图层；完成后会自动下载可编辑版 PPTX。");
+assert.deepEqual(
+  plain(editableDisclosure.steps.map((step) => [step.label, step.status])),
+  [
+    ["解析页面", "done"],
+    ["还原图层", "current"],
+    ["生成 PPTX", "pending"],
+  ]
+);
+
 const staleUpdateDisclosure = buildWorkflowProgressDisclosure({
   active_run: {
     kind: "content_plan",

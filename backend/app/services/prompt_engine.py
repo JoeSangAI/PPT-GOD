@@ -545,6 +545,8 @@ def _reference_descriptions_for_prompt(
                 asset_name = img.get("asset_name") or "visual asset"
                 asset_kind = img.get("asset_kind") or "other"
                 route_mode = str(img.get("asset_route_mode") or "").lower()
+                if route_mode == "overlay":
+                    continue
                 usage_map = page_intent.get("visual_asset_usage") if isinstance(page_intent, dict) else {}
                 page_usage = ""
                 if isinstance(usage_map, dict) and img.get("id") in usage_map:

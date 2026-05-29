@@ -22,11 +22,14 @@ RUN_PROGRESS_LABELS = {
     "page_generation": "单页生成进度",
     "retry_failed": "失败页重试进度",
     "finetune": "单页微调进度",
+    "editable_pptx": "可编辑版生成进度",
 }
 RUN_PROGRESS_UNITS = {
     "style_proposal": "套",
+    "editable_pptx": "页",
 }
 IMAGE_RUN_KINDS = {"prototype_generation", "batch_generation", "page_generation", "retry_failed", "finetune"}
+COUNT_BASED_RUN_KINDS = {"content_plan", "style_proposal", "visual_prompts", "editable_pptx"}
 
 # 全局生成进度存储（内存级，项目重启后丢失）
 generation_progress: dict[str, dict] = {}
@@ -340,7 +343,7 @@ def target_pages_for_run(run: ProjectRun | None, slides: list[Slide]) -> set[int
 
 
 def target_counts(run: ProjectRun | None, slides: list[Slide]) -> tuple[int, int, int]:
-    if run and run.kind in {"content_plan", "style_proposal", "visual_prompts"}:
+    if run and run.kind in COUNT_BASED_RUN_KINDS:
         total = run.total_count or 0
         completed = run.completed_count or 0
         failed = run.failed_count or 0
@@ -436,6 +439,8 @@ def serialize_workflow_status(
     latest_run: ProjectRun | None = None,
     has_pptx: bool = False,
     pptx_path: str | None = None,
+    has_editable_pptx: bool = False,
+    editable_pptx_path: str | None = None,
     quality_report: dict | None = None,
 ) -> dict:
     target_count, target_completed, target_failed = target_counts(active_run, slides)
@@ -459,6 +464,8 @@ def serialize_workflow_status(
         "progress": serialize_run_progress(active_run, slides),
         "has_pptx": has_pptx,
         "pptx_path": pptx_path if has_pptx else None,
+        "has_editable_pptx": has_editable_pptx,
+        "editable_pptx_path": editable_pptx_path if has_editable_pptx else None,
         "quality_report": quality_report,
         "slides": [
             {

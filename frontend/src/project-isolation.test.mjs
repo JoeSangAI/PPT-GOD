@@ -107,6 +107,11 @@ assert.match(
 );
 assert.match(
   source,
+  /function proposalColorValue\(color: any\)[\s\S]*#\?\(\(\?:\[0-9a-fA-F\]\{3\}\)\{1,2\}\)/,
+  "style proposal swatches must render six-digit hex values even when the backend returns them without #"
+);
+assert.match(
+  source,
   /const slideProjectMaterialItems = visualAssetIdsForSlide\(slide\)[\s\S]*projectVisualAssetById\.get\(id\)[\s\S]*slideProjectMaterialItems\.length > 0[\s\S]*slideProjectMaterialItems\.map/,
   "global slide cards must show project-level visual assets selected for the slide"
 );
@@ -174,6 +179,68 @@ assert.match(
   client,
   /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\][^)]*\)[\s\S]*body\.attachment_ids = attachmentIds/,
   "content-plan API requests must support explicit attachment ids"
+);
+assert.match(
+  client,
+  /export async function startEditablePptx\(projectId: string,\s*restoreMode[\s\S]*\/projects\/\$\{projectId\}\/editable-pptx[\s\S]*body:\s*JSON\.stringify\(\{\s*restore_mode:\s*restoreMode\s*\}\)/,
+  "editable PPTX export must start through the dedicated post-processing endpoint with the selected editability level"
+);
+assert.match(
+  client,
+  /export function getEditableDownloadUrl\(projectId: string,\s*restoreMode[\s\S]*\/projects\/\$\{projectId\}\/download-editable[\s\S]*restore_mode/,
+  "editable PPTX export must have a dedicated mode-aware download URL"
+);
+assert.match(
+  source,
+  /editableDownloadRunIdRef[\s\S]*editableDownloadModeRef[\s\S]*handleEditablePptxExport[\s\S]*下载可编辑版 PPTX/,
+  "editable PPTX export must keep a user-facing button, selected level, and track the run that should auto-download"
+);
+assert.match(
+  source,
+  /下载规划 MD/,
+  "download actions should use consistent labels for planning MD, image PPTX, and editable PPTX"
+);
+assert.match(source, /下载图片版 PPTX/, "image PPTX download action should be clearly labeled");
+assert.match(source, /下载可编辑版 PPTX/, "editable PPTX download action should be clearly labeled");
+assert.match(
+  source,
+  /EDITABLE_PPTX_MODE_OPTIONS[\s\S]*标准[\s\S]*推荐[\s\S]*增强[\s\S]*激进[\s\S]*pg-editable-export-menu/,
+  "editable PPTX export UI must expose standard, enhanced, and aggressive levels inside the download menu"
+);
+assert.doesNotMatch(
+  source,
+  /selectedEditablePptxMode/,
+  "editable PPTX export must not show parsing strength as a persistent top-bar segmented control"
+);
+assert.match(
+  workflow,
+  /WORKFLOW_STEPS[\s\S]*可编辑版/,
+  "editable PPTX export must appear as its own workflow step"
+);
+assert.match(
+  workflow,
+  /case "editable_pptx":[\s\S]*return 5;/,
+  "editable PPTX export runs must advance the workflow to the dedicated editable step"
+);
+assert.match(
+  workflow,
+  /editable_pptx:[\s\S]*可编辑版生成进度[\s\S]*正在生成可编辑版/,
+  "editable PPTX export must use dedicated progress copy instead of batch-generation fallback"
+);
+assert.match(
+  source,
+  /aria-label="下载可编辑版 PPTX，选择解析强度"[\s\S]*选择解析强度[\s\S]*越高拆得越细/,
+  "editable PPTX export controls must explain the selected parsing level inside the download menu"
+);
+assert.doesNotMatch(
+  source,
+  /pg-editable-export[\s\S]*title=\{option\.hint\}|title="解析强度越高|title="会重新解析整套 PPT/,
+  "editable PPTX export menu must not duplicate inline explanations as hover-only tooltips"
+);
+assert.match(
+  css,
+  /\.pg-topbar\.pg-project-header\s*\{[\s\S]*z-index:\s*80;[\s\S]*overflow:\s*visible;/,
+  "editable PPTX export menu must render above workflow and style bands instead of being covered"
 );
 assert.match(
   source,
