@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     CELERY_TASK_SOFT_TIME_LIMIT: int = 1800
     CELERY_TASK_TIME_LIMIT: int = 2100
     PPTX_ASSEMBLY_LOCK_TTL_SECONDS: int = 300
+    EDITABLE_PPTX_OCR_TIMEOUT_SECONDS: float = 90.0
+    EDITABLE_PPTX_OCR_RETRY_COUNT: int = 2
+    EDITABLE_PPTX_OCR_RETRY_BACKOFF_SECONDS: float = 1.5
+    EDITABLE_PPTX_MAX_VISUAL_ASSETS_PER_SLIDE: int = 6
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175"
 
     OUTPUT_DIR: str = "./outputs"

@@ -26,6 +26,7 @@ from app.utils.project_docs import (
     write_document_parse_status,
 )
 from app.utils.reference_image import default_visual_asset_process_mode
+from app.services.logo_policy import normalize_logo_anchor
 
 router = APIRouter(prefix="/projects", tags=["documents"])
 logger = logging.getLogger(__name__)
@@ -291,24 +292,50 @@ def _pdf_asset_analysis(image: dict) -> dict:
     source_page_num = _source_page_num_from_analysis(image)
     source_document = str(image.get("source_document") or "")
     nearby_text = str(image.get("nearby_text") or "")
-    return {
+    is_logo = image.get("asset_kind") == "pdf_logo" or image.get("figure_role") == "logo"
+    is_full_page = bool(image.get("is_full_page_reference") or image.get("asset_kind") == "source_page_image")
+    if is_logo:
+        subject = f"从「{source_document}」识别出的 Logo" if source_document else "PDF 中识别出的 Logo"
+        recommended_usage = "从原 PDF 识别出的品牌标识，作为项目级 Logo 使用。"
+    elif is_full_page and source_document and source_page_num:
+        subject = f"「{source_document}」第{source_page_num}页整页原图"
+        recommended_usage = f"作为原 PDF/PPT 第{source_page_num}页的整页画面参考，优先用于 1:1 复刻。"
+    else:
+        subject = f"「{source_document}」第{source_page_num}页原图" if source_document and source_page_num else "PDF 原图"
+        recommended_usage = "作为原文页附近内容的参考配图，优先挂接到引用相同来源页的 PPT 页面。"
+    analysis = {
         **image,
         "source_type": "pdf",
         "source_document": source_document,
         "source_page_num": source_page_num,
         "pdf_source_page_num": source_page_num,
-        "detected_kind": image.get("asset_kind") or "document_image",
-        "subject": f"「{source_document}」第{source_page_num}页原图" if source_document and source_page_num else "PDF 原图",
+        "detected_kind": "logo" if is_logo else image.get("asset_kind") or "document_image",
+        "subject": subject,
         "description": nearby_text,
-        "recommended_usage": "作为原文页附近内容的参考配图，优先挂接到引用相同来源页的 PPT 页面。",
+        "recommended_usage": recommended_usage,
         "suggested_keywords": [
             "PDF原图",
+            "整页原图" if is_full_page else "",
             "原文配图",
             f"第{source_page_num}页" if source_page_num else "",
             str(image.get("chapter_id") or ""),
         ],
         "analysis_status": "completed",
     }
+    if is_logo:
+        classification = image.get("classification") or "pdf_logo"
+        analysis.update({
+            "classification": classification,
+            "review_status": "auto_confirmed",
+            "needs_user_review": False,
+            "confidence_score": 0.84 if classification == "pdf_repeated_logo" else 0.78,
+            "review_reason": (
+                "从 PDF 多页稳定重复位置识别出的 Logo，已作为项目级品牌标识使用。"
+                if classification == "pdf_repeated_logo"
+                else "从 PDF 首页/尾页品牌区识别出的 Logo，已作为项目级品牌标识使用。"
+            ),
+        })
+    return analysis
 
 
 def _attach_extracted_pdf_assets(project: Project, source_pack: dict, db: Session) -> dict:
@@ -325,6 +352,16 @@ def _attach_extracted_pdf_assets(project: Project, source_pack: dict, db: Sessio
         for ref in existing_page_refs
         if isinstance(ref.asset_analysis, dict)
     }
+    existing_logo_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.slide_id.is_(None),
+        ReferenceImage.role == "logo",
+    ).all()
+    existing_logo_hashes = {
+        str(ref.asset_analysis.get("image_sha1") or ref.asset_analysis.get("pdf_image_sha1"))
+        for ref in existing_logo_refs
+        if isinstance(ref.asset_analysis, dict) and (ref.asset_analysis.get("image_sha1") or ref.asset_analysis.get("pdf_image_sha1"))
+    }
     stats = {"logos": 0, "page_refs": 0, "visual_assets": 0}
 
     for image in images:
@@ -334,6 +371,25 @@ def _attach_extracted_pdf_assets(project: Project, source_pack: dict, db: Sessio
         if not file_path or not os.path.exists(file_path):
             continue
         analysis = _pdf_asset_analysis(image)
+        if analysis.get("detected_kind") == "logo" or analysis.get("classification") == "pdf_repeated_logo":
+            digest = str(analysis.get("image_sha1") or analysis.get("pdf_image_sha1") or "")
+            if digest and digest in existing_logo_hashes:
+                continue
+            db.add(ReferenceImage(
+                project_id=project.id,
+                slide_id=None,
+                file_path=file_path,
+                role="logo",
+                process_mode="original",
+                asset_name=analysis.get("subject"),
+                usage_note=analysis.get("recommended_usage"),
+                asset_analysis=analysis,
+                logo_anchor=normalize_logo_anchor(analysis.get("logo_anchor")),
+            ))
+            if digest:
+                existing_logo_hashes.add(digest)
+            stats["logos"] += 1
+            continue
         page_ref_key = _source_page_ref_key_from_analysis(analysis, file_path)
         if page_ref_key in existing_page_ref_keys:
             continue
@@ -343,7 +399,7 @@ def _attach_extracted_pdf_assets(project: Project, source_pack: dict, db: Sessio
             slide_id=None,
             file_path=file_path,
             role="content_ref",
-            process_mode="blend",
+            process_mode="original" if analysis.get("detected_kind") == "source_page_image" else "blend",
             asset_name=analysis.get("subject"),
             asset_kind=analysis.get("detected_kind") or "document_image",
             usage_note=analysis.get("recommended_usage"),

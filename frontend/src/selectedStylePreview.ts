@@ -31,7 +31,7 @@ export interface SelectedStylePreview {
   fontText: string;
 }
 
-const HEX_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
+const HEX_COLOR_PATTERN = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 const FALLBACK_PALETTE: StylePreviewColor[] = [
   { name: "主色", hex: "#4F46E5", role: "标题强调" },
   { name: "强调色", hex: "#7C3AED", role: "重点信息" },
@@ -41,7 +41,7 @@ const FALLBACK_PALETTE: StylePreviewColor[] = [
 
 function stripHexCodes(value: any) {
   return String(value || "")
-    .replace(/#(?:[0-9a-fA-F]{3}){1,2}\b/g, "")
+    .replace(/(^|[^0-9a-fA-F])#?(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})(?![0-9a-fA-F])/g, "$1")
     .replace(/\s+([，。；;,.])/g, "$1")
     .replace(/（\s*）|\(\s*\)/g, "")
     .replace(/\s{2,}/g, " ")
@@ -50,11 +50,13 @@ function stripHexCodes(value: any) {
 
 function normalizeHex(value: any) {
   const raw = String(value || "").trim();
-  if (!HEX_COLOR_PATTERN.test(raw)) return "#CBD5E1";
-  if (raw.length === 4) {
-    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`.toUpperCase();
+  const match = raw.match(HEX_COLOR_PATTERN);
+  if (!match) return "#CBD5E1";
+  const hex = match[1];
+  if (hex.length === 3) {
+    return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`.toUpperCase();
   }
-  return raw.toUpperCase();
+  return `#${hex}`.toUpperCase();
 }
 
 function hexBrightness(hex: string) {

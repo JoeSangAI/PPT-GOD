@@ -400,6 +400,44 @@ def test_workflow_status_exposes_unified_progress_view_model():
     assert payload["progress"]["can_cancel"] is True
 
 
+def test_workflow_status_exposes_editable_pptx_progress_and_download_flag():
+    db = make_session()
+    project = Project(title="Editable deck", status="completed")
+    db.add(project)
+    db.flush()
+    for page_num in range(1, 3):
+        db.add(Slide(project_id=project.id, page_num=page_num, status="completed", image_path=f"/tmp/{page_num}.png"))
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="editable_pptx",
+        stage="editable_pptx",
+        total_count=2,
+        message="正在准备可编辑版",
+    )
+    update_run_progress(db, run.id, completed_count=1, failed_count=0)
+    slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+
+    payload = serialize_workflow_status(
+        project,
+        slides,
+        active_run=run,
+        latest_run=run,
+        has_pptx=True,
+        pptx_path="/tmp/presentation.pptx",
+        has_editable_pptx=True,
+        editable_pptx_path="/tmp/editable_presentation.pptx",
+    )
+
+    assert payload["has_editable_pptx"] is True
+    assert payload["editable_pptx_path"] == "/tmp/editable_presentation.pptx"
+    assert payload["progress"]["label"] == "可编辑版生成进度"
+    assert payload["progress"]["unit"] == "页"
+    assert payload["progress"]["current"] == 1
+    assert payload["progress"]["total"] == 2
+
+
 def test_content_dependent_invalidation_preserves_generated_outputs():
     from app.api import slides as slides_api
 
@@ -600,3 +638,50 @@ def test_download_completed_project_serves_final_presentation(tmp_path, monkeypa
     response = slides_api.download_pptx(project.id, db=db)
 
     assert response.path == str(final_pptx_path)
+
+
+def test_download_completed_project_rebuilds_stale_final_presentation_with_missing_pages(tmp_path, monkeypatch):
+    from app.api import slides as slides_api
+
+    db = make_session()
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
+    project = Project(
+        title="Completed export",
+        status="completed",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+
+    project_dir = tmp_path / project.id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    slide_paths = []
+    for page_num, color in [(1, "red"), (2, "blue")]:
+        slide_path = project_dir / f"slide_{page_num:02d}.png"
+        Image.new("RGB", (1792, 1024), color).save(slide_path)
+        slide_paths.append(slide_path)
+        db.add(
+            Slide(
+                project_id=project.id,
+                page_num=page_num,
+                status="completed",
+                content_json={"page_num": page_num},
+                visual_json={"visual_description": f"page {page_num}"},
+                prompt_text="prompt",
+                image_path=str(slide_path),
+            )
+        )
+
+    final_pptx_path = project_dir / "presentation.pptx"
+    slides_api.assemble_pptx(
+        [{"page_num": 1, "image_path": str(slide_paths[0]), "speaker_notes": ""}],
+        str(final_pptx_path),
+    )
+    db.commit()
+
+    response = slides_api.download_pptx(project.id, db=db)
+    rebuilt = Presentation(response.path)
+
+    assert response.path == str(final_pptx_path)
+    assert len(rebuilt.slides) == 2

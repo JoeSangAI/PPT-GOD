@@ -18,7 +18,7 @@ assert.doesNotMatch(
 
 assert.match(
   source,
-  /const ASSET_ROUTE_HELP: Record<AssetRoute, \{ label: string; description: string \}> = \{/,
+  /const ASSET_ROUTE_HELP: Record<AssetRoute, \{ label: string; description: string; costNote\?: string \}> = \{/,
   "route labels and descriptions should be centralized"
 );
 
@@ -44,6 +44,12 @@ assert.match(
   /aria-label=\{`\$\{help\.label\}：\$\{help\.description\}`\}/,
   "route buttons should expose their explanation to assistive technology"
 );
+assert.match(
+  source,
+  /costNote: "每个组件会单独精修，生成更慢，也会消耗更多 credits。"/,
+  "refined fusion should show a concise user-visible cost note"
+);
+assert.match(source, /help\.costNote/, "refined fusion cost note should render from route help");
 assert.equal(
   (source.match(/ASSET_ROUTE_OPTIONS\.map/g) || []).length,
   3,

@@ -6,6 +6,8 @@ from app.services.source_pack import FRONT_MATTER_ROLE_TERMS, estimate_tokens, f
 
 
 DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET = 120_000
+SOURCE_PAGE_FIGURE_LIMIT = 120
+OTHER_FIGURE_LIMIT = 120
 
 
 @dataclass
@@ -366,7 +368,14 @@ def _scope_images(pack: dict, pages: list[dict], chapter: dict | None = None) ->
         if chapter_id and image.get("chapter_id") and str(image.get("chapter_id")) != chapter_id:
             continue
         images.append(image)
-    return images
+    return sorted(
+        images,
+        key=lambda image: (
+            int(image.get("source_page_num") or image.get("pdf_source_page_num") or 0),
+            0 if image.get("asset_kind") == "source_page_image" or image.get("figure_role") == "source_page" else 1,
+            -float(image.get("bbox_area") or 0),
+        ),
+    )
 
 
 def _escape_attr(value) -> str:
@@ -377,7 +386,7 @@ def _scope_text(pack: dict, pages: list[dict], chapter: dict | None = None) -> s
     doc = pack.get("document") if isinstance(pack.get("document"), dict) else {}
     filename = str(doc.get("filename") or "")
     kind = str(doc.get("kind") or "")
-    lines = [f'--- SOURCE filename="{filename}" kind="{kind}" ---']
+    lines = [f'--- SOURCE filename="{filename}" kind="{kind}" pages="{len(pages)}" ---']
     if chapter:
         lines.append(
             f'--- CHAPTER id="{chapter.get("chapter_id") or ""}" title="{chapter.get("title") or ""}" '
@@ -391,7 +400,16 @@ def _scope_text(pack: dict, pages: list[dict], chapter: dict | None = None) -> s
     images = _scope_images(pack, pages, chapter)
     if images:
         lines.append("--- AVAILABLE_FIGURES ---")
-        for idx, image in enumerate(images[:24], start=1):
+        source_page_images = [
+            image for image in images
+            if image.get("asset_kind") == "source_page_image" or image.get("figure_role") == "source_page"
+        ]
+        other_images = [image for image in images if image not in source_page_images]
+        visible_images = [
+            *source_page_images[:SOURCE_PAGE_FIGURE_LIMIT],
+            *other_images[:OTHER_FIGURE_LIMIT],
+        ]
+        for idx, image in enumerate(visible_images, start=1):
             page_num = int(image.get("source_page_num") or image.get("pdf_source_page_num") or 0)
             bbox = image.get("bbox") if isinstance(image.get("bbox"), list) else []
             nearby_text = _escape_attr(image.get("nearby_text"))[:220]
@@ -404,6 +422,8 @@ def _scope_text(pack: dict, pages: list[dict], chapter: dict | None = None) -> s
                 f'content_significance="{_escape_attr(image.get("content_significance"))}" '
                 f'image_width="{_escape_attr(image.get("image_width"))}" image_height="{_escape_attr(image.get("image_height"))}" '
                 f'bbox_area="{_escape_attr(image.get("bbox_area"))}" '
+                f'asset_kind="{_escape_attr(image.get("asset_kind"))}" '
+                f'is_full_page_reference="{_escape_attr(bool(image.get("is_full_page_reference")))}" '
                 f'nearby_text="{nearby_text}"'
             )
     return "\n".join(lines).strip()

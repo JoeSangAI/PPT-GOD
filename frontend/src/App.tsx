@@ -132,6 +132,8 @@ import {
   confirmPrototype,
   fetchWorkflowStatus,
   getDownloadUrl,
+  startEditablePptx,
+  getEditableDownloadUrl,
   getContentPlanMarkdownUrl,
   uploadFile,
   fetchReferenceImages,
@@ -166,7 +168,14 @@ import {
   getSlideVersions,
   deleteSlideVersion,
   restoreSlideVersion,
+  type EditablePptxMode,
 } from "./api/client";
+
+const EDITABLE_PPTX_MODE_OPTIONS: Array<{ value: EditablePptxMode; label: string; hint: string }> = [
+  { value: "standard", label: "标准版（推荐）", hint: "主标题、正文、结论优先，视觉最稳" },
+  { value: "enhanced", label: "增强版", hint: "额外拆卡片标签和图表主要标签" },
+  { value: "aggressive", label: "激进版", hint: "尽量全拆，可能影响画面" },
+];
 
 interface Project {
   id: string;
@@ -623,7 +632,7 @@ function buildRunCompletionFollowup({
     if (projectStatus === "completed") {
       return {
         agentRole: "visual",
-        content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。`,
+        content: `✅ 全量生成已完成，共 ${completedCount} / ${totalSlides || completedCount} 页。\n\n👉 下一步：点击右上角「下载图片版 PPTX」获取文件；需要调整时可选中页面重新生成。`,
         statusKey: "generation-result",
       };
     }
@@ -1154,8 +1163,8 @@ function buildVisualStyleGenerationContext(
 
 function proposalColorValue(color: any) {
   const raw = typeof color === "string" ? color : color?.hex;
-  const match = String(raw || "").match(/#(?:[0-9a-fA-F]{3}){1,2}\b/);
-  return match?.[0] || "#d1d5db";
+  const match = String(raw || "").trim().match(/^#?((?:[0-9a-fA-F]{3}){1,2})$/);
+  return match ? `#${match[1].toUpperCase()}` : "#d1d5db";
 }
 
 function proposalColorLabel(color: any, index: number) {
@@ -1484,6 +1493,8 @@ function App() {
   const activeChatRoleRef = useRef<string | null>(null);
   const activeChatGateRef = useRef<string | null>(null);
   const activeChatGateRevisionRef = useRef<number | null>(null);
+  const editableDownloadRunIdRef = useRef<string | null>(null);
+  const editableDownloadModeRef = useRef<EditablePptxMode>("standard");
 
   // 保存最近一次聊天的请求参数，用于切回来后自动恢复
   const pendingChatRef = useRef<PendingChatRequest | null>(null);
@@ -3227,7 +3238,7 @@ function App() {
           { role: "system", content: `批量生成完成，共 ${completedCount} 页` },
           {
             role: "agent",
-            content: `✅ 全部 ${completedCount} 页已生成。点击右上角「导出 PPTX」下载。`,
+            content: `✅ 全部 ${completedCount} 页已生成。点击右上角「下载图片版 PPTX」。`,
             agentRole: "visual",
           },
         ]);
@@ -3251,6 +3262,29 @@ function App() {
     prevProjectStatusRef.current = { projectId: pid, status: currentStatus };
     prevActiveRunRef.current = { projectId: pid, runId: activeRunId, kind: activeRun?.kind || null };
   }, [selectedProject?.id, selectedProject?.status, activeRun?.id]);
+
+  useEffect(() => {
+    const projectId = selectedProject?.id;
+    const requestedRunId = editableDownloadRunIdRef.current;
+    if (!projectId || !requestedRunId || hasActiveRun) return;
+    const lastRun = currentProjectStatus?.last_run;
+    if (lastRun?.id !== requestedRunId) return;
+    if (lastRun.status === "succeeded") {
+      const restoreMode = editableDownloadModeRef.current;
+      editableDownloadRunIdRef.current = null;
+      window.location.href = getEditableDownloadUrl(projectId, restoreMode);
+      return;
+    }
+    if (["failed", "cancelled", "stale"].includes(String(lastRun.status || ""))) {
+      editableDownloadRunIdRef.current = null;
+      showToast(lastRun.message || "可编辑版准备失败，请稍后重试。", "error");
+    }
+  }, [
+    selectedProject?.id,
+    hasActiveRun,
+    currentProjectStatus?.last_run?.id,
+    currentProjectStatus?.last_run?.status,
+  ]);
 
   // 最终态补充一份交付前检查，不阻塞生成完成提示和导出动作。
   useEffect(() => {
@@ -3761,7 +3795,7 @@ function App() {
             ? `✅ ${generationOutcome.message}\n\n👉 下一步：${
                 prototype
                   ? "检查样张效果；满意后点击「样张满意，生成全部」，不满意可以勾选页面重打样张或调整风格。"
-                  : "点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。"
+                  : "点击右上角「下载图片版 PPTX」获取文件；需要调整时可选中页面重新生成。"
               }`
             : `⚠️ ${generationOutcome.message}\n\n👉 下一步：${
                 prototype
@@ -3881,7 +3915,7 @@ function App() {
         upsertAgentStatusMessage(prev.filter((m) => m.id !== loadingId), {
           role: "agent",
           content: generationOutcome.isSuccess
-            ? "✅ 全部页面生成完成。\n\n👉 下一步：点击右上角「导出 PPTX」获取文件；需要调整时可选中页面重新生成。"
+            ? "✅ 全部页面生成完成。\n\n👉 下一步：点击右上角「下载图片版 PPTX」获取文件；需要调整时可选中页面重新生成。"
             : `⚠️ ${generationOutcome.message}\n\n👉 下一步：检查失败页后重试，或选中页面单独重新生成。`,
           agentRole: "visual",
           runId: generationRunId || undefined,
@@ -3902,6 +3936,40 @@ function App() {
           agentRole: "visual",
         },
       ]);
+    } finally {
+      setOperatingProjectId(null);
+    }
+  };
+
+  const handleEditablePptxExport = async (restoreMode: EditablePptxMode) => {
+    if (!selectedProject) return;
+    const projectId = selectedProject.id;
+    if (hasActiveRun || operatingProjectId === projectId) {
+      showToast("当前已有任务在执行中，请稍后再试", "info");
+      return;
+    }
+    if (selectedProject.status !== "completed" || !currentProjectStatus?.has_pptx) {
+      showToast("请先完成全量 PPT 生成，再下载可编辑版 PPTX。", "info");
+      return;
+    }
+
+    setOperatingProjectId(projectId);
+    try {
+      const result = await startEditablePptx(projectId, restoreMode);
+      if (result?.status === "ready") {
+        window.location.href = getEditableDownloadUrl(projectId, restoreMode);
+        return;
+      }
+      if (result?.run?.id) {
+        const runId = String(result.run.id);
+        editableDownloadRunIdRef.current = runId;
+        editableDownloadModeRef.current = restoreMode;
+        locallyHandledRunIdsRef.current.add(runId);
+      }
+      await refreshWorkflowStatus();
+      showToast("正在准备可编辑版，完成后会自动下载。", "info");
+    } catch (err: any) {
+      showToast("可编辑版准备失败：" + (err.message || "未知错误"), "error");
     } finally {
       setOperatingProjectId(null);
     }
@@ -7203,6 +7271,17 @@ function App() {
   };
 
   const currentStatus = selectedProject?.status || "draft";
+  const isEditablePptxRunActive = Boolean(hasActiveRun && activeRun?.kind === "editable_pptx");
+  const editableExportDisabled = Boolean(
+    !selectedProject ||
+      chatLoading ||
+      isBusy ||
+      hasActiveRun ||
+      operatingProjectId === selectedProject.id ||
+      selectedProject.status !== "completed" ||
+      !currentProjectStatus?.has_pptx
+  );
+  const editableExportLabel = isEditablePptxRunActive ? "准备中..." : "下载可编辑版 PPTX";
   const normalizePageNums = (pageNums?: number[] | null) =>
     Array.isArray(pageNums)
       ? Array.from(new Set(pageNums.map(Number).filter((n) => Number.isFinite(n)))).sort((a, b) => a - b)
@@ -7502,6 +7581,8 @@ function App() {
           ? "画面方案进度"
           : activeRun?.kind === "prototype_generation"
           ? "样张生成进度"
+          : activeRun?.kind === "editable_pptx"
+          ? "可编辑版生成进度"
           : "批量生成进度"));
   const deckSelectedPageNums = Array.from(deckSelectedPages).sort((a, b) => a - b);
   const agentFinetuneHeadline =
@@ -7949,17 +8030,62 @@ function App() {
           <div className="pg-project-exports">
             {selectedProject && slides.length > 0 && (
               <a href={getContentPlanMarkdownUrl(selectedProject.id)} className="pg-project-export-link">
-                导出 MD
+                下载规划 MD
               </a>
             )}
             {selectedProject && generatedSlideCount > 0 ? (
               <a href={getDownloadUrl(selectedProject.id)} className="pg-project-export-link">
-                导出 PPTX
+                下载图片版 PPTX
               </a>
             ) : selectedProject ? (
               <span className="pg-project-export-link is-disabled" aria-disabled="true">
-                导出 PPTX
+                下载图片版 PPTX
               </span>
+            ) : null}
+            {selectedProject ? (
+              <div className="pg-editable-export">
+                {editableExportDisabled ? (
+                  <button
+                    type="button"
+                    className="pg-project-export-link is-disabled"
+                    disabled
+                    aria-disabled="true"
+                    aria-label={isEditablePptxRunActive ? "正在生成可编辑版 PPTX" : "请先完成全量 PPT 生成"}
+                  >
+                    {editableExportLabel}
+                  </button>
+                ) : (
+                  <details className="pg-editable-export-menu">
+                    <summary
+                      className="pg-project-export-link pg-editable-export-trigger"
+                      aria-label="下载可编辑版 PPTX，选择解析强度"
+                    >
+                      <span>{editableExportLabel}</span>
+                      <span className="pg-editable-export-caret" aria-hidden="true">⌄</span>
+                    </summary>
+                    <div className="pg-editable-export-options" role="menu" aria-label="选择解析强度">
+                      <div className="pg-editable-export-help">
+                        选择解析强度：越高拆得越细，视觉风险越高。
+                      </div>
+                      {EDITABLE_PPTX_MODE_OPTIONS.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="menuitem"
+                          className="pg-editable-export-option"
+                          onClick={(event) => {
+                            event.currentTarget.closest("details")?.removeAttribute("open");
+                            handleEditablePptxExport(option.value);
+                          }}
+                        >
+                          <span className="pg-editable-export-option-title">{option.label}</span>
+                          <span className="pg-editable-export-option-hint">{option.hint}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </div>
             ) : null}
           </div>
         </header>
@@ -11521,7 +11647,7 @@ function SingleSlideEditor({
     : {};
   type AssetRoute = "blend" | "double_blend" | "overlay";
   const ASSET_ROUTE_OPTIONS: AssetRoute[] = ["blend", "double_blend", "overlay"];
-  const ASSET_ROUTE_HELP: Record<AssetRoute, { label: string; description: string }> = {
+  const ASSET_ROUTE_HELP: Record<AssetRoute, { label: string; description: string; costNote?: string }> = {
     blend: {
       label: "智能融合",
       description: "把素材作为画面参考，融入整体风格、光影和构图，适合照片、场景和氛围图。",
@@ -11529,6 +11655,7 @@ function SingleSlideEditor({
     double_blend: {
       label: "精修融合",
       description: "先融合进画面，再校准主体边缘、比例和关键细节，适合产品、人像或必须更准确的素材。",
+      costNote: "每个组件会单独精修，生成更慢，也会消耗更多 credits。",
     },
     overlay: {
       label: "精确粘贴",
@@ -11620,11 +11747,17 @@ function SingleSlideEditor({
           >
             <div className="font-semibold">{help.label}</div>
             <div className="mt-0.5 text-slate-200">{help.description}</div>
+            {help.costNote && <div className="mt-1 text-amber-200">{help.costNote}</div>}
             <div className="absolute -top-1 right-5 h-2 w-2 rotate-45 bg-slate-900" />
           </div>
         )}
       </div>
     );
+  };
+  const renderRouteCostNote = (route: string) => {
+    const help = routeHelp(route);
+    if (!help.costNote) return null;
+    return <div className="text-[11px] text-amber-700 mt-0.5">{help.costNote}</div>;
   };
   const routeProcessMode = (route: AssetRoute) => {
     if (route === "overlay") return "original";
@@ -12341,6 +12474,7 @@ function SingleSlideEditor({
                   <div className="min-w-0 flex-1">
                     <div className="text-xs font-semibold text-slate-700 truncate">{ref.asset_name || ref.asset_analysis?.subject || "本页画面素材"}</div>
                     <div className="text-[11px] text-slate-500 mt-0.5">{pageReferenceLabel(ref)} · {routeLabel(route)}</div>
+                    {renderRouteCostNote(route)}
                   </div>
                   <div className="flex gap-1">
                     {ASSET_ROUTE_OPTIONS.map((target) =>
@@ -12377,6 +12511,7 @@ function SingleSlideEditor({
                       项目素材 · {manual ? "手动指定" : "系统分配"} · {routeLabel(route)}
                     </div>
                     {usage && <div className="text-[11px] text-slate-400 mt-0.5 truncate">{usage}</div>}
+                    {renderRouteCostNote(route)}
                   </div>
                   <div className="flex gap-1">
                     {ASSET_ROUTE_OPTIONS.map((target) =>

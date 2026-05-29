@@ -1,4 +1,7 @@
+import asyncio
 import io
+import json
+import re
 import zipfile
 from xml.etree import ElementTree as ET
 
@@ -6,6 +9,7 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.api import projects as projects_api
 from app.api import documents as documents_api
@@ -14,7 +18,7 @@ from app.services import generation_pipeline
 from app.schemas.project import ProjectUpdate
 from app.api.slides import _resolve_generation_page_nums
 from app.models.base import Base
-from app.models.models import Project, ReferenceImage, Slide
+from app.models.models import Project, ProjectRun, ReferenceImage, Slide
 from app.services.generation_pipeline import (
     _generate_one_slide,
     _load_reference_images,
@@ -60,6 +64,16 @@ def make_session():
     return Session()
 
 
+def make_shared_sessionmaker():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(bind=engine)
+
+
 def png_upload(name="asset.png"):
     buf = io.BytesIO()
     Image.new("RGB", (10, 10), "white").save(buf, "PNG")
@@ -80,6 +94,27 @@ def pdf_upload_with_picture(name="source.pdf"):
     image_buf = io.BytesIO()
     Image.new("RGB", (120, 80), "white").save(image_buf, "PNG")
     page.insert_image(fitz.Rect(72, 140, 220, 240), stream=image_buf.getvalue())
+    out = io.BytesIO(doc.tobytes())
+    return SimpleNamespace(filename=name, file=out, content_type="application/pdf")
+
+
+def pdf_upload_with_repeated_logo(name="brand-deck.pdf", count=5):
+    import fitz
+
+    logo = Image.new("RGBA", (180, 60), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(logo)
+    draw.rounded_rectangle((4, 6, 52, 54), radius=8, fill=(36, 75, 160, 255))
+    draw.rectangle((68, 16, 168, 28), fill=(36, 75, 160, 255))
+    draw.rectangle((68, 36, 138, 46), fill=(36, 75, 160, 255))
+    logo_buf = io.BytesIO()
+    logo.save(logo_buf, "PNG")
+    logo_bytes = logo_buf.getvalue()
+
+    doc = fitz.open()
+    for idx in range(count):
+        page = doc.new_page()
+        page.insert_image(fitz.Rect(36, 28, 180, 76), stream=logo_bytes)
+        page.insert_text((72, 160), f"第{idx + 1}页 业务内容", fontsize=20, fontname="china-s")
     out = io.BytesIO(doc.tobytes())
     return SimpleNamespace(filename=name, file=out, content_type="application/pdf")
 
@@ -789,6 +824,194 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missin
                 }
             ],
         )
+
+
+def test_visual_plan_retries_empty_batch_as_single_pages(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    prompt = kwargs["messages"][-1]["content"]
+                    calls.append(prompt)
+                    if '"page_num": 6' in prompt and '"page_num": 10' in prompt:
+                        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""))])
+                    page_nums = re.findall(r'"page_num":\s*(\d+)', prompt)
+                    payload = {
+                        page_num: {
+                            "visual_evidence": f"第 {page_num} 页画面证据",
+                            "visual_summary": f"第 {page_num} 页画面摘要",
+                            "visual_description": f"第 {page_num} 页画面描述",
+                            "visual_asset_ids": [],
+                            "visual_asset_usage": {},
+                        }
+                        for page_num in page_nums
+                    }
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setenv("PPTGOD_VISUAL_PLAN_BATCH_WORKERS", "1")
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": page_num,
+                "type": "content",
+                "text_content": {"headline": f"第 {page_num} 页", "body": "正文"},
+            }
+            for page_num in range(1, 11)
+        ],
+    )
+
+    assert len(plan) == 10
+    assert plan[5]["page_num"] == 6
+    assert plan[5]["visual_description"] == "第 6 页画面描述"
+    assert any('"page_num": 6' in prompt and '"page_num": 10' in prompt for prompt in calls)
+    assert any('"page_num": 6' in prompt and '"page_num": 10' not in prompt for prompt in calls)
+
+
+def test_visual_prompt_run_fails_when_any_page_prompt_generation_fails(monkeypatch):
+    Session = make_shared_sessionmaker()
+    db = Session()
+    project = Project(
+        title="Prompt partial failure",
+        status="visual_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Test Style"},
+    )
+    db.add(project)
+    db.flush()
+    db.add_all(
+        [
+            Slide(
+                project_id=project.id,
+                page_num=1,
+                status="pending",
+                content_json={"page_num": 1, "type": "content", "text_content": {"headline": "第一页"}},
+            ),
+            Slide(
+                project_id=project.id,
+                page_num=2,
+                status="pending",
+                content_json={"page_num": 2, "type": "content", "text_content": {"headline": "第二页"}},
+            ),
+        ]
+    )
+    run = slides_api.create_project_run(
+        db,
+        project.id,
+        kind="visual_prompts",
+        stage="visual_planning",
+        total_count=2,
+    )
+    db.commit()
+    project_id = project.id
+    run_id = run.id
+    db.close()
+
+    def fake_visual_plan(**_kwargs):
+        return [
+            {"page_num": 1, "visual_description": "第一页画面", "visual_evidence": "第一页证据"},
+            {"page_num": 2, "visual_description": "第二页画面", "visual_evidence": "第二页证据"},
+        ]
+
+    def fake_prompt_for_page(**kwargs):
+        if kwargs["page_intent"]["page_num"] == 2:
+            raise RuntimeError("prompt provider returned empty output")
+        return "page one prompt"
+
+    monkeypatch.setattr(slides_api, "SessionLocal", Session)
+    monkeypatch.setattr(slides_api, "generate_visual_plan", fake_visual_plan)
+    monkeypatch.setattr(slides_api, "generate_prompt_for_page", fake_prompt_for_page)
+    monkeypatch.setattr(slides_api, "_project_visual_assets_for_planning", lambda _project: [])
+    monkeypatch.setattr(slides_api, "_derive_project_style_pack", lambda _project, _content_plan: "")
+
+    asyncio.run(slides_api._do_generate_visual_and_prompts(project_id, None, run_id))
+
+    verify_db = Session()
+    refreshed_run = verify_db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
+    refreshed_project = verify_db.query(Project).filter(Project.id == project_id).first()
+    refreshed_slides = (
+        verify_db.query(Slide)
+        .filter(Slide.project_id == project_id)
+        .order_by(Slide.page_num)
+        .all()
+    )
+
+    assert refreshed_run.status == "failed"
+    assert refreshed_run.completed_count == 1
+    assert refreshed_run.failed_count == 1
+    assert "第 2 页" in (refreshed_run.error_msg or "")
+    assert refreshed_project.status == "visual_ready"
+    assert refreshed_slides[0].prompt_text == "page one prompt"
+    assert refreshed_slides[0].status == "prompt_ready"
+    assert refreshed_slides[1].prompt_text is None
+    assert refreshed_slides[1].status == "visual_ready"
+
+
+def test_pipeline_does_not_retry_slide_after_inner_image_retries_are_exhausted(monkeypatch, tmp_path):
+    db = make_session()
+    project = Project(title="No duplicate image retry", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        content_json={"page_num": 1, "text_content": {"headline": "图片页"}},
+        visual_json={"visual_description": "图片页画面"},
+        prompt_text="generate image",
+    )
+    db.add(slide)
+    run = slides_api.create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="batch_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    db.commit()
+
+    calls = []
+
+    def fake_generate_one_slide(slide_arg, *_args, **_kwargs):
+        calls.append(slide_arg.page_num)
+        return {
+            "slide": slide_arg,
+            "error": "Connection aborted after image API retries",
+            "image_generation_events": [
+                {"status": "interrupted", "attempt": 1},
+                {"status": "interrupted", "attempt": 2},
+                {"status": "interrupted", "attempt": 3},
+                {"status": "interrupted", "attempt": 4},
+            ],
+        }
+
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fake_generate_one_slide)
+    monkeypatch.setattr(generation_pipeline, "_pipeline_image_worker_count", lambda: 1)
+
+    generation_pipeline.run_generation_pipeline(
+        project.id,
+        db,
+        page_nums=[1],
+        prototype=True,
+        run_id=run.id,
+    )
+
+    assert calls == [1]
 
 
 def test_prompt_keeps_exact_text_contract_and_visual_evidence():
@@ -2024,6 +2247,36 @@ def test_generate_one_slide_uses_single_pass_by_default(tmp_path, monkeypatch):
     assert not (tmp_path / "project-1" / "slide_04_base.png").exists()
 
 
+def test_overlay_route_material_ref_does_not_trigger_refinement(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
+        calls.append({"prompt": prompt, "reference_count": len(reference_images or [])})
+        return Image.new("RGB", (16, 9), "blue")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    slide = Slide(page_num=4, prompt_text="draft prompt", visual_json={})
+    ref_data = [
+        {
+            "id": "asset-overlay",
+            "role": "visual_asset",
+            "process_mode": "original",
+            "asset_route_mode": "overlay",
+            "asset_kind": "material",
+            "asset_name": "Dashboard 截图",
+            "image": Image.new("RGB", (8, 8), "white"),
+        }
+    ]
+
+    result = _generate_one_slide(slide, "project-overlay-route", str(tmp_path), ref_data)
+
+    assert result["error"] is None
+    assert len(calls) == 1
+    assert calls[0]["reference_count"] == 1
+    assert not (tmp_path / "project-overlay-route" / "slide_04_base.png").exists()
+
+
 def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkeypatch):
     calls = []
 
@@ -2072,12 +2325,9 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
     assert "fidelity can be approximate" not in calls[0]["prompt"]
     assert "simplify it into a generic placeholder" not in calls[0]["prompt"]
     assert calls[0]["reference_count"] == 1
-    assert calls[1]["prompt"] == (
-        "第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。"
-        "请把第1张图中对应的产品/素材替换成第2张图，要求尽量1:1保留第2张图的所有可见细节。"
-        "不要改变第1张图中的其它任何画面元素、文字、版式、背景、人物、图表和装饰。"
-        "只输出修改后的完整PPT页面图片。"
-    )
+    assert "第2张图是要精修融合进去的参考素材" in calls[1]["prompt"]
+    assert "尽量1:1保留第2张图的所有可见细节、人物身份、文字和标识" in calls[1]["prompt"]
+    assert "不要改变第1张图中的其它任何画面元素" in calls[1]["prompt"]
     assert "胡姬花古法花生油" not in calls[1]["prompt"]
     assert "/tmp/uploads/huji-product.png" not in calls[1]["prompt"]
     assert calls[1]["reference_count"] == 2
@@ -2158,8 +2408,8 @@ def test_product_refinement_pass_accepts_multiple_product_refs(tmp_path, monkeyp
 
     assert result["error"] is None
     assert len(calls) == 2
-    assert "第2张图是要替换进去的产品/素材参考图" in calls[1]["prompt"]
-    assert "第3张" not in calls[1]["prompt"]
+    assert "第2-3张图是要精修融合进去的参考素材" in calls[1]["prompt"]
+    assert "分别把第2-3张参考图" in calls[1]["prompt"]
     assert "产品 A" not in calls[1]["prompt"]
     assert "产品 B" not in calls[1]["prompt"]
     assert "/tmp/uploads/product-a.png" not in calls[1]["prompt"]
@@ -2774,6 +3024,65 @@ def test_visual_edit_invalidates_prompt_and_image_only():
     assert refreshed_slide.status == "completed"
 
 
+def test_visual_edit_persists_exact_overlay_layers(tmp_path):
+    db = make_session()
+    project = Project(title="Visual exact overlay", status="completed", content_plan_confirmed=True, selected_style={"name": "Brand"})
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        visual_json={"visual_description": "old"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    path = tmp_path / "dashboard.png"
+    Image.new("RGB", (120, 70), "white").save(path)
+    asset = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(path),
+        process_mode="blend",
+        asset_name="Dashboard 截图",
+        asset_kind="material",
+        asset_analysis={"subject": "dashboard"},
+    )
+    db.add_all([slide, asset])
+    db.commit()
+
+    slides_api.update_slide_visual(
+        project.id,
+        slides_api.UpdateVisualRequest(
+            page_num=1,
+            visual_json={
+                "visual_description": "reserve background",
+                "asset_route_modes": {asset.id: "overlay"},
+                "overlay_layers": [
+                    {
+                        "asset_id": asset.id,
+                        "preset": "right-card",
+                        "mode": "exact_cutout",
+                        "usage_note": "原样叠加",
+                    }
+                ],
+            },
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).one()
+    refreshed_asset = db.query(ReferenceImage).filter(ReferenceImage.id == asset.id).one()
+
+    assert refreshed_slide.visual_json["overlay_layers"][0]["asset_id"] == asset.id
+    assert refreshed_slide.visual_json["overlay_layers"][0]["fit"] == "contain"
+    assert refreshed_slide.visual_json["asset_route_modes"][asset.id] == "overlay"
+    assert artifact_stale(refreshed_slide.visual_json) == {"visual": True}
+    assert refreshed_asset.process_mode == "original"
+    assert refreshed_asset.asset_analysis["exact_overlay"] is True
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.status == "completed"
+
+
 def test_visual_asset_upload_defaults_crop_but_honors_explicit_blend(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="Asset upload", status="completed", selected_style={"name": "Brand"})
@@ -3117,6 +3426,48 @@ def test_pdf_document_upload_extracts_source_pack_and_page_ref_images(tmp_path, 
     assert docs[0]["source_stats"]["pages"] == 1
     assert docs[0]["source_stats"]["images"] == 1
     assert docs[0]["asset_extraction_status"] == "completed"
+
+
+def test_pdf_document_upload_promotes_repeated_brand_mark_to_logo(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="PDF repeated logo", status="planning")
+    db.add(project)
+    db.commit()
+
+    monkeypatch.setattr(documents_api.settings, "UPLOAD_DIR", str(tmp_path))
+
+    documents_api.upload_document(
+        project.id,
+        pdf_upload_with_repeated_logo("brand-deck.pdf"),
+        db=db,
+    )
+
+    stats = documents_api._extract_pdf_assets_for_document(
+        project.id,
+        str(tmp_path / project.id / "docs" / "brand-deck.pdf"),
+        "brand-deck.pdf",
+        db=db,
+    )
+
+    logos = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "logo",
+        ReferenceImage.slide_id.is_(None),
+    ).all()
+    page_refs = db.query(ReferenceImage).filter(
+        ReferenceImage.project_id == project.id,
+        ReferenceImage.role == "content_ref",
+    ).all()
+
+    assert stats["logos"] == 1
+    assert stats["page_refs"] == 0
+    assert len(logos) == 1
+    assert page_refs == []
+    assert logos[0].process_mode == "original"
+    assert logos[0].asset_analysis["source_type"] == "pdf"
+    assert logos[0].asset_analysis["classification"] == "pdf_repeated_logo"
+    assert logos[0].asset_analysis["review_status"] == "auto_confirmed"
+    assert logos[0].logo_anchor == "top-left"
 
 
 def test_pptx_shape_fill_repeated_logo_goes_to_logo_library(tmp_path, monkeypatch):
@@ -4135,6 +4486,108 @@ def test_overlay_layers_accept_page_reference_assets(tmp_path):
     assert serialized_slide["reference_images"][0]["process_mode"] == "original"
 
 
+def test_page_reference_original_mode_creates_exact_overlay_layer(tmp_path):
+    db = make_session()
+    project = Project(title="Page ref original sync", status="completed", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=6,
+        status="completed",
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+        visual_json={"visual_description": "old"},
+    )
+    db.add(slide)
+    db.flush()
+    path = tmp_path / "page-ref.png"
+    Image.new("RGB", (160, 90), "white").save(path)
+    page_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(path),
+        process_mode="blend",
+        asset_name="原 PDF 第 6 页参考图",
+        asset_analysis={"source_page_num": 6},
+    )
+    db.add(page_ref)
+    db.commit()
+
+    slides_api.update_reference_image(
+        project.id,
+        page_ref.id,
+        {"process_mode": "original"},
+        db=db,
+    )
+    db.refresh(slide)
+    db.refresh(page_ref)
+
+    layers = slide.visual_json["overlay_layers"]
+    assert len(layers) == 1
+    assert layers[0]["asset_id"] == page_ref.id
+    assert layers[0]["mode"] == "exact_cutout"
+    assert page_ref.asset_analysis["exact_overlay"] is True
+    assert artifact_stale(slide.visual_json) == {"visual": True}
+    assert slide.prompt_text == "old prompt"
+
+
+def test_original_page_reference_is_synced_before_reference_context(tmp_path):
+    db = make_session()
+    project = Project(title="Page ref context sync", status="visual_ready")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=8, status="visual_ready", visual_json={})
+    db.add(slide)
+    db.flush()
+    path = tmp_path / "chart.png"
+    Image.new("RGB", (160, 90), "white").save(path)
+    page_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(path),
+        process_mode="original",
+        asset_name="原 PDF 第 8 页截图",
+    )
+    db.add(page_ref)
+    db.commit()
+
+    contexts, hints = slides_api._build_slide_reference_contexts([slide])
+
+    assert contexts == {}
+    assert hints == {}
+    assert slide.visual_json["overlay_layers"][0]["asset_id"] == page_ref.id
+
+
+def test_exact_page_reference_sync_is_noop_without_original_refs(tmp_path):
+    db = make_session()
+    project = Project(title="No exact sync", status="visual_ready")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=3, status="visual_ready", visual_json={})
+    db.add(slide)
+    db.flush()
+    path = tmp_path / "blend.png"
+    Image.new("RGB", (160, 90), "white").save(path)
+    page_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(path),
+        process_mode="blend",
+        asset_name="智能融合参考图",
+    )
+    db.add(page_ref)
+    db.commit()
+
+    changed = slides_api._sync_exact_page_reference_overlay_layers(slide, [page_ref])
+
+    assert changed is False
+    assert slide.visual_json == {}
+
+
 def test_asset_pins_unpin_removes_overlay_layer(tmp_path):
     db = make_session()
     project = Project(title="Unpin overlay", status="completed")
@@ -4270,6 +4723,48 @@ def test_pipeline_skips_exact_overlay_assets_as_image_inputs(tmp_path):
     assert auto_asset.id in [ref.get("id") for ref in refs]
 
 
+def test_pipeline_skips_route_overlay_assets_even_without_layers(tmp_path):
+    db = make_session()
+    project = Project(title="Route overlay", status="prompt_ready")
+    db.add(project)
+    db.flush()
+    overlay_path = tmp_path / "overlay.png"
+    Image.new("RGB", (20, 20), "red").save(overlay_path)
+    overlay_asset = ReferenceImage(
+        project_id=project.id,
+        role="visual_asset",
+        file_path=str(overlay_path),
+        process_mode="original",
+        asset_name="Exact 截图",
+        asset_kind="material",
+    )
+    db.add(overlay_asset)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        prompt_text="prompt",
+        visual_json={
+            "visual_asset_ids": [overlay_asset.id],
+            "asset_route_modes": {overlay_asset.id: "overlay"},
+        },
+    )
+    db.add(slide)
+    db.commit()
+
+    loaded_slide = db.query(Slide).filter(Slide.id == slide.id).one()
+    refs = _load_reference_images(loaded_slide)
+    prompt_refs = slides_api._project_refs_for_prompt(
+        db.query(Project).filter(Project.id == project.id).one(),
+        [overlay_asset.id],
+        loaded_slide.visual_json,
+    )
+
+    assert overlay_asset.id not in [ref.get("id") for ref in refs]
+    assert prompt_refs == []
+
+
 def test_project_asset_route_overrides_stale_process_mode(tmp_path):
     db = make_session()
     project = Project(title="Route override", status="prompt_ready")
@@ -4312,6 +4807,19 @@ def test_project_asset_route_overrides_stale_process_mode(tmp_path):
     assert refs[0]["process_mode"] == "blend"
     assert prompt_refs[0]["asset_route_mode"] == "blend"
     assert prompt_refs[0]["process_mode"] == "blend"
+
+
+def test_precision_page_references_use_refinement_pass():
+    refs = [
+        {"id": "person-1", "role": "content_ref", "process_mode": "crop", "image": object()},
+        {"id": "person-2", "role": "content_ref", "process_mode": "crop", "image": object()},
+        {"id": "blend-ref", "role": "content_ref", "process_mode": "blend", "image": object()},
+        {"id": "overlay-ref", "role": "content_ref", "process_mode": "original", "image": object()},
+    ]
+
+    refined = generation_pipeline._product_refinement_refs(refs)
+
+    assert [ref["id"] for ref in refined] == ["person-1", "person-2"]
 
 
 def test_pipeline_skips_page_reference_overlay_as_image_input(tmp_path):

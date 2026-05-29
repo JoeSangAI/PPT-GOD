@@ -217,6 +217,7 @@ export const WORKFLOW_STEPS = [
   { key: "prompt_ready", label: "画面设计" },
   { key: "prototype_ready", label: "效果预览" },
   { key: "completed", label: "批量生成" },
+  { key: "editable_pptx", label: "可编辑版" },
 ];
 
 export const STATUS_LABEL: Record<string, string> = {
@@ -414,6 +415,13 @@ const RUN_COPY: Record<string, {
     doneNoun: "页面图片",
     detail: "正在根据你的修改生成当前页；完成后会替换到画布中。",
     steps: ["读取修改要求", "生成新画面", "保存版本"],
+  },
+  editable_pptx: {
+    headline: "可编辑版生成进度",
+    running: "正在生成可编辑版",
+    doneNoun: "可编辑版 PPTX",
+    detail: "正在重新解析页面文字与图层；完成后会自动下载可编辑版 PPTX。",
+    steps: ["解析页面", "还原图层", "生成 PPTX"],
   },
 };
 
@@ -729,6 +737,8 @@ function getStepIndexForRun(run?: WorkflowRun | null) {
     case "retry_failed":
     case "finetune":
       return 4;
+    case "editable_pptx":
+      return 5;
     default:
       return null;
   }
@@ -960,6 +970,7 @@ function compactActiveRunTitle(kind?: string | null, status?: string | null) {
     page_generation: "单页生成",
     retry_failed: "失败页重试",
     finetune: "单页微调",
+    editable_pptx: "可编辑版生成",
   };
   const label = noun[String(kind || "")] || "任务";
   return status === "queued" ? `${label}排队中` : `${label}中`;

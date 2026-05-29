@@ -48,12 +48,16 @@ def _palette_color_by(predicate, palette: list[dict], fallback: str) -> str:
 def _normalize_palette_item(item, index: int) -> dict:
     if isinstance(item, dict):
         color = dict(item)
-        color.setdefault("name", f"颜色{index + 1}")
-        color.setdefault("hex", _extract_hex(str(color.get("hex") or "")) or "#CCCCCC")
-        color.setdefault("role", "")
+        color["name"] = color.get("name") or f"颜色{index + 1}"
+        color["hex"] = _extract_hex(str(color.get("hex") or color.get("color") or "")) or "#CCCCCC"
+        color["role"] = color.get("role") or ""
         return color
     hex_color = _extract_hex(str(item or "")) or "#CCCCCC"
     return {"name": _get_color_name(hex_color), "hex": hex_color, "role": ""}
+
+
+def _normalize_palette_items(palette: List | None) -> list[dict]:
+    return [_normalize_palette_item(item, index) for index, item in enumerate(palette or [])]
 
 
 UPLOAD_CONTEXT_TERMS = [
@@ -488,18 +492,7 @@ def _finalize_style_proposals(proposals: List[Dict], summary: Dict) -> List[Dict
         p.setdefault("description", "")
         p.setdefault("source", "original")
 
-        # 兼容旧格式：如果 palette 是字符串数组，转换为对象数组
-        if p["palette"] and isinstance(p["palette"][0], str):
-            default_roles = ["主色", "辅色", "点缀色", "背景色"]
-            default_names = ["主色", "辅色", "点缀色", "背景色"]
-            p["palette"] = [
-                {
-                    "name": default_names[i] if i < len(default_names) else f"颜色{i+1}",
-                    "hex": color,
-                    "role": default_roles[i] if i < len(default_roles) else f"配色{i+1}",
-                }
-                for i, color in enumerate(p["palette"])
-            ]
+        p["palette"] = _normalize_palette_items(p.get("palette") if isinstance(p.get("palette"), list) else [])
 
         # 如果 description 太短，补一段默认话术
         if len(p["description"]) < 60:
@@ -673,8 +666,8 @@ def _get_color_name(hex_color: str) -> str:
 def _extract_hex(value) -> str | None:
     if not isinstance(value, str):
         return None
-    match = re.search(r"#[0-9a-fA-F]{6}", value)
-    return match.group(0).upper() if match else None
+    match = re.search(r"(?<![0-9a-fA-F])#?([0-9a-fA-F]{6})(?![0-9a-fA-F])", value)
+    return f"#{match.group(1).upper()}" if match else None
 
 
 def _collect_clone_palette(ref: Dict, logo: Dict | None = None) -> List[Dict]:
@@ -1250,10 +1243,10 @@ def _generate_asset_based_proposal(
 {{
   "name": "风格调性词，不是布局词。示范：'暖橘衬线'、'墨白极简'、'红白都会' ✅；'三栏暖橘'、'分屏极简'、'居左商务' ❌（版式特征写进 description，不是 name）",
   "palette": [
-    {{"name": "直观颜色名（如'酒红'、'琥珀金'，不要用'品牌主色'这类技术词）", "hex": "参考图中的实际色值", "role": "品牌主色/强视觉页主色"}},
-    {{"name": "直观颜色名", "hex": "参考图中的实际色值", "role": "强调色/标题色/装饰色"}},
-    {{"name": "直观颜色名", "hex": "参考图中可承载正文的底色或内容区颜色", "role": "正文页基底/内容区"}},
-    {{"name": "直观颜色名", "hex": "高可读文字色", "role": "正文/数据文字"}}
+    {{"name": "直观颜色名（如'酒红'、'琥珀金'，不要用'品牌主色'这类技术词）", "hex": "#4A3728", "role": "品牌主色/强视觉页主色"}},
+    {{"name": "直观颜色名", "hex": "#C9924A", "role": "强调色/标题色/装饰色"}},
+    {{"name": "直观颜色名", "hex": "#FBF8F3", "role": "正文页基底/内容区"}},
+    {{"name": "直观颜色名", "hex": "#3A3A3A", "role": "正文/数据文字"}}
   ],
   "mood": "氛围标签（忠实来自参考图，不发明新风格）",
   "font": "字体建议（延续参考图字体气质，同时保证正文可读）",
@@ -1306,18 +1299,7 @@ def _generate_asset_based_proposal(
     proposal.setdefault("description", "")
     proposal.setdefault("source", "asset_based")
 
-    # 兼容旧格式
-    if proposal["palette"] and isinstance(proposal["palette"][0], str):
-        default_roles = ["主色", "辅色", "点缀色", "背景色"]
-        default_names = ["主色", "辅色", "点缀色", "背景色"]
-        proposal["palette"] = [
-            {
-                "name": default_names[i] if i < len(default_names) else f"颜色{i+1}",
-                "hex": color,
-                "role": default_roles[i] if i < len(default_roles) else f"配色{i+1}",
-            }
-            for i, color in enumerate(proposal["palette"])
-        ]
+    proposal["palette"] = _normalize_palette_items(proposal.get("palette") if isinstance(proposal.get("palette"), list) else [])
 
     if len(proposal.get("description", "")) < 60:
         first_name = proposal["palette"][0].get("name", "主色") if proposal["palette"] and isinstance(proposal["palette"][0], dict) else "主色"

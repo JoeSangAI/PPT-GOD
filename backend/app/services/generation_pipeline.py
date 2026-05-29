@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import redis
-from PIL import Image
+from PIL import Image, ImageOps
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
@@ -109,6 +109,7 @@ def _reference_audit(refs: Optional[List[Dict]]) -> List[Dict]:
             "image_mode": getattr(img, "mode", None),
             "source_mtime_ns": getattr(img, "info", {}).get("pptgod_reference_source_mtime_ns"),
             "source_size_bytes": getattr(img, "info", {}).get("pptgod_reference_source_size"),
+            "reference_binding": ref.get("reference_binding"),
         })
     return summary
 
@@ -223,24 +224,234 @@ def _effective_slide_reference_process_mode(ref) -> str:
     return mode
 
 
+def _analysis_bbox(analysis: dict | None) -> tuple[float, float, float, float] | None:
+    if not isinstance(analysis, dict):
+        return None
+    bbox = analysis.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        try:
+            left, top, right, bottom = [float(value) for value in bbox]
+            return left, top, right, bottom
+        except (TypeError, ValueError):
+            return None
+    bounds = analysis.get("shape_bounds") if isinstance(analysis.get("shape_bounds"), dict) else {}
+    try:
+        left = float(bounds.get("left"))
+        top = float(bounds.get("top"))
+        width = float(bounds.get("width"))
+        height = float(bounds.get("height"))
+    except (TypeError, ValueError):
+        return None
+    return left, top, left + width, top + height
+
+
+def _slide_reference_input_sort_key(ref, original_index: int) -> tuple:
+    analysis = getattr(ref, "asset_analysis", None) if hasattr(ref, "asset_analysis") else None
+    analysis = analysis if isinstance(analysis, dict) else {}
+    bbox = _analysis_bbox(analysis)
+    if bbox:
+        left, top, _right, _bottom = bbox
+    else:
+        left, top = 0.0, 0.0
+    try:
+        group_index = int(analysis.get("asset_group_index") or 9999)
+    except (TypeError, ValueError):
+        group_index = 9999
+    role_order = {
+        "content_ref": 0,
+        "chart_ref": 1,
+        "visual_asset": 2,
+        "style_ref": 3,
+        "template": 4,
+        "logo": 5,
+        "finetune_ref": 6,
+    }.get(getattr(ref, "role", None) or "", 9)
+    try:
+        source_page = int(analysis.get("source_page_num") or analysis.get("pdf_source_page_num") or 10_000)
+    except (TypeError, ValueError):
+        source_page = 10_000
+    return (
+        role_order,
+        str(analysis.get("source_document") or ""),
+        source_page,
+        str(analysis.get("asset_group_key") or ""),
+        group_index,
+        top,
+        left,
+        original_index,
+    )
+
+
+def _slide_team_member_names(slide: Slide) -> list[str]:
+    content = slide.content_json if isinstance(slide.content_json, dict) else {}
+    text = content.get("text_content") if isinstance(content.get("text_content"), dict) else {}
+    joined = " ".join(
+        str(value or "")
+        for value in (
+            text.get("headline"),
+            text.get("subhead"),
+            text.get("body"),
+            content.get("page_map_markdown"),
+        )
+    )
+    if not any(term in joined for term in ("团队", "成员", "创始人", "负责人", "核心团队", "team", "Team")):
+        return []
+
+    body = text.get("body")
+    if isinstance(body, list):
+        lines = [str(item or "") for item in body]
+    else:
+        lines = str(body or "").splitlines()
+
+    names: list[str] = []
+    for line in lines:
+        cleaned = re.sub(r"^\s*[-*•·\d.、）)]+\s*", "", str(line or "").strip())
+        if not cleaned:
+            continue
+        match = re.match(r"^([\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z·.\-]{1,18})(?:\s|：|:|，|,|。)", cleaned)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _reference_bbox(ref: Dict) -> tuple[float, float, float, float] | None:
+    analysis = ref.get("asset_analysis") if isinstance(ref.get("asset_analysis"), dict) else {}
+    return _analysis_bbox(analysis)
+
+
+def _binding_position_label(
+    center_x: float,
+    center_y: float,
+    *,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+) -> str:
+    mid_x = (min_x + max_x) / 2.0
+    mid_y = (min_y + max_y) / 2.0
+    horizontal = "left" if center_x <= mid_x else "right"
+    vertical = "top" if center_y <= mid_y else "bottom"
+    return f"{vertical}-{horizontal}"
+
+
+def _attach_page_reference_identity_bindings(slide: Slide, refs: list[Dict]) -> None:
+    """Bind multi-portrait page refs to the matching text item and source position.
+
+    Image models see a flat list of reference images. For team pages, that is not enough:
+    four similar portrait crops can be blended, omitted, or swapped. The source PDF already
+    gives us the order through each crop bbox, and the slide text gives us the names.
+    """
+    page_refs = [
+        ref for ref in refs
+        if ref.get("role") in {"content_ref", "chart_ref"} and ref.get("image") is not None
+    ]
+    if len(page_refs) < 2:
+        return
+    names = _slide_team_member_names(slide)
+    if len(names) != len(page_refs):
+        return
+
+    positioned: list[tuple[Dict, tuple[float, float, float, float], float, float]] = []
+    for ref in page_refs:
+        bbox = _reference_bbox(ref)
+        if not bbox:
+            return
+        left, top, right, bottom = bbox
+        positioned.append((ref, bbox, (left + right) / 2.0, (top + bottom) / 2.0))
+    if len(positioned) != len(names):
+        return
+
+    centers_x = [item[2] for item in positioned]
+    centers_y = [item[3] for item in positioned]
+    min_x, max_x = min(centers_x), max(centers_x)
+    min_y, max_y = min(centers_y), max(centers_y)
+    # Source decks are normally read row-major for cards: top-left, top-right,
+    # then lower rows. Use source bbox order rather than upload/file order.
+    for name, (ref, bbox, center_x, center_y) in zip(names, sorted(positioned, key=lambda item: (item[3], item[2]))):
+        ref["reference_binding"] = {
+            "name": name,
+            "position": _binding_position_label(
+                center_x,
+                center_y,
+                min_x=min_x,
+                max_x=max_x,
+                min_y=min_y,
+                max_y=max_y,
+            ),
+            "source_bbox": list(bbox),
+        }
+
+
+def _reference_binding_lines(refs: list[Dict], *, label_start_index: int = 1) -> list[str]:
+    lines: list[str] = []
+    for offset, ref in enumerate(refs):
+        binding = ref.get("reference_binding") if isinstance(ref.get("reference_binding"), dict) else None
+        if not binding:
+            continue
+        name = str(binding.get("name") or "").strip()
+        position = str(binding.get("position") or "").strip()
+        if not name:
+            continue
+        label = str(ref.get("label") or f"Reference Image {label_start_index + offset}").strip()
+        suffix = f" ({position})" if position else ""
+        lines.append(f"{label} -> {name}{suffix}")
+    return lines
+
+
 def _page_reference_fidelity_instruction(ref_data: List[Dict]) -> str:
+    blend_page_refs = [
+        ref for ref in ref_data
+        if ref.get("role") in {"content_ref", "chart_ref"}
+        and str(ref.get("process_mode") or "").lower() == "blend"
+    ]
     page_refs = [
         ref for ref in ref_data
         if ref.get("role") in {"content_ref", "chart_ref"}
         and str(ref.get("process_mode") or "").lower() in {"crop", "original"}
     ]
-    if not page_refs:
-        return ""
-    labels = [
-        str(ref.get("label") or f"Reference Image {index}")
-        for index, ref in enumerate(page_refs, start=1)
-    ]
-    label_text = ", ".join(labels[:6])
-    return (
-        f"\n\nPAGE REFERENCE FIDELITY: {label_text} are source visuals, not style mood boards. "
-        "Preserve their depicted people, objects, layout relationships, and recognizable scene evidence. "
-        "Do not replace these references with invented people, new scenes, or unrelated stock imagery."
-    )
+    parts: list[str] = []
+    if blend_page_refs:
+        labels = [
+            str(ref.get("label") or f"Reference Image {index}")
+            for index, ref in enumerate(blend_page_refs, start=1)
+        ]
+        label_text = ", ".join(labels[:6])
+        parts.append(
+            f"\n\nPAGE REFERENCE COVERAGE: {label_text} are page-level visual evidence, not generic mood boards. "
+            "Keep a recognizable visual trace from the attached reference material in the final slide. "
+            "Use every attached page reference; when multiple references are provided, do not base the slide on only one."
+        )
+        binding_lines = _reference_binding_lines(blend_page_refs)
+        if binding_lines:
+            parts.append(
+                "\nPAGE REFERENCE BINDINGS: "
+                + "; ".join(binding_lines)
+                + ". Do not swap identities, positions, or name-to-image relationships."
+            )
+    if page_refs:
+        labels = [
+            str(ref.get("label") or f"Reference Image {index}")
+            for index, ref in enumerate(page_refs, start=1)
+        ]
+        label_text = ", ".join(labels[:6])
+        parts.append(
+            f"\n\nPAGE REFERENCE FIDELITY: {label_text} are source visuals, not style mood boards. "
+            "Preserve their depicted people, objects, layout relationships, and recognizable scene evidence. "
+            "Do not replace these references with invented people, new scenes, or unrelated stock imagery. "
+            "When multiple source visuals are attached, account for every one; do not omit all but a single reference."
+        )
+        binding_lines = _reference_binding_lines(page_refs)
+        if binding_lines:
+            parts.append(
+                "\nPAGE REFERENCE BINDINGS: "
+                + "; ".join(binding_lines)
+                + ". Do not swap identities, positions, or name-to-image relationships."
+            )
+    return "".join(parts)
 
 
 def _slide_text_content(slide: Slide) -> Dict:
@@ -366,7 +577,13 @@ def _load_reference_images(
             len(slide.reference_images),
             overlay_asset_ids,
         )
-        for idx, ref in enumerate(slide.reference_images, start=1):
+        ordered_slide_refs = [
+            ref for _original_index, ref in sorted(
+                enumerate(slide.reference_images or [], start=1),
+                key=lambda item: _slide_reference_input_sort_key(item[1], item[0]),
+            )
+        ]
+        for idx, ref in enumerate(ordered_slide_refs, start=1):
             if str(getattr(ref, "id", "") or "") in overlay_asset_ids:
                 skipped_overlay += 1
                 logger.info(f"Slide {slide.page_num}: 页面参考图 {ref.id} 走精确粘贴，跳过生图参考输入")
@@ -498,7 +715,13 @@ def _load_reference_images(
             selected_asset_ids = []
             for x in raw_ids:
                 value = str(x)
-                if value and value not in overlay_asset_ids and value not in selected_asset_ids:
+                route_mode = asset_route_modes.get(value)
+                if (
+                    value
+                    and value not in overlay_asset_ids
+                    and route_mode != "overlay"
+                    and value not in selected_asset_ids
+                ):
                     selected_asset_ids.append(value)
         manual_raw = visual.get("manual_visual_asset_ids") or []
         if isinstance(manual_raw, list):
@@ -613,6 +836,7 @@ def _load_reference_images(
                     template_key,
                 )
 
+    _attach_page_reference_identity_bindings(slide, refs)
     refs = sorted(refs, key=_reference_input_priority)
     image_ref_count = sum(1 for ref in refs if ref.get("image") is not None)
     if image_ref_count > MAX_REFERENCE_INPUTS:
@@ -751,10 +975,16 @@ def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
     for ref in ref_data:
         if not ref.get("image"):
             continue
-        if not _is_product_or_material_ref(ref):
-            continue
         route_mode = str(ref.get("asset_route_mode") or "").lower()
-        if route_mode == "blend":
+        process_mode = str(ref.get("process_mode") or "").lower()
+        is_page_precision_ref = ref.get("role") in {"content_ref", "chart_ref"} and process_mode == "crop"
+        if not (_is_product_or_material_ref(ref) or is_page_precision_ref):
+            continue
+        if route_mode in {"blend", "overlay", "original", "exact", "exact_overlay"}:
+            continue
+        if route_mode and route_mode not in {"double_blend", "crop"}:
+            continue
+        if not route_mode and process_mode in {"blend", "original", "text_only"}:
             continue
         refs.append(ref)
     return refs
@@ -771,19 +1001,234 @@ def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
         prompt
         + "\n\nFIRST PASS: generate the complete slide using the supplied reference material, including "
         f"{ref_label}. Use the uploaded product/material image as the source for the corresponding object. "
-        "Preserve the object shape, color blocks, visible text, labels, logos, and small markings as much "
-        "as possible already in this pass. Do not invent a different object or reduce it to generic shapes. "
+        "Preserve the referenced people, objects, screenshots, charts, shape, color blocks, visible text, "
+        "labels, logos, and small markings as much as possible already in this pass. Do not invent a "
+        "different subject or reduce it to generic shapes. "
         "A second hidden refinement pass will further strengthen the same reference-material details."
     )
 
 
 def _product_refinement_prompt(slide: Slide, product_refs: List[Dict]) -> str:
+    ref_count = len([ref for ref in product_refs if ref.get("image") is not None])
+    binding_lines = []
+    for idx, ref in enumerate([ref for ref in product_refs if ref.get("image") is not None], start=2):
+        binding = ref.get("reference_binding") if isinstance(ref.get("reference_binding"), dict) else None
+        if not binding:
+            continue
+        name = str(binding.get("name") or "").strip()
+        position = str(binding.get("position") or "").strip()
+        if name:
+            binding_lines.append(f"第{idx}张参考图 -> {name}" + (f"（{position}）" if position else ""))
+    binding_text = ""
+    if binding_lines:
+        binding_text = (
+            "参考图身份绑定："
+            + "；".join(binding_lines)
+            + "。不要交换人物身份、姓名对应关系或页面位置。"
+        )
+    if ref_count > 1:
+        last_index = ref_count + 1
+        ref_range = f"第2-{last_index}张"
+        return (
+            f"第1张图是当前PPT页面，{ref_range}图是要精修融合进去的参考素材，可能是人物、产品、截图或图表。"
+            f"{binding_text}"
+            f"请分别把{ref_range}参考图放回第1张图中对应的位置，"
+            f"要求尽量1:1保留{ref_range}图的所有可见细节、比例、颜色、文字、标识、人物身份和小标记。"
+            "不要把多张参考图合并成一个物体，不要遗漏任意一张参考图。"
+            "不要改变第1张图中的其它任何画面元素、文字、版式、背景、人物、图表和装饰。"
+            "只输出修改后的完整PPT页面图片。"
+        )
     return (
-        "第1张图是当前PPT页面，第2张图是要替换进去的产品/素材参考图。"
-        "请把第1张图中对应的产品/素材替换成第2张图，要求尽量1:1保留第2张图的所有可见细节。"
+        "第1张图是当前PPT页面，第2张图是要精修融合进去的参考素材，可能是人物、产品、截图或图表。"
+        f"{binding_text}"
+        "请把第1张图中对应的位置校准为第2张图，要求尽量1:1保留第2张图的所有可见细节、人物身份、文字和标识。"
         "不要改变第1张图中的其它任何画面元素、文字、版式、背景、人物、图表和装饰。"
         "只输出修改后的完整PPT页面图片。"
     )
+
+
+def _ref_image_aspect(ref: Dict) -> float | None:
+    img = ref.get("image")
+    width, height = getattr(img, "size", (0, 0))
+    if width <= 0 or height <= 0:
+        return None
+    return width / height
+
+
+def _slot_center(block: Dict) -> tuple[float, float]:
+    return (
+        float(block.get("x") or 0) + float(block.get("width") or 0) / 2.0,
+        float(block.get("y") or 0) + float(block.get("height") or 0) / 2.0,
+    )
+
+
+def _slot_position_label(block: Dict, blocks: list[Dict]) -> str:
+    centers = [_slot_center(item) for item in blocks]
+    center_x, center_y = _slot_center(block)
+    return _binding_position_label(
+        center_x,
+        center_y,
+        min_x=min(x for x, _y in centers),
+        max_x=max(x for x, _y in centers),
+        min_y=min(y for _x, y in centers),
+        max_y=max(y for _x, y in centers),
+    )
+
+
+def _assign_slots_to_refs(candidates: list[Dict], product_refs: list[Dict]) -> list[Dict]:
+    row_major = sorted(candidates, key=lambda block: (_slot_center(block)[1], _slot_center(block)[0]))
+    if len(row_major) == len(product_refs):
+        labels = [_slot_position_label(block, row_major) for block in row_major]
+        bindings = [
+            ref.get("reference_binding") if isinstance(ref.get("reference_binding"), dict) else {}
+            for ref in product_refs
+        ]
+        desired = [str(binding.get("position") or "") for binding in bindings]
+        if all(desired) and len(set(desired)) == len(desired) and len(set(labels)) == len(labels):
+            by_label = dict(zip(labels, row_major))
+            if all(label in by_label for label in desired):
+                return [by_label[label] for label in desired]
+    return row_major[:len(product_refs)]
+
+
+def _detect_local_refinement_slots(base_path: str, product_refs: list[Dict]) -> list[Dict]:
+    """Find target image slots on the generated page for per-component refinement."""
+    if len(product_refs) <= 1:
+        return []
+    try:
+        from app.services.editable_pptx_export import detect_image_blocks
+
+        blocks = detect_image_blocks(base_path, [])
+    except Exception as exc:
+        logger.warning("Pipeline: local slot detection failed for %s: %s", base_path, exc)
+        return []
+
+    source_aspects = [aspect for aspect in (_ref_image_aspect(ref) for ref in product_refs) if aspect]
+    median_aspect = sorted(source_aspects)[len(source_aspects) // 2] if source_aspects else 1.0
+    max_candidate_aspect = max(1.0, min(4.0, median_aspect * 1.4))
+    candidates: list[Dict] = []
+    for block in blocks:
+        width = float(block.get("width") or 0)
+        height = float(block.get("height") or 0)
+        x = float(block.get("x") or 0)
+        y = float(block.get("y") or 0)
+        if width <= 0 or height <= 0:
+            continue
+        area = width * height
+        aspect = width / height
+        if area < 0.012 or area > 0.18:
+            continue
+        if width < 0.04 or height < 0.10:
+            continue
+        if y < 0.10 or x + width > 0.985:
+            continue
+        if aspect > max_candidate_aspect:
+            continue
+        candidates.append(block)
+    if len(candidates) < len(product_refs):
+        return []
+    return _assign_slots_to_refs(candidates, product_refs)
+
+
+def _normalized_box_to_pixels(block: Dict, size: tuple[int, int]) -> tuple[int, int, int, int]:
+    width, height = size
+    left = max(0, min(width - 1, int(round(float(block.get("x") or 0) * width))))
+    top = max(0, min(height - 1, int(round(float(block.get("y") or 0) * height))))
+    right = max(left + 1, min(width, int(round((float(block.get("x") or 0) + float(block.get("width") or 0)) * width))))
+    bottom = max(top + 1, min(height, int(round((float(block.get("y") or 0) + float(block.get("height") or 0)) * height))))
+    return left, top, right, bottom
+
+
+def _local_slot_refinement_prompt(ref: Dict, index: int, total: int) -> str:
+    binding = ref.get("reference_binding") if isinstance(ref.get("reference_binding"), dict) else {}
+    name = str(binding.get("name") or ref.get("asset_name") or f"素材 {index}").strip()
+    position = str(binding.get("position") or "").strip()
+    target = f"「{name}」" if name else f"第 {index}/{total} 个素材"
+    position_text = f"（目标位置：{position}）" if position else ""
+    return (
+        f"第1张图是必须保留身份和细节的源素材：{target}{position_text}。"
+        "第2张图是当前PPT页面里对应位置的样式裁剪。"
+        "请只输出一个可粘回该位置的局部图片：保持第1张图的人物身份、五官结构、发型、眼镜、服装、产品细节或截图文字；"
+        "同时匹配第2张图的构图、裁切比例、背景质感、光影和色调。"
+        "不要生成整页PPT，不要生成姓名、正文、卡片边框或额外装饰。"
+    )
+
+
+def _try_local_slot_refinement(
+    *,
+    slide: Slide,
+    project_id: str,
+    base_img: Image.Image,
+    base_path: str,
+    product_refs: list[Dict],
+    run_id: str | None = None,
+) -> Image.Image | None:
+    slots = _detect_local_refinement_slots(base_path, product_refs)
+    if len(slots) < len(product_refs):
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "local_slot_refinement_unavailable",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            product_ref_count=len(product_refs),
+            detected_slot_count=len(slots),
+        )
+        return None
+
+    composite = base_img.convert("RGB").copy()
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "local_slot_refinement_started",
+        page_num=slide.page_num,
+        slide_id=slide.id,
+        product_ref_count=len(product_refs),
+        detected_slot_count=len(slots),
+        references=_reference_audit(product_refs),
+    )
+    for index, (ref, slot) in enumerate(zip(product_refs, slots), start=1):
+        left, top, right, bottom = _normalized_box_to_pixels(slot, composite.size)
+        slot_crop = composite.crop((left, top, right, bottom))
+        prompt = _local_slot_refinement_prompt(ref, index, len(product_refs))
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "local_slot_refinement_slot_started",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            slot_index=index,
+            slot_box=slot,
+            reference=(_reference_audit([ref]) or [{}])[0],
+            **_prompt_audit(prompt),
+        )
+        refined = generate_slide_image(
+            prompt=prompt,
+            reference_images=[ref["image"], slot_crop],
+            resolution="4K",
+            aspect_ratio="1:1",
+            project_id=project_id,
+        )
+        patch = ImageOps.fit(refined.convert("RGB"), (right - left, bottom - top), method=Image.Resampling.LANCZOS)
+        composite.paste(patch, (left, top))
+        append_image_generation_log(
+            project_id,
+            run_id,
+            "local_slot_refinement_slot_finished",
+            page_num=slide.page_num,
+            slide_id=slide.id,
+            slot_index=index,
+            slot_box=slot,
+        )
+    append_image_generation_log(
+        project_id,
+        run_id,
+        "local_slot_refinement_finished",
+        page_num=slide.page_num,
+        slide_id=slide.id,
+        product_ref_count=len(product_refs),
+    )
+    return composite
 
 
 def _generate_one_slide(
@@ -891,67 +1336,102 @@ def _generate_one_slide(
                 output_dir=output_dir,
                 suffix="_base",
             )
-            refinement_images = [img] + [ref["image"] for ref in product_refs]
-            refinement_prompt = _product_refinement_prompt(slide, product_refs)
-            refinement_paths = [
-                str(ref.get("file_path") or "").strip()
-                for ref in product_refs
-                if str(ref.get("file_path") or "").strip()
-            ]
-            if refinement_paths:
+            local_refined = None
+            if len(product_refs) > 1:
+                try:
+                    local_refined = _try_local_slot_refinement(
+                        slide=slide,
+                        project_id=project_id,
+                        base_img=img,
+                        base_path=base_path,
+                        product_refs=product_refs,
+                        run_id=run_id,
+                    )
+                except Exception as local_refine_error:
+                    logger.warning(
+                        "Pipeline: 第 %s 页局部精修失败，继续尝试整页精修: %s",
+                        slide.page_num,
+                        local_refine_error,
+                    )
+                    append_image_generation_log(
+                        project_id,
+                        run_id,
+                        "local_slot_refinement_fallback",
+                        page_num=slide.page_num,
+                        slide_id=slide.id,
+                        base_path=base_path,
+                        product_ref_count=len(product_refs),
+                        error=str(local_refine_error)[:1000],
+                    )
+
+            if local_refined is not None:
+                img = local_refined
                 logger.info(
-                    f"Pipeline: 第 {slide.page_num} 页产品二次生成参考素材路径: "
-                    + " | ".join(refinement_paths)
-                )
-            append_image_generation_log(
-                project_id,
-                run_id,
-                "product_refinement_started",
-                page_num=slide.page_num,
-                slide_id=slide.id,
-                base_path=base_path,
-                product_ref_count=len(product_refs),
-                reference_count=len(refinement_images[:MAX_REFERENCE_INPUTS]),
-                references=_reference_audit(product_refs),
-                **_prompt_audit(refinement_prompt),
-            )
-            try:
-                img = generate_slide_image(
-                    prompt=refinement_prompt,
-                    reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
-                    resolution="4K",
-                    aspect_ratio="16:9",
-                    project_id=project_id,
-                )
-                logger.info(
-                    f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
+                    f"Pipeline: 第 {slide.page_num} 页完成逐组件精修 "
                     f"(base={base_path}, product_refs={len(product_refs)})"
                 )
+            else:
+                refinement_images = [img] + [ref["image"] for ref in product_refs]
+                refinement_prompt = _product_refinement_prompt(slide, product_refs)
+                refinement_paths = [
+                    str(ref.get("file_path") or "").strip()
+                    for ref in product_refs
+                    if str(ref.get("file_path") or "").strip()
+                ]
+                if refinement_paths:
+                    logger.info(
+                        f"Pipeline: 第 {slide.page_num} 页产品二次生成参考素材路径: "
+                        + " | ".join(refinement_paths)
+                    )
                 append_image_generation_log(
                     project_id,
                     run_id,
-                    "product_refinement_finished",
+                    "product_refinement_started",
                     page_num=slide.page_num,
                     slide_id=slide.id,
                     base_path=base_path,
                     product_ref_count=len(product_refs),
+                    reference_count=len(refinement_images[:MAX_REFERENCE_INPUTS]),
+                    references=_reference_audit(product_refs),
+                    **_prompt_audit(refinement_prompt),
                 )
-            except Exception as refine_error:
-                logger.warning(
-                    "Pipeline: 第 %s 页产品二次生成失败，回退使用 base image: %s",
-                    slide.page_num,
-                    refine_error,
-                )
-                append_image_generation_log(
-                    project_id,
-                    run_id,
-                    "product_refinement_fallback",
-                    page_num=slide.page_num,
-                    slide_id=slide.id,
-                    base_path=base_path,
-                    product_ref_count=len(product_refs),
-                    error=str(refine_error)[:1000],
-                )
+                try:
+                    img = generate_slide_image(
+                        prompt=refinement_prompt,
+                        reference_images=refinement_images[:MAX_REFERENCE_INPUTS],
+                        resolution="4K",
+                        aspect_ratio="16:9",
+                        project_id=project_id,
+                    )
+                    logger.info(
+                        f"Pipeline: 第 {slide.page_num} 页完成产品二次生成 "
+                        f"(base={base_path}, product_refs={len(product_refs)})"
+                    )
+                    append_image_generation_log(
+                        project_id,
+                        run_id,
+                        "product_refinement_finished",
+                        page_num=slide.page_num,
+                        slide_id=slide.id,
+                        base_path=base_path,
+                        product_ref_count=len(product_refs),
+                    )
+                except Exception as refine_error:
+                    logger.warning(
+                        "Pipeline: 第 %s 页产品二次生成失败，回退使用 base image: %s",
+                        slide.page_num,
+                        refine_error,
+                    )
+                    append_image_generation_log(
+                        project_id,
+                        run_id,
+                        "product_refinement_fallback",
+                        page_num=slide.page_num,
+                        slide_id=slide.id,
+                        base_path=base_path,
+                        product_ref_count=len(product_refs),
+                        error=str(refine_error)[:1000],
+                    )
 
         image_path = save_slide_image(
             img=img,
@@ -1219,17 +1699,30 @@ def run_generation_pipeline(
         )
         return any(marker in lower for marker in transient_markers)
 
+    def _result_has_image_api_attempts(result: Dict) -> bool:
+        events = result.get("image_generation_events")
+        return isinstance(events, list) and bool(events)
+
     def _generate_one_slide_with_retry(
         slide: Slide, project_id: str, output_dir: str,
         preloaded_ref_data: Optional[List[Dict]] = None, run_id: str | None = None,
     ) -> Dict:
         result = _generate_one_slide(slide, project_id, output_dir, preloaded_ref_data, run_id)
-        if result.get("error") and _is_transient_error(result["error"]):
+        if (
+            result.get("error")
+            and _is_transient_error(result["error"])
+            and not _result_has_image_api_attempts(result)
+        ):
             logger.info("Retrying slide %s after transient error: %s", slide.page_num, result["error"][:120])
             time.sleep(1.0)
             result = _generate_one_slide(slide, project_id, output_dir, preloaded_ref_data, run_id)
             if result.get("error"):
                 logger.warning("Slide %s retry also failed: %s", slide.page_num, result["error"][:120])
+        elif result.get("error") and _is_transient_error(result["error"]):
+            logger.info(
+                "Skipping slide-level retry for page %s because image API retries already ran",
+                slide.page_num,
+            )
         return result
 
     def run_slide_group(group_slides: List[Slide], ref_data_by_slide: Dict, on_success=None) -> None:
