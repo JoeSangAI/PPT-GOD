@@ -1054,6 +1054,25 @@ def normalize_same_level_text_metrics(groups: list[dict[str, Any]]) -> None:
             record["group"]["font_size_hint"] = target_size
 
 
+def apply_complex_slide_text_safety_hints(groups: list[dict[str, Any]], visual_complexity: dict[str, float] | None) -> None:
+    if not is_complex_visual_slide(visual_complexity):
+        return
+    for group in groups:
+        role = str(group.get("role") or "")
+        if role in {"subtitle", "label"}:
+            cap = 18.0
+        elif role in {"body", "caption", "footer"}:
+            cap = 11.0
+        else:
+            continue
+        box = _box_for_group(group)
+        fitted = _fitted_size_for_group(group, box)
+        current_hint = group.get("font_size_hint")
+        if current_hint is not None:
+            fitted = min(fitted, float(current_hint))
+        group["font_size_hint"] = round(min(fitted, cap), 2)
+
+
 def choose_font_name(text: str, font_hint: str | None = None) -> str:
     hint = str(font_hint or "").strip()
     safe_hint = hint and len(hint) <= 80 and not re.search(r"[\r\n{}<>]", hint)
@@ -1368,6 +1387,7 @@ def build_editable_pptx(
                 group["background_fill"] = True
             groups.append(group)
         normalize_same_level_text_metrics(groups)
+        apply_complex_slide_text_safety_hints(groups, visual_complexity)
         text_cleanup_boxes = [clamp_box(group["bbox"]) for group in groups if not group.get("background_fill")]
 
         clean_bg_path = str(work / f"slide_{page_num:02d}_cleaned.png")
