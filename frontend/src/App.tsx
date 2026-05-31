@@ -211,6 +211,28 @@ function resolveAssetUrl(apiBase: string, url?: string | null) {
 
 type TemplateApplicationStrength = "light" | "standard" | "strong";
 
+const TEMPLATE_STRENGTH_OPTIONS: Array<{
+  key: TemplateApplicationStrength;
+  label: string;
+  description: string;
+}> = [
+  {
+    key: "light",
+    label: "只参考排版",
+    description: "参考文字区、图片区、卡片位置和层级；颜色按当前视觉方向重新设计。",
+  },
+  {
+    key: "standard",
+    label: "排版 + 配色",
+    description: "参考页面结构、颜色和字体气质；内容换成你的新内容。",
+  },
+  {
+    key: "strong",
+    label: "尽量像原稿",
+    description: "直接参考对应模板页生成，尽量保留原稿的版式、配色和视觉感觉；不复制旧文字。",
+  },
+];
+
 const TEMPLATE_CONFIRM_TYPES = [
   { key: "cover", label: "封面" },
   { key: "toc", label: "目录" },
@@ -1580,6 +1602,7 @@ function App() {
   const [templateConfirmDismissedProjectId, setTemplateConfirmDismissedProjectId] = useState<string | null>(null);
   const [templatePageSelection, setTemplatePageSelection] = useState<Record<string, number>>({});
   const [templateApplicationStrength, setTemplateApplicationStrength] = useState<TemplateApplicationStrength>("standard");
+  const [templatePickerOpenKey, setTemplatePickerOpenKey] = useState<string | null>(null);
   const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<VisualUploadStatus | null>(null);
   const [uploadingDoc, setUploadingDoc] = useState(false);
@@ -1703,6 +1726,7 @@ function App() {
     setTemplateConfirmDismissedProjectId(null);
     setTemplatePageSelection({});
     setTemplateApplicationStrength("standard");
+    setTemplatePickerOpenKey(null);
     if (nextProjectId && cachedSlides) {
       setSlides(cachedSlides);
       setSlidesProjectId(nextProjectId);
@@ -2629,7 +2653,10 @@ function App() {
         logo_removed: Boolean(ref.logo_removed),
       }));
       setTemplatePages(pages);
-      if (pages.length > 0) setTemplatePageSelection(buildDefaultTemplateSelection(pages));
+      if (pages.length > 0) {
+        setTemplatePageSelection(buildDefaultTemplateSelection(pages));
+        setTemplatePickerOpenKey(null);
+      }
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
         void recoverMissingProject(projectId);
@@ -2961,11 +2988,13 @@ function App() {
         setReferenceImages([]);
       setDocuments([]);
       setTemplatePages([]);
+      setAssetsBarExpanded(false);
       setTemplateConfirmVisible(false);
       setTemplateDrawerOpen(false);
       setTemplateConfirmDismissedProjectId(null);
       setTemplatePageSelection({});
       setTemplateApplicationStrength("standard");
+      setTemplatePickerOpenKey(null);
       setDeckSelectedPages(new Set());
       setAgentScope("deck");
       setAgentScopePickerOpen(false);
@@ -7983,7 +8012,7 @@ function App() {
   const renderMaterialLibraryPanel = () => {
     if (!selectedProject) return null;
     return (
-      <aside className="pg-material-side-panel" aria-label="项目素材库">
+      <div className="pg-material-side-panel">
         <VisualAssetsPanel
           referenceImages={referenceImages}
           activeSlide={activeAssetSlide}
@@ -8053,7 +8082,7 @@ function App() {
             setGalleryModal({ urls, index: index >= 0 ? index : 0, title: "设计素材" });
           }}
         />
-      </aside>
+      </div>
     );
   };
 
@@ -8349,20 +8378,19 @@ function App() {
                 type="button"
                 className="pg-assets-toggle pg-workbench-module-button"
                 onClick={() => setAssetsBarExpanded((open) => !open)}
-                aria-pressed={assetsBarExpanded}
+                aria-expanded={assetsBarExpanded}
               >
                 <span className="pg-modulebar-label">素材库</span>
                 <span className={`pg-modulebar-summary ${referenceImages.length === 0 ? "is-muted" : ""}`}>
                   {materialSummary}
                 </span>
                 <span className="ml-auto shrink-0 text-xs text-slate-400">
-                  {assetsBarExpanded ? "收起" : "展开"}
+                  {assetsBarExpanded ? "关闭" : "打开"}
                 </span>
               </button>
             </div>
           </>
         ) : null}
-        {assetsBarExpanded && !isBriefStudioActive && selectedProject && renderMaterialLibraryPanel()}
         {/* 视觉方案：紧凑条，可展开 */}
         {selectedProject?.selected_style && (
           currentStatus === "visual_ready" ||
@@ -9428,7 +9456,7 @@ function App() {
               <div>
                 <div className="pg-drawer-kicker">Template Mapping</div>
                 <h2>模板页面映射</h2>
-                <p>选择每类页面参考哪一张模板缩略图，不再使用长下拉遮挡编辑区。</p>
+                <p>系统已自动匹配核心页面；只在需要时更换某一类页面。</p>
               </div>
               <button type="button" onClick={() => setTemplateDrawerOpen(false)}>关闭</button>
             </div>
@@ -9437,34 +9465,64 @@ function App() {
               const visibleTypes = showAdvancedMapping
                 ? TEMPLATE_CONFIRM_TYPES
                 : TEMPLATE_CONFIRM_TYPES.filter((item) => ["cover", "content", "ending"].includes(item.key));
+              const selectedStrength = TEMPLATE_STRENGTH_OPTIONS.find((option) => option.key === templateApplicationStrength) || TEMPLATE_STRENGTH_OPTIONS[1];
               return (
                 <>
                   <div className="pg-template-drawer-grid">
                     {visibleTypes.map((item) => {
                       const selectedPageNum = templatePageSelection[item.key] || fallbackSelection[item.key];
+                      const selectedTemplatePage = templatePages.find((page: any) => Number(page.page_num) === Number(selectedPageNum));
+                      const isPickerOpen = templatePickerOpenKey === item.key;
                       return (
                         <section key={item.key} className="pg-template-picker-group">
                           <div className="pg-template-picker-head">
                             <span>{item.label}</span>
                             <b>{selectedPageNum ? `P${selectedPageNum}` : "未选择"}</b>
                           </div>
-                          <div className="pg-template-thumb-picker">
-                            {templatePages.map((page: any) => {
-                              const isSelected = Number(page.page_num) === Number(selectedPageNum);
-                              return (
-                                <button
-                                  key={`${item.key}-${page.page_num}`}
-                                  type="button"
-                                  className={isSelected ? "is-selected" : ""}
-                                  onClick={() => setTemplatePageSelection((prev) => ({ ...prev, [item.key]: Number(page.page_num) }))}
-                                  title={`使用模板 P${page.page_num}`}
-                                >
-                                  <img src={page.layout_url || page.url} alt={`模板第 ${page.page_num} 页`} />
-                                  <span>P{page.page_num}</span>
-                                </button>
-                              );
-                            })}
+                          <div className="pg-template-selected-card">
+                            <button
+                              type="button"
+                              onClick={() => setTemplatePickerOpenKey(isPickerOpen ? null : item.key)}
+                              title={selectedPageNum ? `当前参考模板 P${selectedPageNum}` : "选择参考模板页"}
+                            >
+                              {selectedTemplatePage ? (
+                                <img src={selectedTemplatePage.layout_url || selectedTemplatePage.url} alt={`当前参考模板第 ${selectedTemplatePage.page_num} 页`} />
+                              ) : (
+                                <span className="pg-template-empty-thumb" />
+                              )}
+                              <span>当前参考</span>
+                              <b>{selectedPageNum ? `P${selectedPageNum}` : "未选择"}</b>
+                            </button>
+                            <button
+                              type="button"
+                              className="pg-template-change-btn"
+                              onClick={() => setTemplatePickerOpenKey(isPickerOpen ? null : item.key)}
+                            >
+                              {isPickerOpen ? "收起" : "更换"}
+                            </button>
                           </div>
+                          {isPickerOpen && (
+                            <div className="pg-template-thumb-picker">
+                              {templatePages.map((page: any) => {
+                                const isSelected = Number(page.page_num) === Number(selectedPageNum);
+                                return (
+                                  <button
+                                    key={`${item.key}-${page.page_num}`}
+                                    type="button"
+                                    className={isSelected ? "is-selected" : ""}
+                                    onClick={() => {
+                                      setTemplatePageSelection((prev) => ({ ...prev, [item.key]: Number(page.page_num) }));
+                                      setTemplatePickerOpenKey(null);
+                                    }}
+                                    title={`使用模板 P${page.page_num}`}
+                                  >
+                                    <img src={page.layout_url || page.url} alt={`模板第 ${page.page_num} 页`} />
+                                    <span>P{page.page_num}</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
                         </section>
                       );
                     })}
@@ -9477,19 +9535,21 @@ function App() {
                     {showAdvancedMapping ? "只看核心页面" : "显示更多页面类型"}
                   </button>
                   <div className="pg-template-strength-row pg-template-drawer-actions">
-                    <span>参考范围</span>
-                    <button type="button" className={templateApplicationStrength === "light" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("light")}>
-                      只学版式
-                    </button>
-                    <button type="button" className={templateApplicationStrength === "standard" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("standard")}>
-                      版式+配色
-                    </button>
-                    <button type="button" className={templateApplicationStrength === "strong" ? "is-active" : ""} onClick={() => setTemplateApplicationStrength("strong")}>
-                      完全沿用
-                    </button>
+                    <span>模板像到什么程度</span>
+                    {TEMPLATE_STRENGTH_OPTIONS.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        className={templateApplicationStrength === option.key ? "is-active" : ""}
+                        onClick={() => setTemplateApplicationStrength(option.key)}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
                     <button type="button" className="pg-template-confirm-primary" onClick={handleConfirmTemplateRecommendations} disabled={templateConfirmSaving}>
                       {templateConfirmSaving ? "保存中..." : "确认使用模板"}
                     </button>
+                    <p className="pg-template-strength-help">{selectedStrength.description}</p>
                   </div>
                 </>
               );
@@ -9498,6 +9558,21 @@ function App() {
         </div>
       )}
 
+      {assetsBarExpanded && !isBriefStudioActive && selectedProject && (
+        <div className="pg-side-drawer-backdrop pg-material-drawer-backdrop" role="presentation" onClick={() => setAssetsBarExpanded(false)}>
+          <aside className="pg-side-drawer pg-material-drawer" role="dialog" aria-modal="true" aria-label="项目素材库" onClick={(e) => e.stopPropagation()}>
+            <div className="pg-drawer-head">
+              <div>
+                <div className="pg-drawer-kicker">Project Assets</div>
+                <h2>项目素材库</h2>
+                <p>管理整套 PPT 会复用的 Logo、产品图、人物、风格参考和版式模板。</p>
+              </div>
+              <button type="button" onClick={() => setAssetsBarExpanded(false)}>关闭</button>
+            </div>
+            {renderMaterialLibraryPanel()}
+          </aside>
+        </div>
+      )}
 
       {/* Agent 聊天面板 */}
       {!isBriefStudioActive && rightCollapsed && (
@@ -10626,7 +10701,7 @@ function App() {
       {/* Gallery Modal */}
       {galleryModal && (
         <div
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-50"
+          className="fixed inset-0 bg-black/80 flex items-center justify-center z-[140]"
           onClick={() => setGalleryModal(null)}
         >
           <div

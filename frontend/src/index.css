@@ -3909,7 +3909,7 @@ body {
 .pg-asset-manager-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 75;
+  z-index: 112;
   display: flex;
   justify-content: flex-end;
   background: rgba(15, 23, 42, 0.22);
@@ -7635,7 +7635,7 @@ button.pg-project-export-link:disabled {
 .pg-side-drawer-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 62;
+  z-index: 110;
   display: flex;
   justify-content: flex-end;
   background: rgba(15, 23, 42, 0.22);
@@ -7654,7 +7654,7 @@ button.pg-project-export-link:disabled {
 }
 
 .pg-material-drawer {
-  width: min(680px, calc(100vw - 48px));
+  width: min(760px, calc(100vw - 48px));
 }
 
 .pg-drawer-head {
@@ -7719,6 +7719,15 @@ button.pg-project-export-link:disabled {
   padding: 0;
 }
 
+.pg-material-drawer .pg-material-side-panel {
+  min-height: 0;
+  max-height: none;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
 .pg-template-confirm-nudge {
   display: flex;
   align-items: center;
@@ -7767,10 +7776,59 @@ button.pg-project-export-link:disabled {
   font-size: 11px;
 }
 
+.pg-template-selected-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.pg-template-selected-card > button:first-child {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid #dce3ec;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 7px;
+  color: #475467;
+  font-size: 12px;
+  font-weight: 720;
+  text-align: left;
+}
+
+.pg-template-selected-card img,
+.pg-template-empty-thumb {
+  width: 112px;
+  aspect-ratio: 16 / 10;
+  border-radius: 5px;
+  object-fit: cover;
+  background: #eef2f6;
+}
+
+.pg-template-selected-card b {
+  color: #111827;
+  font-size: 13px;
+}
+
+.pg-template-change-btn {
+  align-self: stretch;
+  border: 1px solid #111827;
+  border-radius: 8px;
+  background: #111827;
+  color: #ffffff;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 760;
+}
+
 .pg-template-thumb-picker {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
   gap: 8px;
+  margin-top: 10px;
 }
 
 .pg-template-thumb-picker button {
@@ -7807,6 +7865,14 @@ button.pg-project-export-link:disabled {
   background: rgba(255, 255, 255, 0.96);
   padding: 12px 18px;
   backdrop-filter: blur(12px);
+}
+
+.pg-template-strength-help {
+  flex: 1 0 100%;
+  margin: 8px 0 0;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .pg-drawer-footer {

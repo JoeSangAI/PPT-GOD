@@ -2060,9 +2060,9 @@ def test_generation_loads_selected_visual_assets_without_signature_logo(tmp_path
 
     refs = _load_reference_images(slide)
 
-    assert [r["role"] for r in refs] == ["visual_asset", "content_ref", "template_hint"]
+    assert [r["role"] for r in refs] == ["visual_asset", "content_ref", "template"]
     assert refs[0]["process_mode"] == "crop"
-    assert "image" not in refs[2]
+    assert refs[2]["image"].size == (8, 8)
 
 
 def test_generation_can_load_logo_as_scene_asset_on_cover_when_blend(tmp_path):
