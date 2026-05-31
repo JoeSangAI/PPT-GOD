@@ -94,7 +94,7 @@ const uploadedDocuments = [];
 
 await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
-  window.localStorage.setItem(
+  window.sessionStorage.setItem(
     "pptgod.mvpAuth",
     JSON.stringify({
       testerId: "22222222-2222-4222-8222-222222222222",

@@ -115,7 +115,7 @@ const page = await browser.newPage();
 
 await page.addInitScript(({ projectId, auth }) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
-  window.localStorage.setItem("pptgod.mvpAuth", JSON.stringify(auth));
+  window.sessionStorage.setItem("pptgod.mvpAuth", JSON.stringify(auth));
 }, { projectId: project.id, auth: testerAuth });
 
 await page.route("**/*", async (route) => {
