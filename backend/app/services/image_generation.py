@@ -192,7 +192,13 @@ def _image_lock_ttl_seconds() -> int:
         task_limit = int(settings.CELERY_TASK_TIME_LIMIT or 2100)
     except (TypeError, ValueError):
         task_limit = 2100
-    return max(300, task_limit + 300)
+    wait_timeout = _image_slot_wait_timeout_seconds()
+    if wait_timeout <= 120:
+        stale_slot_ttl = max(30, wait_timeout - 5)
+    else:
+        stale_slot_ttl = min(300, max(120, wait_timeout // 2))
+    # Live requests renew the lease; a killed worker should not block the queue longer than callers wait.
+    return max(30, min(task_limit + 300, stale_slot_ttl))
 
 
 def _image_slot_wait_timeout_seconds() -> int:
