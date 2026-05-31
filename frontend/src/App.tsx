@@ -304,16 +304,17 @@ const slidesForAgentRequestContext = (items: Slide[]) =>
 const DEFAULT_PROTOTYPE_SAMPLE_COUNT = 3;
 const PROTOTYPE_FAMILY_ORDER = ["bookend", "toc", "content", "section", "hero", "data"];
 
+const normalizePrototypeFamily = (value: unknown): string => {
+  const family = String(value || "").toLowerCase();
+  if (family === "cover" || family === "ending") return "bookend";
+  if (family === "quote") return "hero";
+  return family || "content";
+};
+
 const inferPrototypeFamily = (slide: Slide): string => {
   const visualFamily = slide.visual_json?.seed_family;
-  if (visualFamily) return String(visualFamily);
-  const pageType = String(slide.visual_json?.type || slide.type || "content").toLowerCase();
-  if (pageType === "cover" || pageType === "ending") return "bookend";
-  if (pageType === "hero" || pageType === "quote") return "hero";
-  if (pageType === "toc") return "toc";
-  if (pageType === "section") return "section";
-  if (pageType === "data") return "data";
-  return "content";
+  if (visualFamily) return normalizePrototypeFamily(visualFamily);
+  return normalizePrototypeFamily(slide.visual_json?.type || slide.type || "content");
 };
 
 const defaultPrototypePageNumsForSlides = (slides: Slide[]): number[] => {
@@ -336,8 +337,8 @@ const defaultPrototypePageNumsForSlides = (slides: Slide[]): number[] => {
   ];
   return orderedFamilies
     .map((family) => byFamily.get(family)?.page_num)
-    .slice(0, DEFAULT_PROTOTYPE_SAMPLE_COUNT)
-    .filter((pageNum): pageNum is number => Number.isFinite(pageNum));
+    .filter((pageNum): pageNum is number => Number.isFinite(pageNum))
+    .slice(0, DEFAULT_PROTOTYPE_SAMPLE_COUNT);
 };
 
 interface ColorChip {

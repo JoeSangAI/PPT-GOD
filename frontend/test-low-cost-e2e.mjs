@@ -121,7 +121,7 @@ function workflowStatus() {
 
 await page.addInitScript((projectId) => {
   window.localStorage.setItem("ppt_god_last_project_id", projectId);
-  window.localStorage.setItem(
+  window.sessionStorage.setItem(
     "pptgod.mvpAuth",
     JSON.stringify({
       testerId: "11111111-1111-4111-8111-111111111111",
@@ -250,7 +250,7 @@ await page.route("**/*", async (route) => {
 try {
   await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
   await page.getByText("Low Cost E2E").first().waitFor({ timeout: 10_000 });
-  await page.getByRole("button", { name: /^打样\s+\d+\s+页$|^打样确认$/ }).first().click();
+  await page.getByRole("button", { name: /^生成样张\(\d+\s*页\)$/ }).first().click();
   await page.getByText("停止生成").waitFor({ timeout: 10_000 });
   await page.getByText("停止生成").click();
   await page.getByText("已停止生成", { exact: true }).waitFor({ timeout: 10_000 });
@@ -258,7 +258,7 @@ try {
   project.status = "failed";
   slides[0].status = "failed";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByRole("button", { name: "一键重试失败页" }).first().click();
+  await page.getByRole("button", { name: "重试失败页" }).first().click();
   await page.getByText("已启动 1 个失败页面的重试", { exact: true }).waitFor({ timeout: 10_000 });
 
   project.status = "prompt_ready";
@@ -274,8 +274,8 @@ try {
   slides[0].image_path = "./outputs/low-cost-project/slide_01.png";
   slides[0].prompt_text = "Mock prompt";
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByText("当前阶段：确认打样").waitFor({ timeout: 10_000 });
-  await page.getByRole("button", { name: "重新打样" }).first().waitFor({ timeout: 10_000 });
+  await page.getByText(/^样张已生成/).waitFor({ timeout: 10_000 });
+  await page.getByRole("button", { name: /^重打样张\(\d+\s*页\)$/ }).first().waitFor({ timeout: 10_000 });
 
   await page.locator("textarea.pg-chat-input").fill("测试聊天错误处理");
   await page.getByRole("button", { name: "发送" }).click();
