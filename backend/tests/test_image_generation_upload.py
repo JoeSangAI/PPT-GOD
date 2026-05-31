@@ -179,6 +179,16 @@ def test_image_api_slot_uses_redis_global_queue(monkeypatch):
     assert fake.eval_calls
 
 
+def test_redis_image_slot_ttl_expires_before_wait_timeout(monkeypatch):
+    monkeypatch.setattr(image_generation.settings, "CELERY_TASK_TIME_LIMIT", 3600)
+    monkeypatch.setattr(image_generation.settings, "IMAGE_API_SLOT_WAIT_TIMEOUT_SECONDS", 600)
+
+    ttl = image_generation._image_lock_ttl_seconds()
+
+    assert ttl < image_generation._image_slot_wait_timeout_seconds()
+    assert ttl <= 300
+
+
 def test_redis_image_slot_wait_has_timeout(monkeypatch):
     class FullRedis:
         def set(self, *_args, **_kwargs):
