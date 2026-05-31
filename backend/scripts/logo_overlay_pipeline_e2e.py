@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from PIL import Image
 
 from app.api import slides as slides_api
+from app.core.config import settings
 from app.services.generation_pipeline import _generate_one_slide, _load_reference_images
 from app.services.logo_assets import prepare_logo_overlay_image
 from app.services.logo_policy import LOGO_HEIGHT_RATIOS, LOGO_WIDTH_RATIOS, normalize_logo_placement, should_show_logo
@@ -17,16 +18,14 @@ from app.services.prompt_engine import generate_prompt_for_page
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-OUTPUT_DIR = os.path.join(ROOT, "outputs", "logo_overlay_pipeline_e2e")
+OUTPUT_DIR = os.path.join(settings.OUTPUT_DIR, "logo_overlay_pipeline_e2e")
 PROJECT_ID = "logo_overlay_pipeline_e2e"
 LOGO_PATH = os.path.join(
-    ROOT,
-    "backend",
-    "uploads",
+    settings.UPLOAD_DIR,
     "c55e9919-fd8b-4aae-b4ae-fece6932813a",
     "logo_58b54880b0e78b13c5e85c9d793c6296.png",
 )
-PRODUCT_PATH = os.path.join(ROOT, "outputs", "visual_asset_smoke", "product.png")
+PRODUCT_PATH = os.path.join(settings.OUTPUT_DIR, "visual_asset_smoke", "product.png")
 
 
 STYLE_TEXT = "\n".join(

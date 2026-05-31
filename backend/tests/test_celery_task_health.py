@@ -241,6 +241,43 @@ def test_generation_task_queues_continuation_with_same_credential(monkeypatch):
     }
 
 
+def test_prototype_generation_task_marks_prototype_stage(monkeypatch):
+    db = make_session()
+    project = Project(title="Prototype stage", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"))
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="prototype_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run_id = run.id
+    db.commit()
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks, "_acquire_page_locks", lambda _project_id, pages: pages)
+    monkeypatch.setattr(image_tasks, "_release_page_locks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "_cleanup_stale_generating_slides", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(image_tasks, "run_generation_pipeline", lambda *_args, **_kwargs: None)
+
+    result = image_tasks._generate_slides_task_inner(
+        project.id,
+        page_nums=[1],
+        prototype=True,
+        run_id=run_id,
+    )
+    refreshed = db.query(type(run)).filter(type(run).id == run_id).first()
+
+    assert result["status"] == "completed"
+    assert refreshed.stage == "prototype_generation"
+    assert "样张" in (refreshed.message or "")
+
+
 def test_deferred_generation_chunk_keeps_run_active(monkeypatch):
     db = make_session()
     project = Project(title="Chunked run", status="prompt_ready", content_plan_confirmed=True)
@@ -495,6 +532,52 @@ def test_pending_celery_task_waits_when_worker_is_online(monkeypatch):
     assert slide.status == "prompt_ready"
 
 
+def test_running_pending_celery_task_stales_when_missing_from_online_worker(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Running task lost after worker restart",
+        status="generating",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="generating",
+        prompt_text="prompt",
+    )
+    db.add(slide)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="page_generation",
+        stage="page_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    run.task_id = "lost-after-restart"
+    run.updated_at = utc_now() - timedelta(seconds=180)
+    db.flush()
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "PENDING")
+    monkeypatch.setattr(slides_api, "_celery_workers_online", lambda: True)
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 180)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    stale = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+
+    assert stale is True
+    assert run.status == "stale"
+    assert "后台生成服务中断" in run.error_msg
+    assert slide.status == "prompt_ready"
+    assert "请重试未完成页面" in slide.error_msg
+
+
 def test_pending_celery_task_stales_quickly_when_worker_is_offline(monkeypatch):
     db = make_session()
     project = Project(
@@ -632,6 +715,103 @@ def test_start_generation_pre_cleans_stale_generating_slides(monkeypatch):
     assert result["message"] == "Generation started"
 
 
+def test_start_generation_clears_lost_active_run_before_conflict(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Start after lost run",
+        status="generating",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="generating",
+        prompt_text="prompt",
+    )
+    db.add(slide)
+    db.flush()
+    old_run = create_project_run(
+        db,
+        project.id,
+        kind="page_generation",
+        stage="page_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    old_run.status = "running"
+    old_run.task_id = "lost-task"
+    old_run.updated_at = utc_now() - timedelta(seconds=180)
+    db.flush()
+
+    class FakeTask:
+        id = "new-task"
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "PENDING")
+    monkeypatch.setattr(slides_api, "_celery_workers_online", lambda: True)
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 180)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(slides_api, "ensure_generation_worker_ready", lambda: True)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", lambda *args, **kwargs: FakeTask())
+
+    result = slides_api.start_generation(
+        project.id,
+        body=slides_api.PageNumsRequest(page_nums=[1]),
+        db=db,
+    )
+
+    assert result["message"] == "Generation started"
+    assert old_run.status == "stale"
+    assert result["run"]["id"] != old_run.id
+
+
+def test_project_status_clears_lost_active_run(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Status after lost run",
+        status="generating",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="generating",
+        prompt_text="prompt",
+    )
+    db.add(slide)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="page_generation",
+        stage="page_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    run.task_id = "lost-status-task"
+    run.updated_at = utc_now() - timedelta(seconds=180)
+    db.flush()
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "PENDING")
+    monkeypatch.setattr(slides_api, "_celery_workers_online", lambda: True)
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 180)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    result = slides_api.get_project_status(project.id, db=db)
+
+    assert result["active_run"] is None
+    assert run.status == "stale"
+    assert slide.status == "prompt_ready"
+
+
 def test_skipped_pages_are_appended_to_remaining_pages(monkeypatch):
     db = make_session()
     project = Project(title="Skipped retry", status="prompt_ready", content_plan_confirmed=True)
@@ -687,6 +867,40 @@ def test_skipped_pages_are_appended_to_remaining_pages(monkeypatch):
     assert result["status"] == "continued"
     # Page 1 was skipped (locked), page 3 was remaining from chunking
     assert captured["remaining_page_nums"] == [3, 1]
+
+
+def test_stale_redelivered_generation_task_exits_before_page_locks(monkeypatch):
+    db = make_session()
+    project = Project(title="Redelivered stale task", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, status="prompt_ready", prompt_text="p1"))
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="page_generation",
+        stage="page_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "stale"
+    db.commit()
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("stale redelivery must not touch page locks or generation pipeline")
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks, "_acquire_page_locks", fail_if_called)
+    monkeypatch.setattr(image_tasks, "run_generation_pipeline", fail_if_called)
+
+    result = image_tasks._generate_slides_task_inner(
+        project.id,
+        page_nums=[1],
+        run_id=run.id,
+    )
+
+    assert result["status"] == "stale"
 
 
 def test_transient_error_triggers_one_retry(monkeypatch):

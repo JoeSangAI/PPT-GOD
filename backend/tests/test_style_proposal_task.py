@@ -1,14 +1,16 @@
+from datetime import timedelta
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.api import projects as projects_api
+from app.api import slides as slides_api
 from app import tasks
 from app.models.base import Base
 from app.models.models import Project, ReferenceImage, Slide
 from app.services.artifact_versions import content_signature, style_asset_signature
-from app.services.run_state import create_project_run
+from app.services.run_state import create_project_run, utc_now
 
 
 def test_stale_style_proposal_is_hidden_until_regenerated():
@@ -333,6 +335,46 @@ def test_style_proposal_api_invalidates_cache_when_visual_chat_requirements_chan
     assert captured["kwargs"]["user_description"] == "用户：不要红色，改成冷白极简、更多留白。"
     refreshed_project = db.query(Project).filter(Project.id == project_id).first()
     assert refreshed_project.style_proposal is None
+    db.close()
+
+
+def test_style_proposal_api_clears_lost_active_run_before_conflict(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+
+    project = Project(title="Style after lost run", status="visual_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, content_json={"title": "AI营销"}))
+    db.flush()
+    old_run = create_project_run(db, project.id, kind="style_proposal", stage="style_proposal", total_count=1)
+    old_run.status = "running"
+    old_run.task_id = "lost-style-task"
+    old_run.updated_at = utc_now() - timedelta(seconds=180)
+    project_id = project.id
+    db.flush()
+
+    class _FakeTask:
+        @staticmethod
+        def delay(project_id_arg, run_id_arg, **kwargs):
+            return SimpleNamespace(id="fake-style-task-id")
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "PENDING")
+    monkeypatch.setattr(slides_api, "_celery_workers_online", lambda: True)
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(slides_api, "_task_age_seconds", lambda project_id, active_run: 180)
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(projects_api, "ensure_celery_worker", lambda *, queue=None: True)
+    monkeypatch.setattr(projects_api, "store_current_provider_credentials", lambda redis_client: "credential-id")
+    monkeypatch.setattr(projects_api, "generate_style_proposals_task", _FakeTask)
+
+    result = projects_api.create_style_proposals(project_id, db=db)
+
+    assert result["status"] == "generating"
+    assert old_run.status == "stale"
+    assert result["run"]["id"] != old_run.id
     db.close()
 
 

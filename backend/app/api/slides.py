@@ -131,6 +131,8 @@ from app.services.run_state import (
     finish_run,
     get_active_run,
     get_latest_run,
+    image_generation_queued_message,
+    image_generation_run_stage,
     is_run_active,
     mark_run_running,
     reconcile_project_state,
@@ -2066,6 +2068,10 @@ def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, a
         workers_online = _celery_workers_online()
         if workers_online is False:
             reason = "后台生成服务未在线，本次生成已停止。请启动 worker 后重试未完成页面。"
+        elif active_run.status == "running":
+            present = _celery_task_present_in_worker(task_id)
+            if present is False:
+                reason = "后台生成服务中断，本次生成已停止。请重试未完成页面。"
         elif task_age > _queued_celery_timeout_seconds():
             reason = "后台生成服务长时间没有接收本次任务，已停止本次生成。请重试未完成页面。"
     elif state in {"STARTED", "RETRY"} and inactive_for > timeout:
@@ -2091,6 +2097,20 @@ def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, a
     db.commit()
     _auto_restart_generation_if_needed(project, db, active_run)
     return True
+
+
+def _active_run_for_project_action(project: Project | None, db: Session):
+    """Return the current active run after clearing executor state that is known lost."""
+    if not project:
+        return None
+    active_run = get_active_run(db, project.id)
+    lost_celery_task = _stale_missing_celery_task_if_needed(project, db, active_run)
+    if lost_celery_task:
+        return get_active_run(db, project.id)
+    stale_run = stale_inactive_run_if_needed(db, project.id)
+    if stale_run and stale_run.status == "stale":
+        db.commit()
+    return get_active_run(db, project.id)
 
 
 def _auto_restart_generation_if_needed(project: Project, db: Session, previous_run) -> bool:
@@ -2134,7 +2154,7 @@ def _auto_restart_generation_if_needed(project: Project, db: Session, previous_r
     page_nums = [s.page_num for s in slides]
     prototype = previous_run.kind == "prototype_generation"
     run_kind = previous_run.kind if previous_run.kind == "prototype_generation" else "batch_generation"
-    run_stage = "prototype_generation" if prototype else "batch_generation"
+    run_stage = image_generation_run_stage(kind=run_kind, prototype=prototype, page_nums=page_nums)
 
     run = create_project_run(
         db,
@@ -3034,7 +3054,7 @@ def create_content_plan(
         raise HTTPException(status_code=404, detail="Project not found")
     if project.status not in {"draft", "planning", "content_plan_ready"} or project.content_plan_confirmed:
         raise HTTPException(status_code=409, detail="当前阶段不能重新生成内容规划，请先回退到内容规划。")
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     # 优先使用用户传入的 topic，否则用项目标题
@@ -3812,7 +3832,7 @@ def start_generation(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     if project.status == "completed" and not body.page_nums:
@@ -3862,7 +3882,7 @@ def start_generation(
     _cleanup_stale_generating_slides_for_project(db, project_id)
     ensure_generation_worker_ready()
     run_kind = "prototype_generation" if body.prototype else ("page_generation" if page_nums else "batch_generation")
-    run_stage = "prototype_generation" if body.prototype else "batch_generation"
+    run_stage = image_generation_run_stage(kind=run_kind)
     run = create_project_run(
         db,
         project_id,
@@ -3870,7 +3890,7 @@ def start_generation(
         stage=run_stage,
         target_page_nums=[s.page_num for s in target_slides],
         total_count=len(target_slides),
-        message="图片生成任务已排队",
+        message=image_generation_queued_message(run_kind),
     )
     db.commit()
     _update_progress(project_id, {
@@ -3901,7 +3921,7 @@ def confirm_prototype(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     if project.status != "prototype_ready":
@@ -3988,10 +4008,10 @@ def confirm_prototype(
         db,
         project_id,
         kind="batch_generation",
-        stage="batch_generation",
+        stage=image_generation_run_stage(kind="batch_generation"),
         target_page_nums=target_page_nums,
         total_count=len(target_page_nums),
-        message="批量生成任务已排队",
+        message=image_generation_queued_message("batch_generation"),
     )
     db.commit()
 
@@ -4074,6 +4094,13 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         .all()
     )
 
+    active_run = get_active_run(db, project_id)
+    lost_celery_task = _stale_missing_celery_task_if_needed(project, db, active_run)
+    stale_run = None if lost_celery_task else stale_inactive_run_if_needed(db, project_id)
+    if stale_run and stale_run.status == "stale":
+        db.commit()
+    active_run = get_active_run(db, project_id)
+
     slide_status = []
     completed_count = 0
     for s in slides:
@@ -4086,7 +4113,6 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
             "error_msg": s.error_msg,
         })
 
-    active_run = get_active_run(db, project_id)
     before_status = project.status
     reconcile_project_state(project, slides, active_run)
     logo_policy_changed = _repair_project_logo_policies(project, slides)
@@ -4279,10 +4305,7 @@ def start_editable_pptx_export(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    stale_run = stale_inactive_run_if_needed(db, project_id)
-    if stale_run and stale_run.status == "stale":
-        db.commit()
-    active_run = get_active_run(db, project_id)
+    active_run = _active_run_for_project_action(project, db)
     if active_run:
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再下载可编辑版。")
 
@@ -5137,7 +5160,7 @@ def retry_failed_slides(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     failed_slides = (
@@ -5187,10 +5210,10 @@ def retry_failed_slides(
         db,
         project_id,
         kind="retry_failed",
-        stage="batch_generation",
+        stage=image_generation_run_stage(kind="retry_failed"),
         target_page_nums=page_nums,
         total_count=len(page_nums),
-        message="失败页面重试任务已排队",
+        message=image_generation_queued_message("retry_failed"),
     )
     db.commit()
 
@@ -5413,7 +5436,7 @@ def finetune_slide(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
@@ -5473,10 +5496,10 @@ def finetune_slide(
         db,
         project_id,
         kind="finetune",
-        stage="batch_generation",
+        stage=image_generation_run_stage(kind="finetune"),
         target_page_nums=[slide.page_num],
         total_count=1,
-        message="单页微调任务已排队",
+        message=image_generation_queued_message("finetune"),
     )
     db.commit()
 
@@ -5508,7 +5531,7 @@ def retry_slide(
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     slide = db.query(Slide).filter(Slide.id == slide_id, Slide.project_id == project_id).first()
@@ -5543,10 +5566,10 @@ def retry_slide(
         db,
         project_id,
         kind="page_generation",
-        stage="batch_generation",
+        stage=image_generation_run_stage(kind="page_generation"),
         target_page_nums=[slide.page_num],
         total_count=1,
-        message="单页生成任务已排队",
+        message=image_generation_queued_message("page_generation"),
     )
     db.commit()
 

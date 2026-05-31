@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchWorkflowStatus } from "../api/client";
-import { isActiveRun } from "../workflow";
+import { adoptWorkflowRun as adoptWorkflowRunState, isActiveRun } from "../workflow";
 import type { WorkflowRun } from "../workflow";
 
 export interface WorkflowProgress {
@@ -74,6 +74,12 @@ export function useProjectWorkflow(projectId?: string | null) {
     return data as WorkflowStatus;
   }, [projectId]);
 
+  const adoptWorkflowRun = useCallback((run?: WorkflowRun | null) => {
+    if (!projectId || !run?.id) return;
+    if (run.project_id && run.project_id !== projectId) return;
+    setWorkflowStatus((prev) => adoptWorkflowRunState(prev, run) as WorkflowStatus | null);
+  }, [projectId]);
+
   useEffect(() => {
     let cancelled = false;
     if (!projectId) {
@@ -129,6 +135,7 @@ export function useProjectWorkflow(projectId?: string | null) {
     workflowStatus,
     setWorkflowStatus,
     refreshWorkflowStatus,
+    adoptWorkflowRun,
     activeRun,
     hasActiveRun,
   };

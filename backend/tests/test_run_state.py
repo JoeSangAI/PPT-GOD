@@ -12,6 +12,7 @@ from app.services.artifact_versions import artifact_stale, dependency_signature,
 from app.services.run_state import (
     apply_project_rollback,
     create_project_run,
+    image_generation_run_stage,
     normalize_confirmed_project_stage,
     reconcile_project_state,
     serialize_run,
@@ -65,6 +66,16 @@ def test_target_progress_is_scoped_to_run_pages():
     assert target_failed == 0
     assert payload["completed_count"] == 2
     assert payload["completed_count"] <= payload["total_count"]
+
+
+def test_image_generation_run_stage_matches_run_kind():
+    assert image_generation_run_stage(kind="prototype_generation") == "prototype_generation"
+    assert image_generation_run_stage(kind="page_generation") == "page_generation"
+    assert image_generation_run_stage(kind="retry_failed") == "retry_failed"
+    assert image_generation_run_stage(kind="finetune") == "finetune"
+    assert image_generation_run_stage(kind="batch_generation") == "batch_generation"
+    assert image_generation_run_stage(prototype=True) == "prototype_generation"
+    assert image_generation_run_stage(page_nums=[3]) == "page_generation"
 
 
 def test_active_run_guard_rejects_second_run():

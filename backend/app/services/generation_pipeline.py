@@ -28,7 +28,17 @@ from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, should_show_logo, should_use_logo_as_scene_asset
 from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids
 from app.services.pptx_assembler import assemble_pptx
-from app.services.run_state import cleanup_generation_progress, finish_run, get_run, is_run_active, mark_run_running, update_run_progress
+from app.services.run_state import (
+    cleanup_generation_progress,
+    finish_run,
+    get_run,
+    image_generation_progress_message,
+    image_generation_run_stage,
+    image_generation_running_message,
+    is_run_active,
+    mark_run_running,
+    update_run_progress,
+)
 from app.services.section_text import should_render_section_title
 from app.utils.reference_image import default_visual_asset_process_mode
 
@@ -1547,6 +1557,11 @@ def run_generation_pipeline(
         logger.info(f"Pipeline: {mode_desc}，只生成 {len(target_slides)} 页")
 
     run = get_run(db, run_id)
+    run_stage = image_generation_run_stage(
+        kind=run.kind if run else None,
+        prototype=prototype,
+        page_nums=page_nums,
+    )
     run_target_pages = set()
     if run and run.target_page_nums:
         run_target_pages = {int(p) for p in run.target_page_nums}
@@ -1574,7 +1589,7 @@ def run_generation_pipeline(
     )
     logger.info("Pipeline: image generation audit log: %s", log_path)
 
-    mark_run_running(db, run_id, stage="batch_generation", message="正在生成图片...")
+    mark_run_running(db, run_id, stage=run_stage, message=image_generation_running_message(run_stage))
     db.commit()
 
     # 先把目标页标记为 generating（只涉及本任务负责的页面）
@@ -1653,8 +1668,7 @@ def run_generation_pipeline(
             completed_count=completed_now,
             failed_count=failed_now,
             total_count=total_target,
-            message=f"正在生成图片... {completed_now} / {total_target} 页完成"
-            + (f"，{failed_now} 页失败" if failed_now else ""),
+            message=image_generation_progress_message(run_stage, completed_now, total_target, failed_now),
         )
         db.commit()
 
@@ -1879,8 +1893,7 @@ def run_generation_pipeline(
             completed_count=target_completed,
             failed_count=target_failed,
             total_count=total_target,
-            message=f"正在生成图片... {target_completed} / {total_target} 页完成"
-            + (f"，{target_failed} 页失败" if target_failed else ""),
+            message=image_generation_progress_message(run_stage, target_completed, total_target, target_failed),
         )
         db.commit()
         append_image_generation_log(
@@ -2079,8 +2092,7 @@ def run_generation_pipeline(
         message=(
             "PPTX 组装失败"
             if assembly_error
-            else f"图片生成结束：{target_completed} / {total_target} 页完成"
-            + (f"，{target_failed} 页失败" if target_failed else "")
+            else image_generation_progress_message(run_stage, target_completed, total_target, target_failed).replace("正在", "", 1)
         ),
         completed_count=target_completed,
         failed_count=target_failed,

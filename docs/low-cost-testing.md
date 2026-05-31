@@ -10,7 +10,7 @@ PPT God 的普通自动化测试默认不应该触发真实生图。真实生图
 - `IMAGE_GEN_MODE=mock`：返回本地占位图，不调用真实 API。适合自动化测试和 UI 调试。
 - `IMAGE_GEN_MODE=cached`：同一个 prompt 命中缓存时复用图片，未命中才调用真实 API。
 - `MAX_REAL_IMAGES_PER_RUN=1`：限制当前进程最多真实生成 1 张图。`0` 表示不限制。
-- `IMAGE_GEN_CACHE_DIR=./outputs/image-cache`：cached 模式的图片缓存目录。
+- `IMAGE_GEN_CACHE_DIR=.pptgod-data/outputs/image-cache`：cached 模式的默认图片缓存目录。
 
 ## 推荐命令
 

@@ -24,6 +24,7 @@ export interface WorkflowInput {
 
 export interface WorkflowRun {
   id?: string;
+  project_id?: string;
   kind?: string;
   status?: string;
   stage?: string;
@@ -35,6 +36,42 @@ export interface WorkflowRun {
   failed_count?: number;
   started_at?: string | null;
   updated_at?: string | null;
+}
+
+export interface WorkflowStatusLike {
+  project_id?: string;
+  project_phase?: string;
+  project_status?: string;
+  total_slides?: number;
+  completed_slides?: number;
+  total_completed_slides?: number;
+  target_completed_slides?: number;
+  target_failed_slides?: number;
+  target_count?: number;
+  target_page_nums?: number[] | null;
+  active_run?: WorkflowRun | null;
+  last_run?: WorkflowRun | null;
+  progress?: {
+    run_id?: string;
+    kind?: string;
+    status?: string;
+    stage?: string;
+    label?: string;
+    message?: string | null;
+    current?: number;
+    total?: number;
+    failed?: number;
+    unit?: string;
+    percent?: number;
+    target_page_nums?: number[] | null;
+    can_cancel?: boolean;
+    current_page?: number;
+    total_pages?: number;
+    active_page_nums?: number[];
+    running_count?: number;
+    updated_at?: string | null;
+  } | null;
+  quality_report?: unknown;
 }
 
 export interface ImageGenerationOutcomeInput {
@@ -232,6 +269,79 @@ export const STATUS_LABEL: Record<string, string> = {
   completed: "已完成",
   failed: "失败",
 };
+
+const WORKFLOW_RUN_LABELS: Record<string, string> = {
+  content_plan: "内容规划进度",
+  style_proposal: "视觉方向进度",
+  visual_prompts: "画面方案进度",
+  prototype_generation: "打样生成进度",
+  batch_generation: "批量生成进度",
+  page_generation: "单页生成进度",
+  retry_failed: "失败页重试进度",
+  finetune: "单页微调进度",
+  editable_pptx: "可编辑版生成进度",
+};
+
+const WORKFLOW_RUN_UNITS: Record<string, string> = {
+  style_proposal: "套",
+  editable_pptx: "页",
+};
+
+export function adoptWorkflowRun<T extends WorkflowStatusLike | null | undefined>(
+  workflow: T,
+  run?: WorkflowRun | null
+): T {
+  if (!run?.id || !isActiveRun(run)) return workflow;
+
+  const workflowProjectId = workflow?.project_id ? String(workflow.project_id) : "";
+  const runProjectId = run.project_id ? String(run.project_id) : "";
+  if (workflowProjectId && runProjectId && workflowProjectId !== runProjectId) {
+    return workflow;
+  }
+  const projectId = workflowProjectId || runProjectId;
+  if (!projectId) return workflow;
+
+  const kind = String(run.kind || "");
+  const total = Math.max(0, Number(run.total_count ?? run.target_page_nums?.length ?? workflow?.target_count ?? 0) || 0);
+  const completed = Math.min(total || Number.MAX_SAFE_INTEGER, Math.max(0, Number(run.completed_count || 0)));
+  const failed = Math.min(total || Number.MAX_SAFE_INTEGER, Math.max(0, Number(run.failed_count || 0)));
+  const percent = total > 0 ? Math.round((completed / total) * 1000) / 10 : 0;
+  const next = {
+    ...(workflow || {}),
+    project_id: projectId,
+    project_phase: workflow?.project_phase || workflow?.project_status || "draft",
+    project_status: workflow?.project_status || workflow?.project_phase || "draft",
+    total_slides: workflow?.total_slides ?? total,
+    completed_slides: completed,
+    target_completed_slides: completed,
+    target_failed_slides: failed,
+    target_count: total || workflow?.target_count || 0,
+    target_page_nums: run.target_page_nums ?? workflow?.target_page_nums ?? null,
+    active_run: run,
+    progress: {
+      run_id: run.id,
+      kind,
+      status: run.status,
+      stage: run.stage,
+      label: WORKFLOW_RUN_LABELS[kind] || "任务进度",
+      message: run.message || WORKFLOW_RUN_LABELS[kind] || "任务处理中",
+      current: completed,
+      total,
+      failed,
+      unit: WORKFLOW_RUN_UNITS[kind] || "页",
+      percent,
+      target_page_nums: run.target_page_nums ?? workflow?.target_page_nums ?? null,
+      can_cancel: isActiveRun(run),
+      current_page: completed,
+      total_pages: total,
+      active_page_nums: workflow?.progress?.active_page_nums || [],
+      running_count: workflow?.progress?.running_count || 0,
+      updated_at: run.updated_at || null,
+    },
+    quality_report: null,
+  };
+  return next as T;
+}
 
 function uniqueSortedPageNums(items: StaleSlideActionInput[]) {
   return Array.from(new Set(

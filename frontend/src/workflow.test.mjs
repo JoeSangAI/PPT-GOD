@@ -27,6 +27,7 @@ const {
   buildGateContext,
   buildWorkflowState,
   buildWorkflowProgressDisclosure,
+  adoptWorkflowRun,
   evaluateImageGenerationOutcome,
   getWorkflowProgressOverviewDisplay,
   getPrimaryActionKey,
@@ -505,6 +506,73 @@ assert.equal(cancelledPrototypeOutcome.isSuccess, false);
 assert.equal(cancelledPrototypeOutcome.canConfirmPrototype, false);
 assert.match(cancelledPrototypeOutcome.message, /没有生成新样张/);
 
+for (const targetAreaOverride of ["whole", "title", "body", "notes"]) {
+  assert.equal(
+    inferAgentRequestContext({
+      message: "请按上方选择做一次小幅优化，保持主题不变。",
+      activeAgentRole: "visual",
+      activeScope: "deck",
+      targetAreaOverride,
+      projectStatus: "completed",
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+      hasPrompt: true,
+      hasGeneratedImage: true,
+    }).targetRole,
+    "content"
+  );
+}
+
+for (const targetAreaOverride of ["visual", "materials"]) {
+  assert.equal(
+    inferAgentRequestContext({
+      message: "请按上方选择做一次小幅优化，保持主题不变。",
+      activeAgentRole: "content",
+      activeScope: "deck",
+      targetAreaOverride,
+      projectStatus: "completed",
+      contentPlanConfirmed: true,
+      hasSelectedStyle: true,
+      hasPrompt: true,
+      hasGeneratedImage: true,
+    }).targetRole,
+    "visual"
+  );
+}
+
+assert.equal(
+  inferAgentRequestContext({
+    message: "整体表述更精炼有冲击力",
+    activeAgentRole: "visual",
+    activeScope: "current_slide",
+    targetAreaOverride: "whole",
+    editingPageNum: 1,
+    projectStatus: "completed",
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+    hasPrompt: true,
+    hasGeneratedImage: true,
+  }).scope,
+  "current_slide"
+);
+
+assert.equal(
+  inferAgentRequestContext({
+    message: "整体表述更精炼有冲击力",
+    activeAgentRole: "visual",
+    activeScope: "selected_slides",
+    selectedPageNums: [1, 3],
+    targetAreaOverride: "whole",
+    editingPageNum: 1,
+    projectStatus: "completed",
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+    hasPrompt: true,
+    hasGeneratedImage: true,
+  }).scope,
+  "selected_slides"
+);
+
 assert.deepEqual(
   plain(inferAgentRequestContext({
     message: "这一页太空了，补一点市场数据",
@@ -794,6 +862,30 @@ assert.deepEqual(
   }
 );
 
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "保留文字，把画面换成更高级的办公室场景",
+    activeAgentRole: "finetune",
+    activeScope: "current_slide",
+    editingPageNum: 1,
+    projectStatus: "completed",
+    contentPlanConfirmed: true,
+    hasGeneratedImage: true,
+  })),
+  {
+    targetRole: "finetune",
+    scope: "current_slide",
+    risk: "safe",
+    targetArea: "visual",
+    areaLabel: "画面",
+    confidence: "explicit",
+    pageNums: [1],
+    explicitScope: false,
+    scopeLabel: "第 1 页",
+    routeReason: "finetune_mode",
+  }
+);
+
 assert.equal(
   inferAgentRequestContext({
     message: "备注改得像演讲稿一点",
@@ -925,6 +1017,81 @@ assert.equal(runningCard.primary.key, "stop");
 assert.equal(runningCard.title, "批量生成中");
 assert.equal(runningCard.description, undefined);
 assert.deepEqual(plain(runningCard.progress), { current: 1, total: 2, percent: 50, unit: "页" });
+
+const adoptedVisualPromptWorkflow = adoptWorkflowRun({
+  project_id: "project-1",
+  project_phase: "prototype_ready",
+  project_status: "prototype_ready",
+  total_slides: 6,
+  completed_slides: 3,
+  total_completed_slides: 3,
+  target_completed_slides: 3,
+  target_failed_slides: 0,
+  target_count: 6,
+  target_page_nums: null,
+  active_run: null,
+  progress: null,
+  quality_report: { message: "旧的交付检查提示" },
+}, {
+  id: "run-vp-1",
+  project_id: "project-1",
+  kind: "visual_prompts",
+  status: "queued",
+  stage: "visual_planning",
+  message: "画面方案更新已排队",
+  target_page_nums: [2, 4],
+  total_count: 2,
+  completed_count: 0,
+  failed_count: 0,
+});
+assert.equal(adoptedVisualPromptWorkflow.active_run.id, "run-vp-1");
+assert.equal(adoptedVisualPromptWorkflow.progress.run_id, "run-vp-1");
+assert.equal(adoptedVisualPromptWorkflow.progress.label, "画面方案进度");
+assert.deepEqual(plain(adoptedVisualPromptWorkflow.target_page_nums), [2, 4]);
+assert.equal(adoptedVisualPromptWorkflow.target_count, 2);
+assert.equal(adoptedVisualPromptWorkflow.quality_report, null);
+
+const adoptedPrototypeWorkflow = adoptWorkflowRun(adoptedVisualPromptWorkflow, {
+  id: "run-prototype-1",
+  project_id: "project-1",
+  kind: "prototype_generation",
+  status: "running",
+  stage: "prototype_generation",
+  message: "正在生成样张",
+  target_page_nums: [1, 3, 5],
+  total_count: 3,
+  completed_count: 1,
+});
+const adoptedPrototypeCard = getStatusCard({
+  workflowState: buildWorkflowState({
+    projectStatus: adoptedPrototypeWorkflow.project_status,
+    slides: [
+      { page_num: 1, status: "completed", image_path: "./outputs/1.png", prompt_text: "p1" },
+      { page_num: 2, status: "prompt_ready", prompt_text: "p2" },
+      { page_num: 3, status: "generating", prompt_text: "p3" },
+    ],
+    activeRun: adoptedPrototypeWorkflow.active_run,
+    contentPlanConfirmed: true,
+    hasSelectedStyle: true,
+  }),
+  staleActionPlan: planStaleSlideAction([
+    { slide: { id: "s1", page_num: 1 }, stale: { content: true, image: true } },
+  ]),
+  failedPageNums: [],
+  incompletePageNums: [2, 3],
+  visiblePrototypePageNums: [1, 3, 5],
+  resamplePageNums: [1, 3, 5],
+  prototypePromptTargetCount: 3,
+  completedSlideCount: 1,
+  totalSlideCount: 3,
+  progressDisclosure: buildWorkflowProgressDisclosure(adoptedPrototypeWorkflow),
+});
+assert.equal(
+  adoptedPrototypeCard.title,
+  "样张生成中",
+  "adopted active prototype run must hide stale update/resample CTAs immediately"
+);
+assert.equal(adoptedPrototypeCard.primary.key, "stop");
 
 const noIncompleteCard = getStatusCard({
   workflowState: allDoneState,

@@ -1,5 +1,6 @@
 .git
 .DS_Store
+.pptgod-data
 .playwright-cli
 .pytest_cache
 
@@ -11,6 +12,7 @@ backend/.env
 backend/venv
 backend/uploads
 backend/outputs
+backend/test_outputs
 backend/__pycache__
 backend/**/__pycache__
 backend/.pytest_cache
@@ -18,6 +20,7 @@ backend/.pytest_cache
 backups
 output
 outputs
+uploads
 
 *.py[cod]
 *.log

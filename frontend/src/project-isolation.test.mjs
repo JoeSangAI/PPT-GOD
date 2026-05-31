@@ -367,6 +367,11 @@ assert.match(
   /\.pg-slide-body-preview p[\s\S]*white-space: pre-wrap/,
   "slide-card Markdown paragraphs must preserve line breaks from content planning"
 );
+assert.match(
+  css,
+  /\.pg-slide-grid > \.pg-slide-card\s*\{[^}]*flex-grow:\s*0\s*!important[^}]*flex-shrink:\s*0\s*!important[^}]*\}/,
+  "slide cards must not stretch to fill an incomplete final row"
+);
 assert.doesNotMatch(
   source,
   /failContentPlanPoll\("前端等待超时/,
@@ -636,10 +641,30 @@ assert.match(
   /generateVisualPrompts\(projectId,\s*pageNumsForPrompt,\s*buildCrossStageContext\("visual"\)\)/,
   "stale visual updates must use the unified visual-prompts run so the main progress card can show page-by-page progress"
 );
+assert.match(
+  updateStaleSource,
+  /handleWorkflowRunStarted\(projectId,\s*startResult\.run\)/,
+  "stale visual updates must adopt the returned visual-prompts run immediately instead of waiting for a manual refresh"
+);
 assert.doesNotMatch(
   updateStaleSource,
   /await generateVisualPlan\(projectId/,
   "stale visual updates must not use the legacy synchronous visual-plan endpoint without active_run progress"
+);
+assert.match(
+  source,
+  /const handleWorkflowRunStarted = useCallback\([\s\S]*adoptWorkflowRun[\s\S]*void refreshWorkflowStatus\(\)/,
+  "run-starting actions must synchronously adopt the returned run and then refresh workflow status"
+);
+assert.match(
+  source,
+  /const handleStartGeneration = async[\s\S]*const result = await startGeneration\(projectId, pageNums, prototype\);[\s\S]*handleWorkflowRunStarted\(projectId,\s*result\.run\)/,
+  "image generation starts must enter active workflow state from the returned run"
+);
+assert.match(
+  source,
+  /const handleGeneratePrompts = async[\s\S]*const startResult = await generateVisualPrompts\(projectId, pageNums, buildCrossStageContext\("visual"\)\);[\s\S]*handleWorkflowRunStarted\(projectId,\s*startResult\.run\)/,
+  "visual prompt generation starts must enter active workflow state from the returned run"
 );
 assert.doesNotMatch(
   source,
@@ -651,10 +676,65 @@ assert.match(
   /\.pg-agent-command-bar[\s\S]*\.pg-agent-scope-panel/,
   "compact Agent command bar and its scope panel must have explicit styling"
 );
+assert.doesNotMatch(
+  source,
+  /pg-agent-context-capsule[\s\S]*当前理解/,
+  "Agent sidebar must not duplicate the interactive command bar with a separate current-understanding card"
+);
+assert.match(
+  source,
+  /selectedProject\?\.intent_contract[\s\S]*pg-agent-contract-summary[\s\S]*项目背景/,
+  "Agent sidebar must label the folded brief-derived summary in user language"
+);
+assert.doesNotMatch(
+  source,
+  /项目契约/,
+  "Agent sidebar copy must not expose the internal project contract term"
+);
+assert.doesNotMatch(
+  source,
+  /pickContractValue\(contract, \["page_count", "target_page_count", "estimated_pages"\]\) \|\| \(slideCount/,
+  "Agent brief summary must not appear only because the deck has a slide count"
+);
+assert.match(
+  source,
+  /quality_report[\s\S]*pg-agent-delivery-check[\s\S]*交付检查/,
+  "Agent sidebar must show deterministic delivery-check hints without AI scoring"
+);
+assert.match(
+  source,
+  /pg-agent-task-card[\s\S]*handleAgentNextAction/,
+  "Agent next actions must render as task cards instead of plain chat buttons"
+);
+assert.match(
+  source,
+  /pg-agent-execution-event[\s\S]*msg\.runId/,
+  "Agent execution events must be visually separated from normal conversation"
+);
+assert.match(
+  source,
+  /pg-agent-material-group[\s\S]*本轮材料[\s\S]*pg-agent-material-group[\s\S]*项目资产/,
+  "Agent material entry must separate per-message materials from project assets"
+);
+assert.match(
+  css,
+  /\.pg-agent-contract-summary[\s\S]*\.pg-agent-material-group[\s\S]*\.pg-agent-task-card/,
+  "Agent sidebar additions must have dedicated responsive styles"
+);
+assert.match(
+  css,
+  /\.pg-agent-area-panel button\.is-active b[\s\S]*color:\s*#fff(?:fff)?[\s\S]*\.pg-agent-area-panel button\.is-active span[\s\S]*color:\s*#fff(?:fff)?/,
+  "Agent area picker active option must keep both label and hint readable on the dark selected background"
+);
 assert.match(
   source,
   /className="pg-agent-command-sentence"[\s\S]*<span>将修改<\/span>[\s\S]*\{agentScopeButtonLabel\}[\s\S]*<span>的<\/span>[\s\S]*\{agentAreaButtonLabel\}/,
   "Agent command bar must read as a fill-in sentence: 将修改 [范围] 的 [区域]"
+);
+assert.doesNotMatch(
+  source,
+  /pg-agent-tabs[\s\S]{0,2400}内容总监[\s\S]{0,2400}视觉总监[\s\S]{0,2400}单页微调/,
+  "Agent sidebar must not expose separate role tabs; routing should stay internal to the unified Agent surface"
 );
 assert.match(
   source,

@@ -17,7 +17,16 @@ from app.services.image_task_audit import append_image_generation_log
 from app.services.image_analyzer import analyze_logo, analyze_reference_image
 from app.services.logo_assets import prepare_logo_lockup_image
 from app.services.logo_policy import is_logo_confirmed
-from app.services.run_state import finish_run, is_run_active, mark_run_running, set_run_task, update_run_progress
+from app.services.run_state import (
+    finish_run,
+    get_run,
+    image_generation_run_stage,
+    image_generation_running_message,
+    is_run_active,
+    mark_run_running,
+    set_run_task,
+    update_run_progress,
+)
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION, generate_style_proposals
 
 logger = logging.getLogger(__name__)
@@ -262,6 +271,21 @@ def _generate_slides_task_inner(
         requested_page_nums=page_nums,
         prototype=prototype,
     )
+    if run_id:
+        db = SessionLocal()
+        try:
+            if not is_run_active(db, run_id):
+                append_image_generation_log(
+                    project_id,
+                    run_id,
+                    "task_skipped",
+                    reason="run_not_active",
+                    requested_page_nums=page_nums,
+                )
+                return {"project_id": project_id, "status": "stale", "reason": "run_not_active"}
+        finally:
+            db.close()
+
     target_pages = _resolve_target_pages(project_id, page_nums)
     if not target_pages:
         logger.warning(f"No pages to generate for project {project_id}")
@@ -321,7 +345,13 @@ def _generate_slides_task_inner(
     continuation_enqueued = False
     try:
         logger.info(f"Celery task started: project={project_id}, pages={acquired_pages}, prototype={prototype}")
-        mark_run_running(db, run_id, stage="batch_generation", message="图片生成任务已启动")
+        run = get_run(db, run_id)
+        run_stage = image_generation_run_stage(
+            kind=run.kind if run else None,
+            prototype=prototype,
+            page_nums=acquired_pages,
+        )
+        mark_run_running(db, run_id, stage=run_stage, message=image_generation_running_message(run_stage))
         db.commit()
         run_generation_pipeline(
             project_id,

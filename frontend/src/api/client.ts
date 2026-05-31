@@ -47,9 +47,26 @@ export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
   deerImageModel: "gpt-image-2-all",
 };
 
-export function getStoredAuth(): MvpAuth | null {
+function clearLegacyStoredAuth() {
   try {
-    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+    localStorage.removeItem(AUTH_STORAGE_KEY);
+  } catch {
+    // Ignore storage access failures; the login gate will ask for the username again.
+  }
+}
+
+function getAuthSessionStorage(): Storage | null {
+  try {
+    return sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function getStoredAuth(): MvpAuth | null {
+  clearLegacyStoredAuth();
+  try {
+    const raw = getAuthSessionStorage()?.getItem(AUTH_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed?.testerId) return null;
@@ -60,11 +77,13 @@ export function getStoredAuth(): MvpAuth | null {
 }
 
 export function saveStoredAuth(auth: MvpAuth) {
-  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
+  clearLegacyStoredAuth();
+  getAuthSessionStorage()?.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
 }
 
 export function clearStoredAuth() {
-  localStorage.removeItem(AUTH_STORAGE_KEY);
+  getAuthSessionStorage()?.removeItem(AUTH_STORAGE_KEY);
+  clearLegacyStoredAuth();
 }
 
 export function getProviderSettings(): ProviderSettings {

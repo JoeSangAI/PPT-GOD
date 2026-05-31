@@ -38,6 +38,12 @@ def _clear_stale_style_proposal(project: Project) -> bool:
     return True
 
 
+def _active_run_for_project_action(project: Project | None, db: Session):
+    from app.api.slides import _active_run_for_project_action as refresh_active_run
+
+    return refresh_active_run(project, db)
+
+
 @router.post("", response_model=ProjectResponse)
 def create_project(
     payload: ProjectCreate,
@@ -181,7 +187,7 @@ def create_style_proposals(
     verify_project_access(project, tester_id)
     if not project.content_plan_confirmed or project.selected_style:
         raise HTTPException(status_code=409, detail="当前阶段不能生成风格提案，请先确认内容或回退到视觉方案。")
-    if get_active_run(db, project_id):
+    if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
 
     slides = (

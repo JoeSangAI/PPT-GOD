@@ -383,6 +383,10 @@ def _content_action_payload_complete(result: dict) -> bool:
     if not payload_key:
         return True
     payload = result.get(payload_key)
+    if action == "update_all_slides":
+        if not isinstance(payload, list) or not payload:
+            return False
+        return any(isinstance(item, dict) and item.get("page_num") for item in payload)
     if isinstance(payload, list):
         return len(payload) > 0
     if isinstance(payload, dict):
@@ -397,6 +401,126 @@ def _content_result_needs_contract_review(result: dict, is_draft: bool) -> bool:
     if action not in CONTENT_CONTRACT_REVIEW_ACTIONS:
         return False
     return action in {"answer", "collect_content", "forward_to_visual"} or not _content_action_payload_complete(result)
+
+
+def _target_page_nums_from_context(page_context: dict | None) -> list[int]:
+    if not isinstance(page_context, dict):
+        return []
+    nums: list[int] = []
+    raw_nums = page_context.get("target_page_nums")
+    if isinstance(raw_nums, list):
+        for item in raw_nums:
+            try:
+                page_num = int(item)
+            except (TypeError, ValueError):
+                continue
+            if page_num > 0 and page_num not in nums:
+                nums.append(page_num)
+    if not nums and page_context.get("mode") == "page":
+        current_page = page_context.get("current_page")
+        if isinstance(current_page, dict):
+            try:
+                page_num = int(current_page.get("page_num"))
+            except (TypeError, ValueError):
+                page_num = 0
+            if page_num > 0:
+                nums.append(page_num)
+    return nums
+
+
+def _normalize_updated_slides_payload(result: dict, page_context: dict | None = None) -> dict:
+    if not isinstance(result, dict) or result.get("action") != "update_all_slides":
+        return result
+    payload = result.get("updated_slides")
+    if not isinstance(payload, list):
+        return result
+    normalized = copy.deepcopy(result)
+    cleaned = []
+    by_page: dict[int, dict] = {}
+    ordered_pages: list[int] = []
+    target_area = str((page_context or {}).get("target_area") or "").strip() if isinstance(page_context, dict) else ""
+    for item in normalized.get("updated_slides") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page_num = int(item.get("page_num"))
+        except (TypeError, ValueError):
+            continue
+        if page_num <= 0:
+            continue
+        patch = copy.deepcopy(item)
+        patch["page_num"] = page_num
+        text_content = patch.get("text_content")
+        if isinstance(text_content, dict) and "speaker_notes" in text_content:
+            if "speaker_notes" not in patch:
+                patch["speaker_notes"] = text_content.get("speaker_notes")
+            text_content = {k: v for k, v in text_content.items() if k != "speaker_notes"}
+            if text_content:
+                patch["text_content"] = text_content
+            else:
+                patch.pop("text_content", None)
+        if target_area == "notes" and "speaker_notes" not in patch and isinstance(patch.get("notes"), str):
+            patch["speaker_notes"] = patch.pop("notes")
+        if page_num not in by_page:
+            ordered_pages.append(page_num)
+        by_page[page_num] = patch
+    cleaned = [by_page[page_num] for page_num in ordered_pages]
+    normalized["updated_slides"] = cleaned
+    return normalized
+
+
+def _is_replanning_request(user_message: str, project_context: dict) -> bool:
+    if _has_page_count_change_intent(user_message, project_context):
+        return True
+    return bool(re.search(r"(重新规划|重做内容规划|重构内容|重构整套|从头|重新来|重新生成内容规划|重新生成规划)", user_message or ""))
+
+
+def _content_result_conflicts_with_page_context(
+    result: dict,
+    user_message: str,
+    page_context: dict | None,
+    project_context: dict,
+) -> bool:
+    if not isinstance(result, dict) or not isinstance(page_context, dict):
+        return False
+    action = result.get("action")
+    target_area = str(page_context.get("target_area") or "").strip()
+    target_nums = _target_page_nums_from_context(page_context)
+    if action == "regenerate_plan" and target_area in {"whole", "title", "body", "notes"}:
+        return not _is_replanning_request(user_message, project_context)
+    if action == "update_slide_content":
+        updated = result.get("updated_content") if isinstance(result.get("updated_content"), dict) else {}
+        try:
+            page_num = int(updated.get("page_num"))
+        except (TypeError, ValueError):
+            page_num = 0
+        if target_area == "notes" and not str(updated.get("speaker_notes") or "").strip():
+            return True
+        if page_context.get("mode") == "global":
+            return True
+        return bool(target_nums and page_num not in target_nums)
+    if action == "update_all_slides":
+        items = result.get("updated_slides")
+        if not isinstance(items, list) or not items:
+            return True
+        page_nums: list[int] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                page_num = int(item.get("page_num"))
+            except (TypeError, ValueError):
+                continue
+            if page_num > 0:
+                page_nums.append(page_num)
+        if target_area == "notes":
+            valid_items = [item for item in items if isinstance(item, dict) and item.get("page_num")]
+            return not valid_items or any(not str(item.get("speaker_notes") or "").strip() for item in valid_items)
+        if target_nums and any(page_num not in target_nums for page_num in page_nums):
+            return True
+        if page_context.get("scope") == "selected_slides" and target_nums:
+            return not set(target_nums).issubset(set(page_nums))
+    return False
 
 
 def _fallback_regenerate_plan(
@@ -586,6 +710,8 @@ def _has_visual_reroll_intent(message: str) -> bool:
 
 def _visual_instruction_change_note(user_message: str) -> str:
     text = re.sub(r"\s+", " ", user_message or "").strip()
+    if re.search(r"(按上方选择|上方选择|当前选择|所选区域|小幅优化|最小必要修改)", text):
+        return "按当前选择做小幅视觉优化，保持主题、构图、素材关系和版式稳定，只提升画面层级、对比度和关键元素清晰度"
     if re.search(r"(看不清|不清楚|看不见|读不清|辨识|对比度|黑色.{0,8}(字体|文字|字)|(?:字体|文字|字).{0,8}黑色)", text):
         return "提升文字对比度和可读性，避免黑色或低对比文字压在深色背景上，标题和关键信息必须清晰可读"
     if re.search(r"(二维码|QR|qr)", text) and re.search(r"(靠下|太低|底部|下面|下沿)", text):
@@ -660,10 +786,59 @@ def _is_deck_visual_scope(page_context: dict | None) -> bool:
     return page_context.get("mode") == "global" and not target_nums
 
 
-def _visual_result_needs_contract_review(result: dict, user_message: str) -> bool:
+def _page_context_requests_page_visual_update(page_context: dict | None) -> bool:
+    if not isinstance(page_context, dict):
+        return False
+    if str(page_context.get("target_area") or "").strip() not in {"visual", "materials"}:
+        return False
+    return bool(_target_page_nums_from_context(page_context))
+
+
+def _normalize_visual_page_update_result(result: dict, page_context: dict | None = None) -> dict:
+    if not isinstance(result, dict) or not _page_context_requests_page_visual_update(page_context):
+        return result
+    normalized = copy.deepcopy(result)
+    target_nums = set(_target_page_nums_from_context(page_context))
+    if isinstance(normalized.get("updated_slides_visual"), list) and normalized["updated_slides_visual"]:
+        by_page: dict[int, dict] = {}
+        ordered_pages: list[int] = []
+        for item in normalized.get("updated_slides_visual") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                page_num = int(item.get("page_num"))
+            except (TypeError, ValueError):
+                continue
+            if page_num <= 0 or (target_nums and page_num not in target_nums):
+                continue
+            patch = copy.deepcopy(item)
+            patch["page_num"] = page_num
+            if page_num not in by_page:
+                ordered_pages.append(page_num)
+            by_page[page_num] = patch
+        normalized["updated_slides_visual"] = [by_page[page_num] for page_num in ordered_pages]
+        normalized["action"] = "update_all_slides_visual"
+        return normalized
+    if isinstance(normalized.get("updated_visual"), dict):
+        try:
+            page_num = int(normalized["updated_visual"].get("page_num"))
+        except (TypeError, ValueError):
+            page_num = 0
+        if target_nums and page_num and page_num not in target_nums:
+            normalized.pop("updated_visual", None)
+            return normalized
+        normalized["action"] = "update_slide_visual"
+        return normalized
+    return normalized
+
+
+def _visual_result_needs_contract_review(result: dict, user_message: str, page_context: dict | None = None) -> bool:
+    result = _normalize_visual_page_update_result(result, page_context)
     if not isinstance(result, dict):
         return False
     action = result.get("action")
+    if _page_context_requests_page_visual_update(page_context) and action in {"answer", "adjust_style", "propose_styles", "collect_assets"}:
+        return True
     if action == "answer":
         return (
             _has_visual_generation_intent(user_message)
@@ -683,7 +858,8 @@ def _enforce_visual_action_contract(
     compiler=None,
     logger=None,
 ) -> dict:
-    if not _visual_result_needs_contract_review(result, user_message):
+    result = _normalize_visual_page_update_result(result, page_context)
+    if not _visual_result_needs_contract_review(result, user_message, page_context):
         return result
 
     page_nums = _infer_visual_page_nums(user_message, page_context)
@@ -721,9 +897,17 @@ def _enforce_visual_action_contract(
         _has_visual_mutation_intent(user_message)
         or _response_promises_visual_mutation(result.get("response"))
         or result.get("action") in VISUAL_MUTATION_ACTIONS
+        or (
+            _page_context_requests_page_visual_update(page_context)
+            and result.get("action") in {"answer", "adjust_style", "propose_styles", "collect_assets"}
+        )
     ):
         if page_nums:
-            if _has_visual_mutation_intent(user_message) or result.get("action") in {"update_slide_visual", "update_all_slides_visual"}:
+            if (
+                _has_visual_mutation_intent(user_message)
+                or _page_context_requests_page_visual_update(page_context)
+                or result.get("action") in {"update_slide_visual", "update_all_slides_visual"}
+            ):
                 update_payload = _build_visual_update_contract_payload(user_message, page_context, page_nums)
                 if update_payload:
                     return update_payload
@@ -805,6 +989,9 @@ def _build_content_contract_prompt() -> str:
 7. 如果用户在单页上下文里说把附件、截图、图片、这两页或素材信息放到当前页，优先返回 action="update_slide_content"，不要重做整套内容规划。
 8. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
 9. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
+10. page_context_from_frontend 里的 scope、target_area、target_page_nums 是用户在输入框上方手动选择的修改目标，必须当作明确指令执行。用户说“按上方选择”时，不得说缺少修改区域。
+11. 当 page_context.scope="selected_slides" 或 target_page_nums 有多个页码时，必须返回 action="update_all_slides"，不得只返回 update_slide_content。
+12. target_area="notes" 表示修改演讲备注。update_all_slides 的每一项必须把 speaker_notes 放在顶层：{"page_num":N,"speaker_notes":"..."}；不得把 speaker_notes 放进 text_content。
 
 只输出合法 JSON 对象。允许的 action：
 - regenerate_plan
@@ -884,7 +1071,11 @@ def _enforce_content_action_contract(
     compiler=None,
     logger=None,
 ) -> dict:
-    if not _content_result_needs_contract_review(result, is_draft=False):
+    result = _normalize_updated_slides_payload(result, page_context)
+    if (
+        not _content_result_needs_contract_review(result, is_draft=False)
+        and not _content_result_conflicts_with_page_context(result, user_message, page_context, project_context)
+    ):
         return result
     pending_offer = _infer_pending_content_plan_offer(history or [], project_context)
     if (
@@ -927,7 +1118,11 @@ def _enforce_content_action_contract(
             logger.warning("[Chat] Content action contract compiler failed: %s", exc)
         compiled = None
 
-    if _content_contract_result_usable(compiled):
+    compiled = _normalize_updated_slides_payload(compiled, page_context) if isinstance(compiled, dict) else compiled
+    if (
+        _content_contract_result_usable(compiled)
+        and not _content_result_conflicts_with_page_context(compiled, user_message, page_context, project_context)
+    ):
         if compiled.get("action") == "regenerate_plan":
             page_update = _fallback_update_current_slide_from_attachments(
                 user_message=user_message,
@@ -980,6 +1175,12 @@ def _enforce_content_action_contract(
             "action": "answer",
             "response": "我没有把这条指令落成可执行的内容改动，因此没有修改 PPT。请明确要改哪一页，或告诉我是否要重做整套内容规划。",
             "no_change_reason": "content_instruction_compiler_failed",
+        }
+    if _content_result_conflicts_with_page_context(result, user_message, page_context, project_context):
+        return {
+            "action": "answer",
+            "response": "我没有修改 PPT；这条指令没有被转换成可安全应用到所选范围和区域的内容改动。请说清楚要怎么改，或换一个更具体的区域。",
+            "no_change_reason": "page_context_contract_failed",
         }
     return result
 
@@ -1274,10 +1475,12 @@ def _build_normal_prompt() -> str:
   3. 同步在 response 中简要说明改了什么
   4. **response 中必须告诉用户下一步该做什么**（如"如需继续调整其他页面请告诉我，或点击上方切换到视觉总监进入设计阶段"）
 - update_all_slides 时：
-  1. 在 updated_slides 数组中返回需要修改的页面，每个元素格式：{"page_num": N, "text_content": {"headline":"...","subhead":"...","body":"markdown正文..."}}
+  1. 在 updated_slides 数组中返回需要修改的页面，每个元素格式：{"page_num": N, "text_content": {"headline":"...","subhead":"...","body":"markdown正文..."}}；如果修改备注，使用顶层 "speaker_notes"，不要放进 text_content
   2. 只返回确实需要改的页面，无需修改的页面不要出现在数组中
   3. body 是 markdown 格式的字符串，不是数组
-  4. **response 中必须告诉用户下一步该做什么**
+  4. 如果本轮修改目标来自 page_context.target_area，则必须严格限定在该区域：title 只改 headline/subhead；body 只改 body；notes 只改 speaker_notes；whole 才能同时改标题、正文和备注
+  5. 如果 page_context.scope="selected_slides"，updated_slides 只能包含 target_page_nums 中的页面，且不要混入没有 page_num 的说明对象；说明写在 response 字段
+  6. **response 中必须告诉用户下一步该做什么**
 - add_slide_before / add_slide_after 时：
   1. 必须在 new_slide 中返回新页完整的 content_json（包含所有字段）
   2. page_num 填用户指定的目标位置页码；如果用户没有明确指定，填当前上下文中的 page_num
@@ -1290,7 +1493,7 @@ def _build_normal_prompt() -> str:
 示例输出（必须严格遵循此格式）：
 {"action": "regenerate_pages", "page_nums": [3, 4], "response": "好的，正在重新生成第3页和第4页。"}
 {"action": "update_slide_content", "updated_content": {"page_num":1,"type":"cover","section_title":"","text_content":{"headline":"新标题","subhead":"新副标题","body":""},"speaker_notes":"","visual_suggestion":""}, "response": "已更新封面标题和副标题。"}
-{"action": "update_all_slides", "updated_slides": [{"page_num":1,"text_content":{"headline":"...","subhead":"...","body":"markdown正文..."}},{"page_num":2,"text_content":{"headline":"...","subhead":"...","body":"markdown正文..."}}], "response": "已根据原文调整所有页面。"}
+{"action": "update_all_slides", "updated_slides": [{"page_num":1,"text_content":{"headline":"...","subhead":"...","body":"markdown正文..."}},{"page_num":2,"speaker_notes":"演讲备注..."}], "response": "已根据原文调整所有页面。"}
 {"action": "add_slide_after", "new_slide": {"page_num":3,"type":"content","section_title":"","text_content":{"headline":"新标题","subhead":"新副标题","body":""},"speaker_notes":"","visual_suggestion":""}, "response": "已在第3页后插入新页。"}
 
 - 必须只返回合法 JSON，不要 markdown 代码块，不要任何解释性文字。确保 JSON 可以被直接解析。"""
