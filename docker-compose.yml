@@ -23,6 +23,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/app/uploads
+      - OUTPUT_DIR=/app/outputs
+      - IMAGE_GEN_CACHE_DIR=/app/outputs/image-cache
       - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
       - HTTPS_PROXY=${PPTGOD_HTTPS_PROXY:-}
       - ALL_PROXY=${PPTGOD_ALL_PROXY:-}
@@ -33,8 +36,8 @@ services:
       - db
       - redis
     volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/outputs:/app/outputs
+      - ./.pptgod-data/uploads:/app/uploads
+      - ./.pptgod-data/outputs:/app/outputs
 
   celery_text_worker:
     build:
@@ -45,6 +48,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/app/uploads
+      - OUTPUT_DIR=/app/outputs
+      - IMAGE_GEN_CACHE_DIR=/app/outputs/image-cache
       - CELERY_TEXT_QUEUE=${PPTGOD_TEXT_QUEUE:-text}
       - CELERY_IMAGE_QUEUE=${PPTGOD_IMAGE_QUEUE:-image}
       - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
@@ -57,8 +63,8 @@ services:
       - db
       - redis
     volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/outputs:/app/outputs
+      - ./.pptgod-data/uploads:/app/uploads
+      - ./.pptgod-data/outputs:/app/outputs
 
   celery_image_worker:
     build:
@@ -69,6 +75,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://pptgod:pptgod@db:5432/pptgod
       - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_DIR=/app/uploads
+      - OUTPUT_DIR=/app/outputs
+      - IMAGE_GEN_CACHE_DIR=/app/outputs/image-cache
       - CELERY_TEXT_QUEUE=${PPTGOD_TEXT_QUEUE:-text}
       - CELERY_IMAGE_QUEUE=${PPTGOD_IMAGE_QUEUE:-image}
       - HTTP_PROXY=${PPTGOD_HTTP_PROXY:-}
@@ -81,8 +90,8 @@ services:
       - db
       - redis
     volumes:
-      - ./backend/uploads:/app/uploads
-      - ./backend/outputs:/app/outputs
+      - ./.pptgod-data/uploads:/app/uploads
+      - ./.pptgod-data/outputs:/app/outputs
 
 volumes:
   postgres_data:

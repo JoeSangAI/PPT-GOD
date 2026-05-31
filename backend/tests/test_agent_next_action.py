@@ -287,6 +287,80 @@ def test_visual_readability_complaint_is_coerced_to_positive_single_page_update(
     assert "清晰可读" in visual_description
 
 
+def test_page_visual_area_adjust_style_becomes_slide_visual_update():
+    compiled = _enforce_visual_action_contract(
+        result={"action": "adjust_style", "response": "我会对当前页做小幅视觉优化。"},
+        user_message="请按上方选择做一次小幅优化。",
+        page_context={
+            "mode": "page",
+            "scope": "current_slide",
+            "target_page_nums": [1],
+            "target_area": "visual",
+            "area_label": "画面",
+            "current_page": {
+                "page_num": 1,
+                "visual_json": {
+                    "visual_description": "品牌红封面，白色主标题。",
+                    "design_notes": "保持红金经典风格。",
+                },
+            },
+        },
+    )
+
+    assert compiled["action"] == "update_slide_visual"
+    assert compiled["updated_visual"]["page_num"] == 1
+    assert "品牌红封面" in compiled["updated_visual"]["visual_json"]["visual_description"]
+
+
+def test_adjust_style_with_page_visual_payload_becomes_visual_update():
+    compiled = _enforce_visual_action_contract(
+        result={
+            "action": "adjust_style",
+            "response": "已优化第1、3页画面。",
+            "updated_slides_visual": [
+                {"page_num": 1, "visual_json": {"visual_description": "封面强化红金层级。"}},
+                {"page_num": 3, "visual_json": {"visual_description": "内容页增强对比。"}},
+            ],
+        },
+        user_message="请按上方选择做一次小幅优化。",
+        page_context={
+            "mode": "global",
+            "scope": "selected_slides",
+            "target_page_nums": [1, 3],
+            "target_area": "visual",
+            "area_label": "画面",
+        },
+    )
+
+    assert compiled["action"] == "update_all_slides_visual"
+    assert [item["page_num"] for item in compiled["updated_slides_visual"]] == [1, 3]
+
+
+def test_visual_update_payload_is_filtered_to_selected_pages():
+    compiled = _enforce_visual_action_contract(
+        result={
+            "action": "update_all_slides_visual",
+            "response": "已优化所选页面。",
+            "updated_slides_visual": [
+                {"page_num": 1, "visual_json": {"visual_description": "封面强化红金层级。"}},
+                {"page_num": 2, "visual_json": {"visual_description": "第二页不应被修改。"}},
+                {"page_num": 3, "visual_json": {"visual_description": "内容页增强对比。"}},
+            ],
+        },
+        user_message="让画面层次更强，红金质感更高级。",
+        page_context={
+            "mode": "global",
+            "scope": "selected_slides",
+            "target_page_nums": [1, 3],
+            "target_area": "visual",
+            "area_label": "画面",
+        },
+    )
+
+    assert compiled["action"] == "update_all_slides_visual"
+    assert [item["page_num"] for item in compiled["updated_slides_visual"]] == [1, 3]
+
+
 def test_visual_reroll_request_still_uses_reroll_action():
     result = {"action": "answer", "response": "好的，我再给这一页来一版。"}
 
@@ -420,6 +494,139 @@ def test_complete_mutation_payload_bypasses_contract_compiler():
     }
 
     assert not _content_result_needs_contract_review(result, is_draft=False)
+
+
+def test_selected_slide_scope_recompiles_single_page_content_payload():
+    result = {
+        "action": "update_slide_content",
+        "updated_content": {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "",
+            "text_content": {"headline": "新标题", "subhead": "", "body": ""},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+        },
+        "response": "已更新第 1 页。",
+    }
+    page_context = {
+        "mode": "global",
+        "scope": "selected_slides",
+        "target_page_nums": [1, 3],
+        "target_area": "title",
+        "area_label": "标题",
+    }
+    calls = []
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="请按上方选择做一次小幅优化。",
+        project_context={"title": "金龙鱼", "total_slides": 11, "content_plan_confirmed": True},
+        page_context=page_context,
+        compiler=lambda **kwargs: calls.append(kwargs) or {
+            "action": "update_all_slides",
+            "updated_slides": [
+                {"page_num": 1, "text_content": {"headline": "新封面"}},
+                {"page_num": 3, "text_content": {"headline": "新挑战"}},
+            ],
+            "response": "已更新第 1、3 页标题。",
+        },
+    )
+
+    assert calls
+    assert compiled["action"] == "update_all_slides"
+    assert [item["page_num"] for item in compiled["updated_slides"]] == [1, 3]
+
+
+def test_notes_updates_are_hoisted_out_of_text_content():
+    result = {
+        "action": "update_all_slides",
+        "updated_slides": [
+            {
+                "page_num": 1,
+                "text_content": {
+                    "headline": "封面",
+                    "body": "",
+                    "speaker_notes": "新的封面讲稿",
+                },
+            },
+            {"response": "说明文本不应进入 payload"},
+        ],
+        "response": "已更新备注。",
+    }
+    page_context = {
+        "mode": "global",
+        "scope": "selected_slides",
+        "target_page_nums": [1],
+        "target_area": "notes",
+        "area_label": "备注",
+    }
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="请按上方选择做一次小幅优化。",
+        project_context={"title": "金龙鱼", "total_slides": 11, "content_plan_confirmed": True},
+        page_context=page_context,
+        compiler=lambda **_: None,
+    )
+
+    assert compiled["action"] == "update_all_slides"
+    assert compiled["updated_slides"] == [
+        {
+            "page_num": 1,
+            "text_content": {"headline": "封面", "body": ""},
+            "speaker_notes": "新的封面讲稿",
+        }
+    ]
+
+
+def test_notes_update_without_speaker_notes_is_rejected():
+    result = {
+        "action": "update_all_slides",
+        "updated_slides": [
+            {"page_num": 1, "text_content": {"headline": "", "subhead": "", "body": ""}},
+        ],
+        "response": "已更新备注。",
+    }
+    page_context = {
+        "mode": "global",
+        "scope": "selected_slides",
+        "target_page_nums": [1],
+        "target_area": "notes",
+        "area_label": "备注",
+    }
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="请按上方选择做一次小幅优化。",
+        project_context={"title": "金龙鱼", "total_slides": 11, "content_plan_confirmed": True},
+        page_context=page_context,
+        compiler=lambda **_: None,
+    )
+
+    assert compiled["action"] == "answer"
+    assert compiled["no_change_reason"] == "page_context_contract_failed"
+    assert "没有修改 PPT" in compiled["response"]
+
+
+def test_update_all_slides_payload_is_deduped_by_page_num():
+    result = {
+        "action": "update_all_slides",
+        "updated_slides": [
+            {"page_num": 3, "text_content": {"body": "旧正文"}},
+            {"page_num": 3, "text_content": {"body": "新正文"}},
+        ],
+        "response": "已更新正文。",
+    }
+
+    compiled = _enforce_content_action_contract(
+        result=result,
+        user_message="请按上方选择做一次小幅优化。",
+        project_context={"title": "金龙鱼", "total_slides": 11, "content_plan_confirmed": True},
+        compiler=lambda **_: None,
+    )
+
+    assert compiled["updated_slides"] == [{"page_num": 3, "text_content": {"body": "新正文"}}]
 
 
 def test_forward_to_visual_is_reviewed_before_final_handoff():

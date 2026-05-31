@@ -38,6 +38,10 @@ def pptx_text_shapes(path: Path) -> dict[str, object]:
     }
 
 
+def pptx_shape_names(path: Path) -> list[str]:
+    return [shape.name for shape in Presentation(str(path)).slides[0].shapes]
+
+
 def test_parse_vlm_ocr_regions_accepts_fenced_json_and_clamps_boxes():
     raw = """```json
 {
@@ -633,6 +637,17 @@ def test_standard_mode_preserves_complex_campaign_labels_and_short_stats(tmp_pat
         {"text": "Instagram", "x": 0.43, "y": 0.846, "width": 0.08, "height": 0.024, "role": "label"},
         {"text": "2.33亿粉丝", "x": 0.43, "y": 0.876, "width": 0.10, "height": 0.046, "role": "body"},
     ]
+    pill = fake_regions[2]
+    draw.rounded_rectangle(
+        (
+            int((pill["x"] - 0.012) * 1280),
+            int((pill["y"] - 0.006) * 720),
+            int((pill["x"] + pill["width"] + 0.012) * 1280),
+            int((pill["y"] + pill["height"] + 0.006) * 720),
+        ),
+        radius=18,
+        fill=(230, 65, 120),
+    )
     draw_region_marks(img, fake_regions, color="black")
     img.save(slide_path)
 
@@ -644,8 +659,10 @@ def test_standard_mode_preserves_complex_campaign_labels_and_short_stats(tmp_pat
     )
 
     text_shapes = pptx_text_shapes(output_path)
+    slide_shapes = Presentation(str(output_path)).slides[0].shapes
     normalized_text = "\n".join(text_shapes).replace("\x0b", "")
     assert result.text_box_count >= 6
+    assert sum(1 for shape in slide_shapes if shape.name == "Editable text pill background") >= 1
     assert "全球影响力：Instagram 2.33亿粉丝，2026世界杯Puma为其推出专属战靴，品牌动作印证顶级商业价值" in normalized_text
     assert "世界杯机遇：小红书已拿下2026美加墨世界杯直播+短视频全版权，目标冲击2亿日活、优化男性用户结构" in normalized_text
     assert "真人AI漫剧系列：融合真实比赛画面与内马尔AI形象，演绎最后之舞等核心主题" in normalized_text
@@ -655,6 +672,254 @@ def test_standard_mode_preserves_complex_campaign_labels_and_short_stats(tmp_pat
     long_body_shape = next(shape for text, shape in text_shapes.items() if text.startswith("使用已完成的9款卡通形象"))
     assert long_body_shape.text_frame.paragraphs[0].font.size.pt <= 11.0
     assert "一页总览：为什么现在必须拿下这个IP?" not in text_shapes
+
+
+def test_complex_subtitle_on_plain_card_does_not_get_pill_background(tmp_path):
+    slide_path = tmp_path / "complex_plain_subtitle.png"
+    output_path = tmp_path / "complex_plain_subtitle_standard.pptx"
+    img = Image.new("RGB", (1280, 720), "white")
+    draw = ImageDraw.Draw(img)
+    for x in range(-720, 1280, 22):
+        color = ((70 + x * 5) % 255, (40 + x * 9) % 255, (160 + x * 3) % 255)
+        draw.line((x, 720, x + 720, 0), fill=color, width=11)
+    draw.rounded_rectangle((610, 160, 1120, 480), radius=22, fill="white")
+    fake_regions = [
+        {"text": "真人AI漫剧授权——", "x": 0.51, "y": 0.27, "width": 0.20, "height": 0.046, "role": "subtitle"},
+        {"text": "核心权益已经就绪", "x": 0.51, "y": 0.37, "width": 0.23, "height": 0.038, "role": "body"},
+    ]
+    draw_region_marks(img, fake_regions, color=(210, 40, 65))
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    text_shapes = pptx_text_shapes(output_path)
+    slide_shapes = Presentation(str(output_path)).slides[0].shapes
+    assert result.text_box_count == 2
+    assert "真人AI漫剧授权——" in text_shapes
+    assert sum(1 for shape in slide_shapes if shape.name == "Editable text pill background") == 0
+
+
+def test_pill_label_original_text_is_cleaned_before_overlay(tmp_path):
+    slide_path = tmp_path / "pill_cleanup.png"
+    output_path = tmp_path / "pill_cleanup_editable.pptx"
+    work_dir = tmp_path / "work"
+    region = {"text": "世界杯机遇", "x": 0.18, "y": 0.32, "width": 0.18, "height": 0.052, "role": "subtitle"}
+    img = Image.new("RGB", (1280, 720), "white")
+    draw = ImageDraw.Draw(img)
+    for x in range(-720, 1280, 24):
+        color = ((x * 7) % 255, (80 + x * 3) % 255, (180 + x * 5) % 255)
+        draw.line((x, 720, x + 720, 0), fill=color, width=10)
+    draw.rounded_rectangle((210, 218, 490, 292), radius=24, fill=(230, 45, 78))
+    draw_region_marks(img, [region], color="white")
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: [region],
+        work_dir=str(work_dir),
+        restore_mode="standard",
+    )
+
+    patch = Image.open(work_dir / "slide_01_cleanup_patch_01.png").convert("RGB")
+    mark_x = int(region["x"] * 1280) + 12
+    mark_y = int(region["y"] * 720) + int(region["height"] * 720 * 0.42)
+    patch_x = mark_x - int((region["x"] - 0.010) * 1280)
+    patch_y = mark_y - int((region["y"] - 0.004) * 720)
+    names = pptx_shape_names(output_path)
+    assert result.text_box_count == 1
+    assert patch.getpixel((patch_x, patch_y)) != (255, 255, 255)
+    assert "Editable text pill background" in names
+    assert not any(name.startswith("Text cleanup patch") for name in names)
+
+
+def test_standard_build_uses_local_cleanup_patch_not_full_clean_background(tmp_path):
+    slide_path = tmp_path / "clean_background_layers.png"
+    output_path = tmp_path / "clean_background_layers.pptx"
+    work_dir = tmp_path / "work"
+    fake_regions = [
+        {"text": "可编辑标题", "x": 0.16, "y": 0.22, "width": 0.26, "height": 0.07, "role": "title"},
+    ]
+    img = Image.new("RGB", (1280, 720), (245, 247, 250))
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        work_dir=str(work_dir),
+    )
+
+    names = pptx_shape_names(output_path)
+    assert result.text_box_count == 1
+    assert names[0] == "Original slide image"
+    assert names[1] == "Editable cleanup patch - 1"
+    assert "Editable cleaned background" not in names
+    assert not any(name.startswith("Text cleanup patch") for name in names)
+    assert names.index("Editable cleanup patch - 1") < next(i for i, name in enumerate(names) if name.startswith("Editable restored text"))
+
+
+def test_same_row_same_role_text_uses_consistent_font_size(tmp_path):
+    slide_path = tmp_path / "same_row_subtitles.png"
+    output_path = tmp_path / "same_row_subtitles_editable.pptx"
+    fake_regions = [
+        {"text": "IP授权就绪", "x": 0.10, "y": 0.36, "width": 0.16, "height": 0.040, "role": "subtitle"},
+        {"text": "世界杯机遇", "x": 0.42, "y": 0.358, "width": 0.16, "height": 0.050, "role": "subtitle"},
+        {"text": "商业闭环", "x": 0.74, "y": 0.362, "width": 0.13, "height": 0.044, "role": "subtitle"},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    shapes = pptx_text_shapes(output_path)
+    sizes = [shapes[item["text"]].text_frame.paragraphs[0].font.size.pt for item in fake_regions]
+    assert result.text_box_count == 3
+    assert max(sizes) - min(sizes) <= 0.1
+
+
+def test_saturated_label_uses_pill_background_even_on_simple_slide(tmp_path):
+    slide_path = tmp_path / "saturated_label.png"
+    output_path = tmp_path / "saturated_label_editable.pptx"
+    fake_regions = [
+        {"text": "世界杯机遇", "x": 0.105, "y": 0.385, "width": 0.12, "height": 0.045, "role": "subtitle"},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((120, 260, 318, 318), radius=18, fill=(238, 35, 49))
+    draw_region_marks(img, fake_regions, color="white")
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    names = pptx_shape_names(output_path)
+    assert result.text_box_count == 1
+    assert "Editable text pill background" in names
+    assert names.index("Editable text pill background") < next(i for i, name in enumerate(names) if name.startswith("Editable restored text"))
+
+
+def test_inline_prefix_and_body_merge_to_avoid_overlapping_text_boxes(tmp_path):
+    slide_path = tmp_path / "inline_prefix_body.png"
+    output_path = tmp_path / "inline_prefix_body_editable.pptx"
+    fake_regions = [
+        {"text": "全球影响力：", "x": 0.44, "y": 0.44, "width": 0.13, "height": 0.030, "role": "subtitle"},
+        {
+            "text": "Instagram 2.33亿粉丝，品牌动作印证顶级商业价值",
+            "x": 0.44,
+            "y": 0.448,
+            "width": 0.48,
+            "height": 0.055,
+            "role": "body",
+        },
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    text_shapes = pptx_text_shapes(output_path)
+    assert result.text_box_count == 1
+    assert "全球影响力：Instagram 2.33亿粉丝，品牌动作印证顶级商业价值" in text_shapes
+
+
+def test_wide_complex_card_body_is_not_forced_to_tiny_font(tmp_path):
+    slide_path = tmp_path / "wide_complex_card_body.png"
+    output_path = tmp_path / "wide_complex_card_body.pptx"
+    fake_regions = [
+        {
+            "text": "全球影响力：Instagram 2.33亿粉丝，2026世界杯Puma为其推出专属战靴，品牌动作印证顶级商业价值",
+            "x": 0.44,
+            "y": 0.44,
+            "width": 0.48,
+            "height": 0.065,
+            "role": "body",
+        }
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw = ImageDraw.Draw(img)
+    for x in range(-720, 1280, 18):
+        color = ((80 + x * 5) % 255, (20 + x * 11) % 255, (180 + x * 7) % 255)
+        draw.line((x, 720, x + 720, 0), fill=color, width=9)
+    draw.rounded_rectangle((540, 300, 1210, 390), radius=18, fill="white", outline=(230, 60, 60), width=4)
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    shape = next(shape for shape in Presentation(str(output_path)).slides[0].shapes if getattr(shape, "has_text_frame", False) and shape.text.strip())
+    assert result.text_box_count == 1
+    assert shape.text_frame.paragraphs[0].font.size.pt >= 14.0
+
+
+def test_stacked_wide_complex_body_rows_do_not_inherit_tiny_normalized_font(tmp_path):
+    slide_path = tmp_path / "stacked_wide_complex_body.png"
+    output_path = tmp_path / "stacked_wide_complex_body.pptx"
+    fake_regions = [
+        {
+            "text": "全球影响力：Instagram 2.33亿粉丝，2026世界杯Puma为其推出专属战靴，品牌动作印证顶级商业价值",
+            "x": 0.44,
+            "y": 0.44,
+            "width": 0.48,
+            "height": 0.065,
+            "role": "body",
+        },
+        {
+            "text": "中国情感共鸣：巴西足球兴趣用户超1亿，内马尔是情感共鸣最强的球星，无代际门槛",
+            "x": 0.44,
+            "y": 0.55,
+            "width": 0.48,
+            "height": 0.065,
+            "role": "body",
+        },
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw = ImageDraw.Draw(img)
+    for x in range(-720, 1280, 18):
+        color = ((80 + x * 5) % 255, (20 + x * 11) % 255, (180 + x * 7) % 255)
+        draw.line((x, 720, x + 720, 0), fill=color, width=9)
+    draw.rounded_rectangle((540, 300, 1210, 470), radius=18, fill="white", outline=(230, 60, 60), width=4)
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    shapes = [shape for shape in Presentation(str(output_path)).slides[0].shapes if getattr(shape, "has_text_frame", False) and shape.text.strip()]
+    sizes = [shape.text_frame.paragraphs[0].font.size.pt for shape in shapes]
+    assert result.text_box_count == 2
+    assert min(sizes) >= 14.0
 
 
 def test_narrow_dense_body_copy_uses_smaller_fitted_text(tmp_path):
@@ -684,6 +949,18 @@ def test_narrow_dense_body_copy_uses_smaller_fitted_text(tmp_path):
     shape = next(shape for shape in Presentation(str(output_path)).slides[0].shapes if getattr(shape, "has_text_frame", False) and shape.text.strip())
     assert result.text_box_count == 1
     assert shape.text_frame.paragraphs[0].font.size.pt <= 11.0
+
+
+def test_manual_wrap_keeps_opening_quote_with_following_token():
+    text = "全球影响力：Instagram 2.33亿粉丝，2026世界杯Puma为其推出「Showtime」专属战靴，品牌动作印证顶级商业价值"
+    wrapped = editable_export.wrap_text_for_box(
+        text,
+        {"x": 0.44, "y": 0.44, "width": 0.54, "height": 0.0975},
+        14.0,
+        "body",
+    )
+
+    assert "「\nShowtime" not in wrapped
 
 
 def test_standard_mode_keeps_large_display_text_editable_on_simple_slides(tmp_path):
@@ -742,7 +1019,7 @@ def test_standard_mode_restores_primary_title_inside_visual_asset(tmp_path, monk
     assert "解锁武汉卡丁车馆亲子高能体验阵地" in pptx_text_shapes(output_path)
 
 
-def test_background_cleanup_uses_ocr_box_not_expanded_render_box(tmp_path):
+def test_local_cleanup_patch_uses_ocr_box_not_expanded_render_box(tmp_path):
     slide_path = tmp_path / "cleanup_scope.png"
     output_path = tmp_path / "cleanup_scope_editable.pptx"
     work_dir = tmp_path / "work"
@@ -769,5 +1046,7 @@ def test_background_cleanup_uses_ocr_box_not_expanded_render_box(tmp_path):
         work_dir=str(work_dir),
     )
 
-    cleaned = Image.open(work_dir / "slide_01_cleaned.png").convert("RGB")
-    assert cleaned.getpixel((900, 240)) == (0, 92, 255)
+    patch = Image.open(work_dir / "slide_01_cleanup_patch_01.png").convert("RGB")
+    assert patch.width < 500
+    assert patch.height < 180
+    assert (0, 92, 255) not in list(patch.getdata())

@@ -18,7 +18,9 @@ node_modules/
 frontend/dist/
 
 # Uploads and outputs (user data)
+.pptgod-data/
 backend/uploads/
+uploads/
 backend/outputs/
 outputs/
 output/

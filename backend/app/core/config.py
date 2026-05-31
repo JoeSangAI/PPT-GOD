@@ -1,13 +1,31 @@
 import os
+from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+_PROJECT_ROOT = _BACKEND_DIR.parent
+
+
+def _default_runtime_data_dir() -> str:
+    return str(_PROJECT_ROOT / ".pptgod-data")
+
+
+def _resolve_project_path(path: str) -> str:
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = _PROJECT_ROOT / resolved
+    return str(resolved)
 
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "PPT GOD"
     VERSION: str = "0.1.0"
 
-    DATABASE_URL: str = "sqlite:///./pptgod.db"
+    RUNTIME_DATA_DIR: str = _default_runtime_data_dir()
+    DATABASE_URL: str = ""
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_SOCKET_TIMEOUT_SECONDS: float = 3.0
     CELERY_BROKER_CONNECTION_TIMEOUT_SECONDS: float = 3.0
@@ -23,7 +41,7 @@ class Settings(BaseSettings):
     COMET_IMAGE_MODEL: str = "gpt-image-2-all"
     IMAGE_API_TIMEOUT_SECONDS: float = 125.0
     IMAGE_GEN_MODE: str = "real"  # real | mock | cached
-    IMAGE_GEN_CACHE_DIR: str = "./outputs/image-cache"
+    IMAGE_GEN_CACHE_DIR: str = ""
     MAX_REAL_IMAGES_PER_RUN: int = 0  # 0 means unlimited
     IMAGE_API_MAX_CONCURRENCY: int = 1
     IMAGE_GPT_QUALITY: str = "high"  # low | medium | high | auto
@@ -59,8 +77,28 @@ class Settings(BaseSettings):
     EDITABLE_PPTX_MAX_VISUAL_ASSETS_PER_SLIDE: int = 6
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175"
 
-    OUTPUT_DIR: str = "./outputs"
-    UPLOAD_DIR: str = "./uploads"
+    OUTPUT_DIR: str = ""
+    UPLOAD_DIR: str = ""
+
+    @model_validator(mode="after")
+    def apply_runtime_data_defaults(self):
+        data_root = _resolve_project_path(self.RUNTIME_DATA_DIR or _default_runtime_data_dir())
+        self.RUNTIME_DATA_DIR = data_root
+        if not self.UPLOAD_DIR:
+            self.UPLOAD_DIR = str(Path(data_root) / "uploads")
+        else:
+            self.UPLOAD_DIR = _resolve_project_path(self.UPLOAD_DIR)
+        if not self.OUTPUT_DIR:
+            self.OUTPUT_DIR = str(Path(data_root) / "outputs")
+        else:
+            self.OUTPUT_DIR = _resolve_project_path(self.OUTPUT_DIR)
+        if not self.IMAGE_GEN_CACHE_DIR:
+            self.IMAGE_GEN_CACHE_DIR = str(Path(self.OUTPUT_DIR) / "image-cache")
+        else:
+            self.IMAGE_GEN_CACHE_DIR = _resolve_project_path(self.IMAGE_GEN_CACHE_DIR)
+        if not self.DATABASE_URL:
+            self.DATABASE_URL = f"sqlite:///{Path(data_root) / 'db' / 'pptgod.db'}"
+        return self
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(os.path.dirname(__file__), "..", "..", ".env"),

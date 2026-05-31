@@ -162,6 +162,7 @@ const hasAny = (message: string, pattern: RegExp) => pattern.test(message);
 
 const CURRENT_SCOPE_RE = /(当前页|当前页面|这一页|这页|本页|这个页面|这一张|这张PPT|这张幻灯片|正在看的页|这一个页面)/i;
 const DECK_SCOPE_RE = /(整体|全局|全部|所有|整套|全套|每一页|每页|所有页|所有页面|统一|后面所有|后面都|后续所有|一整套|整个PPT|整份PPT|整套PPT)/i;
+const STRONG_DECK_SCOPE_RE = /(全部|所有|整套|全套|每一页|每页|所有页|所有页面|后面所有|后面都|后续所有|一整套|整个PPT|整份PPT|整套PPT)/i;
 const SELECTED_SCOPE_RE = /(选中页|选中的页|这几页|这些页|这几张|这些页面)/i;
 const COVER_SCOPE_RE = /(封面|首页|首屏|开场页|开篇页)/i;
 const ENDING_SCOPE_RE = /(结尾页|封底|结束页|收尾页|最后一页|尾页|致谢页)/i;
@@ -185,6 +186,12 @@ const AREA_LABELS: Record<AgentTargetArea, string> = {
   visual: "画面",
   materials: "素材",
   notes: "备注",
+};
+
+const roleForAreaSelection = (area?: AgentTargetArea | null): AgentRole | null => {
+  if (!area) return null;
+  if (area === "visual" || area === "materials") return "visual";
+  return "content";
 };
 
 const isVisualStage = (status?: string) =>
@@ -280,7 +287,7 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
   const explicitPageNums = requestedPageCount ? [] : extractPageNums(message);
   const rolePageNums = requestedPageCount ? [] : findRolePageNums(input, message);
   const mentionsCurrent = hasAny(message, CURRENT_SCOPE_RE);
-  const mentionsDeck = hasAny(message, DECK_SCOPE_RE);
+  const mentionsDeck = hasAny(message, activeScope === "deck" ? DECK_SCOPE_RE : STRONG_DECK_SCOPE_RE);
   const mentionsSelected = hasAny(message, SELECTED_SCOPE_RE);
   const needsSelectedPages = mentionsSelected && selectedPageNums.length === 0;
 
@@ -342,17 +349,27 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
   const finetuneIntent = hasAny(message, FINETUNE_RE);
   const costIntent = hasAny(message, COST_RE);
   const destructiveIntent = hasAny(message, DESTRUCTIVE_RE);
+  const areaSelectionRole = roleForAreaSelection(input.targetAreaOverride);
+  const visualRoleAvailable =
+    Boolean(input.contentPlanConfirmed) ||
+    isVisualStage(input.projectStatus) ||
+    Boolean(input.hasSelectedStyle || input.hasPrompt || input.hasGeneratedImage);
 
   let targetRole = input.activeAgentRole;
   let routeReason = "active_agent";
   if (
     input.activeAgentRole === "finetune" &&
-    finetuneIntent &&
     (input.hasGeneratedImage || input.projectStatus === "completed" || input.projectStatus === "prototype_ready") &&
     (scope === "current_slide" || input.editingPageNum)
   ) {
     targetRole = "finetune";
-    routeReason = "finetune_intent";
+    routeReason = finetuneIntent ? "finetune_intent" : "finetune_mode";
+  } else if (areaSelectionRole === "content") {
+    targetRole = "content";
+    routeReason = "area_selection";
+  } else if (areaSelectionRole === "visual" && visualRoleAvailable) {
+    targetRole = "visual";
+    routeReason = "area_selection";
   } else if ((input.projectStatus === "draft" || !input.contentPlanConfirmed) && (contentIntent || requestedPageCount || input.projectStatus === "draft")) {
     targetRole = "content";
     routeReason = contentIntent || requestedPageCount ? "content_intent" : "content_stage";

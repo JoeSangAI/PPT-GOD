@@ -2744,6 +2744,8 @@ body {
 
 .pg-slide-grid > .pg-slide-card {
   min-width: min(100%, 326px) !important;
+  flex-grow: 0 !important;
+  flex-shrink: 0 !important;
   flex-basis: clamp(326px, calc((100% - 42px) / 3), 448px) !important;
   height: 328px;
   padding: 14px;
@@ -7868,6 +7870,137 @@ button.pg-project-export-link:disabled {
   opacity: 0.48;
 }
 
+.pg-agent-contract-summary,
+.pg-agent-delivery-check {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #e1e6ee;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px 11px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.pg-agent-context-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.pg-agent-context-main span,
+.pg-agent-delivery-check > div span,
+.pg-agent-material-group > span {
+  color: #667085;
+  font-size: 10.5px;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+}
+
+.pg-agent-context-main b {
+  overflow: hidden;
+  color: #111827;
+  font-size: 12.5px;
+  font-weight: 780;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pg-agent-context-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.pg-agent-context-meta span {
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #f8fafc;
+  color: #475467;
+  padding: 3px 7px;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pg-agent-contract-summary summary {
+  display: flex;
+  cursor: pointer;
+  list-style: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #111827;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.pg-agent-contract-summary summary::-webkit-details-marker {
+  display: none;
+}
+
+.pg-agent-contract-summary summary b {
+  color: #667085;
+  font-size: 10.5px;
+  font-weight: 720;
+}
+
+.pg-agent-contract-summary div {
+  display: grid;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.pg-agent-contract-summary p {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 7px;
+  margin: 0;
+  color: #475467;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.pg-agent-contract-summary p b {
+  color: #111827;
+  font-weight: 760;
+}
+
+.pg-agent-delivery-check > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.pg-agent-delivery-check > div b {
+  color: #111827;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.pg-agent-delivery-check p {
+  margin: 0;
+  border-left: 2px solid #cbd5e1;
+  color: #475467;
+  padding-left: 8px;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.pg-agent-delivery-check p.is-warning {
+  border-left-color: #f59e0b;
+  color: #8a5a11;
+}
+
+.pg-agent-delivery-check p.is-danger {
+  border-left-color: #ef4444;
+  color: #b42318;
+}
+
 .pg-agent-scope-panel,
 .pg-agent-area-panel {
   display: grid;
@@ -7938,6 +8071,16 @@ button.pg-project-export-link:disabled {
   padding: 7px;
 }
 
+.pg-agent-material-group {
+  display: grid;
+  gap: 5px;
+}
+
+.pg-agent-material-group + .pg-agent-material-group {
+  border-top: 1px solid #e5e7eb;
+  padding-top: 7px;
+}
+
 .pg-agent-material-sheet button {
   display: grid;
   gap: 2px;
@@ -7962,6 +8105,47 @@ button.pg-project-export-link:disabled {
 .pg-agent-material-sheet span {
   color: #667085;
   font-size: 11px;
+}
+
+.pg-agent-task-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  border: 1px solid #dbeafe;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.pg-agent-task-card div {
+  display: grid;
+  gap: 2px;
+}
+
+.pg-agent-task-card b {
+  color: #111827;
+  font-size: 12.5px;
+  font-weight: 780;
+}
+
+.pg-agent-task-card span {
+  color: #667085;
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.pg-agent-task-card .pg-action {
+  min-height: 34px;
+  border-radius: 9px !important;
+  background: #111827 !important;
+  color: #ffffff !important;
+  font-size: 12px !important;
+}
+
+.pg-agent-execution-event .pg-message {
+  border-style: solid !important;
+  border-color: #dbeafe !important;
+  background: #f8fbff !important;
 }
 
 .pg-composer-input-shell {
@@ -9071,6 +9255,17 @@ body {
   background: #201f1d !important;
   color: #ffffff !important;
   box-shadow: 0 12px 28px rgba(32, 31, 29, 0.14);
+}
+
+.pg-agent-area-panel button.is-active b,
+.pg-agent-scope-panel button.is-active b {
+  color: #ffffff !important;
+}
+
+.pg-agent-area-panel button.is-active span,
+.pg-agent-scope-panel button.is-active span {
+  color: #ffffff !important;
+  opacity: 0.72;
 }
 
 .pg-sidebar .pg-primary-button:hover,

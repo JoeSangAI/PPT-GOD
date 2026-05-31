@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 
 from app.api import slides as slides_api
+from app.core.config import settings
 from app.services.generation_pipeline import _generate_one_slide, _load_reference_images
 from app.services.prompt_engine import generate_prompt_for_page
 from app.services.visual_plan import generate_visual_plan
@@ -13,9 +14,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-OUTPUT_DIR = os.path.join(ROOT, "outputs", "logo_policy_smoke")
-LOGO_PATH = os.path.join(ROOT, "outputs", "visual_asset_smoke", "logo.png")
-PRODUCT_PATH = os.path.join(ROOT, "outputs", "visual_asset_smoke", "product.png")
+OUTPUT_DIR = os.path.join(settings.OUTPUT_DIR, "logo_policy_smoke")
+LOGO_PATH = os.path.join(settings.OUTPUT_DIR, "visual_asset_smoke", "logo.png")
+PRODUCT_PATH = os.path.join(settings.OUTPUT_DIR, "visual_asset_smoke", "product.png")
 
 
 def main() -> None:

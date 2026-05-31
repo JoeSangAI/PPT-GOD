@@ -31,6 +31,21 @@ RUN_PROGRESS_UNITS = {
 IMAGE_RUN_KINDS = {"prototype_generation", "batch_generation", "page_generation", "retry_failed", "finetune"}
 COUNT_BASED_RUN_KINDS = {"content_plan", "style_proposal", "visual_prompts", "editable_pptx"}
 
+IMAGE_RUN_QUEUED_MESSAGES = {
+    "prototype_generation": "样张生成任务已排队",
+    "batch_generation": "完整页面生成任务已排队",
+    "page_generation": "选中页面生成任务已排队",
+    "retry_failed": "失败页面重试任务已排队",
+    "finetune": "单页微调任务已排队",
+}
+IMAGE_RUN_RUNNING_MESSAGES = {
+    "prototype_generation": "正在生成样张",
+    "batch_generation": "正在生成完整页面",
+    "page_generation": "正在生成选中页面",
+    "retry_failed": "正在重试失败页面",
+    "finetune": "正在微调单页",
+}
+
 # 全局生成进度存储（内存级，项目重启后丢失）
 generation_progress: dict[str, dict] = {}
 
@@ -48,6 +63,40 @@ def normalize_page_nums(page_nums: Iterable[int] | None) -> list[int] | None:
     if not page_nums:
         return None
     return sorted({int(p) for p in page_nums})
+
+
+def image_generation_run_stage(
+    kind: str | None = None,
+    *,
+    prototype: bool = False,
+    page_nums: Iterable[int] | None = None,
+) -> str:
+    normalized_kind = str(kind or "").strip()
+    if normalized_kind in IMAGE_RUN_KINDS:
+        return normalized_kind
+    if prototype:
+        return "prototype_generation"
+    if normalize_page_nums(page_nums):
+        return "page_generation"
+    return "batch_generation"
+
+
+def image_generation_queued_message(kind: str | None = None, **kwargs) -> str:
+    stage = image_generation_run_stage(kind, **kwargs)
+    return IMAGE_RUN_QUEUED_MESSAGES.get(stage, "图片生成任务已排队")
+
+
+def image_generation_running_message(kind: str | None = None, **kwargs) -> str:
+    stage = image_generation_run_stage(kind, **kwargs)
+    return IMAGE_RUN_RUNNING_MESSAGES.get(stage, "正在生成图片")
+
+
+def image_generation_progress_message(kind: str | None, completed: int, total: int, failed: int = 0) -> str:
+    base = image_generation_running_message(kind)
+    message = f"{base}：{completed} / {total} 页完成"
+    if failed:
+        message += f"，{failed} 页失败"
+    return message
 
 
 def get_active_run(db: Session, project_id: str) -> ProjectRun | None:

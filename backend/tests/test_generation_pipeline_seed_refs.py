@@ -47,6 +47,32 @@ def test_template_references_default_to_text_hints_not_uploaded_images(tmp_path)
     assert [ref for ref in refs if ref.get("image") is not None] == []
 
 
+def test_load_reference_images_skips_exact_overlay_assets(tmp_path):
+    ref_path = tmp_path / "overlay.png"
+    Image.new("RGB", (32, 18), "white").save(ref_path)
+    ref = ReferenceImage(
+        id="overlay-ref",
+        project_id="project",
+        file_path=str(ref_path),
+        role="content_ref",
+        process_mode="blend",
+        asset_name="Overlay Reference",
+    )
+    slide = Slide(
+        page_num=5,
+        visual_json={
+            "overlay_layers": [
+                {"asset_id": "overlay-ref", "enabled": True, "preset": "right-card", "mode": "exact_cutout"}
+            ]
+        },
+    )
+    slide.reference_images = [ref]
+
+    refs = generation_pipeline._load_reference_images(slide)
+
+    assert [item.get("id") for item in refs] == []
+
+
 def test_seed_images_can_be_uploaded_when_enabled(monkeypatch, tmp_path):
     seed_path = tmp_path / "seed.png"
     Image.new("RGB", (32, 18), "white").save(seed_path)
