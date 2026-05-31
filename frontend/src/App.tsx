@@ -1045,7 +1045,16 @@ function workflowProgressCounts(status: any) {
 }
 
 function getSlideImageUrl(imagePath: string, status?: string, cacheKey?: string | number) {
-  const base = `${API_BASE}${imagePath.replace("./outputs", "/outputs")}`;
+  const rawPath = String(imagePath || "");
+  const outputMarker = "/outputs/";
+  let publicPath = rawPath.replace("./outputs", "/outputs");
+  const outputIndex = publicPath.indexOf(outputMarker);
+  if (outputIndex >= 0) {
+    publicPath = publicPath.slice(outputIndex);
+  } else if (publicPath && !publicPath.startsWith("/")) {
+    publicPath = `/${publicPath}`;
+  }
+  const base = `${API_BASE}${publicPath}`;
   const version = cacheKey ?? `${status || "image"}-${IMAGE_URL_SESSION_KEY}`;
   const cacheBuster = `?v=${encodeURIComponent(String(version))}`;
   return `${base}${cacheBuster}`;

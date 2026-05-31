@@ -90,6 +90,7 @@ let stopCalls = 0;
 let retryFailedCalls = 0;
 let rollbackCalls = 0;
 let chatCalls = 0;
+const outputImageRequests = [];
 
 function workflowStatus() {
   const activeRun = project.status === "generating"
@@ -241,6 +242,14 @@ await page.route("**/*", async (route) => {
     });
   }
 
+  if (method === "GET" && path.startsWith("/outputs/")) {
+    outputImageRequests.push(path);
+    return route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      "base64",
+    ) });
+  }
+
   if (path.startsWith("/projects") || path.startsWith("/auth")) {
     return route.fulfill({ status: 404, json: { detail: `Unhandled mock route: ${method} ${path}` } });
   }
@@ -271,11 +280,14 @@ try {
   project.status = "prototype_ready";
   project.selected_style = { name: "Mock Style" };
   slides[0].status = "completed";
-  slides[0].image_path = "./outputs/low-cost-project/slide_01.png";
+  slides[0].image_path = "/app/outputs/low-cost-project/slide_01.png";
   slides[0].prompt_text = "Mock prompt";
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByText(/^样张已生成/).waitFor({ timeout: 10_000 });
   await page.getByRole("button", { name: /^重打样张\(\d+\s*页\)$/ }).first().waitFor({ timeout: 10_000 });
+  await page.waitForFunction(() =>
+    Array.from(document.images).some((img) => img.src.includes("/outputs/low-cost-project/slide_01.png")),
+  );
 
   await page.locator("textarea.pg-chat-input").fill("测试聊天错误处理");
   await page.getByRole("button", { name: "发送" }).click();
@@ -286,6 +298,10 @@ try {
   assert.equal(retryFailedCalls, 1, "expected exactly one mocked retry-failed call");
   assert.equal(rollbackCalls, 1, "expected exactly one mocked rollback call");
   assert.equal(chatCalls, 1, "expected exactly one mocked chat call");
+  assert.ok(
+    outputImageRequests.includes("/outputs/low-cost-project/slide_01.png"),
+    "absolute container output paths should be normalized to public /outputs URLs",
+  );
   console.log("Low-cost E2E passed without real image generation.");
 } finally {
   await browser.close();
