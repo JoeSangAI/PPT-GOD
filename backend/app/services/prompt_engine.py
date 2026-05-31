@@ -578,17 +578,18 @@ def _reference_descriptions_for_prompt(
                 strength = str(img.get("application_strength") or "standard").lower()
                 if strength == "strong":
                     reference_descriptions.append(
-                        "Template page: strictly follow the template's color palette, typography, and visual mood. "
-                        "Borrow layout structure and preserve the exact color scheme, material texture, and decoration language."
+                        "Template page: stay very close to the template's layout, color palette, typography rhythm, and visual mood. "
+                        "Replace old content with this slide's own text; do not copy old images or logos."
                     )
                 elif strength == "standard":
                     reference_descriptions.append(
-                        "Template page: borrow layout DNA and color palette; preserve the template's visual mood, typography, and material texture. "
-                        "Do not copy old text, old images, or old logos."
+                        "Template page: borrow page layout plus color palette and typography feel. "
+                        "Use this slide's own subject and evidence; do not copy old text, old images, or old logos."
                     )
                 else:  # light
                     reference_descriptions.append(
-                        "Template page: borrow layout DNA only; do not copy old text, old images, or old logos."
+                        "Template page: borrow layout only: text zones, image zones, card/grid placement, and hierarchy. "
+                        "Do not borrow template colors, old text, old images, or old logos."
                     )
     return [line.strip() for line in reference_descriptions if line and line.strip()]
 

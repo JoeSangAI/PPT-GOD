@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import redis
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
@@ -117,6 +117,8 @@ def _reference_audit(refs: Optional[List[Dict]]) -> List[Dict]:
             "file_path": ref.get("file_path") or getattr(img, "info", {}).get("pptgod_reference_source_path"),
             "image_size": list(getattr(img, "size", []) or []),
             "image_mode": getattr(img, "mode", None),
+            "template_reference_mode": ref.get("template_reference_mode") or getattr(img, "info", {}).get("pptgod_template_reference_mode"),
+            "template_application_strength": ref.get("application_strength") or getattr(img, "info", {}).get("pptgod_template_application_strength"),
             "source_mtime_ns": getattr(img, "info", {}).get("pptgod_reference_source_mtime_ns"),
             "source_size_bytes": getattr(img, "info", {}).get("pptgod_reference_source_size"),
             "reference_binding": ref.get("reference_binding"),
@@ -197,6 +199,43 @@ def _tag_reference_image(img: Image.Image, role: str, source_path: str | None = 
 def _open_reference_image(path: str, role: str) -> Image.Image:
     with Image.open(path) as img:
         return _tag_reference_image(img, role or "reference", path)
+
+
+def _normalize_template_application_strength(strength: str | None) -> str:
+    value = str(strength or "standard").strip().lower()
+    return value if value in {"light", "standard", "strong"} else "standard"
+
+
+def _template_reference_mode(strength: str | None) -> str:
+    normalized = _normalize_template_application_strength(strength)
+    if normalized == "strong":
+        return "direct_page"
+    if normalized == "light":
+        return "layout_map"
+    return "layout_color_map"
+
+
+def _blur_radius_for_template_map(img: Image.Image) -> float:
+    return max(1.0, min(img.size) / 45)
+
+
+def _open_template_reference_image(path: str, strength: str | None) -> Image.Image:
+    normalized = _normalize_template_application_strength(strength)
+    mode = _template_reference_mode(normalized)
+    if normalized == "strong":
+        tagged = _open_reference_image(path, "template")
+    else:
+        with Image.open(path) as source:
+            img = source.convert("RGB")
+            img = img.filter(ImageFilter.GaussianBlur(radius=_blur_radius_for_template_map(img)))
+            if normalized == "light":
+                img = ImageOps.grayscale(img).convert("RGB")
+            else:
+                img = img.quantize(colors=16).convert("RGB")
+            tagged = _tag_reference_image(img, "template", path)
+    tagged.info["pptgod_template_application_strength"] = normalized
+    tagged.info["pptgod_template_reference_mode"] = mode
+    return tagged
 
 
 def _reference_input_priority(ref: Dict) -> int:
@@ -462,6 +501,36 @@ def _page_reference_fidelity_instruction(ref_data: List[Dict]) -> str:
                 + ". Do not swap identities, positions, or name-to-image relationships."
             )
     return "".join(parts)
+
+
+def _template_reference_instruction(ref_data: List[Dict]) -> str:
+    template_refs = [ref for ref in ref_data if ref.get("role") == "template"]
+    if not template_refs:
+        return ""
+    modes = {
+        str(ref.get("template_reference_mode") or _template_reference_mode(ref.get("application_strength"))).lower()
+        for ref in template_refs
+    }
+    if "direct_page" in modes:
+        return (
+            "\n\nTEMPLATE DIRECT PAGE REFERENCE: Attached template page(s) are strong visual anchors. "
+            "Stay close to the attached template page in layout, spacing, hierarchy, palette, typography rhythm, "
+            "material texture, and ornament language. Replace the old template content with this slide's own text. "
+            "Do not copy old template text, images, products, logos, portraits, people, or scene subjects."
+        )
+    if "layout_color_map" in modes:
+        return (
+            "\n\nTEMPLATE LAYOUT AND COLOR MAP: Attached template image(s) are simplified maps, not source content. "
+            "Reuse grid, spacing, hierarchy, and palette relationship from the map. "
+            "Keep this slide's own subject, evidence, and visible text. "
+            "Do not copy old template text, images, products, logos, portraits, people, or scene subjects."
+        )
+    return (
+        "\n\nTEMPLATE LAYOUT MAP: Attached template image(s) are desaturated layout maps, not color references. "
+        "Reuse grid, spacing, hierarchy, text/image zones, card positions, and alignment only. "
+        "Do not reuse the template colors, old text, images, products, logos, portraits, people, or scene subjects; "
+        "choose colors from the current selected style and this slide's content."
+    )
 
 
 def _slide_text_content(slide: Slide) -> Dict:
@@ -821,7 +890,7 @@ def _load_reference_images(
             except Exception as e:
                 logger.warning(f"无法加载种子页 {seed_path}: {e}")
 
-    # 5. 模板级参考（仅作为文字化版式/风格 hint，不上传原始模板整页）
+    # 5. 模板级参考：没有同家族种子页时，使用去 Logo 后的模板页作为版式锚点。
     if not seed_loaded and slide.project and slide.project.selected_template_recommendations:
         recommendations = slide.project.selected_template_recommendations
         slide_type = slide.type or "content"
@@ -829,22 +898,32 @@ def _load_reference_images(
         tmpl = recommendations.get(template_key)
         if tmpl and isinstance(tmpl, dict) and tmpl.get("file_path"):
             tmpl_path = tmpl.get("layout_file_path") or tmpl.get("file_path")
-            if os.path.exists(tmpl_path):
-                refs.append({
-                    "process_mode": "text_only",
-                    "role": "template_hint",
-                    "label": "Template Layout Hint",
-                    "file_path": tmpl_path,
-                    "template_key": template_key,
-                    "application_strength": tmpl.get("application_strength") or "standard",
-                })
-                logger.info(
-                    "Slide %s: 使用模板文字化参考 hint %s (type=%s -> key=%s)，不上传原始模板页",
-                    slide.page_num,
-                    tmpl_path,
-                    slide_type,
-                    template_key,
-                )
+            resolved_tmpl_path = _resolve_file_path(tmpl_path)
+            if resolved_tmpl_path and os.path.exists(resolved_tmpl_path):
+                try:
+                    application_strength = _normalize_template_application_strength(tmpl.get("application_strength"))
+                    template_reference_mode = _template_reference_mode(application_strength)
+                    refs.append({
+                        "image": _open_template_reference_image(resolved_tmpl_path, application_strength),
+                        "process_mode": "blend",
+                        "role": "template",
+                        "label": "Template Layout Reference",
+                        "file_path": resolved_tmpl_path,
+                        "template_key": template_key,
+                        "application_strength": application_strength,
+                        "template_reference_mode": template_reference_mode,
+                        "source_kind": tmpl.get("source_kind"),
+                        "category": tmpl.get("category"),
+                    })
+                    logger.info(
+                        "Slide %s: 加载模板版式参考图 %s (type=%s -> key=%s)",
+                        slide.page_num,
+                        resolved_tmpl_path,
+                        slide_type,
+                        template_key,
+                    )
+                except Exception as e:
+                    logger.warning("无法加载模板版式参考图 %s: %s", resolved_tmpl_path, e)
 
     _attach_page_reference_identity_bindings(slide, refs)
     refs = sorted(refs, key=_reference_input_priority)
@@ -1296,11 +1375,7 @@ def _generate_one_slide(
                 "Keep this slide's own text and visual evidence."
             )
         elif template_ref_count > 0:
-            prompt = prompt + (
-                "\n\nTEMPLATE LAYOUT REFERENCE: Attached template image(s) are layout/style anchors only. "
-                "Reuse grid, spacing, hierarchy, palette relationship, typography rhythm, and ornament language. "
-                "Do not copy old text, images, products, or logos."
-            )
+            prompt = prompt + _template_reference_instruction(first_pass_ref_data)
         elif template_hint_count > 0:
             prompt = prompt + (
                 "\n\nTEMPLATE STYLE MEMORY: Use only the template-derived layout, spacing, hierarchy, "

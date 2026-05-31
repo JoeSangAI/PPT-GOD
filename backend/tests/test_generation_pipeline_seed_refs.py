@@ -19,7 +19,7 @@ def test_seed_images_default_to_prompt_hints(monkeypatch, tmp_path):
     assert "image" not in refs[0]
 
 
-def test_template_references_default_to_text_hints_not_uploaded_images(tmp_path):
+def test_template_references_upload_layout_image_when_no_seed(tmp_path):
     template_path = tmp_path / "template.png"
     Image.new("RGB", (32, 18), "white").save(template_path)
     slide = SimpleNamespace(
@@ -41,10 +41,97 @@ def test_template_references_default_to_text_hints_not_uploaded_images(tmp_path)
 
     refs = generation_pipeline._load_reference_images(slide)
 
-    assert refs[0]["role"] == "template_hint"
+    assert refs[0]["role"] == "template"
     assert refs[0]["file_path"] == str(template_path)
-    assert "image" not in refs[0]
-    assert [ref for ref in refs if ref.get("image") is not None] == []
+    assert refs[0]["image"].size == (32, 18)
+    assert refs[0]["image"].info["pptgod_reference_role"] == "template"
+    assert refs[0]["image"].info["pptgod_reference_source_path"] == str(template_path)
+    assert refs[0]["application_strength"] == "strong"
+    assert refs[0]["template_reference_mode"] == "direct_page"
+
+
+def test_light_template_reference_uses_desaturated_layout_map(tmp_path):
+    template_path = tmp_path / "template.png"
+    img = Image.new("RGB", (64, 36), "white")
+    for x in range(32):
+        for y in range(36):
+            img.putpixel((x, y), (220, 20, 20))
+    img.save(template_path)
+    slide = SimpleNamespace(
+        page_num=4,
+        type="content",
+        visual_json={},
+        reference_images=[],
+        project=SimpleNamespace(
+            reference_images=[],
+            selected_template_recommendations={
+                "content": {
+                    "file_path": str(template_path),
+                    "layout_file_path": str(template_path),
+                    "application_strength": "light",
+                }
+            },
+        ),
+    )
+
+    refs = generation_pipeline._load_reference_images(slide)
+
+    assert refs[0]["role"] == "template"
+    assert refs[0]["template_reference_mode"] == "layout_map"
+    red_area = refs[0]["image"].getpixel((12, 18))
+    assert red_area[0] == red_area[1] == red_area[2]
+
+
+def test_standard_template_reference_uses_color_layout_map(tmp_path):
+    template_path = tmp_path / "template.png"
+    img = Image.new("RGB", (64, 36), "white")
+    for x in range(32):
+        for y in range(36):
+            img.putpixel((x, y), (220, 20, 20))
+    for x in range(32, 64):
+        for y in range(36):
+            img.putpixel((x, y), (20, 50, 220))
+    img.save(template_path)
+    slide = SimpleNamespace(
+        page_num=4,
+        type="content",
+        visual_json={},
+        reference_images=[],
+        project=SimpleNamespace(
+            reference_images=[],
+            selected_template_recommendations={
+                "content": {
+                    "file_path": str(template_path),
+                    "layout_file_path": str(template_path),
+                    "application_strength": "standard",
+                }
+            },
+        ),
+    )
+
+    refs = generation_pipeline._load_reference_images(slide)
+
+    assert refs[0]["template_reference_mode"] == "layout_color_map"
+    red_area = refs[0]["image"].getpixel((12, 18))
+    assert red_area[0] > red_area[1]
+    assert red_area[0] > red_area[2]
+
+
+def test_template_reference_instruction_matches_strength():
+    light_instruction = generation_pipeline._template_reference_instruction([
+        {"role": "template", "template_reference_mode": "layout_map"}
+    ])
+    standard_instruction = generation_pipeline._template_reference_instruction([
+        {"role": "template", "template_reference_mode": "layout_color_map"}
+    ])
+    strong_instruction = generation_pipeline._template_reference_instruction([
+        {"role": "template", "template_reference_mode": "direct_page"}
+    ])
+
+    assert "Reuse grid, spacing, hierarchy, text/image zones" in light_instruction
+    assert "Do not reuse the template colors" in light_instruction
+    assert "Reuse grid, spacing, hierarchy, and palette relationship" in standard_instruction
+    assert "Stay close to the attached template page" in strong_instruction
 
 
 def test_load_reference_images_skips_exact_overlay_assets(tmp_path):
