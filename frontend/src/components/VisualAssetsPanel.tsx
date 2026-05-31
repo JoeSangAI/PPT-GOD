@@ -1,5 +1,14 @@
 import { useMemo, useState } from "react";
 
+export type UploadChoiceKey = "logo" | "asset" | "style" | "template";
+
+export interface UploadStatus {
+  key?: UploadChoiceKey | string;
+  title: string;
+  detail?: string;
+  fileName?: string;
+}
+
 export interface ReferenceImage {
   id: string;
   role: "logo" | "style_ref" | "template" | "visual_asset" | "content_ref" | "chart_ref";
@@ -67,6 +76,8 @@ interface VisualAssetsPanelProps {
   onUnpinAsset?: (slideId: string, assetId: string) => Promise<void> | void;
   onUpdateOverlayLayers?: (slideId: string, layers: any[]) => Promise<void> | void;
   showInVisualStage?: boolean;
+  uploadStatus?: UploadStatus | null;
+  uploadDisabled?: boolean;
 }
 
 function getImageUrl(apiBase: string, url: string) {
@@ -106,6 +117,8 @@ export default function VisualAssetsPanel({
   onUnpinAsset,
   onUpdateOverlayLayers,
   showInVisualStage = false,
+  uploadStatus = null,
+  uploadDisabled = false,
 }: VisualAssetsPanelProps) {
   const [showManager, setShowManager] = useState(false);
   const [showTemplatePages, setShowTemplatePages] = useState(false);
@@ -175,10 +188,12 @@ export default function VisualAssetsPanel({
 
   if (!shouldShow) return null;
 
+  const isUploadActive = uploadDisabled || Boolean(uploadStatus);
   const runUpload = (handler?: () => void) => {
+    if (isUploadActive) return;
     handler?.();
   };
-  const uploadChoices = [
+  const uploadChoices: Array<{ key: UploadChoiceKey; icon: string; title: string; detail: string; action?: () => void }> = [
     { key: "logo", icon: "L", title: "Logo", detail: "品牌标识", action: onUploadLogo },
     { key: "asset", icon: "+", title: "素材", detail: "产品/人物/物料", action: onUploadVisualAsset },
     { key: "style", icon: "S", title: "风格", detail: "参考气质", action: onUploadStyleRef },
@@ -187,13 +202,24 @@ export default function VisualAssetsPanel({
 
   const AddChoiceGrid = ({ compact = false }: { compact?: boolean }) => (
     <div className={`pg-add-menu ${compact ? "is-compact" : ""}`} aria-label="添加项目素材">
-      {uploadChoices.map((choice) => (
-        <button key={choice.key} type="button" onClick={() => runUpload(choice.action)}>
-          <span className="pg-add-choice-icon" aria-hidden="true">{choice.icon}</span>
-          <b>{choice.title}</b>
-          <span>{choice.detail}</span>
-        </button>
-      ))}
+      {uploadChoices.map((choice) => {
+        const isChoiceActive = uploadStatus?.key === choice.key;
+        return (
+          <button
+            key={choice.key}
+            type="button"
+            onClick={() => runUpload(choice.action)}
+            disabled={isUploadActive}
+            aria-busy={isChoiceActive}
+          >
+            <span className={`pg-add-choice-icon ${isChoiceActive ? "is-uploading" : ""}`} aria-hidden="true">
+              {isChoiceActive ? "" : choice.icon}
+            </span>
+            <b>{choice.title}</b>
+            <span>{isChoiceActive ? "上传中..." : choice.detail}</span>
+          </button>
+        );
+      })}
     </div>
   );
 
@@ -416,17 +442,39 @@ export default function VisualAssetsPanel({
             )}
           </div>
           <div className="pg-assets-tray-actions">
-            {uploadChoices.map((choice) => (
-              <button key={choice.key} type="button" className="pg-tray-upload-button" onClick={() => runUpload(choice.action)}>
-                <span className="pg-tray-upload-icon" aria-hidden="true">{choice.icon}</span>
-                <span>{choice.title}</span>
-              </button>
-            ))}
+            {uploadChoices.map((choice) => {
+              const isChoiceActive = uploadStatus?.key === choice.key;
+              return (
+                <button
+                  key={choice.key}
+                  type="button"
+                  className="pg-tray-upload-button"
+                  onClick={() => runUpload(choice.action)}
+                  disabled={isUploadActive}
+                  aria-busy={isChoiceActive}
+                >
+                  <span className={`pg-tray-upload-icon ${isChoiceActive ? "is-uploading" : ""}`} aria-hidden="true">
+                    {isChoiceActive ? "" : choice.icon}
+                  </span>
+                  <span>{isChoiceActive ? "上传中" : choice.title}</span>
+                </button>
+              );
+            })}
             <button type="button" className="pg-assets-manage-button" onClick={() => setShowManager(true)}>
               管理
             </button>
           </div>
         </div>
+        {uploadStatus && (
+          <div className="pg-upload-status" role="status" aria-live="polite">
+            <span className="pg-upload-status-spinner" aria-hidden="true" />
+            <div className="pg-upload-status-copy">
+              <b>{uploadStatus.title}</b>
+              {uploadStatus.fileName && <span title={uploadStatus.fileName}>{uploadStatus.fileName}</span>}
+              {uploadStatus.detail && <em>{uploadStatus.detail}</em>}
+            </div>
+          </div>
+        )}
         {previewItems.length > 0 && (
           <div className="pg-lite-thumb-row pg-project-asset-preview-row">
             {previewItems.slice(0, 8).map(({ item, label }) => (
@@ -485,6 +533,16 @@ export default function VisualAssetsPanel({
             <section className="pg-manager-section">
               <div className="pg-strip-title"><span>添加素材</span><b>上传</b></div>
               <AddChoiceGrid compact />
+              {uploadStatus && (
+                <div className="pg-upload-status is-compact" role="status" aria-live="polite">
+                  <span className="pg-upload-status-spinner" aria-hidden="true" />
+                  <div className="pg-upload-status-copy">
+                    <b>{uploadStatus.title}</b>
+                    {uploadStatus.fileName && <span title={uploadStatus.fileName}>{uploadStatus.fileName}</span>}
+                    {uploadStatus.detail && <em>{uploadStatus.detail}</em>}
+                  </div>
+                </div>
+              )}
             </section>
 
             <section className="pg-manager-section">

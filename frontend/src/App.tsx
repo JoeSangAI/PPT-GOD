@@ -78,7 +78,7 @@ const renderMarkdown = (md: string, chatStyle = false): string => {
   });
 };
 
-import VisualAssetsPanel from "./components/VisualAssetsPanel";
+import VisualAssetsPanel, { type UploadStatus as VisualUploadStatus } from "./components/VisualAssetsPanel";
 import ToastContainer, { type ToastItem } from "./components/Toast";
 import { useProjectWorkflow } from "./hooks/useProjectWorkflow";
 import {
@@ -220,6 +220,8 @@ const TEMPLATE_CONFIRM_TYPES = [
   { key: "quote", label: "金句/强调" },
   { key: "ending", label: "封底" },
 ] as const;
+
+const UPLOAD_WAIT_HINT = "大文件可能需要一点时间，请不要关闭页面。";
 
 function buildDefaultTemplateSelection(pages: any[]) {
   const firstPage = pages[0]?.page_num || 1;
@@ -1579,6 +1581,25 @@ function App() {
   const [templatePageSelection, setTemplatePageSelection] = useState<Record<string, number>>({});
   const [templateApplicationStrength, setTemplateApplicationStrength] = useState<TemplateApplicationStrength>("standard");
   const [showAdvancedMapping, setShowAdvancedMapping] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<VisualUploadStatus | null>(null);
+  const [uploadingDoc, setUploadingDoc] = useState(false);
+  const [uploadingStyleRef, setUploadingStyleRef] = useState(false);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const [uploadingVisualAsset, setUploadingVisualAsset] = useState(false);
+  const [uploadingTemplate, setUploadingTemplate] = useState(false);
+  const materialUploadBusy = uploadingStyleRef || uploadingLogo || uploadingVisualAsset || uploadingTemplate;
+  const materialUploadStatus =
+    uploadStatus && ["logo", "asset", "style", "template"].includes(String(uploadStatus.key))
+      ? uploadStatus
+      : null;
+  const describeUploadFiles = (files: File[]) => {
+    if (files.length === 0) return "文件";
+    if (files.length === 1) return files[0].name;
+    return `${files.length} 个文件`;
+  };
+  const setActiveUploadStatus = (status: VisualUploadStatus) => {
+    setUploadStatus({ detail: UPLOAD_WAIT_HINT, ...status });
+  };
 
   // 主舞台折叠状态：默认折叠以节省空间
   const [styleBarExpanded, setStyleBarExpanded] = useState(false);
@@ -1667,6 +1688,12 @@ function App() {
     const cachedSlides = nextProjectId ? slidesCacheRef.current[nextProjectId] : undefined;
     setProjectStatus(null);
     setOperatingProjectId(null);
+    setUploadStatus(null);
+    setUploadingDoc(false);
+    setUploadingStyleRef(false);
+    setUploadingLogo(false);
+    setUploadingVisualAsset(false);
+    setUploadingTemplate(false);
     generationLoadingIdRef.current = null;
     setReferenceImages([]);
     setDocuments([]);
@@ -1734,11 +1761,6 @@ function App() {
   const [pendingAttachments, setPendingAttachments] = useState<string[]>([]);
   const [pendingChatAttachments, setPendingChatAttachments] = useState<ChatAttachment[]>([]);
   const [pendingFinetuneAttachmentsMap, setPendingFinetuneAttachmentsMap] = useState<Record<string, ChatAttachment[]>>({});
-  const [uploadingDoc, setUploadingDoc] = useState(false);
-  const [, setUploadingStyleRef] = useState(false);
-  const [, setUploadingLogo] = useState(false);
-  const [, setUploadingVisualAsset] = useState(false);
-  const [, setUploadingTemplate] = useState(false);
   const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
   const [editMessageContent, setEditMessageContent] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -4892,10 +4914,22 @@ function App() {
       const files = Array.from((e.target as HTMLInputElement).files || []);
       if (files.length === 0 || !selectedProject) return;
       setOperatingProjectId(selectedProject.id);
+      setActiveUploadStatus({
+        key: currentAgentRole === "finetune" && finetuneTargetSlideId === slideId ? "finetune_ref" : "page_ref",
+        title: currentAgentRole === "finetune" && finetuneTargetSlideId === slideId
+          ? "正在上传本轮参考图"
+          : "正在上传本页素材",
+        fileName: describeUploadFiles(files),
+      });
       try {
         if (currentAgentRole === "finetune" && finetuneTargetSlideId === slideId) {
           const uploaded: ChatAttachment[] = [];
-          for (const file of files) {
+          for (const [index, file] of files.entries()) {
+            setActiveUploadStatus({
+              key: "finetune_ref",
+              title: "正在上传本轮参考图",
+              fileName: files.length > 1 ? `${index + 1}/${files.length} ${file.name}` : file.name,
+            });
             const data = await uploadFile(selectedProject.id, file, "finetune_ref", slideId);
             uploaded.push({
               id: data.id,
@@ -4912,7 +4946,12 @@ function App() {
           addSystemLog(`用户为第 ${slides.find((s) => s.id === slideId)?.page_num || "?"} 页添加了本轮微调参考图`);
           return;
         }
-        for (const file of files) {
+        for (const [index, file] of files.entries()) {
+          setActiveUploadStatus({
+            key: "page_ref",
+            title: "正在上传本页素材",
+            fileName: files.length > 1 ? `${index + 1}/${files.length} ${file.name}` : file.name,
+          });
           await uploadFile(selectedProject.id, file, "content_ref", slideId, "blend", {
             asset_name: file.name.replace(/\.[^.]+$/, ""),
             usage_note: "用户从单页上传的本页参考图",
@@ -4938,6 +4977,7 @@ function App() {
         showToast("上传失败：" + (err.message || "未知错误"), "error");
       } finally {
         setOperatingProjectId(null);
+        setUploadStatus(null);
       }
     };
     input.click();
@@ -5169,12 +5209,24 @@ function App() {
   const uploadBriefFiles = async (files: File[]) => {
     if (!selectedProject || files.length === 0) return;
     setUploadingDoc(true);
+    setActiveUploadStatus({
+      key: "brief",
+      title: "正在加入材料",
+      fileName: describeUploadFiles(files),
+      detail: "大文件上传和解析可能需要一点时间；你可以继续写 Brief。",
+    });
     let uploadedDocs = 0;
     let uploadedImages = 0;
     let docsParsingInBackground = 0;
     const uploadedImageAttachments: ChatAttachment[] = [];
     try {
-      for (const file of files) {
+      for (const [index, file] of files.entries()) {
+        setActiveUploadStatus({
+          key: "brief",
+          title: "正在加入材料",
+          fileName: files.length > 1 ? `${index + 1}/${files.length} ${file.name}` : file.name,
+          detail: "大文件上传和解析可能需要一点时间；你可以继续写 Brief。",
+        });
         try {
           if (isBriefImageFile(file)) {
             const data = await uploadFile(selectedProject.id, file, "content_ref", undefined, "blend", {
@@ -5231,6 +5283,7 @@ function App() {
       }
     } finally {
       setUploadingDoc(false);
+      setUploadStatus(null);
     }
   };
 
@@ -7117,9 +7170,21 @@ function App() {
     const uploadRole = currentAgentRole === "visual" ? "visual_asset" : "content_ref";
     setOperatingProjectId(selectedProject.id);
     setUploadingDoc(true);
+    setActiveUploadStatus({
+      key: "agent",
+      title: "正在加入附件",
+      fileName: describeUploadFiles(files),
+      detail: "大文件可能需要一点时间，上传完成后会自动带入本轮对话。",
+    });
     try {
       const uploaded: ChatAttachment[] = [];
-      for (const file of imageFiles) {
+      for (const [index, file] of imageFiles.entries()) {
+        setActiveUploadStatus({
+          key: "agent",
+          title: "正在加入图片附件",
+          fileName: files.length > 1 ? `${index + 1}/${files.length} ${file.name}` : file.name,
+          detail: "大文件可能需要一点时间，上传完成后会自动带入本轮对话。",
+        });
         const data = await uploadFile(selectedProject.id, file, uploadRole, undefined, "blend", {
           asset_name: file.name.replace(/\.[^.]+$/, ""),
           usage_note:
@@ -7135,7 +7200,13 @@ function App() {
         });
       }
       const uploadedDocs: string[] = [];
-      for (const file of documentFiles) {
+      for (const [index, file] of documentFiles.entries()) {
+        setActiveUploadStatus({
+          key: "agent",
+          title: "正在加入文件附件",
+          fileName: files.length > 1 ? `${imageFiles.length + index + 1}/${files.length} ${file.name}` : file.name,
+          detail: "大文件可能需要一点时间，上传完成后会自动带入本轮对话。",
+        });
         const data = await uploadDocument(selectedProject.id, file);
         if (data.detail) {
           showToast(`"${file.name}" 上传失败：${data.detail}`, "error");
@@ -7163,6 +7234,7 @@ function App() {
     } finally {
       setOperatingProjectId(null);
       setUploadingDoc(false);
+      setUploadStatus(null);
     }
   };
 
@@ -7191,9 +7263,20 @@ function App() {
       const imageFiles = Array.from(files).filter(isBriefImageFile);
       if (imageFiles.length > 0) {
         setOperatingProjectId(selectedProject.id);
+        setUploadingDoc(true);
+        setActiveUploadStatus({
+          key: "finetune_ref",
+          title: "正在上传本轮参考图",
+          fileName: describeUploadFiles(imageFiles),
+        });
         try {
           const uploaded: ChatAttachment[] = [];
-          for (const file of imageFiles) {
+          for (const [index, file] of imageFiles.entries()) {
+            setActiveUploadStatus({
+              key: "finetune_ref",
+              title: "正在上传本轮参考图",
+              fileName: imageFiles.length > 1 ? `${index + 1}/${imageFiles.length} ${file.name}` : file.name,
+            });
             const data = await uploadFile(selectedProject.id, file, "finetune_ref", finetuneTargetSlideId);
             uploaded.push({
               id: data.id,
@@ -7212,6 +7295,8 @@ function App() {
           showToast("参考图上传失败：" + (err.message || "未知错误"), "error");
         } finally {
           setOperatingProjectId(null);
+          setUploadingDoc(false);
+          setUploadStatus(null);
         }
         return;
       }
@@ -7539,7 +7624,7 @@ function App() {
     isDocumentProcessingStatus(doc.asset_extraction_status)
   );
   const briefComposerSupportText = uploadingDoc
-    ? "正在加入材料；你可以继续写 Brief"
+    ? "正在加入材料；你可以继续写 Brief，大文件会多等一会儿"
     : briefDocumentsParsing
     ? "材料解析中；你可以继续补充 Brief"
     : "支持 PDF、Word、PPT、Markdown、TXT、图片";
@@ -7906,6 +7991,8 @@ function App() {
           templatePages={templatePages}
           apiBase={API_BASE}
           showInVisualStage={true}
+          uploadStatus={materialUploadStatus}
+          uploadDisabled={materialUploadBusy}
           onUploadLogo={() => logoInputRef.current?.click()}
           onUploadStyleRef={() => styleRefInputRef.current?.click()}
           onUploadTemplate={() => templateInputRef.current?.click()}
@@ -8432,6 +8519,16 @@ function App() {
                     {isDragging && (
                       <div className="pg-brief-drop-overlay">
                         松开即可加入 Brief
+                      </div>
+                    )}
+                    {uploadStatus && uploadStatus.key === "brief" && (
+                      <div className="pg-inline-upload-status pg-brief-upload-status" role="status" aria-live="polite">
+                        <span className="pg-upload-status-spinner" aria-hidden="true" />
+                        <div className="pg-upload-status-copy">
+                          <b>{uploadStatus.title}</b>
+                          {uploadStatus.fileName && <span title={uploadStatus.fileName}>{uploadStatus.fileName}</span>}
+                          {uploadStatus.detail && <em>{uploadStatus.detail}</em>}
+                        </div>
                       </div>
                     )}
                     <div className="pg-brief-composer-footer">
@@ -9984,8 +10081,19 @@ function App() {
               const file = e.target.files?.[0];
               if (file && selectedProject) {
                 setUploadingStyleRef(true);
+                setActiveUploadStatus({
+                  key: "style",
+                  title: "正在上传风格参考",
+                  fileName: file.name,
+                });
                 try {
                   await uploadFile(selectedProject.id, file, "style_ref");
+                  setActiveUploadStatus({
+                    key: "style",
+                    title: "正在整理风格参考",
+                    fileName: file.name,
+                    detail: "上传已完成，正在更新素材库。",
+                  });
                   showToast("风格参考已添加");
                   await loadReferenceImages(selectedProject.id);
                   await loadProjects();
@@ -9998,6 +10106,7 @@ function App() {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
                 } finally {
                   setUploadingStyleRef(false);
+                  setUploadStatus(null);
                 }
               }
               e.target.value = "";
@@ -10012,8 +10121,19 @@ function App() {
               const file = e.target.files?.[0];
               if (file && selectedProject) {
                 setUploadingLogo(true);
+                setActiveUploadStatus({
+                  key: "logo",
+                  title: "正在上传 Logo",
+                  fileName: file.name,
+                });
                 try {
                   await uploadFile(selectedProject.id, file, "logo", undefined, "original", { logo_anchor: "top-right" });
+                  setActiveUploadStatus({
+                    key: "logo",
+                    title: "正在整理 Logo",
+                    fileName: file.name,
+                    detail: "上传已完成，正在更新素材库。",
+                  });
                   showToast("品牌 Logo 已添加");
                   await loadReferenceImages(selectedProject.id);
                   await loadProjects();
@@ -10026,6 +10146,7 @@ function App() {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
                 } finally {
                   setUploadingLogo(false);
+                  setUploadStatus(null);
                 }
               }
               e.target.value = "";
@@ -10040,8 +10161,19 @@ function App() {
               const file = e.target.files?.[0];
               if (file && selectedProject) {
                 setUploadingVisualAsset(true);
+                setActiveUploadStatus({
+                  key: "asset",
+                  title: "正在上传素材",
+                  fileName: file.name,
+                });
                 try {
                   await uploadFile(selectedProject.id, file, "visual_asset");
+                  setActiveUploadStatus({
+                    key: "asset",
+                    title: "正在整理素材",
+                    fileName: file.name,
+                    detail: "上传已完成，正在更新素材库。",
+                  });
                   showToast("可复用素材已添加");
                   await loadReferenceImages(selectedProject.id);
                   slides.forEach((s) => markSlideStale(s.id, "content"));
@@ -10053,6 +10185,7 @@ function App() {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
                 } finally {
                   setUploadingVisualAsset(false);
+                  setUploadStatus(null);
                 }
               }
               e.target.value = "";
@@ -10067,8 +10200,20 @@ function App() {
               const file = e.target.files?.[0];
               if (file && selectedProject) {
                 setUploadingTemplate(true);
+                setActiveUploadStatus({
+                  key: "template",
+                  title: "正在上传模板",
+                  fileName: file.name,
+                  detail: "PPT、PPTX 或 PDF 需要先上传，再读取页面和 Logo。",
+                });
                 try {
                   const initialResult = await extractTemplate(selectedProject.id, file);
+                  setActiveUploadStatus({
+                    key: "template",
+                    title: "正在提取模板页面",
+                    fileName: file.name,
+                    detail: "正在读取版式、页面预览和 Logo，请稍候。",
+                  });
                   showToast("已收到版式模板，正在提取页面和 Logo");
                   const result = initialResult?.status === "completed"
                     ? initialResult
@@ -10097,6 +10242,7 @@ function App() {
                   showToast("上传失败：" + (err.message || "未知错误"), "error");
                 } finally {
                   setUploadingTemplate(false);
+                  setUploadStatus(null);
                 }
               }
               e.target.value = "";
@@ -10374,6 +10520,16 @@ function App() {
                     <button type="button" onClick={() => { setAgentMaterialSheetOpen(false); templateInputRef.current?.click(); }}>
                       <b>学习模板版式</b><span>PPT、PPTX 或 PDF</span>
                     </button>
+                  </div>
+                </div>
+              )}
+              {uploadStatus && (
+                <div className="pg-inline-upload-status" role="status" aria-live="polite">
+                  <span className="pg-upload-status-spinner" aria-hidden="true" />
+                  <div className="pg-upload-status-copy">
+                    <b>{uploadStatus.title}</b>
+                    {uploadStatus.fileName && <span title={uploadStatus.fileName}>{uploadStatus.fileName}</span>}
+                    {uploadStatus.detail && <em>{uploadStatus.detail}</em>}
                   </div>
                 </div>
               )}

@@ -3207,6 +3207,17 @@ body {
   color: var(--pg-ink);
 }
 
+.pg-tray-upload-button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.pg-tray-upload-button:disabled:hover {
+  border-color: var(--pg-line);
+  background: #ffffff;
+  color: var(--pg-ink-soft);
+}
+
 .pg-tray-upload-icon {
   display: inline-flex;
   width: 18px;
@@ -3219,6 +3230,90 @@ body {
   font-size: 10px;
   font-weight: 820;
   line-height: 1;
+}
+
+.pg-upload-status,
+.pg-inline-upload-status {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 9px;
+  border: 1px solid #bfdbfe;
+  border-radius: 8px;
+  background: #eff6ff;
+  padding: 9px 10px;
+  color: #1e3a8a;
+}
+
+.pg-upload-status {
+  margin-top: 2px;
+}
+
+.pg-upload-status.is-compact {
+  margin-top: 8px;
+}
+
+.pg-inline-upload-status {
+  margin-bottom: 8px;
+}
+
+.pg-brief-upload-status {
+  margin: 8px 10px 0;
+}
+
+.pg-upload-status-spinner {
+  display: inline-flex;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border: 2px solid #bfdbfe;
+  border-top-color: #1d4ed8;
+  border-radius: 999px;
+  animation: pg-upload-spin 760ms linear infinite;
+}
+
+.pg-upload-status-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
+}
+
+.pg-upload-status-copy b {
+  flex: 0 0 auto;
+  color: #1e3a8a;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.pg-upload-status-copy span {
+  min-width: 0;
+  max-width: min(320px, 100%);
+  overflow: hidden;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pg-upload-status-copy em {
+  flex: 1 0 100%;
+  color: #475569;
+  font-size: 11.5px;
+  font-style: normal;
+  line-height: 1.45;
+}
+
+@keyframes pg-upload-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .pg-assets-manage-button {
@@ -3374,6 +3469,16 @@ body {
   background: #fff;
 }
 
+.pg-add-menu button:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.pg-add-menu button:disabled:hover {
+  border-color: var(--pg-line);
+  background: var(--pg-surface-muted);
+}
+
 .pg-add-menu b {
   grid-column: 2;
   color: var(--pg-ink);
@@ -3402,6 +3507,15 @@ body {
   font-size: 18px;
   font-weight: 780;
   line-height: 1;
+}
+
+.pg-add-menu .pg-add-choice-icon.is-uploading,
+.pg-tray-upload-icon.is-uploading {
+  border: 2px solid #c7d2fe;
+  border-top-color: #111827;
+  background: #ffffff;
+  color: transparent;
+  animation: pg-upload-spin 760ms linear infinite;
 }
 
 .pg-add-menu.is-compact {
