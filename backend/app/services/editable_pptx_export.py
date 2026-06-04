@@ -20,6 +20,7 @@ from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
 from app.core.config import settings
+from app.services.editable_pptx_diagnostics import EditablePptxDiagnostics, EditablePptxPageDiagnostics
 from app.services.image_analyzer import _call_vision_model
 
 try:
@@ -120,6 +121,7 @@ class EditablePptxResult:
     qa_retry_pages: list[int] = field(default_factory=list)
     quality_fallback_pages: list[int] = field(default_factory=list)
     quality_warning_pages: list[int] = field(default_factory=list)
+    diagnostics: EditablePptxDiagnostics | None = None
 
 
 def clamp_box(box: dict[str, Any]) -> dict[str, float]:
@@ -766,39 +768,56 @@ def should_restore_text(
     restore_mode: str | None = None,
     visual_complexity: dict[str, float] | None = None,
 ) -> bool:
+    keep, _reason = should_restore_text_with_reason(
+        region,
+        image_blocks,
+        rgb,
+        restore_mode,
+        visual_complexity=visual_complexity,
+    )
+    return keep
+
+
+def should_restore_text_with_reason(
+    region: dict[str, Any],
+    image_blocks: list[dict[str, float]],
+    rgb: np.ndarray,
+    restore_mode: str | None = None,
+    visual_complexity: dict[str, float] | None = None,
+) -> tuple[bool, str]:
     mode = normalize_editable_pptx_restore_mode(restore_mode)
     text = str(region.get("text") or "").strip()
     box = clamp_box(region)
     role = str(region.get("role") or "").lower()
     if not text:
-        return False
+        return False, "empty_text"
     if region.get("editable") is False:
-        return False
+        return False, "ocr_marked_non_editable"
     if not role_allowed_for_restore_mode(role, text, box, mode):
-        return False
+        return False, "role_not_allowed_for_mode"
     if float(region.get("confidence", 1.0) or 1.0) < 0.22:
-        return False
+        return False, "low_confidence"
     if box["width"] < 0.012 or box["height"] < 0.012:
-        return False
+        return False, "box_too_small"
     if mode == "standard" and is_auxiliary_text_on_complex_slide(text, box, role, visual_complexity):
-        return False
+        return False, "standard_complex_auxiliary_text"
     if mode == "standard" and role in {"body", "caption", "label"} and float(box["height"]) < 0.022:
-        return False
+        return False, "standard_small_auxiliary_text"
     if is_timeline_marker_text(text, box):
-        return False
+        return False, "timeline_marker"
     if is_low_contrast_decorative_text(box, rgb):
-        return False
+        return False, "low_contrast_decorative"
     inside_visual_asset = any(center_inside(box_center(box), block) for block in image_blocks)
     if inside_visual_asset and not is_primary_editable_text(text, box, role) and mode == "standard":
-        return False
+        return False, "standard_inside_visual_asset"
     if len(text) <= 1 and box["height"] < 0.06:
-        return False
+        return False, "single_character_noise"
     bg = sample_background(rgb, box)
     color = sample_text_color(rgb, box, bg)
     contrast = math.sqrt(sum((float(color[i]) - float(bg[i])) ** 2 for i in range(3)))
     if contrast < 30 and (len(text) <= 3 or box["height"] > 0.08):
-        return False
-    return True
+        return False, "low_contrast"
+    return True, "restored"
 
 
 def estimate_text_units(text: str) -> float:
@@ -1069,15 +1088,55 @@ def _natural_text_box_for_group(group: dict[str, Any]) -> dict[str, float]:
     )
 
 
+def _max_font_size_by_box_height(
+    box: dict[str, Any],
+    role: str,
+    text: str,
+    original_box: dict[str, Any] | None = None,
+) -> float | None:
+    units = estimate_text_units(text)
+    height = float(box.get("height") or 0.0)
+    original = clamp_box(original_box or box)
+    expansion_ratio = float(box.get("width") or 0.0) / max(0.001, float(original.get("width") or 0.0))
+    is_top_expanded_title = (
+        role == "title"
+        and has_cjk(text)
+        and float(original.get("y") or 0.0) <= 0.18
+        and expansion_ratio >= 1.12
+        and units >= 10
+    )
+    is_top_title_fragment = (
+        role == "title"
+        and has_cjk(text)
+        and float(original.get("y") or 0.0) <= 0.18
+        and units >= 10
+        and str(text).rstrip().endswith(("，", "：", ",", ":"))
+    )
+    caps: list[float] = []
+    if is_top_expanded_title or is_top_title_fragment:
+        caps.append(min(28.0, max(15.0, height * 260.0)))
+    if role == "title" and units >= 30:
+        caps.append(min(28.0, max(13.0, height * 210.0)))
+    if role in {"subtitle", "label"} and units >= 20:
+        caps.append(min(20.0, max(8.0, height * 170.0)))
+    if caps:
+        return min(caps)
+    return None
+
+
 def _fitted_size_for_group(group: dict[str, Any], box: dict[str, float]) -> float:
     role = str(group.get("role") or "")
     preferred = float(box["height"]) * SLIDE_H_IN * 72 * font_height_multiplier(role)
     text = str(group.get("text") or "")
+    height_cap = _max_font_size_by_box_height(box, role, text, group.get("bbox"))
+    max_pt = role_max_font_size(role, text)
+    if height_cap is not None:
+        max_pt = min(max_pt, height_cap)
     return fitted_font_size_pt(
         text,
         box,
         preferred,
-        max_pt=role_max_font_size(role, text),
+        max_pt=max_pt,
         wrap_long_text=should_manually_wrap_text(text, box, role),
     )
 
@@ -1941,6 +2000,7 @@ def build_editable_pptx(
     quality_fallback_pages: list[int] = []
     quality_warning_pages: list[int] = []
     sorted_slides = sorted(slide_images, key=lambda item: int(item.get("page_num") or 0))
+    diagnostics = EditablePptxDiagnostics(restore_mode=mode)
 
     for index, slide_data in enumerate(sorted_slides, start=1):
         page_num = int(slide_data.get("page_num") or index)
@@ -1950,6 +2010,7 @@ def build_editable_pptx(
         slide = prs.slides.add_slide(blank)
         if not image_path or not os.path.exists(image_path):
             ocr_failed_pages.append(page_num)
+            diagnostics.pages.append(EditablePptxPageDiagnostics(page_num=page_num, ocr_failed=True))
             continue
 
         rendered = Image.open(image_path).convert("RGB")
@@ -1969,17 +2030,26 @@ def build_editable_pptx(
         normalized_regions = [region for region in (_coerce_region(r) for r in raw_regions) if region]
         text_boxes_for_detection = [clamp_box(region) for region in normalized_regions]
         image_blocks = detect_image_blocks(image_path, text_boxes_for_detection)
-        text_regions = [
-            region
-            for region in normalized_regions
-            if should_restore_text(
+        page_diag = EditablePptxPageDiagnostics(
+            page_num=page_num,
+            raw_region_count=len(raw_regions),
+            normalized_region_count=len(normalized_regions),
+            visual_asset_count=len(image_blocks),
+            ocr_failed=not bool(raw_regions),
+        )
+        text_regions = []
+        for region in normalized_regions:
+            keep, reason = should_restore_text_with_reason(
                 region,
                 image_blocks,
                 rendered_rgb,
                 mode,
                 visual_complexity=visual_complexity,
             )
-        ]
+            if keep:
+                text_regions.append(region)
+            else:
+                page_diag.rejection_reasons[reason] = page_diag.rejection_reasons.get(reason, 0) + 1
         text_regions = merge_inline_prefix_body_regions(text_regions)
         groups = []
         for region in text_regions:
@@ -1995,6 +2065,7 @@ def build_editable_pptx(
                 group["background_pill"] = True
                 group["alignment"] = "center"
             groups.append(group)
+        page_diag.restored_text_count = len(groups)
         normalize_same_level_text_metrics(groups)
         apply_complex_slide_text_safety_hints(groups, visual_complexity)
         original_pic = slide.shapes.add_picture(image_path, 0, 0, width=SLIDE_W_EMU, height=SLIDE_H_EMU)
@@ -2006,6 +2077,7 @@ def build_editable_pptx(
             apply_cleanup_box_to_image(asset_source, cleanup_box)
 
         underlay = rendered.copy()
+        cleanup_patch_count = 0
 
         def add_cleanup_patch(cleanup_box: dict[str, Any], patch_path: str, shape_name: str) -> bool:
             patch_box = create_cleanup_patch(underlay, cleanup_box, patch_path)
@@ -2026,7 +2098,8 @@ def build_editable_pptx(
             cleanup_boxes.extend(text_cleanup_boxes)
             for cleanup_idx, cleanup_box in enumerate(cleanup_boxes, start=1):
                 patch_path = str(work / f"slide_{page_num:02d}_cleanup_patch_{cleanup_idx:02d}.png")
-                add_cleanup_patch(cleanup_box, patch_path, f"Editable cleanup patch - {cleanup_idx}")
+                if add_cleanup_patch(cleanup_box, patch_path, f"Editable cleanup patch - {cleanup_idx}"):
+                    cleanup_patch_count += 1
 
         for asset_idx, block in enumerate(image_blocks, start=1):
             asset_path = str(work / f"slide_{page_num:02d}_asset_{asset_idx:02d}.png")
@@ -2038,6 +2111,7 @@ def build_editable_pptx(
             visual_asset_count += 1
 
         residuals = residual_text_groups(rendered_rgb, np.asarray(underlay.convert("RGB")), groups, text_cleanup_boxes)
+        page_diag.qa_retry_count = len(residuals)
         if residuals:
             qa_retry_pages.append(page_num)
             cleanup_box_by_group_id = {id(group): cleanup_box for group, cleanup_box in zip(groups, text_cleanup_boxes)}
@@ -2046,7 +2120,8 @@ def build_editable_pptx(
                 retry_box = quality_retry_cleanup_box_for_group(group, cleanup_box_by_group_id.get(id(group)))
                 retry_cleanup_boxes.append(retry_box)
                 patch_path = str(work / f"slide_{page_num:02d}_qa_cleanup_patch_{retry_idx:02d}.png")
-                add_cleanup_patch(retry_box, patch_path, f"Editable QA cleanup patch - {retry_idx}")
+                if add_cleanup_patch(retry_box, patch_path, f"Editable QA cleanup patch - {retry_idx}"):
+                    cleanup_patch_count += 1
             retry_groups = [group for group, _score in residuals]
             retry_residuals = residual_text_groups(
                 rendered_rgb,
@@ -2057,6 +2132,8 @@ def build_editable_pptx(
             )
             if retry_residuals:
                 quality_warning_pages.append(page_num)
+                page_diag.quality_warning = True
+        page_diag.cleanup_patch_count = cleanup_patch_count
 
         for group in groups:
             add_textbox(slide, group, rendered_rgb)
@@ -2068,6 +2145,7 @@ def build_editable_pptx(
 
         if progress_callback:
             progress_callback(index, len(sorted_slides), f"第 {page_num} 页可编辑版已处理")
+        diagnostics.pages.append(page_diag)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     prs.save(output_path)
@@ -2080,6 +2158,7 @@ def build_editable_pptx(
         qa_retry_pages=sorted({int(page) for page in qa_retry_pages}),
         quality_fallback_pages=sorted({int(page) for page in quality_fallback_pages}),
         quality_warning_pages=sorted({int(page) for page in quality_warning_pages}),
+        diagnostics=diagnostics,
     )
 
 
