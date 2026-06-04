@@ -789,9 +789,12 @@ def should_restore_text_with_reason(
     text = str(region.get("text") or "").strip()
     box = clamp_box(region)
     role = str(region.get("role") or "").lower()
+    role = ROLE_ALIASES.get(role, role)
     if not text:
         return False, "empty_text"
-    if region.get("editable") is False:
+    if role in STRICT_NON_EDITABLE_ROLES:
+        return False, "role_not_allowed_for_mode"
+    if region.get("editable") is False and mode != "aggressive":
         return False, "ocr_marked_non_editable"
     if not role_allowed_for_restore_mode(role, text, box, mode):
         return False, "role_not_allowed_for_mode"

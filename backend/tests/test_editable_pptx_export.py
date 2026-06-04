@@ -238,6 +238,46 @@ def test_vlm_non_editable_regions_remain_as_image_content(tmp_path):
     assert "看得见的信任" in text_shapes
 
 
+def test_aggressive_mode_overrides_non_editable_optional_text_but_not_logo(tmp_path):
+    slide_path = tmp_path / "aggressive_non_editable_optional.png"
+    standard_output = tmp_path / "aggressive_non_editable_optional_standard.pptx"
+    aggressive_output = tmp_path / "aggressive_non_editable_optional_aggressive.pptx"
+    fake_regions = [
+        {
+            "text": "屏幕内说明文字",
+            "x": 0.30,
+            "y": 0.38,
+            "width": 0.24,
+            "height": 0.035,
+            "role": "image_text",
+            "editable": False,
+        },
+        {"text": "vivo", "x": 0.86, "y": 0.06, "width": 0.06, "height": 0.03, "role": "logo", "editable": False},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    standard_result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(standard_output),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+    aggressive_result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(aggressive_output),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="aggressive",
+    )
+
+    aggressive_text = pptx_text_shapes(aggressive_output)
+    assert standard_result.text_box_count == 0
+    assert aggressive_result.text_box_count == 1
+    assert "屏幕内说明文字" in aggressive_text
+    assert "vivo" not in aggressive_text
+
+
 def test_large_chinese_title_keeps_readable_size_and_exact_short_chars(tmp_path):
     slide_path = tmp_path / "large_chinese_title.png"
     output_path = tmp_path / "large_chinese_title_editable.pptx"
