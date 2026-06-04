@@ -1551,6 +1551,39 @@ def residual_text_groups(
     return [item for item in scored if item is not None]
 
 
+def _boxes_near(a: dict[str, float], b: dict[str, float], gap: float) -> bool:
+    ax2 = float(a["x"]) + float(a["width"])
+    ay2 = float(a["y"]) + float(a["height"])
+    bx2 = float(b["x"]) + float(b["width"])
+    by2 = float(b["y"]) + float(b["height"])
+    return not (
+        ax2 + gap < float(b["x"])
+        or bx2 + gap < float(a["x"])
+        or ay2 + gap < float(b["y"])
+        or by2 + gap < float(a["y"])
+    )
+
+
+def _union_box(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
+    x1 = min(float(a["x"]), float(b["x"]))
+    y1 = min(float(a["y"]), float(b["y"]))
+    x2 = max(float(a["x"]) + float(a["width"]), float(b["x"]) + float(b["width"]))
+    y2 = max(float(a["y"]) + float(a["height"]), float(b["y"]) + float(b["height"]))
+    return clamp_box({"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1})
+
+
+def merge_cleanup_boxes(boxes: list[dict[str, Any]], gap: float = 0.01) -> list[dict[str, float]]:
+    merged: list[dict[str, float]] = []
+    for box in sorted((clamp_box(b) for b in boxes), key=lambda b: (float(b["y"]), float(b["x"]))):
+        for index, existing in enumerate(merged):
+            if _boxes_near(existing, box, gap):
+                merged[index] = _union_box(existing, box)
+                break
+        else:
+            merged.append(box)
+    return merged
+
+
 def create_text_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path: str) -> dict[str, float] | None:
     rgb = np.asarray(rendered.convert("RGB")).copy()
     h, w, _ = rgb.shape
@@ -2095,7 +2128,14 @@ def build_editable_pptx(
                 cleanup_box = clamp_box(block)
                 cleanup_box["full_fill"] = True
                 cleanup_boxes.append(cleanup_box)
-            cleanup_boxes.extend(text_cleanup_boxes)
+            simple_text_cleanup_boxes = [
+                box for box in text_cleanup_boxes if not box.get("full_fill") and not box.get("solid_fill")
+            ]
+            special_text_cleanup_boxes = [
+                box for box in text_cleanup_boxes if box.get("full_fill") or box.get("solid_fill")
+            ]
+            cleanup_boxes.extend(special_text_cleanup_boxes)
+            cleanup_boxes.extend(merge_cleanup_boxes(simple_text_cleanup_boxes))
             for cleanup_idx, cleanup_box in enumerate(cleanup_boxes, start=1):
                 patch_path = str(work / f"slide_{page_num:02d}_cleanup_patch_{cleanup_idx:02d}.png")
                 if add_cleanup_patch(cleanup_box, patch_path, f"Editable cleanup patch - {cleanup_idx}"):

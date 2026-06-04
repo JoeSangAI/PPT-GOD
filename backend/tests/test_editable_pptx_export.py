@@ -156,6 +156,20 @@ def test_should_restore_text_reason_rejects_small_standard_label():
     assert reason == "standard_small_auxiliary_text"
 
 
+def test_merge_cleanup_boxes_combines_nearby_text_boxes():
+    boxes = [
+        {"x": 0.10, "y": 0.10, "width": 0.20, "height": 0.04},
+        {"x": 0.10, "y": 0.145, "width": 0.21, "height": 0.04},
+        {"x": 0.70, "y": 0.70, "width": 0.10, "height": 0.03},
+    ]
+
+    merged = editable_export.merge_cleanup_boxes(boxes, gap=0.015)
+
+    assert len(merged) == 2
+    assert merged[0]["height"] > 0.08
+    assert merged[1]["x"] == 0.70
+
+
 def test_same_level_text_normalization_applies_outside_left_column(tmp_path):
     slide_path = tmp_path / "right_column.png"
     output_path = tmp_path / "right_column_editable.pptx"

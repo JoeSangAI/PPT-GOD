@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 import logging
 import os
 
@@ -11,6 +12,7 @@ from app.models.base import SessionLocal
 from app.models.models import Project, Slide
 from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.editable_pptx_export import build_editable_pptx, build_project_slide_images, normalize_editable_pptx_restore_mode
+from app.services.editable_pptx_quality import evaluate_editable_pptx_quality
 from app.services.generation_pipeline import run_generation_pipeline
 from app.services.image_generation import clear_reference_upload_cache
 from app.services.image_task_audit import append_image_generation_log
@@ -526,8 +528,22 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
             restore_mode=mode,
             reuse_ocr_cache=False,
         )
-        if result.slide_count and result.text_box_count <= 0:
-            message = "没有解析出可编辑文字，请稍后重试或检查文字识别服务。"
+        diagnostics_path = os.path.splitext(output_path)[0] + "_diagnostics.json"
+        if result.diagnostics:
+            os.makedirs(os.path.dirname(diagnostics_path), exist_ok=True)
+            with open(diagnostics_path, "w", encoding="utf-8") as f:
+                json.dump(result.diagnostics.to_dict(), f, ensure_ascii=False, indent=2)
+
+        decision = evaluate_editable_pptx_quality(
+            result.diagnostics,
+            min_text_boxes=int(settings.EDITABLE_PPTX_MIN_TEXT_BOXES or 1),
+            warning_page_ratio=float(settings.EDITABLE_PPTX_WARNING_PAGE_RATIO or 0.65),
+        )
+        should_fail_for_quality = decision.status == "fail" or (
+            decision.status == "warn" and bool(settings.EDITABLE_PPTX_FAIL_ON_WARNING)
+        )
+        if should_fail_for_quality:
+            message = "没有解析出可编辑文字，请稍后重试或检查文字识别服务。" if decision.reason == "no_editable_text" else decision.message
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
@@ -538,14 +554,15 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
                 run_id,
                 status="failed",
                 message=message,
-                error_msg="editable_pptx_no_text_boxes",
+                error_msg="editable_pptx_no_text_boxes" if decision.reason == "no_editable_text" else decision.reason,
                 completed_count=result.slide_count,
                 failed_count=result.slide_count,
             )
             db.commit()
             logger.error(
-                "Editable PPTX task produced no editable text: project=%s slides=%s failed_pages=%s",
+                "Editable PPTX task failed quality gate: project=%s reason=%s slides=%s failed_pages=%s",
                 project_id,
+                decision.reason,
                 result.slide_count,
                 result.ocr_failed_pages,
             )
@@ -556,11 +573,14 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
                 "error": message,
                 "text_box_count": result.text_box_count,
                 "ocr_failed_pages": result.ocr_failed_pages,
+                "quality_reason": decision.reason,
             }
         fallback_pages = sorted({int(page) for page in [*result.ocr_failed_pages, *result.quality_fallback_pages]})
         warning_pages = sorted({int(page) for page in result.quality_warning_pages})
         failed_count = len(fallback_pages)
-        if failed_count and warning_pages:
+        if decision.status == "warn" and decision.reason == "many_pages_need_review":
+            message = decision.message
+        elif failed_count and warning_pages:
             message = f"可编辑版已生成，{failed_count} 页保留为图片，{len(warning_pages)} 页建议复查局部画面"
         elif failed_count:
             message = f"可编辑版已生成，{failed_count} 页保留为图片"
@@ -599,6 +619,9 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
             "qa_retry_pages": result.qa_retry_pages,
             "quality_fallback_pages": result.quality_fallback_pages,
             "quality_warning_pages": result.quality_warning_pages,
+            "quality_status": decision.status,
+            "quality_reason": decision.reason,
+            "diagnostics_path": diagnostics_path if result.diagnostics else None,
         }
     except Exception as exc:
         db.rollback()
