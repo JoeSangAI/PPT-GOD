@@ -1020,7 +1020,9 @@ def infer_role(region: dict[str, Any]) -> str:
         return "body"
     if role == "label":
         return "label"
-    if role in {"body", "caption", "footer"} and estimate_text_units(text) > 18:
+    if role in {"body", "caption", "footer"}:
+        if h >= 0.105 and estimate_text_units(text) <= 8:
+            return "title"
         return role
     if h >= 0.105:
         return "title"
@@ -1151,13 +1153,15 @@ def normalize_same_level_text_metrics(groups: list[dict[str, Any]]) -> None:
         role = str(group.get("role") or "")
         if role not in {"title", "subtitle", "body", "caption", "label"}:
             continue
-        if not (0.014 <= float(box["height"]) <= 0.12):
+        max_candidate_height = 0.16 if role in {"body", "caption"} else 0.12
+        if not (0.014 <= float(box["height"]) <= max_candidate_height):
             continue
         natural_box = _natural_text_box_for_group(group)
         candidates.append({
             "group": group,
             "role": role,
             "alignment": str(group.get("alignment") or "left"),
+            "original_box": box,
             "box": natural_box,
             "size": _fitted_size_for_group(group, natural_box),
         })
@@ -1243,10 +1247,23 @@ def normalize_same_level_text_metrics(groups: list[dict[str, Any]]) -> None:
             x_positions = [float(record["box"]["x"]) for _, record in row]
             if max(x_positions) - min(x_positions) < 0.16:
                 continue
+            if role in {"body", "caption"}:
+                ordered_row = sorted(row, key=lambda item: float(item[1]["original_box"]["x"]))
+                for row_position, (_other_index, record) in enumerate(ordered_row):
+                    original_box = record["original_box"]
+                    if row_position < len(ordered_row) - 1:
+                        next_box = ordered_row[row_position + 1][1]["original_box"]
+                        width_limit = max(0.02, float(next_box["x"]) - float(original_box["x"]) - 0.006)
+                    else:
+                        width_limit = max(0.02, 0.98 - float(original_box["x"]))
+                    current_limit = record["group"].get("box_width_limit")
+                    if current_limit is not None:
+                        width_limit = min(float(current_limit), width_limit)
+                    record["group"]["box_width_limit"] = round(width_limit, 5)
             row_sizes = []
             for _, record in row:
                 hinted = record["group"].get("font_size_hint")
-                size = float(record["size"])
+                size = _fitted_size_for_group(record["group"], _box_for_group(record["group"]))
                 if hinted is not None:
                     size = min(size, float(hinted))
                 row_sizes.append(size)
@@ -1575,12 +1592,30 @@ def _union_box(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
     return clamp_box({"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1})
 
 
-def merge_cleanup_boxes(boxes: list[dict[str, Any]], gap: float = 0.01) -> list[dict[str, float]]:
+def _box_area(box: dict[str, Any]) -> float:
+    b = clamp_box(box)
+    return float(b["width"]) * float(b["height"])
+
+
+def merge_cleanup_boxes(
+    boxes: list[dict[str, Any]],
+    gap: float = 0.01,
+    *,
+    max_area_growth: float | None = None,
+    max_union_area: float | None = None,
+) -> list[dict[str, float]]:
     merged: list[dict[str, float]] = []
     for box in sorted((clamp_box(b) for b in boxes), key=lambda b: (float(b["y"]), float(b["x"]))):
         for index, existing in enumerate(merged):
             if _boxes_near(existing, box, gap):
-                merged[index] = _union_box(existing, box)
+                union = _union_box(existing, box)
+                if max_union_area is not None and _box_area(union) > max_union_area:
+                    continue
+                if max_area_growth is not None:
+                    source_area = max(0.0001, _box_area(existing) + _box_area(box))
+                    if _box_area(union) > source_area * max_area_growth:
+                        continue
+                merged[index] = union
                 break
         else:
             merged.append(box)
@@ -1816,6 +1851,8 @@ def _box_for_group(group: dict[str, Any]) -> dict[str, float]:
     box = _natural_text_box_for_group(group)
     if group.get("box_width_hint") is not None:
         box["width"] = max(float(box["width"]), float(group["box_width_hint"]))
+    if group.get("box_width_limit") is not None:
+        box["width"] = min(float(box["width"]), max(0.01, float(group["box_width_limit"])))
     if group.get("box_height_hint") is not None:
         box["height"] = max(float(box["height"]), float(group["box_height_hint"]))
     return clamp_box(box)
@@ -2162,6 +2199,13 @@ def build_editable_pptx(
             for retry_idx, (group, _score) in enumerate(residuals, start=1):
                 retry_box = quality_retry_cleanup_box_for_group(group, cleanup_box_by_group_id.get(id(group)))
                 retry_cleanup_boxes.append(retry_box)
+            merged_retry_cleanup_boxes = merge_cleanup_boxes(
+                retry_cleanup_boxes,
+                gap=0.003,
+                max_area_growth=1.28,
+                max_union_area=0.018,
+            )
+            for retry_idx, retry_box in enumerate(merged_retry_cleanup_boxes, start=1):
                 patch_path = str(work / f"slide_{page_num:02d}_qa_cleanup_patch_{retry_idx:02d}.png")
                 if add_cleanup_patch(retry_box, patch_path, f"Editable QA cleanup patch - {retry_idx}"):
                     cleanup_patch_count += 1

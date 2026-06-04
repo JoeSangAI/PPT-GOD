@@ -1174,6 +1174,24 @@ Policy-layer findings:
 - Strict non-editable roles remain rejected in aggressive mode: Logo, watermark, decorative, page marker, and visual-only regions are still not restored as editable text.
 - Visual tradeoff is explicit: aggressive now restores more image/chart annotations and can look busier, while standard/enhanced remain more conservative.
 
+## Layout Stability Execution Notes
+
+June 4 vivo standard-mode layout audit focused on high-density pages where editable text crossed card/column boundaries.
+
+Artifacts:
+
+- Before layout fix: `.pptgod-data/outputs/mode-audit-vivo-20260604-after-aggressive-fix/standard/diagnostics_summary.json`
+- After column-boundary fix: `.pptgod-data/outputs/layout-stability-vivo-20260604/standard/contact_sheet_standard.png`
+- After conservative QA patch merge: `.pptgod-data/outputs/layout-stability-vivo-20260604-qa-smallmerge/standard/contact_sheet_standard.png`
+
+Findings:
+
+- Root cause of the P7 overlap: explicit OCR `body` text with tall boxes was promoted to `title`, then expanded horizontally without considering neighboring columns.
+- Fix: preserve explicit `body`/`caption` roles except for very short large display words, and cap same-row body/caption expansion at the next column boundary.
+- P7 key body text width changed from roughly 9.47 inches to 2.99 inches, with font size reduced from 35.43pt to 11.18pt.
+- QA retry patches are now merged only for small nearby residual boxes. A broader merge reduced more patch shapes but introduced large blank areas, so it was rejected.
+- Final vivo standard benchmark keeps 329 restored text boxes while reducing cleanup patches from 574 to 545 after the layout fix baseline.
+
 ## Acceptance Criteria
 
 - A bad all-image editable export cannot be marked successful.

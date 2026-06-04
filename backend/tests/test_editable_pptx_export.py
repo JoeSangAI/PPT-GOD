@@ -137,6 +137,57 @@ def test_build_editable_pptx_returns_page_diagnostics(tmp_path):
     assert inspection.has_editable_text is True
 
 
+def test_same_row_body_text_does_not_expand_across_neighbor_columns(tmp_path):
+    slide_path = tmp_path / "same_row_columns.png"
+    output_path = tmp_path / "same_row_columns_editable.pptx"
+    fake_regions = [
+        {
+            "text": "抢高考毕业生的入学新手机决策窗口",
+            "x": 0.27,
+            "y": 0.50,
+            "width": 0.23,
+            "height": 0.13,
+            "role": "body",
+        },
+        {
+            "text": "从品牌曝光升级为优惠领取、线下活动和换机转化",
+            "x": 0.50,
+            "y": 0.50,
+            "width": 0.22,
+            "height": 0.13,
+            "role": "body",
+        },
+        {
+            "text": "保持品牌热度，承接双 11、双 12、期末等节点",
+            "x": 0.72,
+            "y": 0.50,
+            "width": 0.22,
+            "height": 0.13,
+            "role": "body",
+        },
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    text_shapes = pptx_text_shapes(output_path)
+    first = text_shapes["抢高考毕业生的入学新手机决策窗口"]
+    second = next(
+        shape
+        for text, shape in text_shapes.items()
+        if text.replace("\n", "").replace("\x0b", "").startswith("从品牌曝光升级为优惠领取")
+    )
+    assert result.text_box_count == 3
+    assert first.left + first.width <= second.left + int(0.02 * 914400)
+
+
 def test_should_restore_text_reason_rejects_small_standard_label():
     image = np.zeros((720, 1280, 3), dtype=np.uint8) + 255
     region = {
@@ -1343,6 +1394,36 @@ def test_quality_gate_preserves_editable_text_when_residual_persists(tmp_path, m
     assert result.ocr_failed_pages == []
     assert "Editable QA fallback slide image" not in names
     assert "清不掉的原字" in pptx_text_shapes(output_path)
+
+
+def test_quality_retry_cleanup_merges_nearby_residual_patches(tmp_path, monkeypatch):
+    slide_path = tmp_path / "qa_nearby_residuals.png"
+    output_path = tmp_path / "qa_nearby_residuals_editable.pptx"
+    fake_regions = [
+        {"text": "第一行", "x": 0.20, "y": 0.30, "width": 0.10, "height": 0.035, "role": "body"},
+        {"text": "第二行", "x": 0.20, "y": 0.338, "width": 0.10, "height": 0.035, "role": "body"},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    def all_residuals(_original_rgb, _underlay_rgb, groups, _cleanup_boxes, **_kwargs):
+        return [(group, 1.0) for group in groups]
+
+    monkeypatch.setattr(editable_export, "residual_text_groups", all_residuals)
+
+    result = editable_export.build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    names = pptx_shape_names(output_path)
+    qa_patch_names = [name for name in names if name.startswith("Editable QA cleanup patch")]
+    assert result.qa_retry_pages == [1]
+    assert result.diagnostics.pages[0].qa_retry_count == 2
+    assert len(qa_patch_names) == 1
 
 
 def test_quality_retry_cleanup_uses_bounded_previous_cleanup_box():
