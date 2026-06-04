@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw
 from pptx import Presentation
 
@@ -552,7 +553,7 @@ def test_standard_mode_skips_tiny_screenshot_body_text_but_enhanced_keeps_it(tmp
     assert any(text.startswith("Twitter - Allow") for text in pptx_text_shapes(enhanced_output))
 
 
-def test_standard_mode_preserves_large_display_text_on_complex_colorful_slides(tmp_path):
+def test_standard_mode_restores_primary_display_text_on_complex_colorful_slides(tmp_path):
     slide_path = tmp_path / "complex_colorful_display.png"
     standard_output = tmp_path / "complex_colorful_display_standard.pptx"
     enhanced_output = tmp_path / "complex_colorful_display_enhanced.pptx"
@@ -583,8 +584,8 @@ def test_standard_mode_preserves_large_display_text_on_complex_colorful_slides(t
         restore_mode="enhanced",
     )
 
-    assert standard_result.text_box_count == 1
-    assert "世界杯情绪营销" not in pptx_text_shapes(standard_output)
+    assert standard_result.text_box_count == 2
+    assert "世界杯情绪营销" in pptx_text_shapes(standard_output)
     assert "宽正文仍然需要可编辑" in pptx_text_shapes(standard_output)
     assert enhanced_result.text_box_count == 2
     assert "世界杯情绪营销" in pptx_text_shapes(enhanced_output)
@@ -671,7 +672,7 @@ def test_standard_mode_preserves_complex_campaign_labels_and_short_stats(tmp_pat
     assert text_shapes["世界杯机遇"].text_frame.paragraphs[0].font.size.pt <= 18.0
     long_body_shape = next(shape for text, shape in text_shapes.items() if text.startswith("使用已完成的9款卡通形象"))
     assert long_body_shape.text_frame.paragraphs[0].font.size.pt <= 11.0
-    assert "一页总览：为什么现在必须拿下这个IP?" not in text_shapes
+    assert "一页总览：为什么现在必须拿下这个IP?" in text_shapes
 
 
 def test_complex_subtitle_on_plain_card_does_not_get_pill_background(tmp_path):
@@ -1017,6 +1018,222 @@ def test_standard_mode_restores_primary_title_inside_visual_asset(tmp_path, monk
 
     assert result.text_box_count == 1
     assert "解锁武汉卡丁车馆亲子高能体验阵地" in pptx_text_shapes(output_path)
+
+
+def test_visual_asset_crop_uses_text_cleaned_source(tmp_path, monkeypatch):
+    slide_path = tmp_path / "visual_asset_text_overlap.png"
+    output_path = tmp_path / "visual_asset_text_overlap_editable.pptx"
+    work_dir = tmp_path / "work"
+    block = {"x": 0.12, "y": 0.22, "width": 0.58, "height": 0.42}
+    region = {
+        "text": "视觉块里的标题",
+        "x": 0.22,
+        "y": 0.36,
+        "width": 0.24,
+        "height": 0.085,
+        "role": "title",
+    }
+    img = Image.new("RGB", (1280, 720), (12, 18, 30))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((154, 158, 896, 468), radius=24, fill=(0, 48, 110))
+    draw_region_marks(img, [region], color="white")
+    img.save(slide_path)
+    monkeypatch.setattr(editable_export, "detect_image_blocks", lambda *_args, **_kwargs: [block])
+
+    result = editable_export.build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: [region],
+        work_dir=str(work_dir),
+        restore_mode="standard",
+    )
+
+    asset = Image.open(work_dir / "slide_01_asset_01.png").convert("RGB")
+    mark_x = int(region["x"] * 1280) + 12 - int(block["x"] * 1280)
+    mark_y = int(region["y"] * 720) + int(region["height"] * 720 * 0.42) - int(block["y"] * 720)
+    assert result.text_box_count == 1
+    assert result.visual_asset_count == 1
+    assert asset.getpixel((mark_x, mark_y)) != (255, 255, 255)
+    assert "视觉块里的标题" in pptx_text_shapes(output_path)
+
+
+def test_display_cleanup_patch_expands_to_cover_shadow_outside_ocr_box(tmp_path, monkeypatch):
+    slide_path = tmp_path / "display_shadow_overlap.png"
+    output_path = tmp_path / "display_shadow_overlap_editable.pptx"
+    work_dir = tmp_path / "work"
+    region = {
+        "text": "金色展示标题",
+        "x": 0.42,
+        "y": 0.22,
+        "width": 0.28,
+        "height": 0.080,
+        "role": "title",
+    }
+    shadow_y = region["y"] - 0.026
+    shadow_x = region["x"] + 0.04
+    gold = (230, 184, 80)
+    img = Image.new("RGB", (1280, 720), (10, 14, 20))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle(
+        (
+            int(shadow_x * 1280),
+            int(shadow_y * 720),
+            int((shadow_x + 0.12) * 1280),
+            int((shadow_y + 0.014) * 720),
+        ),
+        fill=gold,
+    )
+    draw_region_marks(img, [region], color=gold)
+    img.save(slide_path)
+    monkeypatch.setattr(editable_export, "detect_image_blocks", lambda *_args, **_kwargs: [])
+
+    result = editable_export.build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: [region],
+        work_dir=str(work_dir),
+        restore_mode="standard",
+    )
+
+    prs = Presentation(str(output_path))
+    patch_shape = next(shape for shape in prs.slides[0].shapes if shape.name == "Editable cleanup patch - 1")
+    patch_top = int(patch_shape.top) / int(prs.slide_height)
+    patch_bottom = (int(patch_shape.top) + int(patch_shape.height)) / int(prs.slide_height)
+    patch = Image.open(work_dir / "slide_01_cleanup_patch_01.png").convert("RGB")
+    assert result.text_box_count == 1
+    assert patch_top <= shadow_y <= patch_bottom
+    assert gold not in set(patch.getdata())
+
+
+def test_quality_gate_retries_when_visual_asset_reintroduces_original_text(tmp_path, monkeypatch):
+    slide_path = tmp_path / "qa_asset_reintroduces_text.png"
+    output_path = tmp_path / "qa_asset_reintroduces_text_editable.pptx"
+    work_dir = tmp_path / "work"
+    block = {"x": 0.10, "y": 0.18, "width": 0.72, "height": 0.50}
+    region = {
+        "text": "被裁回的原字",
+        "x": 0.24,
+        "y": 0.34,
+        "width": 0.24,
+        "height": 0.090,
+        "role": "title",
+    }
+    img = Image.new("RGB", (1280, 720), (12, 18, 30))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((128, 130, 1050, 510), radius=24, fill=(0, 48, 110))
+    draw_region_marks(img, [region], color="white")
+    img.save(slide_path)
+    monkeypatch.setattr(editable_export, "detect_image_blocks", lambda *_args, **_kwargs: [block])
+    original_crop_asset_from_image = editable_export.crop_asset_from_image
+
+    def buggy_crop_asset_from_image(_img, crop_region, output):
+        return original_crop_asset_from_image(Image.open(slide_path).convert("RGB"), crop_region, output)
+
+    monkeypatch.setattr(editable_export, "crop_asset_from_image", buggy_crop_asset_from_image)
+
+    result = editable_export.build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: [region],
+        work_dir=str(work_dir),
+        restore_mode="standard",
+    )
+
+    names = pptx_shape_names(output_path)
+    assert result.qa_retry_pages == [1]
+    assert result.quality_fallback_pages == []
+    assert "Editable QA cleanup patch - 1" in names
+    assert "被裁回的原字" in pptx_text_shapes(output_path)
+
+
+def test_quality_gate_preserves_editable_text_when_residual_persists(tmp_path, monkeypatch):
+    slide_path = tmp_path / "qa_fallback.png"
+    output_path = tmp_path / "qa_fallback_editable.pptx"
+    region = {
+        "text": "清不掉的原字",
+        "x": 0.30,
+        "y": 0.30,
+        "width": 0.24,
+        "height": 0.080,
+        "role": "title",
+    }
+    img = Image.new("RGB", (1280, 720), (12, 18, 30))
+    draw_region_marks(img, [region], color="white")
+    img.save(slide_path)
+
+    def always_residual(_original_rgb, _underlay_rgb, groups, _cleanup_boxes, **_kwargs):
+        return [(groups[0], 1.0)] if groups else []
+
+    monkeypatch.setattr(editable_export, "residual_text_groups", always_residual)
+
+    result = editable_export.build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: [region],
+        restore_mode="standard",
+    )
+
+    names = pptx_shape_names(output_path)
+    assert result.qa_retry_pages == [1]
+    assert result.quality_fallback_pages == []
+    assert result.quality_warning_pages == [1]
+    assert result.ocr_failed_pages == []
+    assert "Editable QA fallback slide image" not in names
+    assert "清不掉的原字" in pptx_text_shapes(output_path)
+
+
+def test_quality_retry_cleanup_uses_bounded_previous_cleanup_box():
+    group = {
+        "text": "金色展示标题",
+        "role": "title",
+        "bbox": {"x": 0.42, "y": 0.22, "width": 0.28, "height": 0.08},
+    }
+    previous = {
+        "x": 0.395,
+        "y": 0.195,
+        "width": 0.33,
+        "height": 0.13,
+        "full_fill": True,
+    }
+
+    retry = editable_export.quality_retry_cleanup_box_for_group(group, previous)
+
+    assert retry["full_fill"] is True
+    assert retry["width"] <= previous["width"] + 0.016
+    assert retry["height"] <= previous["height"] + 0.020
+
+
+def test_quality_gate_residual_checks_run_with_bounded_parallelism(monkeypatch):
+    captured = {}
+
+    class FakePool:
+        def __init__(self, max_workers=None, thread_name_prefix=None):
+            captured["max_workers"] = max_workers
+            captured["thread_name_prefix"] = thread_name_prefix
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def map(self, fn, items):
+            return [fn(item) for item in items]
+
+    monkeypatch.setattr(editable_export.settings, "EDITABLE_PPTX_QA_MAX_WORKERS", 3)
+    monkeypatch.setattr(editable_export.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(editable_export, "ThreadPoolExecutor", FakePool)
+    monkeypatch.setattr(editable_export, "residual_original_text_score", lambda *_args: 1.0)
+
+    groups = [{"text": str(index)} for index in range(5)]
+    boxes = [{"x": 0, "y": 0, "width": 0.1, "height": 0.1} for _ in groups]
+    rgb = np.zeros((12, 12, 3), dtype=np.uint8)
+
+    residuals = editable_export.residual_text_groups(rgb, rgb, groups, boxes)
+
+    assert len(residuals) == 5
+    assert captured["max_workers"] == 3
+    assert captured["thread_name_prefix"] == "editable-pptx-qa"
 
 
 def test_local_cleanup_patch_uses_ocr_box_not_expanded_render_box(tmp_path):

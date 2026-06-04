@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import time
+import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import List, Optional
 from urllib.parse import quote
@@ -69,8 +70,8 @@ from app.services.content_plan import (
     generate_content_plan,
     generate_long_deck_outline_chunk,
     infer_page_count_from_single_ppt,
-    infer_page_count_from_topic,
     resolve_content_plan_page_target,
+    resolve_requested_content_plan_page_count,
     should_generate_incremental_long_deck,
     _fallback_deck_blueprint,
     _auto_reclassify_page_type,
@@ -223,6 +224,20 @@ def _pptx_slide_count(path: str) -> int | None:
         return None
 
 
+def _pptx_has_editable_text(path: str) -> bool:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not re.fullmatch(r"ppt/slides/slide\d+\.xml", name):
+                    continue
+                xml = archive.read(name).decode("utf-8", errors="ignore")
+                if "<p:txBody>" in xml and "<a:t>" in xml:
+                    return True
+    except Exception as exc:
+        logger.warning("Unable to inspect editable PPTX text: path=%s error=%s", path, exc)
+    return False
+
+
 def _completed_slide_image_count(slides: list[Slide]) -> int:
     count = 0
     for slide in slides:
@@ -249,6 +264,7 @@ def _has_current_editable_pptx(project_id: str, final_pptx_path: str, has_final_
         has_final_pptx
         and os.path.exists(editable_path)
         and os.path.getmtime(editable_path) >= os.path.getmtime(final_pptx_path)
+        and _pptx_has_editable_text(editable_path)
     )
     return has_editable, editable_path
 
@@ -779,6 +795,50 @@ def _manual_asset_usage(visual_json: dict | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in raw.items() if k and v}
 
 
+def _manual_asset_route_modes(visual_json: dict | None, manual_ids: list[str] | None = None) -> dict[str, str]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    raw = visual.get("asset_route_modes") or {}
+    if not isinstance(raw, dict):
+        return {}
+    allowed_ids = set(manual_ids if manual_ids is not None else _manual_asset_ids(visual))
+    allowed_modes = {"blend", "double_blend", "overlay"}
+    return {
+        str(asset_id): str(mode).lower()
+        for asset_id, mode in raw.items()
+        if str(asset_id) in allowed_ids and str(mode).lower() in allowed_modes
+    }
+
+
+def _visual_asset_ids(visual_json: dict | None) -> list[str]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    raw = visual.get("visual_asset_ids") or []
+    if not isinstance(raw, list):
+        return []
+    ids: list[str] = []
+    for asset_id in raw:
+        value = str(asset_id)
+        if value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _excluded_asset_ids(visual_json: dict | None) -> list[str]:
+    visual = visual_json if isinstance(visual_json, dict) else {}
+    raw = visual.get("excluded_visual_asset_ids") or []
+    if not isinstance(raw, list):
+        return []
+    ids: list[str] = []
+    for asset_id in raw:
+        value = str(asset_id)
+        if value and value not in ids:
+            ids.append(value)
+    return ids
+
+
+def _without_asset_ids(values: list[str], blocked_ids: set[str]) -> list[str]:
+    return [asset_id for asset_id in values if asset_id not in blocked_ids]
+
+
 def _merge_asset_ids(manual_ids: list[str], auto_ids: list[str] | None) -> list[str]:
     merged: list[str] = []
     for asset_id in [*manual_ids, *(auto_ids or [])]:
@@ -793,15 +853,65 @@ def _merge_manual_pins_into_visual_json(visual_json: dict | None, existing_visua
     existing = existing_visual_json if isinstance(existing_visual_json, dict) else {}
     manual_ids = _manual_asset_ids(existing)
     manual_usage = _manual_asset_usage(existing)
+    manual_route_modes = _manual_asset_route_modes(existing, manual_ids)
+    excluded_ids = [
+        asset_id for asset_id in _excluded_asset_ids(existing)
+        if asset_id not in set(manual_ids)
+    ]
+    excluded_set = set(excluded_ids)
     visual = merge_overlay_layers_into_visual_json(visual, existing)
+    visual["visual_asset_ids"] = _without_asset_ids(_visual_asset_ids(visual), excluded_set)
+    usage = visual.get("visual_asset_usage") if isinstance(visual.get("visual_asset_usage"), dict) else {}
+    visual["visual_asset_usage"] = {
+        str(k): str(v)
+        for k, v in usage.items()
+        if k and v and str(k) not in excluded_set
+    }
+    route_modes = visual.get("asset_route_modes") if isinstance(visual.get("asset_route_modes"), dict) else {}
+    visual["asset_route_modes"] = {
+        str(k): str(v)
+        for k, v in route_modes.items()
+        if k and v and str(k) in set(visual["visual_asset_ids"])
+    }
+    if excluded_ids:
+        visual["excluded_visual_asset_ids"] = excluded_ids
+    else:
+        visual.pop("excluded_visual_asset_ids", None)
     if not manual_ids:
         return visual
     visual["manual_visual_asset_ids"] = manual_ids
     visual["manual_visual_asset_usage"] = manual_usage
     visual["visual_asset_ids"] = _merge_asset_ids(manual_ids, visual.get("visual_asset_ids") or [])
-    usage = visual.get("visual_asset_usage") if isinstance(visual.get("visual_asset_usage"), dict) else {}
-    visual["visual_asset_usage"] = {**manual_usage, **{str(k): str(v) for k, v in usage.items() if k and v}}
+    visual["visual_asset_usage"] = {**manual_usage, **visual["visual_asset_usage"]}
+    route_modes = visual.get("asset_route_modes") if isinstance(visual.get("asset_route_modes"), dict) else {}
+    if manual_route_modes or route_modes:
+        visual["asset_route_modes"] = {
+            **{str(k): str(v) for k, v in route_modes.items() if k and v and str(k) in set(visual["visual_asset_ids"])},
+            **manual_route_modes,
+        }
     return visual
+
+
+def _merge_excluded_assets_after_visual_edit(previous_visual: dict | None, next_visual: dict | None) -> list[str]:
+    previous = previous_visual if isinstance(previous_visual, dict) else {}
+    current = next_visual if isinstance(next_visual, dict) else {}
+    previous_ids = _visual_asset_ids(previous)
+    next_ids = _visual_asset_ids(current)
+    previous_manual = set(_manual_asset_ids(previous))
+    current_manual = set(_manual_asset_ids(current))
+    current_selected = set(next_ids) | current_manual
+    excluded: list[str] = [
+        asset_id
+        for asset_id in _excluded_asset_ids(current)
+        if asset_id not in current_selected
+    ]
+
+    for asset_id in previous_ids:
+        if asset_id in previous_manual:
+            continue
+        if asset_id not in current_selected and asset_id not in excluded:
+            excluded.append(asset_id)
+    return excluded
 
 
 EXACT_PAGE_REFERENCE_ROLES = {"content_ref", "chart_ref"}
@@ -3059,7 +3169,8 @@ def create_content_plan(
 
     # 优先使用用户传入的 topic，否则用项目标题
     topic = body.topic.strip() if body.topic else project.title
-    page_count = body.page_count or infer_page_count_from_topic(topic)
+    page_count = resolve_requested_content_plan_page_count(topic, body.page_count)
+    target_page_count, _, _ = resolve_content_plan_page_target(topic, page_count)
 
     try:
         run = create_project_run(
@@ -3067,7 +3178,7 @@ def create_content_plan(
             project_id,
             kind="content_plan",
             stage="content_plan",
-            total_count=page_count or 10,
+            total_count=target_page_count,
             message="内容规划生成已排队",
         )
         db.commit()
@@ -3209,6 +3320,8 @@ def create_visual_plan(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        item["asset_route_modes"] = _manual_asset_route_modes(s.visual_json, item["manual_visual_asset_ids"])
+        item["excluded_visual_asset_ids"] = _excluded_asset_ids(s.visual_json)
         visual = s.visual_json if isinstance(s.visual_json, dict) else {}
         if visual.get("overlay_layers"):
             item["overlay_layers"] = visual["overlay_layers"]
@@ -3322,6 +3435,8 @@ def create_prompts(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        item["asset_route_modes"] = _manual_asset_route_modes(s.visual_json, item["manual_visual_asset_ids"])
+        item["excluded_visual_asset_ids"] = _excluded_asset_ids(s.visual_json)
         visual = s.visual_json if isinstance(s.visual_json, dict) else {}
         if visual.get("overlay_layers"):
             item["overlay_layers"] = visual["overlay_layers"]
@@ -3423,6 +3538,8 @@ async def create_visual_and_prompts(
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+        item["asset_route_modes"] = _manual_asset_route_modes(s.visual_json, item["manual_visual_asset_ids"])
+        item["excluded_visual_asset_ids"] = _excluded_asset_ids(s.visual_json)
         visual = s.visual_json if isinstance(s.visual_json, dict) else {}
         if visual.get("overlay_layers"):
             item["overlay_layers"] = visual["overlay_layers"]
@@ -3529,6 +3646,8 @@ async def _do_generate_visual_and_prompts(
             item["page_num"] = s.page_num
             item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
             item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
+            item["asset_route_modes"] = _manual_asset_route_modes(s.visual_json, item["manual_visual_asset_ids"])
+            item["excluded_visual_asset_ids"] = _excluded_asset_ids(s.visual_json)
             visual = s.visual_json if isinstance(s.visual_json, dict) else {}
             if visual.get("overlay_layers"):
                 item["overlay_layers"] = visual["overlay_layers"]
@@ -4854,6 +4973,9 @@ def delete_reference_image(
                 if isinstance(manual_usage, dict):
                     manual_usage.pop(ref_id, None)
                     visual["manual_visual_asset_usage"] = manual_usage
+            excluded_ids = visual.get("excluded_visual_asset_ids")
+            if isinstance(excluded_ids, list) and ref_id in excluded_ids:
+                visual["excluded_visual_asset_ids"] = [x for x in excluded_ids if x != ref_id]
             visual = remove_asset_from_overlay_layers(visual, ref_id)
             slide.visual_json = visual
             flag_modified(slide, "visual_json")
@@ -5050,9 +5172,22 @@ def update_slide_asset_pins(
         for asset_id in (visual.get("visual_asset_ids") or [])
         if str(asset_id) not in requested_ids
     ]
+    excluded_ids = [
+        asset_id
+        for asset_id in _excluded_asset_ids(visual)
+        if asset_id not in set(requested_ids)
+    ]
+    excluded_set = set(excluded_ids)
     visual["manual_visual_asset_ids"] = requested_ids
     visual["manual_visual_asset_usage"] = manual_usage
-    visual["visual_asset_ids"] = _merge_asset_ids(requested_ids, auto_ids)
+    visual["visual_asset_ids"] = _merge_asset_ids(
+        requested_ids,
+        [asset_id for asset_id in auto_ids if asset_id not in excluded_set],
+    )
+    if excluded_ids:
+        visual["excluded_visual_asset_ids"] = excluded_ids
+    else:
+        visual.pop("excluded_visual_asset_ids", None)
     if isinstance(visual.get("overlay_layers"), list):
         requested_set = set(requested_ids)
         global_asset_ids = {
@@ -5067,7 +5202,7 @@ def update_slide_asset_pins(
             if str(layer.get("asset_id")) not in global_asset_ids or str(layer.get("asset_id")) in requested_set
         ]
     visual["visual_asset_usage"] = {
-        **{str(k): str(v) for k, v in existing_usage.items() if k and v and str(k) not in manual_usage},
+        **{str(k): str(v) for k, v in existing_usage.items() if k and v and str(k) not in manual_usage and str(k) not in excluded_set},
         **manual_usage,
     }
     slide.visual_json = visual
@@ -5684,6 +5819,7 @@ def update_slide_visual(
         raise HTTPException(status_code=404, detail="Slide not found")
 
     existing = copy.deepcopy(slide.visual_json) or {}
+    previous_visual = copy.deepcopy(existing)
     new_visual = body.visual_json
 
     # 安全 merge：替换传入的字段，保留其他字段
@@ -5693,11 +5829,21 @@ def update_slide_visual(
         "visual_summary",
         "design_notes",
         "layout",
+        "visual_asset_ids",
+        "visual_asset_usage",
         "asset_route_modes",
+        "excluded_visual_asset_ids",
+        "image_slots",
     }
     for key in allowed_fields:
         if key in new_visual:
             existing[key] = new_visual[key]
+    if "visual_asset_ids" in new_visual:
+        excluded_ids = _merge_excluded_assets_after_visual_edit(previous_visual, existing)
+        if excluded_ids:
+            existing["excluded_visual_asset_ids"] = excluded_ids
+        else:
+            existing.pop("excluded_visual_asset_ids", None)
 
     if "overlay_layers" in new_visual:
         raw_layers = new_visual.get("overlay_layers") or []

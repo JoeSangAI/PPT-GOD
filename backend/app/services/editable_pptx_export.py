@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 import json
 import logging
 import math
@@ -45,10 +46,10 @@ STRICT_NON_EDITABLE_ROLES = {"logo", "watermark", "decorative", "page_marker", "
 MODE_OPTIONAL_TEXT_ROLES = {"image_text", "chart_internal"}
 NON_EDITABLE_ROLES = STRICT_NON_EDITABLE_ROLES | MODE_OPTIONAL_TEXT_ROLES
 EDITABLE_PPTX_RESTORE_MODES = {"standard", "enhanced", "aggressive"}
-DISPLAY_TEXT_ROLES = {"title", "subtitle", "label"}
 COMPLEX_SLIDE_HIGH_SATURATION_THRESHOLD = 0.25
 COMPLEX_SLIDE_EDGE_P90_THRESHOLD = 0.15
-COMPLEX_DISPLAY_TEXT_HEIGHT_THRESHOLD = 0.08
+TEXT_RESIDUAL_RETRY_THRESHOLD = 0.18
+TEXT_RESIDUAL_FALLBACK_THRESHOLD = 0.26
 ROLE_ALIASES = {
     "heading": "title",
     "headline": "title",
@@ -98,6 +99,17 @@ def has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
 
 
+def editable_pptx_qa_worker_count(item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    try:
+        configured = int(settings.EDITABLE_PPTX_QA_MAX_WORKERS or 1)
+    except (TypeError, ValueError):
+        configured = 4
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(item_count, configured, cpu_count))
+
+
 @dataclass(frozen=True)
 class EditablePptxResult:
     output_path: str
@@ -105,6 +117,9 @@ class EditablePptxResult:
     text_box_count: int
     visual_asset_count: int
     ocr_failed_pages: list[int]
+    qa_retry_pages: list[int] = field(default_factory=list)
+    quality_fallback_pages: list[int] = field(default_factory=list)
+    quality_warning_pages: list[int] = field(default_factory=list)
 
 
 def clamp_box(box: dict[str, Any]) -> dict[str, float]:
@@ -510,6 +525,18 @@ def sample_background(rgb: np.ndarray, box: dict[str, Any]) -> tuple[int, int, i
     return bg
 
 
+def sample_background_unclamped(rgb: np.ndarray, box: dict[str, Any]) -> tuple[int, int, int]:
+    h, w, _ = rgb.shape
+    x1 = max(0, int((float(box["x"]) - 0.012) * w))
+    y1 = max(0, int((float(box["y"]) - 0.012) * h))
+    x2 = min(w, int((float(box["x"]) + float(box["width"]) + 0.012) * w))
+    y2 = min(h, int((float(box["y"]) + float(box["height"]) + 0.012) * h))
+    crop = rgb[y1:y2, x1:x2].reshape(-1, 3)
+    if crop.size == 0:
+        return corner_background(rgb)
+    return tuple(int(x) for x in np.median(crop, axis=0))
+
+
 def sample_text_color(rgb: np.ndarray, box: dict[str, Any], bg: tuple[int, int, int]) -> tuple[int, int, int]:
     h, w, _ = rgb.shape
     x1 = max(0, int(float(box["x"]) * w))
@@ -618,19 +645,6 @@ def is_complex_visual_slide(visual_complexity: dict[str, float] | None) -> bool:
     )
 
 
-def is_large_display_text_on_complex_slide(
-    box: dict[str, Any],
-    role: str,
-    visual_complexity: dict[str, float] | None,
-) -> bool:
-    normalized_role = ROLE_ALIASES.get(str(role or "").lower(), str(role or "").lower())
-    return (
-        normalized_role in DISPLAY_TEXT_ROLES
-        and float(box["height"]) >= COMPLEX_DISPLAY_TEXT_HEIGHT_THRESHOLD
-        and is_complex_visual_slide(visual_complexity)
-    )
-
-
 def is_auxiliary_text_on_complex_slide(
     text: str,
     box: dict[str, Any],
@@ -670,6 +684,27 @@ def _expanded_solid_cleanup_box(group: dict[str, Any]) -> dict[str, float]:
     else:
         x_margin = min(0.024, max(0.008, box_h * 0.22))
         y_margin = min(0.020, max(0.006, box_h * 0.26))
+    return clamp_box({
+        "x": b["x"] - x_margin,
+        "y": b["y"] - y_margin,
+        "width": b["width"] + x_margin * 2,
+        "height": b["height"] + y_margin * 2,
+    })
+
+
+def _expanded_display_cleanup_box(group: dict[str, Any]) -> dict[str, float]:
+    b = clamp_box(group.get("bbox") or {})
+    box_h = float(b["height"])
+    role = str(group.get("role") or "")
+    if role == "title":
+        x_margin = min(0.048, max(0.014, box_h * 0.32))
+        y_margin = min(0.054, max(0.018, box_h * 0.42))
+    elif role == "subtitle":
+        x_margin = min(0.038, max(0.012, box_h * 0.28))
+        y_margin = min(0.044, max(0.014, box_h * 0.38))
+    else:
+        x_margin = min(0.030, max(0.010, box_h * 0.22))
+        y_margin = min(0.034, max(0.010, box_h * 0.32))
     return clamp_box({
         "x": b["x"] - x_margin,
         "y": b["y"] - y_margin,
@@ -744,8 +779,6 @@ def should_restore_text(
     if float(region.get("confidence", 1.0) or 1.0) < 0.22:
         return False
     if box["width"] < 0.012 or box["height"] < 0.012:
-        return False
-    if mode == "standard" and is_large_display_text_on_complex_slide(box, role, visual_complexity):
         return False
     if mode == "standard" and is_auxiliary_text_on_complex_slide(text, box, role, visual_complexity):
         return False
@@ -1360,10 +1393,27 @@ def _text_cleanup_pixel_bounds(box: dict[str, Any], width: int, height: int) -> 
     return x1, y1, x2, y2
 
 
-def _text_cleanup_patch_array(rgb: np.ndarray, box: dict[str, Any], x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
-    h, w, _ = rgb.shape
+def _cleanup_pixel_bounds_for_box(box: dict[str, Any], width: int, height: int) -> tuple[int, int, int, int]:
+    b = clamp_box(box)
+    if box.get("solid_fill") or box.get("full_fill"):
+        x1 = max(0, int(float(b["x"]) * width))
+        y1 = max(0, int(float(b["y"]) * height))
+        x2 = min(width, int((float(b["x"]) + float(b["width"])) * width))
+        y2 = min(height, int((float(b["y"]) + float(b["height"])) * height))
+        return x1, y1, x2, y2
+    return _text_cleanup_pixel_bounds(b, width, height)
+
+
+def _text_foreground_mask(
+    rgb: np.ndarray,
+    box: dict[str, Any],
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+) -> tuple[np.ndarray, np.ndarray]:
     patch = _context_fill_patch(rgb, x1, y1, x2, y2)
-    sampled_bg = np.array(sample_background(rgb, box), dtype=np.int32)
+    sampled_bg = np.array(sample_background_unclamped(rgb, box), dtype=np.int32)
     crop = rgb[y1:y2, x1:x2].astype(np.int32)
     expected = patch.astype(np.int32)
     dist = np.sqrt(np.sum((crop - expected) ** 2, axis=2))
@@ -1376,6 +1426,11 @@ def _text_cleanup_patch_array(rgb: np.ndarray, box: dict[str, Any], x1: int, y1:
         foreground |= (direct_dist > 32) & (crop_luma < bg_luma - 18)
     else:
         foreground |= (direct_dist > 32) & (crop_luma > bg_luma + 18)
+    return foreground, patch
+
+
+def _text_cleanup_patch_array(rgb: np.ndarray, box: dict[str, Any], x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    foreground, patch = _text_foreground_mask(rgb, box, x1, y1, x2, y2)
     if not bool(np.any(foreground)):
         return patch
     mask = Image.fromarray((foreground.astype(np.uint8) * 255), mode="L")
@@ -1394,6 +1449,47 @@ def _text_cleanup_patch_array(rgb: np.ndarray, box: dict[str, Any], x1: int, y1:
         soft_mask = mask.filter(ImageFilter.GaussianBlur(1.1))
         crop_image.paste(Image.fromarray(patch), (0, 0), soft_mask)
     return np.asarray(crop_image.convert("RGB"))
+
+
+def residual_original_text_score(original_rgb: np.ndarray, underlay_rgb: np.ndarray, cleanup_box: dict[str, Any]) -> float:
+    h, w, _ = original_rgb.shape
+    x1, y1, x2, y2 = _cleanup_pixel_bounds_for_box(cleanup_box, w, h)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    foreground, _patch = _text_foreground_mask(original_rgb, cleanup_box, x1, y1, x2, y2)
+    foreground_count = int(np.count_nonzero(foreground))
+    if foreground_count < 12:
+        return 0.0
+    original_crop = original_rgb[y1:y2, x1:x2].astype(np.int32)
+    underlay_crop = underlay_rgb[y1:y2, x1:x2].astype(np.int32)
+    unchanged = np.sqrt(np.sum((underlay_crop - original_crop) ** 2, axis=2)) < 10
+    return float(np.count_nonzero(foreground & unchanged) / max(1, foreground_count))
+
+
+def residual_text_groups(
+    original_rgb: np.ndarray,
+    underlay_rgb: np.ndarray,
+    groups: list[dict[str, Any]],
+    cleanup_boxes: list[dict[str, Any]],
+    *,
+    threshold: float = TEXT_RESIDUAL_RETRY_THRESHOLD,
+) -> list[tuple[dict[str, Any], float]]:
+    pairs = list(zip(groups, cleanup_boxes))
+    if not pairs:
+        return []
+
+    def score_pair(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[dict[str, Any], float] | None:
+        group, cleanup_box = pair
+        score = residual_original_text_score(original_rgb, underlay_rgb, cleanup_box)
+        return (group, score) if score >= threshold else None
+
+    workers = editable_pptx_qa_worker_count(len(pairs))
+    if workers <= 1:
+        scored = [score_pair(pair) for pair in pairs]
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="editable-pptx-qa") as pool:
+            scored = list(pool.map(score_pair, pairs))
+    return [item for item in scored if item is not None]
 
 
 def create_text_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path: str) -> dict[str, float] | None:
@@ -1438,13 +1534,7 @@ def create_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path
     rgb = np.asarray(rendered.convert("RGB")).copy()
     h, w, _ = rgb.shape
     b = clamp_box(box)
-    if box.get("solid_fill") or box.get("full_fill"):
-        x1 = max(0, int(float(b["x"]) * w))
-        y1 = max(0, int(float(b["y"]) * h))
-        x2 = min(w, int((float(b["x"]) + float(b["width"])) * w))
-        y2 = min(h, int((float(b["y"]) + float(b["height"])) * h))
-    else:
-        x1, y1, x2, y2 = _text_cleanup_pixel_bounds(b, w, h)
+    x1, y1, x2, y2 = _cleanup_pixel_bounds_for_box(box, w, h)
     if x2 <= x1 or y2 <= y1:
         return None
     if box.get("solid_fill"):
@@ -1463,24 +1553,60 @@ def create_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path
     }
 
 
+def apply_cleanup_box_to_image(img: Image.Image, box: dict[str, Any]) -> None:
+    if box.get("solid_fill"):
+        _fit_solid_context_fill(img, box)
+    elif box.get("full_fill"):
+        _fit_context_fill(img, box)
+    else:
+        _fit_text_foreground_fill(img, box)
+
+
+def paste_cleanup_patch_to_image(img: Image.Image, patch_path: str, patch_box: dict[str, Any]) -> None:
+    b = clamp_box(patch_box)
+    width, height = img.size
+    x1 = max(0, int(float(b["x"]) * width))
+    y1 = max(0, int(float(b["y"]) * height))
+    x2 = min(width, int((float(b["x"]) + float(b["width"])) * width))
+    y2 = min(height, int((float(b["y"]) + float(b["height"])) * height))
+    if x2 <= x1 or y2 <= y1:
+        return
+    patch = Image.open(patch_path).convert("RGB")
+    if patch.size != (x2 - x1, y2 - y1):
+        patch = patch.resize((x2 - x1, y2 - y1), Image.Resampling.BICUBIC)
+    img.paste(patch, (x1, y1))
+
+
+def paste_asset_crop_to_image(img: Image.Image, asset_path: str, region: dict[str, Any]) -> None:
+    b = clamp_box(region)
+    width, height = img.size
+    x1 = max(0, int(float(b["x"]) * width))
+    y1 = max(0, int(float(b["y"]) * height))
+    x2 = min(width, int((float(b["x"]) + float(b["width"])) * width))
+    y2 = min(height, int((float(b["y"]) + float(b["height"])) * height))
+    if x2 <= x1 or y2 <= y1:
+        return
+    asset = Image.open(asset_path).convert("RGBA")
+    if asset.size != (x2 - x1, y2 - y1):
+        asset = asset.resize((x2 - x1, y2 - y1), Image.Resampling.BICUBIC)
+    img.paste(asset.convert("RGB"), (x1, y1), asset.getchannel("A"))
+
+
 def prepare_clean_background(image_path: str, text_boxes: list[dict[str, Any]], image_blocks: list[dict[str, Any]], output_path: str) -> str:
     img = Image.open(image_path).convert("RGB")
     for block in sorted(image_blocks, key=lambda b: float(b["width"]) * float(b["height"]), reverse=True):
-        _fit_context_fill(img, block)
+        cleanup_box = clamp_box(block)
+        cleanup_box["full_fill"] = True
+        apply_cleanup_box_to_image(img, cleanup_box)
     for box in sorted(text_boxes, key=lambda b: float(b["height"])):
-        if box.get("solid_fill"):
-            _fit_solid_context_fill(img, box)
-        elif box.get("full_fill"):
-            _fit_context_fill(img, box)
-        else:
-            _fit_text_foreground_fill(img, box)
+        apply_cleanup_box_to_image(img, box)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img.save(output_path)
     return output_path
 
 
-def crop_asset(image_path: str, region: dict[str, Any], output_path: str) -> str:
-    img = Image.open(image_path).convert("RGB")
+def crop_asset_from_image(img: Image.Image, region: dict[str, Any], output_path: str) -> str:
+    img = img.convert("RGB")
     w, h = img.size
     box = clamp_box(region)
     x1 = int(box["x"] * w)
@@ -1508,6 +1634,10 @@ def crop_asset(image_path: str, region: dict[str, Any], output_path: str) -> str
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     crop.save(output_path)
     return output_path
+
+
+def crop_asset(image_path: str, region: dict[str, Any], output_path: str) -> str:
+    return crop_asset_from_image(Image.open(image_path).convert("RGB"), region, output_path)
 
 
 def _group_from_region(region: dict[str, Any]) -> dict[str, Any]:
@@ -1646,6 +1776,84 @@ def should_full_fill_text_cleanup(group: dict[str, Any], rgb: np.ndarray) -> boo
     return median_luma >= 172 or median_luma <= 82
 
 
+def should_full_fill_display_cleanup(group: dict[str, Any], visual_complexity: dict[str, float] | None) -> bool:
+    role = str(group.get("role") or "")
+    if role not in {"title", "subtitle", "label"}:
+        return False
+    if group.get("background_pill"):
+        return False
+    box = clamp_box(group.get("bbox") or {})
+    text = str(group.get("text") or "")
+    if role == "title":
+        return float(box["height"]) >= 0.052 or estimate_text_units(text) >= 8
+    if role == "subtitle":
+        return (
+            float(box["height"]) >= 0.040
+            or (is_complex_visual_slide(visual_complexity) and estimate_text_units(text) >= 4)
+        )
+    return is_complex_visual_slide(visual_complexity) and float(box["height"]) >= 0.032
+
+
+def cleanup_box_for_group(
+    group: dict[str, Any],
+    rgb: np.ndarray,
+    visual_complexity: dict[str, float] | None,
+) -> dict[str, Any]:
+    if group.get("background_pill"):
+        cleanup_box = _pill_background_box_for_group(group)
+        cleanup_box["full_fill"] = True
+        return cleanup_box
+    if should_full_fill_text_cleanup(group, rgb):
+        cleanup_box = _expanded_solid_cleanup_box(group)
+        cleanup_box["solid_fill"] = True
+        return cleanup_box
+    if should_full_fill_display_cleanup(group, visual_complexity):
+        cleanup_box = _expanded_display_cleanup_box(group)
+        cleanup_box["full_fill"] = True
+        return cleanup_box
+    return clamp_box(group["bbox"])
+
+
+def quality_retry_cleanup_box_for_group(
+    group: dict[str, Any],
+    previous_box: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if previous_box:
+        b = clamp_box(previous_box)
+        box_h = float(b["height"])
+        x_margin = min(0.008, max(0.003, box_h * 0.06))
+        y_margin = min(0.010, max(0.004, box_h * 0.08))
+        cleanup_box = clamp_box({
+            "x": b["x"] - x_margin,
+            "y": b["y"] - y_margin,
+            "width": b["width"] + x_margin * 2,
+            "height": b["height"] + y_margin * 2,
+        })
+        if previous_box.get("solid_fill"):
+            cleanup_box["solid_fill"] = True
+        else:
+            cleanup_box["full_fill"] = True
+        return cleanup_box
+
+    role = str(group.get("role") or "")
+    b = clamp_box(group.get("bbox") or {})
+    box_h = float(b["height"])
+    if role in {"title", "subtitle", "label"}:
+        x_margin = min(0.070, max(0.020, box_h * 0.48))
+        y_margin = min(0.078, max(0.024, box_h * 0.60))
+    else:
+        x_margin = min(0.040, max(0.014, box_h * 0.30))
+        y_margin = min(0.052, max(0.018, box_h * 0.46))
+    cleanup_box = clamp_box({
+        "x": b["x"] - x_margin,
+        "y": b["y"] - y_margin,
+        "width": b["width"] + x_margin * 2,
+        "height": b["height"] + y_margin * 2,
+    })
+    cleanup_box["full_fill"] = True
+    return cleanup_box
+
+
 def add_pill_background(slide, group: dict[str, Any], rendered_rgb: np.ndarray) -> tuple[int, int, int]:
     box = _pill_background_box_for_group(group)
     left, top, width, height = emu_from_top_box(box)
@@ -1729,6 +1937,9 @@ def build_editable_pptx(
     text_box_count = 0
     visual_asset_count = 0
     ocr_failed_pages: list[int] = []
+    qa_retry_pages: list[int] = []
+    quality_fallback_pages: list[int] = []
+    quality_warning_pages: list[int] = []
     sorted_slides = sorted(slide_images, key=lambda item: int(item.get("page_num") or 0))
 
     for index, slide_data in enumerate(sorted_slides, start=1):
@@ -1789,39 +2000,63 @@ def build_editable_pptx(
         original_pic = slide.shapes.add_picture(image_path, 0, 0, width=SLIDE_W_EMU, height=SLIDE_H_EMU)
         original_pic.name = "Original slide image"
 
+        text_cleanup_boxes = [cleanup_box_for_group(group, rendered_rgb, visual_complexity) for group in groups]
+        asset_source = rendered.copy()
+        for cleanup_box in text_cleanup_boxes:
+            apply_cleanup_box_to_image(asset_source, cleanup_box)
+
+        underlay = rendered.copy()
+
+        def add_cleanup_patch(cleanup_box: dict[str, Any], patch_path: str, shape_name: str) -> bool:
+            patch_box = create_cleanup_patch(underlay, cleanup_box, patch_path)
+            if not patch_box:
+                return False
+            paste_cleanup_patch_to_image(underlay, patch_path, patch_box)
+            left, top, width, height = emu_from_top_box(patch_box)
+            patch_pic = slide.shapes.add_picture(patch_path, left, top, width=width, height=height)
+            patch_pic.name = shape_name
+            return True
+
         if groups or image_blocks:
             cleanup_boxes = []
             for block in image_blocks:
                 cleanup_box = clamp_box(block)
                 cleanup_box["full_fill"] = True
                 cleanup_boxes.append(cleanup_box)
-            for group in groups:
-                if group.get("background_pill"):
-                    pill_box = _pill_background_box_for_group(group)
-                    pill_box["full_fill"] = True
-                    cleanup_boxes.append(pill_box)
-                else:
-                    cleanup_box = clamp_box(group["bbox"])
-                    if should_full_fill_text_cleanup(group, rendered_rgb):
-                        cleanup_box = _expanded_solid_cleanup_box(group)
-                        cleanup_box["solid_fill"] = True
-                    cleanup_boxes.append(cleanup_box)
+            cleanup_boxes.extend(text_cleanup_boxes)
             for cleanup_idx, cleanup_box in enumerate(cleanup_boxes, start=1):
                 patch_path = str(work / f"slide_{page_num:02d}_cleanup_patch_{cleanup_idx:02d}.png")
-                patch_box = create_cleanup_patch(rendered, cleanup_box, patch_path)
-                if not patch_box:
-                    continue
-                left, top, width, height = emu_from_top_box(patch_box)
-                patch_pic = slide.shapes.add_picture(patch_path, left, top, width=width, height=height)
-                patch_pic.name = f"Editable cleanup patch - {cleanup_idx}"
+                add_cleanup_patch(cleanup_box, patch_path, f"Editable cleanup patch - {cleanup_idx}")
 
         for asset_idx, block in enumerate(image_blocks, start=1):
             asset_path = str(work / f"slide_{page_num:02d}_asset_{asset_idx:02d}.png")
-            crop_asset(image_path, block, asset_path)
+            crop_asset_from_image(asset_source, block, asset_path)
+            paste_asset_crop_to_image(underlay, asset_path, block)
             left, top, width, height = emu_from_top_box(block)
             pic = slide.shapes.add_picture(asset_path, left, top, width=width, height=height)
             pic.name = f"Replaceable visual asset - {asset_idx}"
             visual_asset_count += 1
+
+        residuals = residual_text_groups(rendered_rgb, np.asarray(underlay.convert("RGB")), groups, text_cleanup_boxes)
+        if residuals:
+            qa_retry_pages.append(page_num)
+            cleanup_box_by_group_id = {id(group): cleanup_box for group, cleanup_box in zip(groups, text_cleanup_boxes)}
+            retry_cleanup_boxes = []
+            for retry_idx, (group, _score) in enumerate(residuals, start=1):
+                retry_box = quality_retry_cleanup_box_for_group(group, cleanup_box_by_group_id.get(id(group)))
+                retry_cleanup_boxes.append(retry_box)
+                patch_path = str(work / f"slide_{page_num:02d}_qa_cleanup_patch_{retry_idx:02d}.png")
+                add_cleanup_patch(retry_box, patch_path, f"Editable QA cleanup patch - {retry_idx}")
+            retry_groups = [group for group, _score in residuals]
+            retry_residuals = residual_text_groups(
+                rendered_rgb,
+                np.asarray(underlay.convert("RGB")),
+                retry_groups,
+                retry_cleanup_boxes,
+                threshold=TEXT_RESIDUAL_FALLBACK_THRESHOLD,
+            )
+            if retry_residuals:
+                quality_warning_pages.append(page_num)
 
         for group in groups:
             add_textbox(slide, group, rendered_rgb)
@@ -1841,7 +2076,10 @@ def build_editable_pptx(
         slide_count=len(sorted_slides),
         text_box_count=text_box_count,
         visual_asset_count=visual_asset_count,
-        ocr_failed_pages=ocr_failed_pages,
+        ocr_failed_pages=sorted({int(page) for page in ocr_failed_pages}),
+        qa_retry_pages=sorted({int(page) for page in qa_retry_pages}),
+        quality_fallback_pages=sorted({int(page) for page in quality_fallback_pages}),
+        quality_warning_pages=sorted({int(page) for page in quality_warning_pages}),
     )
 
 

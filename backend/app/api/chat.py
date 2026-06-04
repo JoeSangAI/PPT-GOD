@@ -475,6 +475,115 @@ def _is_replanning_request(user_message: str, project_context: dict) -> bool:
     return bool(re.search(r"(重新规划|重做内容规划|重构内容|重构整套|从头|重新来|重新生成内容规划|重新生成规划)", user_message or ""))
 
 
+def _page_nums_from_user_message(message: str) -> list[int]:
+    text = message or ""
+    nums: list[int] = []
+    patterns = [
+        r"第\s*(\d{1,3})\s*[-到至~～]\s*(?:第\s*)?(\d{1,3})\s*(?:页|頁|张|張)",
+        r"\bP\s*(\d{1,3})\s*[-到至~～]\s*(?:P\s*)?(\d{1,3})\b",
+        r"第\s*(\d{1,3})\s*(?:页|頁|张|張)",
+        r"\bP\s*(\d{1,3})\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            try:
+                start = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if start > 0:
+                nums.append(start)
+            try:
+                end = int(match.group(2))
+            except (IndexError, TypeError, ValueError):
+                end = 0
+            if end >= start and end - start <= 40:
+                nums.extend(range(start + 1, end + 1))
+    return sorted({num for num in nums if num > 0})
+
+
+def _infer_content_edit_policy(
+    user_message: str,
+    page_context: dict | None,
+    project_context: dict,
+) -> dict:
+    target_nums = _target_page_nums_from_context(page_context)
+    message_nums = _page_nums_from_user_message(user_message)
+    page_nums = target_nums or message_nums
+    local_scope = bool(page_nums)
+    if isinstance(page_context, dict):
+        local_scope = local_scope or page_context.get("mode") == "page" or page_context.get("scope") == "selected_slides"
+
+    text = user_message or ""
+    has_preservation_constraint = bool(re.search(
+        r"(保留|保持|沿用|不删|别删|不要删|不要删减|不减|别压缩|不要压缩|不压缩|不要缩减|"
+        r"不丢|不要丢|完整|核心内容|核心信息|关键事实|关键数据|原有|原来|现有|原文|正文|细节|案例)",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    has_bounded_transform = bool(re.search(
+        r"(提到标题|提成标题|作为标题|改成标题|标题里|标题重点|主标题|副标题|小标题|"
+        r"突出|强化|强调|层级|结构|顺序|调整|改写|优化|精炼|提炼|归纳|聚焦|前置|换标题)",
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+    if local_scope and has_preservation_constraint and has_bounded_transform and not _is_replanning_request(user_message, project_context):
+        required_action = "update_slide_content" if len(page_nums) <= 1 and (page_nums or (page_context or {}).get("mode") == "page") else "update_all_slides"
+        return {
+            "kind": "local_preservation_edit",
+            "required_action": required_action,
+            "target_page_nums": page_nums,
+            "rules": [
+                "只修改用户指定范围内的页面。",
+                "把现有信息重新组织为更清晰的标题、层级或重点表达。",
+                "保留原有关键事实、数据、案例、细节和正文信息。",
+                "不得整套重生成，不得减少页数，不得压缩成摘要。",
+            ],
+        }
+
+    return {"kind": "standard_content_edit"}
+
+
+def _content_edit_policy_text(policy: dict) -> str:
+    if not isinstance(policy, dict) or policy.get("kind") != "local_preservation_edit":
+        return ""
+    target_pages = policy.get("target_page_nums") or []
+    target_text = f"目标页：第 {'、'.join(str(num) for num in target_pages)} 页\n" if target_pages else ""
+    rules = "\n".join(f"- {rule}" for rule in policy.get("rules") or [])
+    return (
+        "【确定性内容编辑策略：局部保真编辑】\n"
+        f"{target_text}"
+        f"必须返回 action=\"{policy.get('required_action')}\"，并输出可直接应用的局部修改 payload。\n"
+        f"{rules}\n"
+        "如果无法安全生成局部 payload，不要承诺已修改，也不要改为整套内容规划重生成。"
+    ).strip()
+
+
+def _content_result_conflicts_with_edit_policy(result: dict | None, policy: dict) -> bool:
+    if not isinstance(result, dict) or not isinstance(policy, dict):
+        return False
+    if policy.get("kind") != "local_preservation_edit":
+        return False
+    action = result.get("action")
+    required_action = policy.get("required_action")
+    if action == "regenerate_plan":
+        return True
+    if required_action == "update_all_slides" and action == "update_slide_content":
+        return True
+    return False
+
+
+def _local_preservation_no_change_response() -> dict:
+    return {
+        "action": "answer",
+        "response": (
+            "我没有修改 PPT；这条是局部保留原内容的修改，不能安全地改成整套内容规划重生成。"
+            "请再明确目标页的标题提炼方向，或重新发送这条局部修改要求。"
+        ),
+        "no_change_reason": "local_preservation_contract_failed",
+    }
+
+
 def _content_result_conflicts_with_page_context(
     result: dict,
     user_message: str,
@@ -837,6 +946,10 @@ def _visual_result_needs_contract_review(result: dict, user_message: str, page_c
     if not isinstance(result, dict):
         return False
     action = result.get("action")
+    if action == "confirm_style":
+        # The frontend and style-save endpoint resolve bare confirmations
+        # ("直接继续", "方案2", missing style payload) against current project state.
+        return False
     if _page_context_requests_page_visual_update(page_context) and action in {"answer", "adjust_style", "propose_styles", "collect_assets"}:
         return True
     if action == "answer":
@@ -984,14 +1097,15 @@ def _build_content_contract_prompt() -> str:
 2. 严禁用 action="answer" 口头承诺“我会修改/我建议调整/可以重构”。凡是会改变 PPT 内容的回复，都必须带上具体 action 和 payload。
 3. 只有纯咨询、纯解释、寒暄、明显视觉问题、或确实无法判断要改哪里时，才允许 action="answer"，并必须提供 no_change_reason。
 4. 如果用户只是确认内容已经可以进入视觉阶段，返回 action="forward_to_visual"。
-5. 如果用户给的是整体质量反馈，或者局部补丁风险较高，优先返回 action="regenerate_plan"，把用户反馈写进 topic，让后台重新生成内容规划。
-6. 如果用户指定单页且当前页内容足够明确，返回 action="update_slide_content"，updated_content 必须是该页完整 content_json。
-7. 如果用户在单页上下文里说把附件、截图、图片、这两页或素材信息放到当前页，优先返回 action="update_slide_content"，不要重做整套内容规划。
-8. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
-9. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
-10. page_context_from_frontend 里的 scope、target_area、target_page_nums 是用户在输入框上方手动选择的修改目标，必须当作明确指令执行。用户说“按上方选择”时，不得说缺少修改区域。
-11. 当 page_context.scope="selected_slides" 或 target_page_nums 有多个页码时，必须返回 action="update_all_slides"，不得只返回 update_slide_content。
-12. target_area="notes" 表示修改演讲备注。update_all_slides 的每一项必须把 speaker_notes 放在顶层：{"page_num":N,"speaker_notes":"..."}；不得把 speaker_notes 放进 text_content。
+5. 对“局部保真编辑”必须优先局部 mutation：当用户给出明确局部范围（单页、选中页、页码范围、标题/正文/备注区域），同时要求做有限变换（如提炼标题、突出重点、调整层级、优化表达、前置结论、强化某类信息），并要求保留原有核心内容/事实/数据/案例/细节/正文时，必须返回 update_slide_content 或 update_all_slides。只改指定范围和必要字段，保留原有关键内容，不得返回 regenerate_plan。
+6. 只有用户给的是整套质量反馈、明确要求重新规划/重做整套/改页数/从头来，或没有明确页码范围且无法安全局部修改时，才返回 action="regenerate_plan"，把用户反馈写进 topic，让后台重新生成内容规划。
+7. 如果用户指定单页且当前页内容足够明确，返回 action="update_slide_content"，updated_content 必须是该页完整 content_json。
+8. 如果用户在单页上下文里说把附件、截图、图片、这两页或素材信息放到当前页，优先返回 action="update_slide_content"，不要重做整套内容规划。
+9. 如果用户要求多页/全局局部文字修改，返回 action="update_all_slides"，updated_slides 只包含需要改的页，每项包含 page_num 和 text_content。
+10. 如果用户要求插入新页，返回 add_slide_before 或 add_slide_after，并给出完整 new_slide。
+11. page_context_from_frontend 里的 scope、target_area、target_page_nums 是用户在输入框上方手动选择的修改目标，必须当作明确指令执行。用户说“按上方选择”时，不得说缺少修改区域。
+12. 当 page_context.scope="selected_slides" 或 target_page_nums 有多个页码时，必须返回 action="update_all_slides"，不得只返回 update_slide_content。
+13. target_area="notes" 表示修改演讲备注。update_all_slides 的每一项必须把 speaker_notes 放在顶层：{"page_num":N,"speaker_notes":"..."}；不得把 speaker_notes 放进 text_content。
 
 只输出合法 JSON 对象。允许的 action：
 - regenerate_plan
@@ -1026,6 +1140,7 @@ def _compile_content_instruction_with_llm(
         "user_message": user_message,
         "initial_agent_result": initial_result,
         "page_context_from_frontend": page_context,
+        "deterministic_edit_policy": _infer_content_edit_policy(user_message, page_context, project_context),
         "current_deck_content": slides_context or [],
         "uploaded_documents_excerpt": (documents or "")[:12000],
         "current_message_attachment_context": (attachment_context or "")[:12000],
@@ -1072,9 +1187,11 @@ def _enforce_content_action_contract(
     logger=None,
 ) -> dict:
     result = _normalize_updated_slides_payload(result, page_context)
+    edit_policy = _infer_content_edit_policy(user_message, page_context, project_context)
     if (
         not _content_result_needs_contract_review(result, is_draft=False)
         and not _content_result_conflicts_with_page_context(result, user_message, page_context, project_context)
+        and not _content_result_conflicts_with_edit_policy(result, edit_policy)
     ):
         return result
     pending_offer = _infer_pending_content_plan_offer(history or [], project_context)
@@ -1122,6 +1239,7 @@ def _enforce_content_action_contract(
     if (
         _content_contract_result_usable(compiled)
         and not _content_result_conflicts_with_page_context(compiled, user_message, page_context, project_context)
+        and not _content_result_conflicts_with_edit_policy(compiled, edit_policy)
     ):
         if compiled.get("action") == "regenerate_plan":
             page_update = _fallback_update_current_slide_from_attachments(
@@ -1159,6 +1277,8 @@ def _enforce_content_action_contract(
         )
         if page_update:
             return page_update
+        if edit_policy.get("kind") == "local_preservation_edit":
+            return _local_preservation_no_change_response()
         return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
     if strong_mutation_intent:
         page_update = _fallback_update_current_slide_from_attachments(
@@ -1169,7 +1289,11 @@ def _enforce_content_action_contract(
         )
         if page_update:
             return page_update
+        if edit_policy.get("kind") == "local_preservation_edit":
+            return _local_preservation_no_change_response()
         return _fallback_regenerate_plan(user_message, project_context, result.get("response"))
+    if edit_policy.get("kind") == "local_preservation_edit":
+        return _local_preservation_no_change_response()
     if result.get("action") in {"answer", "collect_content"}:
         return {
             "action": "answer",
@@ -1462,6 +1586,7 @@ def _build_normal_prompt() -> str:
 - **用户提到"按照 content plan"、"按照原文/文档"、"完全按照...来"、"按原来的大纲"等，意图是让现有页面内容对齐文档/大纲时 → action="update_all_slides"，不要只口头答应**
 - **用户要求"重新生成内容规划"、"重新规划页面"、"按大纲重新来"、页数需要增减变化时 → action="regenerate_plan"，并在 topic 字段中输出完整的主题描述（用于重新生成内容规划）**
 - **【阶段优先规则·内容规划阶段】如果内容规划尚未被用户确认（上下文显示"内容规划已确认：否"），用户给出的任何与叙事结构、页面顺序、逻辑脉络、整体节奏、内容完整性、页数增减相关的反馈，必须优先视为对整套内容规划的调整，返回 action="regenerate_plan"（重构整套规划）或 "update_all_slides"（全局文字调整）。禁止把这些反馈理解为对单页内容的局部修改（update_slide_content），除非用户明确指定了具体页码和具体修改内容。**
+- **【局部保真编辑】如果用户明确指定局部范围（单页、选中页、页码范围、标题/正文/备注区域），并要求做有限变换（如提炼标题、突出重点、调整层级、优化表达、前置结论、强化某类信息），同时要求保留原有核心内容/事实/数据/案例/细节/正文，则必须返回 update_slide_content 或 update_all_slides。你只能把目标页的标题层级和必要正文结构调清楚；不得返回 regenerate_plan，不得减少页数，不得把多页内容压缩成摘要。**
 - 用户说"在第X页前面加一页"、"在前面插入一页"、"加一页" → action="add_slide_before"
 - 用户说"在第X页后面加一页"、"在后面插入一页"、"追加一页" → action="add_slide_after"
 - 如果用户提出的是偏视觉呈现的要求（如"后面视觉上突出这些数字/时间轴/对比关系"），但当前仍处于内容总监阶段：不能无响应。若这条要求会影响内容规划的页面类型、重点数据、标题或叙事顺序，返回对应内容 mutation；若只影响后续视觉表达，返回 action="answer"，明确说明内容层面已记录/会带入后续视觉阶段，并建议进入视觉总监后继续强调该视觉要求。
@@ -1640,6 +1765,12 @@ def _stream_intent(
                 system_prompt += f"\n\n{page_context_prompt}"
         except Exception as e:
             logger.warning(f"Failed to serialize page_context: {e}")
+    if agent_role == "content":
+        edit_policy_prompt = _content_edit_policy_text(
+            _infer_content_edit_policy(user_message, page_context, project_context)
+        )
+        if edit_policy_prompt:
+            system_prompt += f"\n\n{edit_policy_prompt}"
 
     attachment_context = ""
     if attachments:

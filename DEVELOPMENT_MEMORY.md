@@ -42,6 +42,17 @@ Recorded 2026-05-24 from user direction.
 - Use model intelligence for intent and judgment, and deterministic code for objective boundaries. The product should behave like a serious content director who understands the user's job, while code enforces page refs, source metadata, empty-body rejection, and persistence rules.
 - The highest bar is not "the system returns something"; it is "the artifact respects the user's serious intent and is worth using."
 
+## Case-Driven Robustness Principle
+
+Recorded 2026-06-04 from user direction during editable PPTX pipeline testing.
+
+- Treat real-world test cases as compounding product memory. Each serious case should either validate the current pipeline or produce a generalized improvement that makes the system stronger for the next similar case.
+- Do not turn case learning into case-specific patches. A fix learned from one deck, client, industry, language, or visual style must be expressed as a reusable diagnostic, contract, policy, metric, or source-level correction.
+- Preserve the existing architecture taste while learning from more examples: keep pipelines simple, use Occam's razor, and avoid adding orchestration, layers, or state paths unless they remove more complexity than they introduce.
+- Be especially cautious about prompt growth. Do not respond to every failed case by appending more instructions. Prefer better input structure, smaller model contracts, deterministic measurement, source repair, and narrow prompt changes with regression evidence.
+- Every practical test should leave behind one of three durable assets: a reproducible benchmark, a regression test, or a documented design rule. If it leaves only an anecdote or a one-off workaround, the learning was not captured.
+- Case-driven robustness is a loop: reproduce with a real artifact, diagnose the failure class, fix the smallest general source, add a guard or benchmark, and only then broaden to more cases.
+
 ## Simplicity Principle
 
 Recorded 2026-05-12 from user direction.

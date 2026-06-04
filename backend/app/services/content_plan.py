@@ -86,6 +86,7 @@ AUTO_DOCUMENT_PAGE_MIN = 12
 AUTO_DOCUMENT_PAGE_MAX = 60
 AUTO_DOCUMENT_CHARS_PER_SLIDE = 700
 AUTO_RESTORATION_PAGE_MAX = 100
+MIN_UNPROMPTED_CONTENT_PLAN_PAGE_COUNT = 3
 
 CONTENT_PLAN_STRATEGY_REUSE_EXPORTED = "reuse_exported_plan"
 CONTENT_PLAN_STRATEGY_REUSE_PAGINATED = "reuse_paginated_markdown"
@@ -316,7 +317,71 @@ def _is_hard_upper_page_count_request(topic: str) -> bool:
 
 
 def _normalize_page_count_digits(text: str) -> str:
-    return (text or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    normalized = (text or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+    chinese_count = r"[一二两三四五六七八九十]{1,4}"
+    page_unit = r"(?:页|頁|张|張|pages?|slides?)"
+    count_label = r"(?:页数|頁数|页面数|頁面数|张数|張数|slide\s*count|page\s*count|slides?|pages?)"
+
+    def replace_chinese_count(match: re.Match) -> str:
+        value = _parse_chinese_page_count(match.group("count"))
+        return str(value) if value else match.group("count")
+
+    def replace_range(match: re.Match) -> str:
+        start = _parse_chinese_page_count(match.group("start"))
+        end = _parse_chinese_page_count(match.group("end"))
+        if not start or not end:
+            return match.group(0)
+        return f"{start}{match.group('sep')}{end}{match.group('unit')}"
+
+    normalized = re.sub(
+        rf"(?P<start>{chinese_count})\s*(?P<sep>-|~|～|—|–|－|到|至|to)\s*(?P<end>{chinese_count})\s*(?P<unit>{page_unit})",
+        replace_range,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        rf"(?P<count>{chinese_count})\s*(?={page_unit})",
+        replace_chinese_count,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        rf"(?P<label>{count_label}\D{{0,12}})(?P<count>{chinese_count})",
+        lambda match: match.group("label") + replace_chinese_count(match),
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized
+
+
+def _parse_chinese_page_count(value: str | None) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    digits = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if text == "十":
+        return 10
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = digits.get(left, 1 if left == "" else 0)
+        ones = digits.get(right, 0 if right == "" else -1)
+        value = tens * 10 + ones
+        return value if 1 <= value <= 200 else None
+    if len(text) == 1:
+        return digits.get(text)
+    return None
 
 
 def _coerce_requested_page_count(value: str | int | None) -> int | None:
@@ -325,6 +390,29 @@ def _coerce_requested_page_count(value: str | int | None) -> int | None:
     except (TypeError, ValueError):
         return None
     return page_count if 1 <= page_count <= 200 else None
+
+
+def resolve_requested_content_plan_page_count(topic: str, page_count: int | None) -> int | None:
+    """Resolve a page-count request without letting an LLM estimate become a tiny deck.
+
+    User-visible topic text is authoritative. A separate page_count can come from
+    Agent estimates or UI payloads, so implausibly small values are ignored unless
+    the user explicitly asked for that size in the topic.
+    """
+    topic_page_count = infer_page_count_from_topic(topic)
+    if topic_page_count:
+        return topic_page_count
+    supplied_page_count = _coerce_requested_page_count(page_count)
+    if not supplied_page_count:
+        return None
+    if supplied_page_count < MIN_UNPROMPTED_CONTENT_PLAN_PAGE_COUNT:
+        logger.info(
+            "ContentPlan: ignored unprompted low page_count=%s for topic='%s'",
+            supplied_page_count,
+            (topic or "")[:80],
+        )
+        return None
+    return supplied_page_count
 
 
 def _looks_like_slide_reference(text: str, index: int) -> bool:
@@ -2453,7 +2541,7 @@ def resolve_content_plan_page_target(
     """Return target, min, max pages using the same policy as content-plan generation."""
     documents = sanitize_ppt_recovery_text_for_content(documents)
     requested_page_range = infer_page_count_range_from_topic(topic)
-    explicit_page_count = page_count or infer_page_count_from_topic(topic)
+    explicit_page_count = resolve_requested_content_plan_page_count(topic, page_count)
     same_source_page_count = _same_source_page_count_for_contract(topic, documents, intent_contract)
     if same_source_page_count and not requested_page_range:
         return same_source_page_count, same_source_page_count, same_source_page_count

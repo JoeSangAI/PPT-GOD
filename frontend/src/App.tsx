@@ -103,9 +103,10 @@ import {
 } from "./workflow";
 import { StatusCard } from "./components/StatusCard";
 import { buildSelectedStylePreview } from "./selectedStylePreview";
+import { resolveStyleForConfirmation } from "./styleConfirmation";
 import {
   inferAgentRequestContext,
-  inferRequestedPageCount,
+  resolveContentPlanPageCount,
   type AgentRequestContext,
   type AgentRequestScope,
   type AgentRole,
@@ -1539,7 +1540,7 @@ function App() {
   const slidesCacheRef = useRef<Record<string, Slide[]>>({});
   const [imageRefreshMap, setImageRefreshMap] = useState<Record<string, number>>({});
   const [slidesHistory, setSlidesHistory] = useState<Slide[][]>([]);
-  const [slidesHistoryIndex, setSlidesHistoryIndex] = useState(-1);
+  const [slidesRedoHistory, setSlidesRedoHistory] = useState<Slide[][]>([]);
   const isGlobalUndoingRef = useRef(false);
   const [operatingProjectId, setOperatingProjectId] = useState<string | null>(null);
   const gateContextRef = useRef<GateContext | null>(null);
@@ -1735,6 +1736,8 @@ function App() {
       setSlidesProjectId(null);
     }
     setSlidesLoadingProjectId(null);
+    setSlidesHistory([]);
+    setSlidesRedoHistory([]);
     setStaleMap({});
     if (nextProjectId && cachedSlides) hydrateSlideStaleMap(cachedSlides);
     setDeckSelectedPages(new Set());
@@ -2509,47 +2512,78 @@ function App() {
     setEditingSlide(replacement || null);
   }, [selectedProject?.id, slidesProjectId, slides, editingSlide]);
 
-  // 全局撤销/重做：保存 slides 快照
+  // 全局回退/重做：保存整套内容快照。
+  const cloneSlidesSnapshot = (items: Slide[]) => JSON.parse(JSON.stringify(items || [])) as Slide[];
+
   const pushSlidesHistory = (currentSlides: Slide[]) => {
-    if (isGlobalUndoingRef.current) return;
+    if (isGlobalUndoingRef.current || currentSlides.length === 0) return;
+    const snapshot = cloneSlidesSnapshot(currentSlides);
     setSlidesHistory((prev) => {
-      const trimmed = prev.slice(0, slidesHistoryIndex + 1);
-      const next = [...trimmed, JSON.parse(JSON.stringify(currentSlides))];
-      if (next.length > 20) {
-        next.shift();
-        setSlidesHistoryIndex((idx) => idx - 1);
-        return next;
-      }
-      return next;
+      const next = [...prev, snapshot];
+      return next.length > 20 ? next.slice(next.length - 20) : next;
     });
-    setSlidesHistoryIndex((idx) => Math.min(idx + 1, 19));
+    setSlidesRedoHistory([]);
   };
 
   const restoreSlidesToBackend = async (projectId: string, targetSlides: Slide[]) => {
     if (operatingProjectId === projectId) return;
     setOperatingProjectId(projectId);
     try {
-      for (const slide of targetSlides) {
-        await updateSlideContent(projectId, slide.page_num, slide.content_json, slide.id);
+      const orderedTargets = cloneSlidesSnapshot(targetSlides).sort((a, b) => a.page_num - b.page_num);
+      let currentSlides = await fetchSlides(projectId);
+      for (let idx = 0; idx < orderedTargets.length; idx += 1) {
+        const target = orderedTargets[idx];
+        const targetPageNum = idx + 1;
+        const targetType = target.type || target.content_json?.type || "content";
+        const targetContent = {
+          ...(target.content_json || {}),
+          page_num: targetPageNum,
+          type: targetType,
+        };
+        const current = currentSlides.find((slide: Slide) => slide.page_num === targetPageNum);
+        if (current) {
+          await updateSlideContent(projectId, targetPageNum, targetContent);
+          if ((current.type || "content") !== targetType) {
+            await updateSlideType(projectId, targetPageNum, targetType);
+          }
+        } else {
+          await createSlide(projectId, targetPageNum, targetContent);
+          currentSlides = await fetchSlides(projectId);
+        }
       }
-      const nextSlides = JSON.parse(JSON.stringify(targetSlides));
+      const afterUpsert = await fetchSlides(projectId);
+      const extras = afterUpsert
+        .filter((slide: Slide) => slide.page_num > orderedTargets.length)
+        .sort((a: Slide, b: Slide) => b.page_num - a.page_num);
+      for (const extra of extras) {
+        await deleteSlide(projectId, extra.id);
+      }
+      const nextSlides = await fetchSlides(projectId);
+      await loadProjects();
       slidesCacheRef.current[projectId] = nextSlides;
       setSlidesProjectId(projectId);
       setSlides(nextSlides);
-      showToast("已撤销到之前的状态", "success");
+      hydrateSlideStaleMap(nextSlides);
+      showToast("已回退到上一步", "success");
     } catch (err: any) {
-      showToast("撤销保存失败：" + (err.message || "未知错误"), "error");
+      showToast("回退保存失败：" + (err.message || "未知错误"), "error");
     } finally {
       setOperatingProjectId(null);
     }
   };
 
   const handleGlobalUndo = async () => {
-    if (slidesHistoryIndex <= 0 || !selectedProject) return;
-    const targetIndex = slidesHistoryIndex - 1;
-    const targetSlides = slidesHistory[targetIndex];
+    if (slidesHistory.length === 0 || !selectedProject) return;
+    const targetSlides = slidesHistory[slidesHistory.length - 1];
+    const currentSnapshot = cloneSlidesSnapshot(slides);
     isGlobalUndoingRef.current = true;
-    setSlidesHistoryIndex(targetIndex);
+    setSlidesHistory((prev) => prev.slice(0, -1));
+    if (currentSnapshot.length > 0) {
+      setSlidesRedoHistory((prev) => {
+        const next = [...prev, currentSnapshot];
+        return next.length > 20 ? next.slice(next.length - 20) : next;
+      });
+    }
     await restoreSlidesToBackend(selectedProject.id, targetSlides);
     setTimeout(() => {
       isGlobalUndoingRef.current = false;
@@ -2557,19 +2591,25 @@ function App() {
   };
 
   const handleGlobalRedo = async () => {
-    if (slidesHistoryIndex >= slidesHistory.length - 1 || !selectedProject) return;
-    const targetIndex = slidesHistoryIndex + 1;
-    const targetSlides = slidesHistory[targetIndex];
+    if (slidesRedoHistory.length === 0 || !selectedProject) return;
+    const targetSlides = slidesRedoHistory[slidesRedoHistory.length - 1];
+    const currentSnapshot = cloneSlidesSnapshot(slides);
     isGlobalUndoingRef.current = true;
-    setSlidesHistoryIndex(targetIndex);
+    setSlidesRedoHistory((prev) => prev.slice(0, -1));
+    if (currentSnapshot.length > 0) {
+      setSlidesHistory((prev) => {
+        const next = [...prev, currentSnapshot];
+        return next.length > 20 ? next.slice(next.length - 20) : next;
+      });
+    }
     await restoreSlidesToBackend(selectedProject.id, targetSlides);
     setTimeout(() => {
       isGlobalUndoingRef.current = false;
     }, 0);
   };
 
-  const canGlobalUndo = slidesHistoryIndex > 0;
-  const canGlobalRedo = slidesHistoryIndex < slidesHistory.length - 1;
+  const canGlobalUndo = slidesHistory.length > 0;
+  const canGlobalRedo = slidesRedoHistory.length > 0;
 
   const loadStatus = async (projectId: string) => {
     try {
@@ -2772,6 +2812,7 @@ function App() {
       updateLoadingMsg("正在读取原 PPT 的文字和页面截图，准备生成内容规划。");
       // 记录旧 slides 的 ID，用于区分"旧内容还在"和"新生成完成"
       const previousSlides = await loadSlides(projectId);
+      if (previousSlides.length > 0) pushSlidesHistory(previousSlides);
       const previousSlideIds = previousSlides.map((s: any) => s.id).sort().join(",");
       updateLoadingMsg("正在向后台提交内容规划任务...");
       const result = await generateContentPlan(projectId, topic, pageCount, options?.attachmentIds, options?.chatContext);
@@ -4833,6 +4874,74 @@ function App() {
     }
   };
 
+  const handleRemoveProjectAssetFromSlide = async (slide: Slide, assetId: string) => {
+    if (!selectedProject) return;
+    const manualIds: string[] = Array.isArray(slide.visual_json?.manual_visual_asset_ids)
+      ? slide.visual_json.manual_visual_asset_ids.map(String)
+      : [];
+    if (manualIds.includes(assetId)) {
+      await handleUnpinAssetFromSlide(slide.id, assetId);
+      return;
+    }
+
+    const visual = slide.visual_json || {};
+    const nextVisualAssetIds = Array.isArray(visual.visual_asset_ids)
+      ? visual.visual_asset_ids.map(String).filter((id: string) => id !== assetId)
+      : [];
+    const nextUsage = { ...(visual.visual_asset_usage || {}) };
+    delete nextUsage[assetId];
+    const nextRouteModes = { ...(visual.asset_route_modes || {}) };
+    delete nextRouteModes[assetId];
+    const currentOverlayLayers = Array.isArray(visual.overlay_layers) ? visual.overlay_layers : [];
+    const nextOverlayLayers = currentOverlayLayers.filter((layer: any) => String(layer?.asset_id) !== assetId);
+
+    try {
+      await updateVisualPlan(selectedProject.id, slide.page_num, {
+        visual_asset_ids: nextVisualAssetIds,
+        visual_asset_usage: nextUsage,
+        asset_route_modes: nextRouteModes,
+        ...(nextOverlayLayers.length !== currentOverlayLayers.length ? { overlay_layers: nextOverlayLayers } : {}),
+      }, slide.id);
+      markSlideStale(slide.id, "visual");
+      const updated = await loadSlides(selectedProject.id);
+      const fresh = updated.find((s: Slide) => s.id === slide.id);
+      if (fresh && editingSlide?.id === slide.id) setEditingSlide(fresh);
+      showToast("已从本页移除素材", "success");
+      addSystemLog(`用户从第 ${slide.page_num} 页移除了素材`);
+    } catch (err: any) {
+      showToast("移除失败：" + (err.message || "未知错误"), "error");
+    }
+  };
+
+  const handleUploadPageMaterialForSlide = async (slide: Slide) => {
+    if (!selectedProject) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.multiple = true;
+    input.onchange = async (e) => {
+      const files = Array.from((e.target as HTMLInputElement).files || []);
+      if (files.length === 0 || !selectedProject) return;
+      try {
+        for (const file of files) {
+          await uploadFile(selectedProject.id, file, "content_ref", slide.id, "blend", {
+            asset_name: file.name.replace(/\.[^.]+$/, ""),
+            usage_note: "用户上传的本页画面素材",
+          });
+        }
+        markSlideStale(slide.id, "visual");
+        const updated = await loadSlides(selectedProject.id);
+        const fresh = updated.find((s: Slide) => s.id === slide.id);
+        if (fresh && editingSlide?.id === slide.id) setEditingSlide(fresh);
+        showToast(files.length > 1 ? `已加入 ${files.length} 个本页素材` : "已加入本页素材", "success");
+        addSystemLog(`用户为第 ${slide.page_num} 页上传了 ${files.length} 个本页素材`);
+      } catch (err: any) {
+        showToast("上传失败：" + (err.message || "未知错误"), "error");
+      }
+    };
+    input.click();
+  };
+
   const handleUpdateOverlayLayers = async (slideId: string, layers: any[]) => {
     if (!selectedProject) return;
     const slide = slides.find((s) => s.id === slideId) || editingSlide;
@@ -5842,9 +5951,9 @@ function App() {
 
       // 根据本轮自然语言推断出的作用范围构建 pageContext。
       let pageContext: any = undefined;
-      const summarizeSlideForAgent = (s: Slide) => {
+      const summarizeSlideForAgent = (s: Slide, options: { includeFullContent?: boolean } = {}) => {
         const tc = s.content_json?.text_content || {};
-        return {
+        const summary: any = {
           page_num: s.page_num,
           type: s.type,
           headline: tc.headline || "",
@@ -5855,6 +5964,10 @@ function App() {
                 typeof item === "string" ? item : item?.content || ""
               ),
         };
+        if (options.includeFullContent) {
+          summary.content_json = s.content_json;
+        }
+        return summary;
       };
       const requestTargetSlide =
         requestContext.scope === "current_slide"
@@ -5897,6 +6010,7 @@ function App() {
           requestContext.scope === "selected_slides" && targetPageSet.size > 0
             ? slides.filter((s) => targetPageSet.has(s.page_num))
             : slides;
+        const includeFullContent = requestContext.scope === "selected_slides" && targetPageSet.size > 0;
         pageContext = {
           mode: "global",
           scope: requestContext.scope,
@@ -5904,7 +6018,7 @@ function App() {
           target_area: requestContext.targetArea,
           area_label: requestContext.areaLabel,
           confidence: requestContext.confidence,
-          slides: scopedSlides.map(summarizeSlideForAgent),
+          slides: scopedSlides.map((s) => summarizeSlideForAgent(s, { includeFullContent })),
         };
       }
 
@@ -6051,7 +6165,7 @@ function App() {
         return;
       }
       const frontendWillHandleAgentReply = isRequestVisible() && (
-        (action === "confirm_style" && result.style) ||
+        action === "confirm_style" ||
         (action === "regenerate_pages" && result.page_nums?.length > 0) ||
         action === "retry_failed" ||
         (action === "reroll_page_visual_plan" && hasPageTarget) ||
@@ -6098,8 +6212,8 @@ function App() {
       }
 
         // Agent 在聊天中确认风格，自动保存并推进
-        if (result.action === "confirm_style" && result.style) {
-          await dispatchGateAction("confirm_style", { style: result.style }, { allowWhileChatLoading: true, source: "agent" });
+        if (result.action === "confirm_style") {
+          await dispatchGateAction("confirm_style", { style: result.style || userMsg }, { allowWhileChatLoading: true, source: "agent" });
         }
   
         // Agent 要求重新生成指定页
@@ -6893,7 +7007,7 @@ function App() {
           return { ok: true };
         case "generate_content_plan": {
           const userBrief = payload?.topic || getLatestComposerTextForSubmission();
-          const inferredPageCount = payload?.page_count || inferRequestedPageCount(userBrief);
+          const inferredPageCount = resolveContentPlanPageCount(userBrief, payload?.page_count);
           const topic = [userBrief, briefAttachmentSummary ? `【用户上传材料】\n${briefAttachmentSummary}` : ""]
             .filter(Boolean)
             .join("\n\n");
@@ -7047,11 +7161,14 @@ function App() {
             return { ok: true };
           }
         case "confirm_style":
-          if (!payload?.style) {
-            return reportBlockedAction("请先选择一套风格方案。", "invalid_input", "info");
+          {
+            const resolved = resolveStyleForConfirmation(payload?.style, currentProject, styleProposalsInChat);
+            if (!resolved.style) {
+              return reportBlockedAction(resolved.message || "请先选择一套风格方案。", "invalid_input", "info");
+            }
+            await handleSelectStyle(resolved.style);
+            return { ok: true };
           }
-          await handleSelectStyle(payload.style);
-          return { ok: true };
         case "generate_visual_prompts":
           await handleGeneratePrompts(false);
           return { ok: true };
@@ -9239,9 +9356,6 @@ function App() {
                         imgClassName="w-full h-full object-contain bg-slate-50 group-hover/img:scale-[1.01] transition-transform duration-300"
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (activateFinetuneForSlide(slide)) {
-                            handleEnterEdit(slide);
-                          }
                           const gallerySlides = slides
                             .filter((s) => s.status === "completed" && s.image_path)
                             .sort((a, b) => a.page_num - b.page_num);
@@ -9344,10 +9458,11 @@ function App() {
                                         showToast("删除失败：" + (err.message || "未知错误"), "error");
                                       }
                                     }}
-                                    className="absolute -top-1 -right-1 h-3.5 bg-red-500 text-white text-2xs rounded-full items-center justify-center hidden group-hover:flex shadow-sm px-0.5"
-                                    title="删除"
+                                    className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-red-100 bg-white px-1 text-[9px] leading-none text-red-500 shadow-sm hover:bg-red-50 hover:text-red-600"
+                                    title="移除本页素材"
+                                    aria-label={`移除第 ${slide.page_num} 页素材`}
                                   >
-                                    删
+                                    x
                                   </button>
                                 </div>
                               ))}
@@ -9381,6 +9496,18 @@ function App() {
                                       }}
                                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                                     />
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleRemoveProjectAssetFromSlide(slide, id);
+                                      }}
+                                      className="absolute -top-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full border border-emerald-100 bg-white px-1 text-[9px] leading-none text-emerald-700 shadow-sm hover:border-red-100 hover:bg-red-50 hover:text-red-600"
+                                      title="从本页移除"
+                                      aria-label={`从第 ${slide.page_num} 页移除项目素材`}
+                                    >
+                                      x
+                                    </button>
                                   </div>
                                 );
                               })}
@@ -9388,24 +9515,41 @@ function App() {
                           )}
                         </div>
                         {!isBusy && !chatLoading && (
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleDeleteSlide(slide.id);
-                            }}
-                            className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-full border border-red-100 bg-white text-red-500 shadow-sm transition-all hover:border-red-200 hover:bg-red-50 hover:text-red-600 focus:outline-none focus:ring-2 focus:ring-red-200"
-                            title={`删除第 ${slide.page_num} 页`}
-                            aria-label={`删除第 ${slide.page_num} 页`}
-                          >
-                            <svg viewBox="0 0 24 24" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M6 7h12" />
-                              <path d="M9 7V5h6v2" />
-                              <path d="M9 10v7" />
-                              <path d="M15 10v7" />
-                              <path d="M8 7l1 13h6l1-13" />
-                            </svg>
-                          </button>
+                          <div className="flex flex-shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleUploadPageMaterialForSlide(slide);
+                              }}
+                              className="flex h-6 w-6 items-center justify-center rounded-full border border-emerald-100 bg-white text-emerald-700 shadow-sm transition-all hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-800 focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                              title={`为第 ${slide.page_num} 页添加画面素材`}
+                              aria-label={`为第 ${slide.page_num} 页添加画面素材`}
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M12 5v14" />
+                                <path d="M5 12h14" />
+                              </svg>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteSlide(slide.id);
+                              }}
+                              className="flex h-6 w-6 items-center justify-center rounded-full border border-red-100 bg-white text-red-500 shadow-sm transition-all hover:border-red-200 hover:bg-red-50 hover:text-red-600 focus:outline-none focus:ring-2 focus:ring-red-200"
+                              title={`删除第 ${slide.page_num} 页`}
+                              aria-label={`删除第 ${slide.page_num} 页`}
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M6 7h12" />
+                                <path d="M9 7V5h6v2" />
+                                <path d="M9 10v7" />
+                                <path d="M15 10v7" />
+                                <path d="M8 7l1 13h6l1-13" />
+                              </svg>
+                            </button>
+                          </div>
                         )}
                       </div>
 
@@ -9651,27 +9795,27 @@ function App() {
                   <button
                     onClick={handleGlobalUndo}
                     disabled={!canGlobalUndo || !!operatingProjectId || chatLoading}
-                  title="撤销 (Ctrl+Z)"
+                  title="回退上一步 (Ctrl+Z)"
                   className={`text-xs px-1.5 py-0.5 rounded transition-colors ${
                     canGlobalUndo && !operatingProjectId && !chatLoading
                       ? "text-gray-600 hover:bg-gray-200 hover:text-gray-900"
                       : "text-gray-300 cursor-not-allowed"
                   }`}
                 >
-                  撤销
+                  回退上一步
                 </button>
                 <button
                   onClick={handleGlobalRedo}
                   disabled={!canGlobalRedo || !!operatingProjectId || chatLoading}
-                  title="重做 (Ctrl+Shift+Z)"
+                  title="恢复 (Ctrl+Shift+Z)"
                   className={`text-xs px-1.5 py-0.5 rounded transition-colors ${
                     canGlobalRedo && !operatingProjectId && !chatLoading
                       ? "text-gray-600 hover:bg-gray-200 hover:text-gray-900"
                       : "text-gray-300 cursor-not-allowed"
                   }`}
-                  >
-                    重做
-                  </button>
+                >
+                  恢复
+                </button>
               </div>
             </div>
           )}
@@ -12186,6 +12330,44 @@ function SingleSlideEditor({
     }
   };
 
+  const removePageProjectAsset = async (assetId: string) => {
+    setAssetRouteLoading(assetId);
+    try {
+      if (manualVisualAssetIds.includes(assetId)) {
+        const nextManualIds = manualVisualAssetIds.filter((id: string) => id !== assetId);
+        const nextManualUsage = { ...(slide.visual_json?.manual_visual_asset_usage || {}) };
+        delete nextManualUsage[assetId];
+        await updateSlideAssetPins(projectId, slide.id, nextManualIds, nextManualUsage);
+      } else {
+        const nextVisualAssetIds = visualAssetIds.filter((id: string) => id !== assetId);
+        const nextUsage = { ...(slide.visual_json?.visual_asset_usage || {}) };
+        delete nextUsage[assetId];
+        const nextRouteModes = { ...assetRouteModes };
+        delete nextRouteModes[assetId];
+        const nextLayers = enabledOverlayLayers.filter((layer: any) => String(layer.asset_id) !== assetId);
+        await updateVisualPlan(projectId, slide.page_num, {
+          visual_asset_ids: nextVisualAssetIds,
+          visual_asset_usage: nextUsage,
+          asset_route_modes: nextRouteModes,
+          ...(nextLayers.length !== enabledOverlayLayers.length ? { overlay_layers: nextLayers } : {}),
+        }, slide.id);
+      }
+      markSlideStale?.(slide.id, "visual");
+      await onSaved?.();
+      onToast?.("已从本页移除素材", "success");
+      onSystemLog?.(`用户从第 ${slide.page_num} 页移除了素材`);
+    } catch (err: any) {
+      try {
+        await onSaved?.();
+      } catch {
+        // Best-effort refresh after a failed removal.
+      }
+      onToast?.("移除失败：" + (err.message || "未知错误"), "error");
+    } finally {
+      setAssetRouteLoading(null);
+    }
+  };
+
   // 内容规划阶段不显示 "需更新画面方案" 的 content stale 提示
   const hasVisualPlan = !!slide.visual_json?.visual_description;
   const pastContentPlanning = !["draft", "planning", "content_plan_ready"].includes(projectStatus || "");
@@ -12196,129 +12378,122 @@ function SingleSlideEditor({
   const contentBlockMaterialCount = pageReferenceItems.filter((ref: any) => ref?.asset_analysis?.source === "content_block").length;
 
   return (
-    <div className="pg-editor pg-single-slide-editor max-w-3xl mx-auto bg-white rounded border shadow-sm p-6">
-      {/* 顶部工具栏 — 全文字，无图标，三区布局 */}
-      <div className="pg-editor-toolbar sticky top-0 z-30 -mx-6 -mt-6 mb-6 flex items-center justify-between border-b border-slate-200 px-6 pb-4 pt-6">
-        {/* 左：核心操作 */}
-        <div className="flex items-center gap-1.5">
+    <div className="pg-editor pg-single-slide-editor pg-single-slide-layer max-w-3xl mx-auto bg-white rounded border shadow-sm">
+      <div className="pg-editor-toolbar pg-single-slide-nav sticky top-0 z-30">
+        <div className="pg-single-nav-main">
           <button
+            type="button"
             onClick={handleSaveAndExit}
             disabled={saving}
-            className={`pg-action pg-action-link text-sm px-2.5 py-1.5 rounded-md transition-colors ${
-              saving ? "text-slate-300 cursor-not-allowed" : "text-slate-500 hover:text-slate-700 hover:bg-slate-100"
-            }`}
+            className="pg-single-nav-back"
+            title="保存后返回列表"
           >
-            {saving ? "保存中..." : "返回列表"}
+            <span aria-hidden="true">←</span>
+            <span>{saving ? "保存中..." : "列表"}</span>
           </button>
-          <button
-            onClick={async () => { await handleSave(); }}
-            disabled={saving || isGenerating}
-            className={`pg-action pg-action-secondary text-sm px-3 py-1.5 rounded-md border transition-colors ${
-              saving || isGenerating
-                ? "text-slate-300 border-slate-200 cursor-not-allowed"
-                : "text-slate-700 border-slate-300 hover:bg-slate-50"
-            }`}
-            title="保存 (Ctrl+S)"
-          >
-            {saving ? "保存中..." : "保存"}
-          </button>
-          <button
-            onClick={handleSaveAndGenerate}
-            disabled={saving || isGenerating}
-            className={`pg-action pg-action-primary text-sm px-3 py-1.5 rounded-md font-medium transition-all ${
-              saving || isGenerating
-                ? "bg-slate-300 text-white cursor-not-allowed"
-                : "bg-purple-600 text-white hover:bg-purple-700 shadow-sm"
-            }`}
-            title="保存并重新生成此页图片"
-          >
-            {isGenerating ? "生成中..." : saving ? "保存中..." : "保存并重新生成"}
-          </button>
-        </div>
 
-        {/* 中：页面定位 */}
-        <div className="flex items-center gap-2">
-          {onPrev && (
-            <button
-              onClick={async () => { const result = await handleSave(); if (result.ok) onPrev?.(); }}
-              disabled={!hasPrev || saving}
-              className={`text-sm px-2.5 py-1.5 rounded-md transition-colors ${
-                hasPrev && !saving ? "text-slate-600 hover:bg-slate-100" : "text-slate-300 cursor-not-allowed"
-              }`}
-            >
-              上一页
-            </button>
-          )}
-          <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 rounded-md">
-            <span className="text-sm font-bold text-slate-700">P{slide.page_num}</span>
-            <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${typeColor[slide.type] || "bg-white text-slate-600"}`}>
-              {typeLabel[slide.type] || slide.type}
-            </span>
-          </div>
-          {onNext && (
-            <button
-              onClick={async () => { const result = await handleSave(); if (result.ok) onNext?.(); }}
-              disabled={!hasNext || saving}
-              className={`text-sm px-2.5 py-1.5 rounded-md transition-colors ${
-                hasNext && !saving ? "text-slate-600 hover:bg-slate-100" : "text-slate-300 cursor-not-allowed"
-              }`}
-            >
-              下一页
-            </button>
-          )}
-        </div>
-
-        {/* 右：编辑管理 */}
-        <div className="flex items-center gap-0.5">
-          <button
-            onClick={handleUndo}
-            disabled={!canUndo}
-            className={`text-sm px-2 py-1.5 rounded-md transition-colors ${
-              canUndo ? "text-slate-500 hover:text-slate-700 hover:bg-slate-100" : "text-slate-300 cursor-not-allowed"
-            }`}
-          >
-            撤销
-          </button>
-          <button
-            onClick={handleRedo}
-            disabled={!canRedo}
-            className={`text-sm px-2 py-1.5 rounded-md transition-colors ${
-              canRedo ? "text-slate-500 hover:text-slate-700 hover:bg-slate-100" : "text-slate-300 cursor-not-allowed"
-            }`}
-          >
-            重做
-          </button>
-          <div className="w-px h-5 bg-slate-200 mx-1.5" />
-          {onInsertBefore && (
-            <button
-              onClick={onInsertBefore}
-              className="text-sm text-slate-500 hover:text-green-600 px-2 py-1.5 rounded-md hover:bg-green-50 transition-colors"
-            >
-              前插
-            </button>
-          )}
-          {onInsertAfter && (
-            <button
-              onClick={onInsertAfter}
-              className="text-sm text-slate-500 hover:text-green-600 px-2 py-1.5 rounded-md hover:bg-green-50 transition-colors"
-            >
-              后插
-            </button>
-          )}
-          {onDelete && (
-            <>
-              <div className="w-px h-5 bg-slate-200 mx-1.5" />
+          <div className="pg-single-page-control" aria-label={`第 ${slide.page_num} 页导航`}>
+            {onPrev && (
               <button
-                onClick={onDelete}
-                className="text-sm text-slate-500 hover:text-red-600 px-2 py-1.5 rounded-md hover:bg-red-50 transition-colors"
+                type="button"
+                onClick={async () => { const result = await handleSave(); if (result.ok) onPrev?.(); }}
+                disabled={!hasPrev || saving}
+                className="pg-single-icon-button"
+                title="上一页"
+                aria-label="上一页"
               >
-                删除
+                ‹
               </button>
-            </>
+            )}
+            <div className="pg-single-page-chip">
+              <span className="pg-single-page-number">第 {slide.page_num} 页</span>
+              <span className={`pg-single-type-chip ${typeColor[slide.type] || "bg-white text-slate-600"}`}>
+                {typeLabel[slide.type] || slide.type}
+              </span>
+            </div>
+            {onNext && (
+              <button
+                type="button"
+                onClick={async () => { const result = await handleSave(); if (result.ok) onNext?.(); }}
+                disabled={!hasNext || saving}
+                className="pg-single-icon-button"
+                title="下一页"
+                aria-label="下一页"
+              >
+                ›
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="pg-single-nav-actions">
+          <div className="pg-single-tool-group" aria-label="撤销和重做">
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={!canUndo}
+              className="pg-single-icon-button"
+              title="撤销 (Ctrl+Z)"
+              aria-label="撤销"
+            >
+              ↶
+            </button>
+            <button
+              type="button"
+              onClick={handleRedo}
+              disabled={!canRedo}
+              className="pg-single-icon-button"
+              title="重做 (Ctrl+Shift+Z)"
+              aria-label="重做"
+            >
+              ↷
+            </button>
+          </div>
+
+          {(onInsertBefore || onInsertAfter || onDelete) && (
+            <div className="pg-single-tool-group pg-single-tool-group-text" aria-label="页面管理">
+              {onInsertBefore && (
+                <button type="button" onClick={onInsertBefore} className="pg-single-text-button" title="在当前页前插入一页">
+                  + 前
+                </button>
+              )}
+              {onInsertAfter && (
+                <button type="button" onClick={onInsertAfter} className="pg-single-text-button" title="在当前页后插入一页">
+                  + 后
+                </button>
+              )}
+              {onDelete && (
+                <button type="button" onClick={onDelete} className="pg-single-text-button pg-single-danger-button" title="删除这一页">
+                  删除
+                </button>
+              )}
+            </div>
           )}
+
+          <div className="pg-single-save-group">
+            <button
+              type="button"
+              onClick={async () => { await handleSave(); }}
+              disabled={saving || isGenerating}
+              className="pg-single-save-button"
+              title="保存 (Ctrl+S)"
+            >
+              {saving ? "保存中..." : "保存"}
+            </button>
+            <button
+              type="button"
+              onClick={handleSaveAndGenerate}
+              disabled={saving || isGenerating}
+              className="pg-single-save-button pg-single-save-button-primary"
+              title="保存并重新生成此页图片"
+            >
+              {isGenerating ? "生成中..." : saving ? "保存中..." : "保存并重新生成"}
+            </button>
+          </div>
         </div>
       </div>
 
+      <div className="pg-single-slide-body">
       {/* Stale 状态横幅 */}
       {(showContentStale || showVisualStale || showImageStale) && (
         <div className="pg-stale-banner mb-4 bg-amber-50 border border-amber-200 rounded p-3">
@@ -12795,6 +12970,14 @@ function SingleSlideEditor({
                         onClick: () => setPageAssetRoute(id, target),
                       })
                     )}
+                    <button
+                      type="button"
+                      onClick={() => removePageProjectAsset(id)}
+                      disabled={assetRouteLoading === id}
+                      className="text-[11px] px-2 py-1 rounded border border-red-100 bg-white text-red-500 hover:bg-red-50 disabled:opacity-60"
+                    >
+                      移除
+                    </button>
                   </div>
                 </div>
               );
@@ -12829,6 +13012,14 @@ function SingleSlideEditor({
                         onClick: () => setPageAssetRoute(id, target),
                       })
                     )}
+                    <button
+                      type="button"
+                      onClick={() => removePageProjectAsset(id)}
+                      disabled={assetRouteLoading === id}
+                      className="text-[11px] px-2 py-1 rounded border border-red-100 bg-white text-red-500 hover:bg-red-50 disabled:opacity-60"
+                    >
+                      移除
+                    </button>
                   </div>
                 </div>
               );
@@ -12963,6 +13154,7 @@ function SingleSlideEditor({
           )}
         </div>
       )}
+      </div>
     </div>
   );
 }

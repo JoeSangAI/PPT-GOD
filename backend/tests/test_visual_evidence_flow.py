@@ -1720,6 +1720,80 @@ def test_visual_asset_recall_uses_structured_source_refs():
     assert "源 PPT 页" in recalled[0]["reason"]
 
 
+def test_visual_asset_recall_ignores_shared_brand_terms_across_assets():
+    recalled = _recall_visual_assets_for_page(
+        {
+            "page_num": 2,
+            "type": "content",
+            "text_content": {
+                "headline": "vivo 校园传播链路",
+                "body": "这一页讲学生换机窗口和校园媒体组合，没有指定具体机型。",
+            },
+        },
+        [
+            {
+                "id": "s30",
+                "name": "机型_vivo S30 KV",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "analysis_summary": "keywords=vivo、S30、KV、手机、校园",
+            },
+            {
+                "id": "s50",
+                "name": "机型_vivo S50 KV",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "analysis_summary": "keywords=vivo、S50、KV、手机、校园",
+            },
+            {
+                "id": "s60",
+                "name": "机型_vivo S60 KV",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "analysis_summary": "keywords=vivo、S60、KV、手机、校园",
+            },
+        ],
+    )
+
+    assert recalled == []
+
+
+def test_visual_asset_recall_keeps_specific_model_terms_with_shared_brand():
+    recalled = _recall_visual_assets_for_page(
+        {
+            "page_num": 17,
+            "type": "content",
+            "text_content": {
+                "headline": "女大学生内容分享型学生：主推 S60、S50、S30",
+                "body": "拍照好看、自拍自然、轻薄，适合开学新生活。",
+            },
+        },
+        [
+            {
+                "id": "s30",
+                "name": "机型_vivo S30 KV",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "analysis_summary": "keywords=vivo、S30、KV、手机、校园",
+            },
+            {
+                "id": "z11",
+                "name": "机型_iQOO Z11 KV",
+                "kind": "product",
+                "selection_tier": "core_global",
+                "importance_score": 60,
+                "analysis_summary": "keywords=iQOO、Z11、KV、游戏、手机、校园",
+            },
+        ],
+    )
+
+    assert [item["id"] for item in recalled] == ["s30"]
+
+
 def test_visual_plan_prompt_treats_toc_as_simple_navigation():
     prompt = _build_batch_prompt(
         pages_summary=[
@@ -2708,7 +2782,7 @@ def test_visual_plan_forces_logo_policy_off_when_project_has_no_logo(monkeypatch
     assert "品牌标识" not in plan[0]["visual_description"]
 
 
-def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypatch):
+def test_visual_plan_locks_manual_pins_and_route_modes_when_llm_selects_other_asset(monkeypatch):
     class FakeClient:
         class chat:
             class completions:
@@ -2750,6 +2824,7 @@ def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypa
                 "text_content": {"headline": "校园驿站", "body": "取件机与回收场景"},
                 "manual_visual_asset_ids": ["manual-1"],
                 "manual_visual_asset_usage": {"manual-1": "用户指定放在左侧"},
+                "asset_route_modes": {"manual-1": "blend", "auto-1": "double_blend"},
             }
         ],
         global_visual_assets=[
@@ -2759,8 +2834,9 @@ def test_visual_plan_preserves_manual_pins_when_llm_selects_other_asset(monkeypa
     )
 
     assert plan[0]["manual_visual_asset_ids"] == ["manual-1"]
-    assert plan[0]["visual_asset_ids"][:2] == ["manual-1", "auto-1"]
+    assert plan[0]["visual_asset_ids"] == ["manual-1"]
     assert plan[0]["visual_asset_usage"]["manual-1"] == "用户指定放在左侧"
+    assert plan[0]["asset_route_modes"] == {"manual-1": "blend"}
 
 
 def test_prototype_without_selected_pages_samples_first_three_and_ignores_seed_flags():
@@ -3024,6 +3100,150 @@ def test_visual_edit_invalidates_prompt_and_image_only():
     assert refreshed_slide.status == "completed"
 
 
+def test_visual_edit_can_remove_auto_visual_asset_ids():
+    db = make_session()
+    project = Project(title="Visual asset removal", status="completed", content_plan_confirmed=True, selected_style={"name": "Brand"})
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        visual_json={
+            "visual_description": "old visual",
+            "visual_asset_ids": ["asset-keep", "asset-remove"],
+            "visual_asset_usage": {"asset-keep": "保留", "asset-remove": "移除"},
+        },
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.commit()
+
+    slides_api.update_slide_visual(
+        project.id,
+        slides_api.UpdateVisualRequest(
+            page_num=1,
+            visual_json={
+                "visual_asset_ids": ["asset-keep"],
+                "visual_asset_usage": {"asset-keep": "保留"},
+            },
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+
+    assert refreshed_slide.visual_json["visual_asset_ids"] == ["asset-keep"]
+    assert refreshed_slide.visual_json["visual_asset_usage"] == {"asset-keep": "保留"}
+    assert artifact_stale(refreshed_slide.visual_json) == {"visual": True}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.image_path == "/tmp/old.png"
+
+
+def test_visual_edit_records_removed_auto_visual_asset_ids():
+    db = make_session()
+    project = Project(title="Visual asset exclusion", status="completed", content_plan_confirmed=True, selected_style={"name": "Brand"})
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        visual_json={
+            "visual_description": "old visual",
+            "visual_asset_ids": ["asset-keep", "asset-remove"],
+            "visual_asset_usage": {"asset-keep": "保留", "asset-remove": "移除"},
+        },
+        prompt_text="old prompt",
+    )
+    db.add(slide)
+    db.commit()
+
+    slides_api.update_slide_visual(
+        project.id,
+        slides_api.UpdateVisualRequest(
+            page_num=1,
+            slide_id=slide.id,
+            visual_json={
+                "visual_asset_ids": ["asset-keep"],
+                "visual_asset_usage": {"asset-keep": "保留"},
+            },
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+
+    assert refreshed_slide.visual_json["visual_asset_ids"] == ["asset-keep"]
+    assert refreshed_slide.visual_json["excluded_visual_asset_ids"] == ["asset-remove"]
+
+
+def test_visual_merge_preserves_excluded_auto_assets():
+    merged = slides_api._merge_manual_pins_into_visual_json(
+        {
+            "visual_asset_ids": ["asset-remove", "asset-fresh"],
+            "visual_asset_usage": {"asset-remove": "自动回流", "asset-fresh": "新素材"},
+        },
+        {"excluded_visual_asset_ids": ["asset-remove"]},
+    )
+
+    assert merged["visual_asset_ids"] == ["asset-fresh"]
+    assert merged["visual_asset_usage"] == {"asset-fresh": "新素材"}
+    assert merged["excluded_visual_asset_ids"] == ["asset-remove"]
+
+
+def test_visual_plan_skips_user_excluded_visual_assets(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"1": {'
+                                        '"visual_evidence": "校园驿站场景", '
+                                        '"visual_summary": "驿站场景", '
+                                        '"visual_description": "用校园驿站场景组织画面。", '
+                                        '"visual_asset_ids": ["asset-remove"], '
+                                        '"visual_asset_usage": {"asset-remove": "右侧展示"}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 1,
+                "type": "content",
+                "text_content": {"headline": "校园驿站", "body": "取件机与回收场景"},
+                "excluded_visual_asset_ids": ["asset-remove"],
+            }
+        ],
+        global_visual_assets=[
+            {"id": "asset-remove", "name": "取件机", "kind": "scene", "analysis_summary": "取件机;校园驿站"},
+        ],
+    )
+
+    assert plan[0]["excluded_visual_asset_ids"] == ["asset-remove"]
+    assert plan[0]["visual_asset_ids"] == []
+    assert plan[0]["visual_asset_usage"] == {}
+
+
 def test_visual_edit_persists_exact_overlay_layers(tmp_path):
     db = make_session()
     project = Project(title="Visual exact overlay", status="completed", content_plan_confirmed=True, selected_style={"name": "Brand"})
@@ -3081,6 +3301,48 @@ def test_visual_edit_persists_exact_overlay_layers(tmp_path):
     assert refreshed_asset.asset_analysis["exact_overlay"] is True
     assert refreshed_slide.prompt_text == "old prompt"
     assert refreshed_slide.status == "completed"
+
+
+def test_visual_edit_persists_image_slots():
+    db = make_session()
+    project = Project(title="Visual image slots", status="completed", content_plan_confirmed=True, selected_style={"name": "Brand"})
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="completed",
+        visual_json={"visual_description": "old"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.commit()
+
+    image_slots = [
+        {
+            "id": "A",
+            "subject": "特罗卡德罗 Trocadéro 正面铁塔远景",
+            "role": "primary",
+            "position": "upper-center large landscape",
+            "shape": "landscape postcard",
+            "linked_text": ["body_1", "特罗卡德罗 Trocadéro"],
+        }
+    ]
+    slides_api.update_slide_visual(
+        project.id,
+        slides_api.UpdateVisualRequest(
+            page_num=1,
+            visual_json={"image_slots": image_slots},
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).one()
+
+    assert refreshed_slide.visual_json["image_slots"] == image_slots
+    assert artifact_stale(refreshed_slide.visual_json) == {"visual": True}
+    assert refreshed_slide.prompt_text == "old prompt"
+    assert refreshed_slide.image_path == "/tmp/old.png"
 
 
 def test_visual_asset_upload_defaults_crop_but_honors_explicit_blend(tmp_path, monkeypatch):
@@ -4379,11 +4641,20 @@ def test_asset_pins_replace_reorder_and_survive_visual_merge(tmp_path):
     assert slide.prompt_text == "old"
     assert slide.status == "completed"
 
+    slide.visual_json["asset_route_modes"] = {
+        assets[1].id: "blend",
+        assets[0].id: "double_blend",
+        "old-auto": "overlay",
+    }
     merged = slides_api._merge_manual_pins_into_visual_json(
         {"visual_asset_ids": ["auto-1"], "visual_asset_usage": {"auto-1": "自动"}},
         slide.visual_json,
     )
     assert merged["visual_asset_ids"][:3] == [assets[1].id, assets[0].id, "auto-1"]
+    assert merged["asset_route_modes"] == {
+        assets[1].id: "blend",
+        assets[0].id: "double_blend",
+    }
 
 
 def test_overlay_layers_endpoint_and_visual_merge(tmp_path):

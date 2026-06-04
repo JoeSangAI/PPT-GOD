@@ -34,6 +34,58 @@ def test_stale_style_proposal_is_kept_after_user_selects_style():
     assert project.style_proposal["proposals"][0]["name"] == "旧方案"
 
 
+def test_style_confirmation_resolves_direct_continue_to_recommended_proposal():
+    project = Project(title="Direct continue", status="visual_ready", content_plan_confirmed=True)
+    project.style_proposal = {
+        "proposals": [
+            {"name": "推荐视觉方向", "decision_label": "推荐", "palette": [{"hex": "#111111"}]},
+            {"name": "备选视觉方向", "decision_label": "方案 2", "palette": [{"hex": "#FFFFFF"}]},
+        ]
+    }
+
+    resolved = projects_api._resolve_selected_style_input(project, "直接继续吧")
+
+    assert resolved["name"] == "推荐视觉方向"
+
+
+def test_style_update_request_accepts_agent_string_confirmation():
+    payload = projects_api.StyleUpdateRequest(selected_style="方案2")
+
+    assert payload.selected_style == "方案2"
+
+
+def test_update_project_style_persists_string_confirmation_choice():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+
+    project = Project(title="String style save", status="visual_ready", content_plan_confirmed=True)
+    project.style_proposal = {
+        "proposals": [
+            {"name": "推荐视觉方向", "decision_label": "推荐", "palette": [{"hex": "#111111"}]},
+            {"name": "备选视觉方向", "decision_label": "方案 2", "palette": [{"hex": "#FFFFFF"}]},
+        ]
+    }
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path="/outputs/old.png", prompt_text="old"))
+    db.commit()
+
+    updated = projects_api.update_project_style(
+        project.id,
+        projects_api.StyleUpdateRequest(selected_style="方案2"),
+        db=db,
+    )
+
+    assert updated.selected_style["name"] == "备选视觉方向"
+    assert updated.status == "visual_ready"
+    slide = db.query(Slide).filter(Slide.project_id == project.id).first()
+    assert slide.status == "pending"
+    assert slide.image_path is None
+    assert slide.prompt_text is None
+
+
 def test_style_proposal_uses_cached_style_ref_when_file_is_missing(monkeypatch, tmp_path):
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)

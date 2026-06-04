@@ -1,6 +1,7 @@
 import functools
 import glob
 import json
+import json_repair
 import logging
 import os
 import re
@@ -16,6 +17,40 @@ from app.services.visual_strategy import build_visual_strategy
 logger = logging.getLogger(__name__)
 
 STYLE_PROPOSAL_POLICY_VERSION = "2026-05-15-style-source-priority-v1"
+
+
+def _parse_llm_json(raw: str, *, expected_type: type, context: str):
+    text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.DOTALL).strip()
+    text = re.sub(r"^```(?:json)?\s*|```$", "", text, flags=re.MULTILINE | re.IGNORECASE).strip()
+    if expected_type is list:
+        start, end = text.find("["), text.rfind("]")
+    else:
+        start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        text = text[start:end + 1]
+
+    parse_errors: list[str] = []
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        parse_errors.append(f"json.loads: {exc}")
+    else:
+        if isinstance(parsed, expected_type):
+            return parsed
+        parse_errors.append(f"json.loads type={type(parsed).__name__}")
+
+    try:
+        parsed = json_repair.loads(text)
+    except Exception as exc:
+        parse_errors.append(f"json_repair: {exc}")
+    else:
+        if isinstance(parsed, expected_type):
+            logger.info("%s: json_repair recovered malformed LLM JSON", context)
+            return parsed
+        parse_errors.append(f"json_repair type={type(parsed).__name__}")
+
+    logger.warning("%s: JSON 解析失败: %s，raw前200字: %s", context, "; ".join(parse_errors), text[:200])
+    return [] if expected_type is list else {}
 
 
 
@@ -1110,20 +1145,10 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
     raw = raw.strip()
     logger.info(f"StyleProposal: LLM raw response length={len(raw)}")
 
-    import re
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    raw = re.sub(r"^```(?:json)?\s*|```$", "", raw, flags=re.MULTILINE | re.IGNORECASE).strip()
-
-    proposals = []
     if raw:
-        try:
-            proposals = json.loads(raw)
-            if not isinstance(proposals, list):
-                logger.warning("StyleProposal: LLM 返回的不是数组，使用默认方案")
-                proposals = []
-        except json.JSONDecodeError as e:
-            logger.warning(f"StyleProposal: JSON 解析失败: {e}，raw前200字: {raw[:200]}")
+        proposals = _parse_llm_json(raw, expected_type=list, context="StyleProposal")
     else:
+        proposals = []
         logger.warning("StyleProposal: LLM 返回空内容，使用默认方案")
 
     # Under "LLM thick" philosophy, style drift and topic mismatch are handled
@@ -1276,18 +1301,10 @@ def _generate_asset_based_proposal(
     raw = raw.strip()
     logger.info(f"StyleProposal(AssetBased): LLM raw response length={len(raw)}")
 
-    import re
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    raw = re.sub(r"^```(?:json)?\s*|```$", "", raw, flags=re.MULTILINE | re.IGNORECASE).strip()
-
-    proposal = {}
     if raw:
-        try:
-            proposal = json.loads(raw)
-            if not isinstance(proposal, dict):
-                proposal = {}
-        except json.JSONDecodeError as e:
-            logger.warning(f"StyleProposal(AssetBased): JSON 解析失败: {e}")
+        proposal = _parse_llm_json(raw, expected_type=dict, context="StyleProposal(AssetBased)")
+    else:
+        proposal = {}
 
     if not proposal:
         raise RuntimeError("StyleProposal(AssetBased): LLM 未返回有效风格提案")

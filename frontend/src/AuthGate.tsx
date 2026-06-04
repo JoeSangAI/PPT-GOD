@@ -183,7 +183,7 @@ function ProviderSetup({
                   className="pg-auth-input"
                   value={value.minimaxLlmModel}
                   onChange={(e) => update("minimaxLlmModel", e.target.value)}
-                  placeholder="MiniMax-M2.7"
+                  placeholder="MiniMax-M3"
                 />
               </label>
             </div>

@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 logger = logging.getLogger(__name__)
@@ -133,11 +134,105 @@ def delete_project(project_id: str, tester_id: str = Depends(tester_id_from_head
 
 
 class StyleUpdateRequest(BaseModel):
-    selected_style: dict | None = None
+    selected_style: Any = None
 
 
 class StyleProposalRequest(BaseModel):
     user_description: str | None = None
+
+
+def _normalize_style_choice_text(value: Any) -> str:
+    return re.sub(r"[\s。.!！?？,，、:：;；~～\"'“”‘’（）()【】\\[\\]_-]+", "", str(value or "")).lower()
+
+
+def _style_choice_candidates(project: Project) -> list[dict]:
+    candidates: list[dict] = []
+    proposal = project.style_proposal if isinstance(project.style_proposal, dict) else None
+    proposals = proposal.get("proposals") if proposal else None
+    if isinstance(proposals, list):
+        candidates.extend([item for item in proposals if isinstance(item, dict)])
+    if isinstance(project.selected_style, dict):
+        candidates.append(project.selected_style)
+
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = str(item.get("name") or item.get("decision_label") or id(item))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _requested_style_index(text: str) -> int | None:
+    normalized = _normalize_style_choice_text(text)
+    cn_nums = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+    match = re.search(r"(?:方案|第)?([0-9]{1,2}|[一二两三四五六七八九十])(?:套|个|号|版)?", normalized)
+    if not match:
+        return None
+    raw = match.group(1)
+    number = int(raw) if raw.isdigit() else cn_nums.get(raw)
+    if not number or number <= 0:
+        return None
+    return number - 1
+
+
+def _style_choice_labels(style: dict, index: int) -> list[str]:
+    labels = [
+        style.get("name"),
+        style.get("decision_label"),
+        style.get("source"),
+        f"方案{index + 1}",
+        f"第{index + 1}套",
+    ]
+    if index == 0:
+        labels.extend(["推荐", "默认", "第一套"])
+    return [_normalize_style_choice_text(item) for item in labels if item]
+
+
+def _resolve_selected_style_input(project: Project, selected_style: Any) -> dict:
+    candidates = _style_choice_candidates(project)
+
+    if isinstance(selected_style, dict):
+        if any(selected_style.get(key) for key in ("name", "palette", "mood", "font", "description", "visual_strategy")):
+            return selected_style
+        if candidates:
+            return candidates[0]
+
+    text = selected_style.strip() if isinstance(selected_style, str) else ""
+    normalized_text = _normalize_style_choice_text(text)
+    if normalized_text and candidates:
+        requested_index = _requested_style_index(text)
+        if requested_index is not None and 0 <= requested_index < len(candidates):
+            return candidates[requested_index]
+
+        for index, candidate in enumerate(candidates):
+            labels = _style_choice_labels(candidate, index)
+            if normalized_text in labels or any(label and label in normalized_text for label in labels):
+                return candidate
+
+        if re.search(r"(直接|继续|跳过|默认|推荐|就这个|选这个|确认|可以|ok|okay|好)", normalized_text):
+            return candidates[0]
+
+    if selected_style is None and candidates:
+        return candidates[0]
+
+    if isinstance(selected_style, (list, tuple)):
+        raise HTTPException(status_code=400, detail="视觉方向格式不正确，请重新选择一套视觉方向。")
+    raise HTTPException(status_code=400, detail="请先生成视觉方向，再选择一套继续。")
 
 
 @router.patch("/{project_id}/style", response_model=ProjectResponse)
@@ -150,11 +245,12 @@ def update_project_style(
     project = db.query(Project).filter(Project.id == project_id).first()
     verify_project_access(project, tester_id)
     if payload.selected_style is not None:
+        selected_style = _resolve_selected_style_input(project, payload.selected_style)
         slides = list(project.slides or [])
         style_dependencies = dependency_signature(project, slides)
-        style_dependencies["selected_style"] = selected_style_signature(payload.selected_style)
+        style_dependencies["selected_style"] = selected_style_signature(selected_style)
         project.selected_style = with_artifact_meta(
-            payload.selected_style,
+            selected_style,
             kind="selected_style",
             dependencies=style_dependencies,
         )

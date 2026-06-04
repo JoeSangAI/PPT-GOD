@@ -35,7 +35,7 @@ class Settings(BaseSettings):
 
     MINIMAX_API_KEY: str = ""
     MINIMAX_API_BASE: str = "https://api.minimaxi.com/v1"
-    MINIMAX_LLM_MODEL: str = "MiniMax-M2.7"
+    MINIMAX_LLM_MODEL: str = "MiniMax-M3"
     COMET_API_KEY: str = ""
     COMET_API_BASE: str = "https://api.cometapi.com/v1"
     COMET_IMAGE_MODEL: str = "gpt-image-2-all"
@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     EDITABLE_PPTX_OCR_RETRY_COUNT: int = 2
     EDITABLE_PPTX_OCR_RETRY_BACKOFF_SECONDS: float = 1.5
     EDITABLE_PPTX_MAX_VISUAL_ASSETS_PER_SLIDE: int = 6
+    EDITABLE_PPTX_QA_MAX_WORKERS: int = 4
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:8000,http://127.0.0.1:8000,http://127.0.0.1:5173,http://127.0.0.1:5174,http://127.0.0.1:5175"
 
     OUTPUT_DIR: str = ""

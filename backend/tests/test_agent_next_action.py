@@ -1,6 +1,8 @@
 from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VISUAL_ACTIONS, with_next_action
 from app.api.chat import (
+    _build_content_contract_prompt,
     _build_page_context_prompt_section,
+    _infer_content_edit_policy,
     _content_result_needs_contract_review,
     _enforce_content_action_contract,
     _enforce_visual_action_contract,
@@ -36,6 +38,32 @@ def test_content_proposal_gets_generate_plan_next_action():
         "payload": {"topic": "品牌年轻化策略提案", "page_count": 12},
     }
     assert "next_action" not in result
+
+
+def test_content_proposal_does_not_treat_one_page_estimate_as_user_request():
+    result = {
+        "action": "propose_plan",
+        "topic": "恒河猴实验",
+        "positioning": {"estimated_pages": 1},
+        "response": "已整理好方向。",
+    }
+
+    decorated = with_next_action(result, {"total_slides": 0}, "content")
+
+    assert decorated["next_action"]["payload"] == {"topic": "恒河猴实验", "page_count": None}
+
+
+def test_content_proposal_preserves_explicit_one_page_request():
+    result = {
+        "action": "propose_plan",
+        "topic": "做成一页 PPT：恒河猴实验",
+        "positioning": {"estimated_pages": 1},
+        "response": "已整理好方向。",
+    }
+
+    decorated = with_next_action(result, {"total_slides": 0}, "content")
+
+    assert decorated["next_action"]["payload"] == {"topic": "做成一页 PPT：恒河猴实验", "page_count": 1}
 
 
 def test_brief_page_count_range_is_inferred_from_initial_topic():
@@ -241,6 +269,16 @@ def test_visual_generation_answer_is_coerced_to_confirmation_action():
 
     assert compiled["action"] == "request_generate_image"
     assert compiled["page_nums"] == [2, 3]
+
+
+def test_visual_confirm_style_without_payload_is_kept_for_state_resolver():
+    compiled = _enforce_visual_action_contract(
+        result={"action": "confirm_style", "response": "收到，直接继续。"},
+        user_message="直接继续吧",
+        page_context={"mode": "global", "scope": "deck", "target_page_nums": []},
+    )
+
+    assert compiled["action"] == "confirm_style"
 
 
 def test_visual_page_edit_answer_is_coerced_to_precise_update_action():
@@ -627,6 +665,56 @@ def test_update_all_slides_payload_is_deduped_by_page_num():
     )
 
     assert compiled["updated_slides"] == [{"page_num": 3, "text_content": {"body": "新正文"}}]
+
+
+def test_content_contract_prefers_targeted_preservation_edit_over_deck_regeneration():
+    prompt = _build_content_contract_prompt()
+
+    assert "局部保真编辑" in prompt
+    assert "update_all_slides" in prompt
+    assert "regenerate_plan" in prompt
+    assert "促销点" not in prompt
+    assert "投放点" not in prompt
+
+
+def test_local_preservation_edit_policy_is_generalized_from_scope_transform_and_preservation():
+    policy = _infer_content_edit_policy(
+        user_message="把第 3 到 5 页的关键风险提到标题里，正文里的案例和数据都别删",
+        page_context={
+            "mode": "global",
+            "scope": "selected_slides",
+            "target_page_nums": [3, 4, 5],
+            "target_area": "whole",
+        },
+        project_context={"title": "风险复盘", "total_slides": 12, "content_plan_confirmed": False},
+    )
+
+    assert policy["kind"] == "local_preservation_edit"
+    assert policy["required_action"] == "update_all_slides"
+    assert policy["target_page_nums"] == [3, 4, 5]
+
+
+def test_local_preservation_edit_does_not_fallback_to_regenerate_plan_when_payload_is_unsafe():
+    compiled = _enforce_content_action_contract(
+        result={"action": "answer", "response": "收到，正在调整。"},
+        user_message="把第 3 到 5 页的关键风险提到标题里，正文里的案例和数据都别删",
+        project_context={"title": "风险复盘", "total_slides": 12, "content_plan_confirmed": False},
+        page_context={
+            "mode": "global",
+            "scope": "selected_slides",
+            "target_page_nums": [3, 4, 5],
+            "target_area": "whole",
+        },
+        compiler=lambda **_: {
+            "action": "regenerate_plan",
+            "topic": "风险复盘。重新生成内容规划。",
+            "response": "收到，重新生成内容规划。",
+        },
+    )
+
+    assert compiled["action"] == "answer"
+    assert compiled["no_change_reason"] == "local_preservation_contract_failed"
+    assert "没有修改 PPT" in compiled["response"]
 
 
 def test_forward_to_visual_is_reviewed_before_final_handoff():

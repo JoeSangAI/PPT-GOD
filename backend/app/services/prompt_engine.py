@@ -179,20 +179,273 @@ def _strip_absent_text_slot_clauses(text: str, content_text: Optional[Dict] = No
         return str(text)
 
     subhead_markers = ("副标题", "小标题", "subtitle", "subhead")
-    body_markers = (
-        "说明文字", "说明文案", "正文", "正文文字", "正文文案",
-        "body copy", "body text", "small copy", *_MICROCOPY_MARKERS,
-    )
     kept: list[str] = []
     for clause in _split_clauses(text):
         lowered = clause.lower()
         mentions_subhead = any(marker in lowered for marker in subhead_markers)
-        mentions_body = any(marker in lowered for marker in body_markers)
+        mentions_body = any(marker.lower() in lowered for marker in (*_BODY_SLOT_MARKERS, *_MICROCOPY_MARKERS))
+        mentions_info_block = any(marker.lower() in lowered for marker in _INFO_BLOCK_MARKERS)
         if mentions_subhead and not has_subhead:
             continue
         if mentions_body and not has_body:
             continue
+        if mentions_info_block and not has_body:
+            continue
         kept.append(clause)
+    return "；".join(kept).strip()
+
+
+_INFO_BLOCK_MARKERS = (
+    "信息块", "信息区", "提示块", "提示框", "说明框", "浅黄色", "黄色信息",
+    "info block", "note block", "callout", "yellow note", "footer strip",
+)
+
+_BODY_SLOT_MARKERS = (
+    "正文", "正文要点", "正文文字", "正文文案", "文字内容",
+    "简介文字", "介绍文字", "说明内容", "要点", "文案",
+    "body", "body copy", "body text", "copy", "points",
+)
+
+_BODY_CONTAINER_ACTION_MARKERS = (
+    "承载", "容纳", "收拢", "放入", "放置", "展示", "呈现", "内含", "包含", "贴合",
+    "carry", "carries", "contain", "contains", "hold", "holds", "show", "shows",
+)
+
+_INFO_BLOCK_DECORATIVE_MARKERS = (
+    "装饰", "页码", "短标签", "label-only", "decorative", "page number",
+)
+
+_MULTI_VISUAL_SUBJECT_MARKERS = (
+    "多张", "多个", "多图", "三图", "拼贴", "辅图", "小图", "小尺寸",
+    "照片组合", "照片卡片", "环绕", "叠放", "错位", "分栏", "对比",
+    "集合", "三宝", "作品", "馆藏", "机位", "餐厅", "橱窗", "门面",
+    "主图与辅图", "1-2张", "0-2张", "2张", "3张",
+    "collage", "multiple", "comparison", "grid", "cards",
+)
+
+
+def _body_items(content_text: Optional[Dict]) -> list[str]:
+    body = (content_text or {}).get("body")
+    raw_items: list[str]
+    if isinstance(body, str):
+        raw_items = [line.strip() for line in body.splitlines() if line.strip()]
+    elif isinstance(body, list):
+        raw_items = [
+            str(item.get("content") if isinstance(item, dict) else item).strip()
+            for item in body
+            if str(item.get("content") if isinstance(item, dict) else item).strip()
+        ]
+    else:
+        raw_items = []
+    return [_strip_markdown(item) for item in raw_items if _strip_markdown(item)]
+
+
+def _body_item_anchor(item: str) -> str:
+    value = _strip_markdown(item).strip()
+    if not value:
+        return ""
+    artwork_match = re.match(r"^(《[^》]{1,36}》)", value)
+    if artwork_match:
+        return artwork_match.group(1).strip()
+    if "：" in value or ":" in value:
+        label = re.split(r"[：:]", value, maxsplit=1)[0].strip()
+        if 2 <= len(label) <= 48:
+            return label
+    return ""
+
+
+def _body_item_anchors(content_text: Optional[Dict]) -> list[str]:
+    anchors: list[str] = []
+    for item in _body_items(content_text):
+        anchor = _body_item_anchor(item)
+        if anchor and anchor not in anchors:
+            anchors.append(anchor)
+    return anchors
+
+
+def _slot_text(value, max_chars: int = 80) -> str:
+    cleaned = _strip_markdown(str(value or "")).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars].rstrip() + "..."
+    return cleaned
+
+
+def _slot_links(value) -> list[str]:
+    if isinstance(value, str):
+        raw_links = [part.strip() for part in re.split(r"[,，;；\n]+", value) if part.strip()]
+    elif isinstance(value, list):
+        raw_links = [str(item or "").strip() for item in value if str(item or "").strip()]
+    else:
+        raw_links = []
+    links: list[str] = []
+    for link in raw_links:
+        cleaned = _slot_text(link, 48)
+        if cleaned and cleaned not in links:
+            links.append(cleaned)
+    return links[:4]
+
+
+def _normalize_image_slots(page_intent: Dict) -> list[Dict]:
+    raw_slots = (page_intent or {}).get("image_slots") or []
+    if not isinstance(raw_slots, list):
+        return []
+
+    slots: list[Dict] = []
+    for index, raw_slot in enumerate(raw_slots[:8]):
+        if not isinstance(raw_slot, dict):
+            continue
+        subject = _slot_text(
+            raw_slot.get("subject")
+            or raw_slot.get("visual")
+            or raw_slot.get("label")
+            or raw_slot.get("description"),
+            86,
+        )
+        if not subject:
+            continue
+        slot_id = _slot_text(raw_slot.get("id") or chr(ord("A") + index), 16)
+        linked_text = _slot_links(
+            raw_slot.get("linked_text")
+            or raw_slot.get("linked_body")
+            or raw_slot.get("links")
+            or raw_slot.get("caption_anchor")
+        )
+        slots.append({
+            "id": slot_id,
+            "subject": subject,
+            "role": _slot_text(raw_slot.get("role"), 28),
+            "position": _slot_text(raw_slot.get("position") or raw_slot.get("placement"), 56),
+            "shape": _slot_text(raw_slot.get("shape") or raw_slot.get("frame"), 48),
+            "linked_text": linked_text,
+            "strictness": _slot_text(raw_slot.get("strictness"), 16),
+        })
+    return slots
+
+
+def _has_explicit_image_slot_links(page_intent: Dict) -> bool:
+    return any(slot.get("linked_text") for slot in _normalize_image_slots(page_intent))
+
+
+def _image_slot_map_instruction(page_intent: Dict) -> str:
+    slots = _normalize_image_slots(page_intent)
+    if not slots:
+        return ""
+
+    lines: list[str] = []
+    for slot in slots:
+        attrs: list[str] = []
+        if slot.get("role"):
+            attrs.append(f"role={slot['role']}")
+        if slot.get("position"):
+            attrs.append(f"position={slot['position']}")
+        if slot.get("shape"):
+            attrs.append(f"shape={slot['shape']}")
+        if slot.get("linked_text"):
+            attrs.append("linked text=" + ", ".join(slot["linked_text"]))
+        if slot.get("strictness"):
+            attrs.append(f"strictness={slot['strictness']}")
+        suffix = "; " + "; ".join(attrs) if attrs else ""
+        lines.append(f"{slot['id']}: {slot['subject']}{suffix}")
+
+    lines.append("Use Slot map as the source of truth for image placement and caption association.")
+    return "\n".join(lines)
+
+
+def _should_bind_body_to_visual_subjects(page_intent: Dict, content_text: Optional[Dict]) -> bool:
+    """Use caption-like body when multiple body items map to multiple visual subjects."""
+    items = _body_items(content_text)
+    if len(items) < 2:
+        return False
+    if len(_body_item_anchors(content_text)) < 2:
+        return False
+    source = " ".join(
+        str((page_intent or {}).get(key) or "")
+        for key in ("visual_evidence", "visual_summary", "visual_description", "design_notes")
+    ).lower()
+    if not any(marker.lower() in source for marker in _MULTI_VISUAL_SUBJECT_MARKERS):
+        return False
+    return True
+
+
+def _composition_binding_instruction(page_intent: Dict, content_text: Optional[Dict], body_label: str) -> str:
+    if body_label != "Linked caption body":
+        return ""
+    if _normalize_image_slots(page_intent):
+        return (
+            "Place each Linked caption body close to the Slot map photo it belongs to, using the slot IDs or short "
+            "caption chips consistently. Let photo cards and captions interleave across the center instead of forming "
+            "a detached bottom tag bar or a rigid left-text/right-image split."
+        )
+    item_labels = _body_item_anchors(content_text)[:8]
+    label_text = "、".join(item_labels[:6])
+    label_clause = f" Match these caption anchors to corresponding photos/subjects: {label_text}." if label_text else ""
+    return (
+        "Image-text binding: use an interleaved composition. Place each Linked caption body near its matching photo "
+        "or visual subject, using small numbered markers, caption chips, or short connector lines consistently across "
+        "text and images. Let photo cards and captions cross the center line so the middle of the slide feels active "
+        "and balanced, not split into a detached text side and detached image side."
+        + label_clause
+    )
+
+
+def _body_directive_label(page_intent: Dict, style_text: str | None, content_text: Optional[Dict] = None) -> str:
+    """Name the body text slot once, based on the visual system's intended container."""
+    if _has_explicit_image_slot_links(page_intent) and _body_items(content_text):
+        return "Linked caption body"
+    if _should_bind_body_to_visual_subjects(page_intent, content_text):
+        return "Linked caption body"
+    for source in (
+        (page_intent or {}).get("visual_description"),
+        (page_intent or {}).get("design_notes"),
+        style_text,
+    ):
+        phrases = [
+            part.strip()
+            for part in re.split(r"[。；;，,\n]+", str(source or ""))
+            if part.strip()
+        ]
+        for idx, phrase in enumerate(phrases):
+            lowered = phrase.lower()
+            mentions_info_block = any(marker.lower() in lowered for marker in _INFO_BLOCK_MARKERS)
+            mentions_body_slot = any(marker.lower() in lowered for marker in _BODY_SLOT_MARKERS)
+            if mentions_info_block and mentions_body_slot:
+                return "Info block body"
+            if not mentions_info_block:
+                continue
+            if any(marker.lower() in lowered for marker in _INFO_BLOCK_DECORATIVE_MARKERS):
+                continue
+            next_phrase = phrases[idx + 1].lower() if idx + 1 < len(phrases) else ""
+            if (
+                any(marker.lower() in next_phrase for marker in _BODY_SLOT_MARKERS)
+                and any(marker.lower() in next_phrase for marker in _BODY_CONTAINER_ACTION_MARKERS)
+            ):
+                return "Info block body"
+    return "Body"
+
+
+def _normalize_body_slot_clauses(text: str, body_label: str = "Body") -> str:
+    """
+    Keep layout prose about where the text container sits, but remove duplicate
+    instructions that describe the same body copy as another text slot.
+    """
+    if not text or body_label == "Body":
+        return str(text or "")
+
+    kept: list[str] = []
+    for clause in _split_clauses(text):
+        lowered = clause.lower()
+        mentions_info_block = any(marker.lower() in lowered for marker in _INFO_BLOCK_MARKERS)
+        mentions_body = any(marker.lower() in lowered for marker in _BODY_SLOT_MARKERS)
+        if mentions_info_block and mentions_body:
+            clause = re.split(
+                r"(承载|容纳|收拢|放入|放置|展示|呈现|内含|包含|贴合|用来|作为|carr(?:y|ies)|contain(?:s)?|hold(?:s)?|place(?:s)?|show(?:s)?)",
+                clause,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" ，,。；;")
+        if clause:
+            kept.append(clause)
     return "；".join(kept).strip()
 
 
@@ -337,6 +590,7 @@ def _compact_visual_evidence_with_style(
     reference_images: Optional[List[Dict]],
     style_text: str | None,
     content_text: Optional[Dict] = None,
+    body_label: str = "Body",
 ) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     visual_evidence = _strip_internal_reference_metadata(visual_evidence)
@@ -344,6 +598,7 @@ def _compact_visual_evidence_with_style(
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
     visual_evidence = _strip_absent_text_slot_clauses(visual_evidence, content_text)
+    visual_evidence = _normalize_body_slot_clauses(visual_evidence, body_label)
     if str((page_intent or {}).get("type") or "").strip().lower() == "section":
         visual_evidence = sanitize_section_visual_numbering(visual_evidence)
     return visual_evidence or "Use the uploaded product image as the product source, with supporting visuals derived from this slide's content."
@@ -354,6 +609,7 @@ def _compact_layout_intent(
     reference_images: Optional[List[Dict]] = None,
     style_text: str | None = None,
     content_text: Optional[Dict] = None,
+    body_label: str = "Body",
 ) -> str:
     layout = page_intent.get("layout") or page_intent.get("type", "content")
     visual_desc = " ".join(str(page_intent.get("visual_description", "")).split())
@@ -363,6 +619,7 @@ def _compact_layout_intent(
         visual_desc = _sanitize_product_reference_text(visual_desc)
     visual_desc = _remove_brand_mark_drawing_language(visual_desc)
     visual_desc = _strip_absent_text_slot_clauses(visual_desc, content_text)
+    visual_desc = _normalize_body_slot_clauses(visual_desc, body_label)
     if str((page_intent or {}).get("type") or "").strip().lower() == "section":
         visual_desc = sanitize_section_visual_numbering(visual_desc)
     if len(visual_desc) > 260:
@@ -624,6 +881,7 @@ def generate_prompt_for_page(
         )
 
     reference_descriptions = _reference_descriptions_for_prompt(page_intent, content_text or {}, reference_images)
+    body_label = _body_directive_label(page_intent, style_text, content_text)
 
     # 强制追加文字渲染指令（确保文字一定出现在图片上）
     # 外层用单引号包裹用户文本，避免与用户文本中的双引号冲突
@@ -647,18 +905,18 @@ def generate_prompt_for_page(
         s = _escape(_strip_markdown(content_text["subhead"]))
         text_directives.append(f'Subhead: "{s}"')
     body = content_text.get("body")
-    if body and not is_punchline_page:
+    if body and (not is_punchline_page or body_label != "Body"):
         if isinstance(body, str):
             lines = [line.strip() for line in body.splitlines() if line.strip()]
             for item in lines:
                 cleaned = _escape(_strip_markdown(item))
                 if cleaned:
-                    text_directives.append(f'Body: "{cleaned}"')
+                    text_directives.append(f'{body_label}: "{cleaned}"')
         else:
             for item in body:
                 cleaned = _escape(_strip_markdown(item))
                 if cleaned:
-                    text_directives.append(f'Body: "{cleaned}"')
+                    text_directives.append(f'{body_label}: "{cleaned}"')
     for label in diagram_labels[:16]:
         cleaned = _escape(_strip_markdown(label))
         if cleaned:
@@ -712,8 +970,28 @@ def generate_prompt_for_page(
     )
     style_block = _compact_style_pack(style_text)
     overlay_layers = enabled_overlay_layers(page_intent)
-    visual_evidence = _compact_visual_evidence_with_style(page_intent, reference_images, style_text, content_text)
-    layout_intent = _compact_layout_intent(page_intent, reference_images, style_text, content_text)
+    visual_evidence = _compact_visual_evidence_with_style(
+        page_intent,
+        reference_images,
+        style_text,
+        content_text,
+        body_label=body_label,
+    )
+    layout_intent = _compact_layout_intent(
+        page_intent,
+        reference_images,
+        style_text,
+        content_text,
+        body_label=body_label,
+    )
+    slot_map = _image_slot_map_instruction(page_intent)
+    composition_binding = _composition_binding_instruction(page_intent, content_text, body_label)
+    composition_parts = []
+    if slot_map:
+        composition_parts.append("Slot map:\n" + slot_map)
+    if composition_binding:
+        composition_parts.append(composition_binding)
+    composition_section = f"\n\nComposition:\n" + "\n".join(composition_parts) if composition_parts else ""
     refs_block = "\n".join(f"- {desc}" for desc in reference_descriptions[:6])
     refs_section = f"\n\nReferences:\n{refs_block}" if refs_block else ""
     overlay_reservation = overlay_reservation_instruction(
@@ -737,6 +1015,7 @@ def generate_prompt_for_page(
         + str(visual_evidence)
         + "\n\nLayout:\n"
         + str(layout_intent)
+        + composition_section
         + (f"\n{punchline_treatment}" if punchline_treatment else "")
         + overlay_section
         + "\n\nCreate one polished widescreen landscape presentation slide. Keep visible text legible."
