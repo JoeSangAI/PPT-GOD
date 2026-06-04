@@ -7,9 +7,9 @@ import re
 from typing import Dict
 
 from PIL import Image as PILImage
-import requests
 
-from app.core.provider_credentials import get_provider_credentials
+from app.core.llm_client import get_llm_client
+from app.core.provider_credentials import get_minimax_chat_extra_body, get_minimax_llm_model
 from app.services.visual_strategy import detect_logo_tone_from_image
 
 logger = logging.getLogger(__name__)
@@ -150,38 +150,39 @@ def _merge_logo_local_palette(result: Dict, local_palette: list[Dict]) -> Dict:
     return result
 
 
-def _minimax_coding_plan_url() -> str:
-    base = get_provider_credentials().minimax_api_base.rstrip("/")
-    if base.endswith("/v1"):
-        return f"{base}/coding_plan/vlm"
-    return f"{base}/v1/coding_plan/vlm"
-
-
 def _call_vision_model(image_path: str, prompt: str, *, timeout_seconds: float | None = None) -> str:
-    """调用 MiniMax Token Plan VLM 分析图片，返回文本结果。"""
+    """调用 MiniMax M3 原生多模态 chat 分析图片，返回文本结果。"""
     try:
         b64 = _encode_image_to_base64(image_path)
         mime = _guess_mime_type(image_path)
         image_url = f"data:{mime};base64,{b64}"
         request_timeout = 120 if timeout_seconds is None else max(3, float(timeout_seconds))
-        resp = requests.post(
-            _minimax_coding_plan_url(),
-            headers={
-                "Authorization": f"Bearer {get_provider_credentials().minimax_api_key}",
-                "Content-Type": "application/json",
-                "MM-API-Source": "Minimax-MCP",
-            },
-            json={"prompt": prompt, "image_url": image_url},
+        client = get_llm_client()
+        response = client.chat.completions.create(
+            model=get_minimax_llm_model(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                                "detail": "default",
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=8192,
             timeout=request_timeout,
+            extra_body=get_minimax_chat_extra_body(),
         )
-        resp.raise_for_status()
-        body = resp.json()
-        base_resp = body.get("base_resp") or {}
-        if base_resp and base_resp.get("status_code", 0) != 0:
-            raise RuntimeError(f"{base_resp.get('status_code')}: {base_resp.get('status_msg')}")
-        return body.get("content", "") or ""
+        return response.choices[0].message.content or ""
     except Exception as e:
-        logger.error(f"Token Plan VLM call failed for {image_path}: {e}")
+        logger.error(f"MiniMax M3 vision call failed for {image_path}: {e}")
         return ""
 
 

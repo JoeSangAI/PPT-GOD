@@ -22,6 +22,8 @@ COMET_IMAGE_MODEL_HEADER = "x-pptgod-comet-image-model"
 TESTER_NAME_HEADER = "x-pptgod-tester-name"
 
 TASK_CREDENTIAL_TTL_SECONDS = 12 * 60 * 60
+MINIMAX_M3_MODEL = "MiniMax-M3"
+LEGACY_BUILTIN_MINIMAX_LLM_MODELS = {"MiniMax-M2.7"}
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class ProviderCredentials:
         return ProviderCredentials(
             minimax_api_key=self.minimax_api_key or settings.MINIMAX_API_KEY,
             minimax_api_base=_clean_base_url(self.minimax_api_base or settings.MINIMAX_API_BASE),
-            minimax_llm_model=(self.minimax_llm_model or settings.MINIMAX_LLM_MODEL).strip(),
+            minimax_llm_model=_normalize_minimax_llm_model(self.minimax_llm_model or settings.MINIMAX_LLM_MODEL),
             comet_api_key=self.comet_api_key or settings.COMET_API_KEY or self.minimax_api_key or settings.MINIMAX_API_KEY,
             comet_api_base=_clean_base_url(self.comet_api_base or settings.COMET_API_BASE),
             comet_image_model=(self.comet_image_model or settings.COMET_IMAGE_MODEL).strip(),
@@ -94,6 +96,13 @@ def _clean_base_url(value: Any) -> str:
     return raw
 
 
+def _normalize_minimax_llm_model(value: Any) -> str:
+    model = str(value or "").strip()
+    if not model or model in LEGACY_BUILTIN_MINIMAX_LLM_MODELS:
+        return settings.MINIMAX_LLM_MODEL.strip()
+    return model
+
+
 def set_provider_credentials(credentials: ProviderCredentials):
     return _current_provider_credentials.set(credentials)
 
@@ -121,6 +130,13 @@ def get_raw_provider_credentials() -> ProviderCredentials:
 
 def get_minimax_llm_model() -> str:
     return get_provider_credentials().minimax_llm_model
+
+
+def get_minimax_chat_extra_body(model: str | None = None) -> dict[str, Any]:
+    selected_model = str(model or get_minimax_llm_model() or "").strip()
+    if selected_model == MINIMAX_M3_MODEL:
+        return {"thinking": {"type": "disabled"}}
+    return {}
 
 
 def get_comet_image_model() -> str:

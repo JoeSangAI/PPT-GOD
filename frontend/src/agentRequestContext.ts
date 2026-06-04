@@ -54,6 +54,56 @@ const parsePageCountNumber = (value: string) => {
   return Number.isFinite(num) && num >= 1 && num <= 200 ? num : null;
 };
 
+const MIN_UNPROMPTED_CONTENT_PLAN_PAGE_COUNT = 3;
+
+const parseChinesePageCount = (value: string) => {
+  const text = String(value || "").trim();
+  const digits: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  if (text === "十") return 10;
+  if (text.includes("十")) {
+    const [left, right = ""] = text.split("十");
+    const tens = left ? digits[left] || 0 : 1;
+    const ones = right ? digits[right] ?? -1 : 0;
+    const parsed = tens * 10 + ones;
+    return parsed >= 1 && parsed <= 200 ? parsed : null;
+  }
+  return text.length === 1 ? digits[text] || null : null;
+};
+
+const normalizePageCountTokens = (value: string) => {
+  const chineseCount = "[一二两三四五六七八九十]{1,4}";
+  const pageUnit = "(?:页|頁|张|張|pages?|slides?)";
+  const countLabel = "(?:页数|頁数|页面数|頁面数|张数|張数|slide\\s*count|page\\s*count|slides?|pages?)";
+  return normalizeNumberToken(value)
+    .replace(
+      new RegExp(`(${chineseCount})\\s*(-|~|～|—|–|－|到|至|to)\\s*(${chineseCount})\\s*(${pageUnit})`, "gi"),
+      (match, start, sep, end, unit) => {
+        const startValue = parseChinesePageCount(start);
+        const endValue = parseChinesePageCount(end);
+        return startValue && endValue ? `${startValue}${sep}${endValue}${unit}` : match;
+      }
+    )
+    .replace(new RegExp(`(${chineseCount})\\s*(?=${pageUnit})`, "gi"), (match, count) => {
+      const parsed = parseChinesePageCount(count);
+      return parsed ? String(parsed) : match;
+    })
+    .replace(new RegExp(`(${countLabel}\\D{0,12})(${chineseCount})`, "gi"), (match, label, count) => {
+      const parsed = parseChinesePageCount(count);
+      return parsed ? `${label}${parsed}` : match;
+    });
+};
+
 const isSlideReferencePrefix = (message: string, index: number) =>
   /(?:第|P)\s*$/i.test(message.slice(Math.max(0, index - 4), index));
 
@@ -66,7 +116,7 @@ const hasPageCountContext = (message: string, start: number, end: number) => {
 };
 
 export function inferRequestedPageCount(message: string): number | undefined {
-  const text = normalizeNumberToken(String(message || ""));
+  const text = normalizePageCountTokens(String(message || ""));
   const pageUnit = "(?:页|頁|张|張|pages?|slides?)";
   const countLabel = "(?:页数|頁数|页面数|頁面数|张数|張数|slide\\s*count|page\\s*count|slides?|pages?)";
   const boundedPatterns = [
@@ -133,6 +183,14 @@ export function inferRequestedPageCount(message: string): number | undefined {
     if (value) return value;
   }
   return undefined;
+}
+
+export function resolveContentPlanPageCount(message: string, suggestedPageCount?: number | null): number | undefined {
+  const explicitPageCount = inferRequestedPageCount(message);
+  if (explicitPageCount) return explicitPageCount;
+  const suggested = parsePageCountNumber(String(suggestedPageCount ?? ""));
+  if (!suggested || suggested < MIN_UNPROMPTED_CONTENT_PLAN_PAGE_COUNT) return undefined;
+  return suggested;
 }
 
 const extractPageNums = (message: string) => {

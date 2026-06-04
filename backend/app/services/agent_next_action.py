@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.services.content_plan import resolve_requested_content_plan_page_count
+
 
 CONTENT_ACTIONS = frozenset({
     "diagnose",
@@ -70,7 +72,10 @@ def infer_next_action(result: dict[str, Any], project_context: dict[str, Any], a
 
 def _content_next_action(action: str | None, result: dict[str, Any], project_context: dict[str, Any]) -> dict[str, Any] | None:
     if action in {"propose_plan", "generate_plan"} and result.get("topic"):
-        page_count = result.get("page_count") or (result.get("positioning") or {}).get("estimated_pages")
+        page_count = resolve_requested_content_plan_page_count(
+            result.get("topic") or "",
+            result.get("page_count") or (result.get("positioning") or {}).get("estimated_pages"),
+        )
         return {
             "type": "generate_content_plan",
             "label": "开始生成内容规划",
@@ -81,12 +86,13 @@ def _content_next_action(action: str | None, result: dict[str, Any], project_con
         }
 
     if action == "regenerate_plan" and result.get("topic"):
+        page_count = resolve_requested_content_plan_page_count(result.get("topic") or "", result.get("page_count"))
         return {
             "type": "generate_content_plan",
             "label": "重新生成内容规划",
             "payload": {
                 "topic": result.get("topic"),
-                "page_count": result.get("page_count"),
+                "page_count": page_count,
             },
         }
 

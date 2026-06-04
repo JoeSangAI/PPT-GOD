@@ -41,7 +41,7 @@ export interface ProviderSettings {
 export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
   minimaxApiKey: "",
   minimaxApiBase: "https://api.minimaxi.com/v1",
-  minimaxLlmModel: "MiniMax-M2.7",
+  minimaxLlmModel: "MiniMax-M3",
   deerApiKey: "",
   deerApiBase: "https://api.deerapi.com/v1",
   deerImageModel: "gpt-image-2-all",
@@ -97,6 +97,9 @@ export function getProviderSettings(): ProviderSettings {
     if (next.deerImageModel === "GPT-Image-V4") {
       next.deerImageModel = DEFAULT_PROVIDER_SETTINGS.deerImageModel;
     }
+    if (next.minimaxLlmModel === "MiniMax-M2.7") {
+      next.minimaxLlmModel = DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel;
+    }
     return next;
   } catch {
     return { ...DEFAULT_PROVIDER_SETTINGS };
@@ -144,6 +147,28 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   return window.fetch(input, { ...init, headers });
 }
 
+export function formatApiErrorDetail(detail: any): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const formatted = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return String(item);
+        const loc = Array.isArray(item.loc)
+          ? item.loc.filter((part: any) => part !== "body").join(".")
+          : "";
+        const msg = item.msg || item.message || item.type || JSON.stringify(item);
+        return loc ? `${loc}: ${msg}` : String(msg);
+      })
+      .filter(Boolean);
+    return formatted.join("；") || "请求参数不正确";
+  }
+  if (detail && typeof detail === "object") {
+    return detail.message || detail.msg || JSON.stringify(detail);
+  }
+  return String(detail || "服务器错误");
+}
+
 export async function testerLogin(displayName: string, passcode: string = ""): Promise<MvpAuth> {
   const res = await window.fetch(`${API_BASE}/auth/tester-login`, {
     method: "POST",
@@ -176,7 +201,7 @@ async function checkRes(res: Response) {
       json = null;
     }
     if (json?.detail) {
-      throw new Error(`HTTP ${res.status}: ${json.detail}`);
+      throw new Error(`HTTP ${res.status}: ${formatApiErrorDetail(json.detail)}`);
     }
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
   }

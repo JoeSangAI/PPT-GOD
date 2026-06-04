@@ -9,6 +9,22 @@ const workflow = readFileSync(join(import.meta.dirname, "workflow.ts"), "utf8");
 const client = readFileSync(join(import.meta.dirname, "api/client.ts"), "utf8");
 const lines = source.split(/\r?\n/);
 
+assert.match(
+  css,
+  /Login density[\s\S]*\.pg-auth-v2 \.pg-auth-shell\s*\{[\s\S]*max-width:\s*1120px;[\s\S]*grid-template-columns:\s*minmax\(360px, 520px\) minmax\(320px, 400px\);[\s\S]*padding:\s*28px 32px;/,
+  "public login screen must default to the compact production workspace ratio"
+);
+assert.match(
+  css,
+  /Login density[\s\S]*\.pg-auth-v2 \.pg-auth-card-v2\s*\{[\s\S]*max-width:\s*400px;[\s\S]*padding:\s*22px;/,
+  "public login card must stay compact instead of reverting to the oversized default"
+);
+assert.match(
+  css,
+  /Login density[\s\S]*\.pg-auth-input\s*\{[\s\S]*height:\s*40px;[\s\S]*font-size:\s*13\.5px;/,
+  "public login form controls must match the denser production UI scale"
+);
+
 assert.match(source, /projectId\?: string;/, "ChatMessage must carry projectId ownership");
 assert.match(
   source,
@@ -264,8 +280,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const userBrief = payload\?\.topic \|\| getLatestComposerTextForSubmission\(\);[\s\S]*const inferredPageCount = payload\?\.page_count \|\| inferRequestedPageCount\(userBrief\)/,
-  "content-plan submission must infer explicit page-count goals from the submitted Brief"
+  /const userBrief = payload\?\.topic \|\| getLatestComposerTextForSubmission\(\);[\s\S]*const inferredPageCount = resolveContentPlanPageCount\(userBrief, payload\?\.page_count\)/,
+  "content-plan submission must infer explicit page-count goals and ignore tiny unprompted Agent estimates"
 );
 assert.match(
   source,
@@ -301,6 +317,31 @@ assert.doesNotMatch(
   source,
   /回退前|已失效|当前步骤不能执行|回滚到此消息/,
   "current user-facing UI must not expose stale rollback/internal-state wording"
+);
+assert.match(
+  source,
+  /const \[slidesRedoHistory,\s*setSlidesRedoHistory\]/,
+  "deck-level rollback must keep redo snapshots separately from the undo stack"
+);
+assert.match(
+  source,
+  /const canGlobalUndo = slidesHistory\.length > 0;/,
+  "first Agent content mutation must immediately enable rollback to the previous deck snapshot"
+);
+assert.match(
+  source,
+  /回退上一步/,
+  "planning UI must expose a user-facing rollback button"
+);
+assert.match(
+  source,
+  /const previousSlides = await loadSlides\(projectId\);[\s\S]*if \(previousSlides\.length > 0\) pushSlidesHistory\(previousSlides\);[\s\S]*generateContentPlan/,
+  "Agent-triggered content-plan regeneration must save the current deck before replacing slides"
+);
+assert.match(
+  source,
+  /restoreSlidesToBackend[\s\S]*await fetchSlides\(projectId\)[\s\S]*updateSlideContent\(projectId, targetPageNum, targetContent\)[\s\S]*createSlide\(projectId, targetPageNum, targetContent\)/,
+  "deck rollback must restore by page number and recreate missing pages instead of relying on stale slide ids"
 );
 assert.match(
   source,
@@ -596,6 +637,20 @@ assert.match(
   source,
   /保存并重新生成/,
   "single-slide edit primary action must say it will regenerate, not just generate"
+);
+const slideImagePreviewStart = source.indexOf('alt={"Slide " + slide.page_num}');
+const slideImagePreviewEnd = source.indexOf("onError={(e) => {", slideImagePreviewStart);
+assert.ok(slideImagePreviewStart >= 0 && slideImagePreviewEnd > slideImagePreviewStart, "must find global slide image preview click handler");
+const slideImagePreviewHandler = source.slice(slideImagePreviewStart, slideImagePreviewEnd);
+assert.match(
+  slideImagePreviewHandler,
+  /e\.stopPropagation\(\);[\s\S]*setGalleryModal\(\{ urls: allUrls[\s\S]*title: "PPT 预览"/,
+  "global slide image click must open the deck preview in place"
+);
+assert.doesNotMatch(
+  slideImagePreviewHandler,
+  /handleEnterEdit|activateFinetuneForSlide/,
+  "global slide image preview must not enter single-page edit mode"
 );
 assert.match(
   source,

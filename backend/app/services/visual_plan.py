@@ -37,6 +37,16 @@ LOW_CONFIDENCE_ASSET_TERMS = {
     "展示",
     "页面",
     "ppt页面",
+    "素材",
+    "图片",
+    "照片",
+    "产品",
+    "产品图",
+    "主视觉",
+    "场景",
+    "手机",
+    "机型",
+    "kv",
     "核心",
     "作为核心",
     "适合",
@@ -293,6 +303,30 @@ def _asset_search_terms(asset: Dict) -> set[str]:
     return terms
 
 
+def _looks_like_specific_identifier(term: str) -> bool:
+    value = str(term or "").strip().lower()
+    if not value:
+        return False
+    if re.fullmatch(r"\d+(?:[.-]\d+)*", value):
+        return False
+    # Product/model identifiers such as S30, Y300, Z11, M3 are strong enough
+    # to disambiguate assets that share a brand or campaign vocabulary.
+    return bool(re.search(r"[a-z]", value) and re.search(r"\d", value))
+
+
+def _is_strong_asset_term(term: str, term_counts: Dict[str, int]) -> bool:
+    value = str(term or "").strip().lower()
+    if not value or value in LOW_CONFIDENCE_ASSET_TERMS:
+        return False
+    if _looks_like_specific_identifier(value):
+        return True
+    if term_counts.get(value, 0) > 1:
+        return False
+    if re.fullmatch(r"[a-z]{2,8}", value):
+        return False
+    return len(value) >= 3
+
+
 def _asset_is_recallable(asset: Dict) -> bool:
     tier = str(asset.get("selection_tier") or "").lower()
     if tier in {"page_ref_only", "low_value", "decorative"}:
@@ -315,25 +349,49 @@ def _recall_visual_assets_for_page(page: Dict, global_visual_assets: Optional[Li
     if not global_visual_assets:
         return []
 
+    excluded_asset_ids = {
+        str(asset_id)
+        for asset_id in (page.get("excluded_visual_asset_ids") or [])
+        if asset_id
+    }
+    recallable_assets: list[Dict] = []
+    terms_by_asset: dict[str, set[str]] = {}
+    term_counts: dict[str, int] = {}
+    for asset in global_visual_assets:
+        asset_id = asset.get("id")
+        if not asset_id or str(asset_id) in excluded_asset_ids or not _asset_is_recallable(asset):
+            continue
+        terms = _asset_search_terms(asset)
+        recallable_assets.append(asset)
+        terms_by_asset[str(asset_id)] = terms
+        for term in terms:
+            term_counts[term] = term_counts.get(term, 0) + 1
+
     page_text = _page_search_text(page)
     page_source_refs = _page_source_ref_keys(page)
     recalled = []
-    for asset in global_visual_assets:
+    for asset in recallable_assets:
         asset_id = asset.get("id")
         if not asset_id:
             continue
-        if not _asset_is_recallable(asset):
-            continue
         kind = str(asset.get("kind") or "other").lower()
-        terms = _asset_search_terms(asset)
-        direct_hits = [term for term in terms if len(term) >= 2 and term in page_text]
+        terms = terms_by_asset.get(str(asset_id), set())
+        raw_direct_hits = [term for term in terms if len(term) >= 2 and term in page_text]
+        strong_hits = [term for term in raw_direct_hits if _is_strong_asset_term(term, term_counts)]
+        weak_unique_hits = [
+            term for term in raw_direct_hits
+            if term_counts.get(term, 0) == 1
+            and term not in LOW_CONFIDENCE_ASSET_TERMS
+            and not re.fullmatch(r"[a-z]{2,8}|\d+(?:[.-]\d+)*", term)
+        ]
         try:
             asset_source_page = int(asset.get("source_page_num") or 0)
         except (TypeError, ValueError):
             asset_source_page = 0
         asset_source_key = (str(asset.get("source_document") or "").strip(), asset_source_page)
         source_hit = bool(asset_source_key[0] and asset_source_key[1] and asset_source_key in page_source_refs)
-        should_recall = source_hit or bool(direct_hits)
+        direct_hits = strong_hits or weak_unique_hits[:8]
+        should_recall = source_hit or bool(strong_hits) or len(weak_unique_hits) >= 2
         if should_recall:
             reason = "页面继承了该素材的源 PPT 页" if source_hit else "页面内容命中资产名称/关键词"
             recalled.append({
@@ -374,6 +432,33 @@ def _manual_visual_asset_usage(page: Dict, manual_ids: list[str]) -> dict[str, s
         return {}
     allowed = set(manual_ids)
     return {str(k): str(v) for k, v in raw.items() if str(k) in allowed and v}
+
+
+def _manual_visual_asset_route_modes(page: Dict, valid_asset_ids: set[str], manual_ids: list[str]) -> dict[str, str]:
+    raw = page.get("asset_route_modes") or {}
+    if not isinstance(raw, dict):
+        return {}
+    allowed_ids = set(manual_ids)
+    allowed_modes = {"blend", "double_blend", "overlay"}
+    return {
+        str(asset_id): str(mode).lower()
+        for asset_id, mode in raw.items()
+        if str(asset_id) in valid_asset_ids
+        and str(asset_id) in allowed_ids
+        and str(mode).lower() in allowed_modes
+    }
+
+
+def _excluded_visual_asset_ids(page: Dict, valid_asset_ids: set[str]) -> list[str]:
+    raw = page.get("excluded_visual_asset_ids") or []
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for asset_id in raw:
+        value = str(asset_id)
+        if value in valid_asset_ids and value not in result:
+            result.append(value)
+    return result
 
 
 def _manual_overlay_layers(page: Dict, valid_asset_ids: set[str]) -> list[dict]:
@@ -607,6 +692,7 @@ def _build_batch_prompt(
 - ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
 - hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
 - content / data / table / 对比分析页：优先保证阅读效率，但必须在整套明暗/基底策略内处理。信息越密集，越应通过卡片、内容区、网格、字号层级和留白降噪；不要机械切换到另一套浅底风格。
+- 多对象内容页：当正文列出多个地点、作品、产品、步骤或人物，且画面包含多张图/多个对象时，visual_description 必须说明图文如何一一贴近对应：可用编号、短标签、旁注、轻连线或穿插式照片卡片。版面应让图片和文字跨越中线形成互动，不要只写孤立的左文右图或单独信息块。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
 - 如果参考图本身是强视觉封面、海报、广告KV或单页主视觉，必须先抽象为色彩/材质/装饰/构图原则，再按页面类型调节强度，不能把单页主视觉机械扩散到全 deck。
 """
@@ -685,6 +771,7 @@ def _build_batch_prompt(
    - hero / quote / 金句页不要引入与全局风格冲突的字体方向；只描述“同一套字体气质下更大、更克制/更有张力的排版层级”。
 8. ⚠️ 每页的 visual_description 只能描述该页自己的画面。严禁引用其他页面的参考图或视觉元素。
 9. 如果本页选择了产品/物料/人物视觉资产，visual_evidence、visual_description 和 visual_asset_usage 不要描述该资产的名称、外观或身份细节；只写 uploaded product/person/material image 以及位置、大小、与背景关系。资产身份由上传图决定。
+10. 如果页面数据里有 excluded_visual_asset_ids，说明用户已经从这一页手动移除了这些素材；本页不得再选择、描述或暗示使用这些素材。
 
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
@@ -918,6 +1005,8 @@ def _do_generate_visual_plan(
             "reference_user_hint": page.get("reference_user_hint", ""),
             "global_user_requirements": page.get("global_user_requirements", ""),
         }
+        if page.get("excluded_visual_asset_ids"):
+            summary["excluded_visual_asset_ids"] = page.get("excluded_visual_asset_ids")
         if recalled_assets:
             summary["must_consider_visual_assets"] = recalled_assets
         overlay_layers = page.get("overlay_layers")
@@ -1063,17 +1152,27 @@ def _do_generate_visual_plan(
         }
         manual_asset_ids = _manual_visual_asset_ids(page, valid_asset_ids)
         manual_asset_usage = _manual_visual_asset_usage(page, manual_asset_ids)
+        manual_asset_route_modes = _manual_visual_asset_route_modes(page, valid_asset_ids, manual_asset_ids)
+        excluded_asset_ids = [
+            asset_id
+            for asset_id in _excluded_visual_asset_ids(page, valid_asset_ids)
+            if asset_id not in set(manual_asset_ids)
+        ]
+        excluded_asset_id_set = set(excluded_asset_ids)
         overlay_layers = _manual_overlay_layers(page, valid_asset_ids)
         # 应用 LLM 建议的 overlay 布局（如果 LLM 返回了 overlay_layout）
         if isinstance(desc_data, dict) and desc_data.get("overlay_layout"):
             overlay_layers = apply_llm_overlay_layout(overlay_layers, desc_data.get("overlay_layout"))
         if not isinstance(visual_asset_ids, list):
             visual_asset_ids = []
-        visual_asset_ids = [
-            str(asset_id)
-            for asset_id in visual_asset_ids
-            if str(asset_id) in valid_asset_ids and str(asset_id) not in set(manual_asset_ids)
-        ][:3]
+        if manual_asset_ids:
+            visual_asset_ids = []
+        else:
+            visual_asset_ids = [
+                str(asset_id)
+                for asset_id in visual_asset_ids
+                if str(asset_id) in valid_asset_ids and str(asset_id) not in excluded_asset_id_set
+            ][:3]
         if not isinstance(visual_asset_usage, dict):
             visual_asset_usage = {}
         visual_asset_usage = {
@@ -1085,14 +1184,14 @@ def _do_generate_visual_plan(
         visual_asset_usage = {**manual_asset_usage, **visual_asset_usage}
 
         recalled_assets = recalled_assets_by_page.get(int(page.get("page_num", 0) or 0), [])
-        if recalled_assets:
+        if recalled_assets and not manual_asset_ids:
             # Safety net: if the LLM missed a recalled core product/person/material asset,
             # include it without constraining composition. This keeps recall high while
             # leaving visual execution to the model.
             auto_added_count = len([asset_id for asset_id in visual_asset_ids if asset_id not in set(manual_asset_ids)])
             for recalled in recalled_assets:
                 asset_id = str(recalled.get("id") or "")
-                if not asset_id or asset_id in visual_asset_ids or auto_added_count >= 3:
+                if not asset_id or asset_id in excluded_asset_id_set or asset_id in visual_asset_ids or auto_added_count >= 3:
                     continue
                 asset_obj = next(
                     (asset for asset in (global_visual_assets or []) if str(asset.get("id")) == asset_id),
@@ -1198,9 +1297,11 @@ def _do_generate_visual_plan(
             "reference_image_ids": reference_image_ids or [],
             "manual_visual_asset_ids": manual_asset_ids,
             "manual_visual_asset_usage": manual_asset_usage,
+            "excluded_visual_asset_ids": excluded_asset_ids,
             "overlay_layers": overlay_layers,
             "visual_asset_ids": visual_asset_ids,
             "visual_asset_usage": visual_asset_usage,
+            "asset_route_modes": manual_asset_route_modes,
             "style_pack_snapshot": style_pack_snapshot,
             "visual_language_group": visual_language_group(
                 page_type,

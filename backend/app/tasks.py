@@ -526,9 +526,46 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
             restore_mode=mode,
             reuse_ocr_cache=False,
         )
-        failed_count = len(result.ocr_failed_pages)
-        if failed_count:
+        if result.slide_count and result.text_box_count <= 0:
+            message = "没有解析出可编辑文字，请稍后重试或检查文字识别服务。"
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    logger.warning("Failed to remove unusable editable PPTX: %s", output_path)
+            finish_run(
+                db,
+                run_id,
+                status="failed",
+                message=message,
+                error_msg="editable_pptx_no_text_boxes",
+                completed_count=result.slide_count,
+                failed_count=result.slide_count,
+            )
+            db.commit()
+            logger.error(
+                "Editable PPTX task produced no editable text: project=%s slides=%s failed_pages=%s",
+                project_id,
+                result.slide_count,
+                result.ocr_failed_pages,
+            )
+            return {
+                "project_id": project_id,
+                "status": "failed",
+                "restore_mode": mode,
+                "error": message,
+                "text_box_count": result.text_box_count,
+                "ocr_failed_pages": result.ocr_failed_pages,
+            }
+        fallback_pages = sorted({int(page) for page in [*result.ocr_failed_pages, *result.quality_fallback_pages]})
+        warning_pages = sorted({int(page) for page in result.quality_warning_pages})
+        failed_count = len(fallback_pages)
+        if failed_count and warning_pages:
+            message = f"可编辑版已生成，{failed_count} 页保留为图片，{len(warning_pages)} 页建议复查局部画面"
+        elif failed_count:
             message = f"可编辑版已生成，{failed_count} 页保留为图片"
+        elif warning_pages:
+            message = f"可编辑版已生成，{len(warning_pages)} 页文字已保留可编辑，建议复查局部画面"
         else:
             message = "可编辑版已生成"
         finish_run(
@@ -548,7 +585,7 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
             result.slide_count,
             result.text_box_count,
             result.visual_asset_count,
-            result.ocr_failed_pages,
+            fallback_pages,
         )
         return {
             "project_id": project_id,
@@ -559,6 +596,9 @@ def _generate_editable_pptx_task_inner(project_id: str, run_id: str = None, rest
             "text_box_count": result.text_box_count,
             "visual_asset_count": result.visual_asset_count,
             "ocr_failed_pages": result.ocr_failed_pages,
+            "qa_retry_pages": result.qa_retry_pages,
+            "quality_fallback_pages": result.quality_fallback_pages,
+            "quality_warning_pages": result.quality_warning_pages,
         }
     except Exception as exc:
         db.rollback()

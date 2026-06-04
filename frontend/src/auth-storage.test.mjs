@@ -63,7 +63,7 @@ const legacyAuth = JSON.stringify({
     testerId: "22222222-2222-4222-8222-222222222222",
     displayName: "朋友A",
   };
-  const { saveStoredAuth, getStoredAuth, clearStoredAuth } = loadClient({ localStorage, sessionStorage });
+  const { saveStoredAuth, getStoredAuth, clearStoredAuth, formatApiErrorDetail } = loadClient({ localStorage, sessionStorage });
 
   saveStoredAuth(auth);
 
@@ -79,4 +79,34 @@ const legacyAuth = JSON.stringify({
 
   assert.equal(getStoredAuth(), null);
   assert.equal(sessionStorage.getItem("pptgod.mvpAuth"), null);
+  assert.equal(
+    formatApiErrorDetail([{ loc: ["body", "selected_style"], msg: "Input should be a valid dictionary" }]),
+    "selected_style: Input should be a valid dictionary",
+    "FastAPI validation arrays should not render as [object Object]",
+  );
+}
+
+{
+  const localStorage = makeStorage();
+  const sessionStorage = makeStorage();
+  const { DEFAULT_PROVIDER_SETTINGS } = loadClient({ localStorage, sessionStorage });
+
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel, "MiniMax-M3");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.deerImageModel, "gpt-image-2-all");
+}
+
+{
+  const localStorage = makeStorage({
+    "pptgod.providerSettings": JSON.stringify({
+      minimaxLlmModel: "MiniMax-M2.7",
+      deerImageModel: "gpt-image-2-all",
+    }),
+  });
+  const sessionStorage = makeStorage();
+  const { getProviderSettings } = loadClient({ localStorage, sessionStorage });
+
+  const provider = getProviderSettings();
+
+  assert.equal(provider.minimaxLlmModel, "MiniMax-M3");
+  assert.equal(provider.deerImageModel, "gpt-image-2-all");
 }

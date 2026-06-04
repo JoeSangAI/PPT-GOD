@@ -62,6 +62,24 @@ class _FakeClient:
         self.chat = SimpleNamespace(completions=_FakeCompletions())
 
 
+def test_style_proposal_parser_repairs_near_json_list():
+    raw = """
+    [
+      {
+        "name": "方案A",
+        "palette": [{"name": "黑", "hex": "#000000", "role": "背景"}],
+        "mood": "克制"
+        "font": "黑体"
+      }
+    ]
+    """
+
+    parsed = style_proposal._parse_llm_json(raw, expected_type=list, context="test")
+
+    assert parsed[0]["name"] == "方案A"
+    assert parsed[0]["font"] == "黑体"
+
+
 def test_ai_marketing_summary_does_not_misread_generic_traditional_words():
     summary = style_proposal._extract_content_summary(
         [

@@ -1,15 +1,17 @@
 from datetime import timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from PIL import Image
 from pptx import Presentation
+from pptx.util import Inches
 
 from app.api import slides as slides_api
 from app.celery_app import celery_app
 from app.core.config import settings
 from app.models.base import Base
-from app.models.models import Project, Slide
+from app.models.models import Project, ProjectRun, Slide
 from app import tasks as image_tasks
 from app.services import generation_pipeline
 from app.services.run_state import create_project_run, utc_now
@@ -109,6 +111,101 @@ def test_start_editable_pptx_export_queues_text_task(tmp_path, monkeypatch):
     assert captured["credential_id"] == "credential-1"
     assert captured["restore_mode"] == "standard"
     assert (f"project:{project.id}:task_id", "editable-task-1", 3600) in captured["redis_sets"]
+
+
+def _save_one_slide_pptx(path):
+    prs = Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.save(path)
+
+
+def _save_image_only_pptx(path, image_path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    slide.shapes.add_picture(str(image_path), 0, 0, width=Inches(13.333), height=Inches(7.5))
+    prs.save(path)
+
+
+def _save_text_pptx(path):
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    box.text_frame.text = "editable text"
+    prs.save(path)
+
+
+def test_has_current_editable_pptx_rejects_image_only_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
+    project_id = "project-1"
+    output_dir = tmp_path / project_id
+    output_dir.mkdir(parents=True)
+    final_path = output_dir / "presentation.pptx"
+    editable_path = output_dir / "editable_presentation.pptx"
+    image_path = output_dir / "slide_01.png"
+    Image.new("RGB", (1280, 720), "white").save(image_path)
+    _save_one_slide_pptx(final_path)
+    _save_image_only_pptx(editable_path, image_path)
+
+    has_editable, path = slides_api._has_current_editable_pptx(project_id, str(final_path), True, "standard")
+
+    assert path == str(editable_path)
+    assert has_editable is False
+
+
+def test_has_current_editable_pptx_accepts_text_shapes(tmp_path, monkeypatch):
+    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
+    project_id = "project-1"
+    output_dir = tmp_path / project_id
+    output_dir.mkdir(parents=True)
+    final_path = output_dir / "presentation.pptx"
+    editable_path = output_dir / "editable_presentation.pptx"
+    _save_one_slide_pptx(final_path)
+    _save_text_pptx(editable_path)
+
+    has_editable, _path = slides_api._has_current_editable_pptx(project_id, str(final_path), True, "standard")
+
+    assert has_editable is True
+
+
+def test_editable_pptx_task_fails_when_no_text_boxes_are_restored(tmp_path, monkeypatch):
+    db = make_session()
+    monkeypatch.setattr(image_tasks.settings, "OUTPUT_DIR", str(tmp_path))
+    project = Project(title="No editable text", status="completed", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    output_dir = tmp_path / project.id
+    output_dir.mkdir(parents=True)
+    slide_path = output_dir / "slide_01.png"
+    Image.new("RGB", (1280, 720), "white").save(slide_path)
+    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
+    run = create_project_run(db, project.id, kind="editable_pptx", stage="editable_pptx", total_count=1)
+    run_id = run.id
+    db.commit()
+
+    def fake_build_editable_pptx(*, output_path, **_kwargs):
+        _save_image_only_pptx(output_path, slide_path)
+        return SimpleNamespace(
+            output_path=output_path,
+            slide_count=1,
+            text_box_count=0,
+            visual_asset_count=1,
+            ocr_failed_pages=[1],
+            qa_retry_pages=[],
+            quality_fallback_pages=[],
+            quality_warning_pages=[],
+        )
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks, "build_editable_pptx", fake_build_editable_pptx)
+
+    result = image_tasks._generate_editable_pptx_task_inner(project.id, run_id=run_id, restore_mode="standard")
+
+    updated_run = db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
+    assert result["status"] == "failed"
+    assert result["text_box_count"] == 0
+    assert updated_run.status == "failed"
+    assert updated_run.error_msg == "editable_pptx_no_text_boxes"
+    assert not (output_dir / "editable_presentation.pptx").exists()
 
 
 def test_stop_generation_releases_page_locks(monkeypatch):

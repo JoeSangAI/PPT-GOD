@@ -26,6 +26,7 @@ from app.services.content_plan import (
     parse_paginated_markdown_content_plan,
     parse_exported_content_plan_markdown,
     resolve_content_plan_page_target,
+    resolve_requested_content_plan_page_count,
     should_generate_incremental_long_deck,
     _soft_page_bounds,
 )
@@ -100,6 +101,16 @@ def test_transform_request_allows_restructure_but_preserves_facts():
 def test_page_count_expansion_is_general_transform_request():
     assert _is_general_transform_request("以这个为基础扩成 60-80 页培训课")
     assert _is_general_transform_request("做成60页到80页的PPT")
+
+
+def test_unprompted_one_page_payload_is_not_treated_as_deck_size():
+    assert resolve_requested_content_plan_page_count("恒河猴实验", 1) is None
+    assert resolve_content_plan_page_target("恒河猴实验", 1) == (10, 9, 11)
+
+
+def test_explicit_chinese_one_page_request_is_preserved():
+    assert resolve_requested_content_plan_page_count("做成一页 PPT：恒河猴实验", 1) == 1
+    assert resolve_content_plan_page_target("做成一页 PPT：恒河猴实验", 1) == (1, 1, 2)
 
 
 def test_long_page_target_uses_deck_blueprint():

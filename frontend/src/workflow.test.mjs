@@ -34,7 +34,11 @@ const {
   getStatusCard,
   planStaleSlideAction,
 } = loadTsModule("workflow.ts");
-const { inferAgentRequestContext, inferRequestedPageCount } = loadTsModule("agentRequestContext.ts");
+const {
+  inferAgentRequestContext,
+  inferRequestedPageCount,
+  resolveContentPlanPageCount,
+} = loadTsModule("agentRequestContext.ts");
 const {
   buildChangeReceipt,
   formatPageNumsForReceipt,
@@ -575,6 +579,52 @@ assert.equal(
 
 assert.deepEqual(
   plain(inferAgentRequestContext({
+    message: "从 P12 到 P15，把原来的投放节点作为标题重点突出一下，但保留核心内容",
+    activeAgentRole: "content",
+    activeScope: "deck",
+    projectStatus: "planning",
+    slideCount: 15,
+    contentPlanConfirmed: false,
+  })),
+  {
+    targetRole: "content",
+    scope: "selected_slides",
+    risk: "safe",
+    targetArea: "body",
+    areaLabel: "正文",
+    confidence: "explicit",
+    pageNums: [12, 13, 14, 15],
+    explicitScope: true,
+    scopeLabel: "第 12, 13, 14, 15 页",
+    routeReason: "content_intent",
+  }
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
+    message: "把第 3 到 5 页的关键风险提到标题里，正文里的案例和数据都别删",
+    activeAgentRole: "content",
+    activeScope: "deck",
+    projectStatus: "planning",
+    slideCount: 12,
+    contentPlanConfirmed: false,
+  })),
+  {
+    targetRole: "content",
+    scope: "selected_slides",
+    risk: "safe",
+    targetArea: "body",
+    areaLabel: "正文",
+    confidence: "explicit",
+    pageNums: [3, 4, 5],
+    explicitScope: true,
+    scopeLabel: "第 3, 4, 5 页",
+    routeReason: "content_intent",
+  }
+);
+
+assert.deepEqual(
+  plain(inferAgentRequestContext({
     message: "这一页太空了，补一点市场数据",
     activeAgentRole: "visual",
     activeScope: "deck",
@@ -934,6 +984,10 @@ assert.equal(inferRequestedPageCount("第 3 页标题更锐利"), undefined);
 assert.equal(inferRequestedPageCount("P12 页标题改小"), undefined);
 assert.equal(inferRequestedPageCount("12页标题改小"), undefined);
 assert.equal(inferRequestedPageCount("Make this into 60-80 slides for a workshop"), 80);
+assert.equal(inferRequestedPageCount("做成一页 PPT"), 1);
+assert.equal(resolveContentPlanPageCount("恒河猴实验", 1), undefined);
+assert.equal(resolveContentPlanPageCount("恒河猴实验", 12), 12);
+assert.equal(resolveContentPlanPageCount("做成一页 PPT：恒河猴实验", 1), 1);
 
 // --- stuck-slide / continue-generation tests ---
 
