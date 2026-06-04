@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.models.base import Base
 from app.models.models import Project, ProjectRun, Slide
 from app import tasks as image_tasks
+from app.services.editable_pptx_diagnostics import EditablePptxDiagnostics, EditablePptxPageDiagnostics
 from app.services import generation_pipeline
 from app.services.run_state import create_project_run, utc_now
 
@@ -193,6 +194,17 @@ def test_editable_pptx_task_fails_when_no_text_boxes_are_restored(tmp_path, monk
             qa_retry_pages=[],
             quality_fallback_pages=[],
             quality_warning_pages=[],
+            diagnostics=EditablePptxDiagnostics(
+                restore_mode="standard",
+                pages=[
+                    EditablePptxPageDiagnostics(
+                        page_num=1,
+                        raw_region_count=0,
+                        restored_text_count=0,
+                        ocr_failed=True,
+                    )
+                ],
+            ),
         )
 
     monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
@@ -206,6 +218,59 @@ def test_editable_pptx_task_fails_when_no_text_boxes_are_restored(tmp_path, monk
     assert updated_run.status == "failed"
     assert updated_run.error_msg == "editable_pptx_no_text_boxes"
     assert not (output_dir / "editable_presentation.pptx").exists()
+    assert (output_dir / "editable_presentation_diagnostics.json").exists()
+
+
+def test_editable_pptx_task_warns_when_many_pages_need_review(tmp_path, monkeypatch):
+    db = make_session()
+    monkeypatch.setattr(image_tasks.settings, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(image_tasks.settings, "EDITABLE_PPTX_WARNING_PAGE_RATIO", 0.5)
+    monkeypatch.setattr(image_tasks.settings, "EDITABLE_PPTX_FAIL_ON_WARNING", False)
+    project = Project(title="Warn editable text", status="completed", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    output_dir = tmp_path / project.id
+    output_dir.mkdir(parents=True)
+    slide_path = output_dir / "slide_01.png"
+    Image.new("RGB", (1280, 720), "white").save(slide_path)
+    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
+    db.add(Slide(project_id=project.id, page_num=2, status="completed", image_path=str(slide_path)))
+    run = create_project_run(db, project.id, kind="editable_pptx", stage="editable_pptx", total_count=2)
+    run_id = run.id
+    db.commit()
+
+    def fake_build_editable_pptx(*, output_path, **_kwargs):
+        _save_text_pptx(output_path)
+        return SimpleNamespace(
+            output_path=output_path,
+            slide_count=2,
+            text_box_count=2,
+            visual_asset_count=0,
+            ocr_failed_pages=[],
+            qa_retry_pages=[1, 2],
+            quality_fallback_pages=[],
+            quality_warning_pages=[1, 2],
+            diagnostics=EditablePptxDiagnostics(
+                restore_mode="standard",
+                pages=[
+                    EditablePptxPageDiagnostics(page_num=1, raw_region_count=2, restored_text_count=1, quality_warning=True),
+                    EditablePptxPageDiagnostics(page_num=2, raw_region_count=2, restored_text_count=1, quality_warning=True),
+                ],
+            ),
+        )
+
+    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
+    monkeypatch.setattr(image_tasks, "build_editable_pptx", fake_build_editable_pptx)
+
+    result = image_tasks._generate_editable_pptx_task_inner(project.id, run_id=run_id, restore_mode="standard")
+
+    updated_run = db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
+    assert result["status"] == "completed"
+    assert result["quality_status"] == "warn"
+    assert result["quality_reason"] == "many_pages_need_review"
+    assert updated_run.status == "succeeded"
+    assert updated_run.message == "可编辑版已生成，但多数页面建议复核"
+    assert (output_dir / "editable_presentation_diagnostics.json").exists()
 
 
 def test_stop_generation_releases_page_locks(monkeypatch):
