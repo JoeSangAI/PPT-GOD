@@ -14,6 +14,7 @@ from app.services.editable_pptx_export import (
     run_ocr_with_retries,
 )
 from app.services import editable_pptx_export as editable_export
+from app.services.editable_pptx_diagnostics import inspect_pptx_editability
 
 
 def draw_region_marks(img: Image.Image, regions: list[dict], *, color: str = "black") -> None:
@@ -104,6 +105,55 @@ def test_build_editable_pptx_normalizes_same_level_text_and_keeps_timeline_visua
     performance_size = text_shapes["没有先讨论性能"].text_frame.paragraphs[0].font.size.pt
     assert jobs_size == performance_size
     assert round(text_shapes["Jobs回来后没有先讨论CPU"].width / 914400, 2) == round(text_shapes["没有先讨论性能"].width / 914400, 2)
+
+
+def test_build_editable_pptx_returns_page_diagnostics(tmp_path):
+    slide_path = tmp_path / "diagnostics_slide.png"
+    output_path = tmp_path / "diagnostics_editable.pptx"
+    fake_regions = [
+        {"text": "主标题", "x": 0.1, "y": 0.1, "width": 0.3, "height": 0.08, "role": "title", "confidence": 0.95},
+        {"text": "1997", "x": 0.2, "y": 0.91, "width": 0.05, "height": 0.03, "role": "page_marker", "confidence": 0.9},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+        reuse_ocr_cache=False,
+    )
+
+    assert result.diagnostics is not None
+    assert result.diagnostics.page_count == 1
+    page = result.diagnostics.pages[0]
+    assert page.raw_region_count == 2
+    assert page.normalized_region_count == 2
+    assert page.restored_text_count == 1
+    assert page.rejection_reasons["role_not_allowed_for_mode"] == 1
+    inspection = inspect_pptx_editability(output_path)
+    assert inspection.has_editable_text is True
+
+
+def test_should_restore_text_reason_rejects_small_standard_label():
+    image = np.zeros((720, 1280, 3), dtype=np.uint8) + 255
+    region = {
+        "text": "小标签",
+        "x": 0.2,
+        "y": 0.2,
+        "width": 0.04,
+        "height": 0.018,
+        "role": "label",
+        "editable": True,
+        "confidence": 0.9,
+    }
+
+    keep, reason = editable_export.should_restore_text_with_reason(region, [], image, "standard", visual_complexity=None)
+
+    assert keep is False
+    assert reason == "standard_small_auxiliary_text"
 
 
 def test_same_level_text_normalization_applies_outside_left_column(tmp_path):
@@ -203,6 +253,65 @@ def test_large_chinese_title_keeps_readable_size_and_exact_short_chars(tmp_path)
     assert "有" in title.text
     assert title.text_frame.paragraphs[0].font.size.pt >= 33
     assert title.text_frame.paragraphs[0].font.name == "PingFang SC"
+
+
+def test_dense_cjk_title_is_capped_by_box_height(tmp_path):
+    slide_path = tmp_path / "dense_cjk_title.png"
+    output_path = tmp_path / "dense_cjk_title_editable.pptx"
+    title_text = "一条主线：围绕大学生手机消费场景，建立 6-12 月学生市场长周期品牌心智"
+    fake_regions = [
+        {
+            "text": title_text,
+            "x": 0.08,
+            "y": 0.08,
+            "width": 0.58,
+            "height": 0.10,
+            "role": "title",
+            "weight_hint": "bold",
+        },
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    assert result.text_box_count == 1
+    title = pptx_text_shapes(output_path)[title_text]
+    assert 13 <= title.text_frame.paragraphs[0].font.size.pt <= 22
+
+
+def test_top_cjk_title_fragment_is_capped_and_normalized_with_next_line(tmp_path):
+    slide_path = tmp_path / "fragmented_cjk_title.png"
+    output_path = tmp_path / "fragmented_cjk_title_editable.pptx"
+    first_line = "一条主线：围绕大学生手机消费场景，"
+    second_line = "建立 6-12 月学生市场长周期品牌心智"
+    fake_regions = [
+        {"text": first_line, "x": 0.06, "y": 0.085, "width": 0.78, "height": 0.08, "role": "title"},
+        {"text": second_line, "x": 0.06, "y": 0.175, "width": 0.78, "height": 0.08, "role": "title"},
+    ]
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, fake_regions)
+    img.save(slide_path)
+
+    result = build_editable_pptx(
+        slide_images=[{"page_num": 1, "image_path": str(slide_path)}],
+        output_path=str(output_path),
+        ocr_provider=lambda *_args: fake_regions,
+        restore_mode="standard",
+    )
+
+    assert result.text_box_count == 2
+    text_shapes = pptx_text_shapes(output_path)
+    first_size = text_shapes[first_line].text_frame.paragraphs[0].font.size.pt
+    second_size = text_shapes[second_line].text_frame.paragraphs[0].font.size.pt
+    assert first_size <= 22
+    assert second_size == first_size
 
 
 def test_generic_font_hints_are_normalized_to_stable_deck_fonts():
