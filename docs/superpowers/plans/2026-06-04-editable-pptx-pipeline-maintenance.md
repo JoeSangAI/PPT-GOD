@@ -1156,6 +1156,24 @@ Phase 3: mode robustness.
 
 This order is intentional. Do not tune OCR prompts or thresholds before Task 1 and Task 2 are complete; otherwise we will keep making changes without knowing whether quality improved or merely changed shape.
 
+## Phase 3 Execution Notes
+
+June 4 vivo mode audit used the standard OCR cache from the real source deck to isolate restore-policy differences without spending another full VLM run.
+
+Artifacts:
+
+- Before aggressive-policy fix: `.pptgod-data/outputs/mode-audit-vivo-20260604/editable_pipeline_summary.json`
+- After aggressive-policy fix: `.pptgod-data/outputs/mode-audit-vivo-20260604-after-aggressive-fix/editable_pipeline_summary.json`
+- After-fix aggressive visual contact sheet: `.pptgod-data/outputs/mode-audit-vivo-20260604-after-aggressive-fix/aggressive/contact_sheet_aggressive.png`
+
+Policy-layer findings:
+
+- Before fix: `enhanced` and `aggressive` were identical on the shared OCR input, both restoring 339 text boxes.
+- Root cause: `editable=false` from OCR was applied before mode policy, so aggressive could not recover image/chart text marked non-editable.
+- After fix: `standard` restores 329 text boxes, `enhanced` restores 339, and `aggressive` restores 368.
+- Strict non-editable roles remain rejected in aggressive mode: Logo, watermark, decorative, page marker, and visual-only regions are still not restored as editable text.
+- Visual tradeoff is explicit: aggressive now restores more image/chart annotations and can look busier, while standard/enhanced remain more conservative.
+
 ## Acceptance Criteria
 
 - A bad all-image editable export cannot be marked successful.
