@@ -207,6 +207,78 @@ def test_should_restore_text_reason_rejects_small_standard_label():
     assert reason == "standard_small_auxiliary_text"
 
 
+def test_standard_mode_rejects_auxiliary_text_on_dense_restore_layout():
+    visual_complexity = {
+        "restore_complex": True,
+        "restore_region_count": 24,
+        "restore_small_region_count": 16,
+    }
+    title = {
+        "text": "校园传播策略",
+        "x": 0.05,
+        "y": 0.06,
+        "width": 0.42,
+        "height": 0.07,
+        "role": "title",
+        "editable": True,
+    }
+    label = {
+        "text": "游戏稳",
+        "x": 0.20,
+        "y": 0.62,
+        "width": 0.08,
+        "height": 0.04,
+        "role": "label",
+        "editable": True,
+    }
+    img = Image.new("RGB", (1280, 720), "white")
+    draw_region_marks(img, [title, label])
+    image = np.asarray(img)
+
+    keep_title, title_reason = editable_export.should_restore_text_with_reason(
+        title,
+        [],
+        image,
+        "standard",
+        visual_complexity=visual_complexity,
+    )
+    keep_label, label_reason = editable_export.should_restore_text_with_reason(
+        label,
+        [],
+        image,
+        "standard",
+        visual_complexity=visual_complexity,
+    )
+
+    assert (keep_title, title_reason) == (True, "restored")
+    assert keep_label is False
+    assert label_reason == "standard_complex_layout_auxiliary_text"
+
+
+def test_restore_layout_complexity_flags_timeline_with_many_medium_regions():
+    regions = [
+        {"text": "主标题", "x": 0.07, "y": 0.08, "width": 0.78, "height": 0.10, "role": "title"},
+        {"text": "副标题", "x": 0.07, "y": 0.18, "width": 0.78, "height": 0.10, "role": "title"},
+    ]
+    for index in range(16):
+        regions.append({
+            "text": f"阶段说明 {index}",
+            "x": 0.10 + (index % 4) * 0.20,
+            "y": 0.40 + (index // 4) * 0.08,
+            "width": 0.16,
+            "height": 0.04,
+            "role": "body" if index >= 4 else "label",
+        })
+
+    complexity = editable_export.slide_restore_layout_complexity(
+        regions,
+        [{"x": 0.05, "y": 0.35, "width": 0.90, "height": 0.45}],
+        {"edge_p90": 0.03, "high_saturation_ratio": 0.08},
+    )
+
+    assert complexity["restore_complex"] is True
+
+
 def test_merge_cleanup_boxes_combines_nearby_text_boxes():
     boxes = [
         {"x": 0.10, "y": 0.10, "width": 0.20, "height": 0.04},
@@ -219,6 +291,20 @@ def test_merge_cleanup_boxes_combines_nearby_text_boxes():
     assert len(merged) == 2
     assert merged[0]["height"] > 0.08
     assert merged[1]["x"] == 0.70
+
+
+def test_merge_cleanup_boxes_keeps_side_by_side_columns_separate():
+    boxes = [
+        {"x": 0.16, "y": 0.42, "width": 0.18, "height": 0.05},
+        {"x": 0.355, "y": 0.421, "width": 0.18, "height": 0.05},
+        {"x": 0.16, "y": 0.485, "width": 0.18, "height": 0.05},
+    ]
+
+    merged = editable_export.merge_cleanup_boxes(boxes, gap=0.02)
+
+    assert len(merged) == 2
+    assert max(box["width"] for box in merged) < 0.24
+    assert any(box["height"] > 0.10 for box in merged)
 
 
 def test_same_level_text_normalization_applies_outside_left_column(tmp_path):
@@ -1445,6 +1531,21 @@ def test_quality_retry_cleanup_uses_bounded_previous_cleanup_box():
     assert retry["full_fill"] is True
     assert retry["width"] <= previous["width"] + 0.016
     assert retry["height"] <= previous["height"] + 0.020
+
+
+def test_cleanup_patch_uses_feathered_alpha_edges(tmp_path):
+    patch_path = tmp_path / "feathered_cleanup.png"
+    image = Image.new("RGB", (320, 180), (235, 240, 248))
+    box = {"x": 0.20, "y": 0.30, "width": 0.38, "height": 0.20, "full_fill": True}
+
+    patch_box = editable_export.create_cleanup_patch(image, box, str(patch_path))
+
+    assert patch_box is not None
+    patch = Image.open(patch_path)
+    assert patch.mode == "RGBA"
+    alpha = np.asarray(patch.getchannel("A"))
+    assert alpha[0, 0] < 255
+    assert alpha[alpha.shape[0] // 2, alpha.shape[1] // 2] == 255
 
 
 def test_quality_gate_residual_checks_run_with_bounded_parallelism(monkeypatch):
