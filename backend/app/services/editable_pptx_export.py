@@ -647,6 +647,61 @@ def is_complex_visual_slide(visual_complexity: dict[str, float] | None) -> bool:
     )
 
 
+def slide_restore_layout_complexity(
+    regions: list[dict[str, Any]],
+    image_blocks: list[dict[str, float]],
+    visual_complexity: dict[str, float] | None,
+) -> dict[str, float | bool]:
+    visible_regions = []
+    small_regions = 0
+    for region in regions:
+        role = ROLE_ALIASES.get(str(region.get("role") or "").lower(), str(region.get("role") or "").lower())
+        if role in {"logo", "watermark", "decorative", "page_marker"}:
+            continue
+        box = clamp_box(region)
+        visible_regions.append(region)
+        if role == "label" or float(box["height"]) <= 0.035 or (float(box["width"]) <= 0.14 and float(box["height"]) <= 0.055):
+            small_regions += 1
+
+    region_count = len(visible_regions)
+    image_block_count = len(image_blocks)
+    high_saturation = float((visual_complexity or {}).get("high_saturation_ratio") or 0.0)
+    restore_complex = (
+        region_count >= 22
+        or (region_count >= 14 and small_regions >= 6)
+        or (image_block_count >= 1 and region_count >= 18)
+        or (image_block_count >= 2 and region_count >= 10)
+        or (high_saturation >= COMPLEX_SLIDE_HIGH_SATURATION_THRESHOLD and region_count >= 10)
+    )
+    return {
+        "restore_region_count": float(region_count),
+        "restore_small_region_count": float(small_regions),
+        "restore_image_block_count": float(image_block_count),
+        "restore_complex": restore_complex,
+    }
+
+
+def is_complex_restore_layout(visual_complexity: dict[str, float] | None) -> bool:
+    metrics = visual_complexity or {}
+    return bool(metrics.get("restore_complex"))
+
+
+def is_primary_text_for_complex_restore(text: str, box: dict[str, Any], role: str) -> bool:
+    normalized_role = ROLE_ALIASES.get(str(role or "").lower(), str(role or "").lower())
+    text_units = estimate_text_units(text)
+    height = float(box["height"])
+    width = float(box["width"])
+    if normalized_role == "title":
+        return height >= 0.052 or text_units >= 8
+    if normalized_role == "subtitle":
+        return height >= 0.055 or (height >= 0.045 and width >= 0.28 and text_units >= 8)
+    if normalized_role == "footer":
+        return width >= 0.48 and height >= 0.040 and text_units >= 16
+    if normalized_role in {"body", "caption"}:
+        return width >= 0.46 and height >= 0.065 and text_units >= 18
+    return False
+
+
 def is_auxiliary_text_on_complex_slide(
     text: str,
     box: dict[str, Any],
@@ -804,6 +859,8 @@ def should_restore_text_with_reason(
         return False, "box_too_small"
     if mode == "standard" and is_auxiliary_text_on_complex_slide(text, box, role, visual_complexity):
         return False, "standard_complex_auxiliary_text"
+    if mode == "standard" and is_complex_restore_layout(visual_complexity) and not is_primary_text_for_complex_restore(text, box, role):
+        return False, "standard_complex_layout_auxiliary_text"
     if mode == "standard" and role in {"body", "caption", "label"} and float(box["height"]) < 0.022:
         return False, "standard_small_auxiliary_text"
     if is_timeline_marker_text(text, box):
@@ -1584,6 +1641,59 @@ def _boxes_near(a: dict[str, float], b: dict[str, float], gap: float) -> bool:
     )
 
 
+def _axis_overlap(a_start: float, a_size: float, b_start: float, b_size: float) -> float:
+    return max(0.0, min(a_start + a_size, b_start + b_size) - max(a_start, b_start))
+
+
+def _axis_gap(a_start: float, a_size: float, b_start: float, b_size: float) -> float:
+    return max(0.0, max(a_start, b_start) - min(a_start + a_size, b_start + b_size))
+
+
+def _axis_overlap_ratio(a_start: float, a_size: float, b_start: float, b_size: float) -> float:
+    return _axis_overlap(a_start, a_size, b_start, b_size) / max(0.0001, min(a_size, b_size))
+
+
+def _intersection_area(a: dict[str, Any], b: dict[str, Any]) -> float:
+    a_box = clamp_box(a)
+    b_box = clamp_box(b)
+    x_overlap = _axis_overlap(
+        float(a_box["x"]),
+        float(a_box["width"]),
+        float(b_box["x"]),
+        float(b_box["width"]),
+    )
+    y_overlap = _axis_overlap(
+        float(a_box["y"]),
+        float(a_box["height"]),
+        float(b_box["y"]),
+        float(b_box["height"]),
+    )
+    return x_overlap * y_overlap
+
+
+def _cleanup_boxes_should_merge(a: dict[str, Any], b: dict[str, Any], gap: float) -> bool:
+    if not _boxes_near(a, b, gap):
+        return False
+
+    smaller_area = max(0.0001, min(_box_area(a), _box_area(b)))
+    if _intersection_area(a, b) / smaller_area >= 0.35:
+        return True
+
+    x_overlap_ratio = _axis_overlap_ratio(
+        float(a["x"]),
+        float(a["width"]),
+        float(b["x"]),
+        float(b["width"]),
+    )
+    y_gap = _axis_gap(
+        float(a["y"]),
+        float(a["height"]),
+        float(b["y"]),
+        float(b["height"]),
+    )
+    return x_overlap_ratio >= 0.48 and y_gap <= gap
+
+
 def _union_box(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
     x1 = min(float(a["x"]), float(b["x"]))
     y1 = min(float(a["y"]), float(b["y"]))
@@ -1607,7 +1717,7 @@ def merge_cleanup_boxes(
     merged: list[dict[str, float]] = []
     for box in sorted((clamp_box(b) for b in boxes), key=lambda b: (float(b["y"]), float(b["x"]))):
         for index, existing in enumerate(merged):
-            if _boxes_near(existing, box, gap):
+            if _cleanup_boxes_should_merge(existing, box, gap):
                 union = _union_box(existing, box)
                 if max_union_area is not None and _box_area(union) > max_union_area:
                     continue
@@ -1660,6 +1770,19 @@ def create_visual_cleanup_patch(rendered: Image.Image, box: dict[str, Any], outp
     }
 
 
+def _feathered_cleanup_patch_image(patch: np.ndarray) -> Image.Image:
+    img = Image.fromarray(patch.astype(np.uint8)).convert("RGBA")
+    height, width = patch.shape[:2]
+    if width <= 2 or height <= 2:
+        return img
+    feather = max(2, min(12, min(width, height) // 8))
+    yy, xx = np.mgrid[0:height, 0:width]
+    edge_distance = np.minimum.reduce([xx, yy, width - 1 - xx, height - 1 - yy]).astype(np.float32)
+    alpha = np.clip(edge_distance / max(1, feather) * 255, 0, 255).astype(np.uint8)
+    img.putalpha(Image.fromarray(alpha))
+    return img
+
+
 def create_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path: str) -> dict[str, float] | None:
     rgb = np.asarray(rendered.convert("RGB")).copy()
     h, w, _ = rgb.shape
@@ -1674,7 +1797,7 @@ def create_cleanup_patch(rendered: Image.Image, box: dict[str, Any], output_path
     else:
         patch = _text_cleanup_patch_array(rgb, b, x1, y1, x2, y2)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    Image.fromarray(patch).save(output_path)
+    _feathered_cleanup_patch_image(patch).save(output_path)
     return {
         "x": x1 / w,
         "y": y1 / h,
@@ -1701,10 +1824,10 @@ def paste_cleanup_patch_to_image(img: Image.Image, patch_path: str, patch_box: d
     y2 = min(height, int((float(b["y"]) + float(b["height"])) * height))
     if x2 <= x1 or y2 <= y1:
         return
-    patch = Image.open(patch_path).convert("RGB")
+    patch = Image.open(patch_path).convert("RGBA")
     if patch.size != (x2 - x1, y2 - y1):
         patch = patch.resize((x2 - x1, y2 - y1), Image.Resampling.BICUBIC)
-    img.paste(patch, (x1, y1))
+    img.paste(patch.convert("RGB"), (x1, y1), patch.getchannel("A"))
 
 
 def paste_asset_crop_to_image(img: Image.Image, asset_path: str, region: dict[str, Any]) -> None:
@@ -2103,6 +2226,10 @@ def build_editable_pptx(
         normalized_regions = [region for region in (_coerce_region(r) for r in raw_regions) if region]
         text_boxes_for_detection = [clamp_box(region) for region in normalized_regions]
         image_blocks = detect_image_blocks(image_path, text_boxes_for_detection)
+        visual_complexity = {
+            **visual_complexity,
+            **slide_restore_layout_complexity(normalized_regions, image_blocks, visual_complexity),
+        }
         page_diag = EditablePptxPageDiagnostics(
             page_num=page_num,
             raw_region_count=len(raw_regions),
