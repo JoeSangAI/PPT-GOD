@@ -391,6 +391,7 @@ def _cache_key(
     reference_images: Optional[List[Image.Image]],
     resolution: str,
     aspect_ratio: str,
+    edit_mask: Optional[Image.Image] = None,
 ) -> str:
     h = hashlib.sha256()
     h.update(get_comet_image_model().encode("utf-8"))
@@ -402,6 +403,10 @@ def _cache_key(
         h.update(str(ref.size).encode("utf-8"))
         h.update(str(ref.mode).encode("utf-8"))
         h.update(ref.tobytes())
+    if edit_mask:
+        h.update(str(edit_mask.size).encode("utf-8"))
+        h.update(str(edit_mask.mode).encode("utf-8"))
+        h.update(edit_mask.tobytes())
     return h.hexdigest()
 
 
@@ -761,6 +766,29 @@ def _build_reference_upload_files(
     )
 
 
+def _edit_mask_upload_file(
+    edit_mask: Image.Image,
+    base_reference: Image.Image,
+    upload_profile: _ReferenceUploadProfile,
+) -> tuple[tuple[str, io.BytesIO, str], int]:
+    max_side, _jpeg_quality, _png_threshold_bytes, _role = _effective_reference_upload_settings(
+        base_reference,
+        upload_profile,
+    )
+    prepared_base = _prepare_reference_image_for_upload(base_reference, max_side=max_side)
+    if edit_mask.mode == "L":
+        mask = Image.new("RGBA", edit_mask.size, (0, 0, 0, 255))
+        mask.putalpha(edit_mask)
+    else:
+        mask = ImageOps.exif_transpose(edit_mask).convert("RGBA")
+    if mask.size != prepared_base.size:
+        mask = mask.resize(prepared_base.size, Image.Resampling.NEAREST)
+    buf = io.BytesIO()
+    mask.save(buf, format="PNG", optimize=True)
+    payload = buf.getvalue()
+    return ("mask.png", io.BytesIO(payload), "image/png"), len(payload)
+
+
 def _is_connection_timeout(exc: Exception) -> bool:
     if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
         return True
@@ -837,12 +865,18 @@ def _call_gpt_image_2_edit(
     prompt: str, reference_images: List[Image.Image], size: str = "1792x1024",
     idempotency_key: Optional[str] = None,
     project_id: str | None = None,
+    edit_mask: Optional[Image.Image] = None,
 ) -> Image.Image:
     """使用 requests 直接调用 DeerAPI images/edit，支持 additional_images[] 多图垫图。"""
     if not reference_images:
         raise ValueError("reference_images required for edit")
     prepare_started_at = time.time()
     files, upload_bytes, upload_profile = _build_reference_upload_files(reference_images, project_id)
+    mask_upload_bytes = 0
+    if edit_mask:
+        mask_file, mask_upload_bytes = _edit_mask_upload_file(edit_mask, reference_images[0], upload_profile)
+        files.append(("mask", mask_file))
+        upload_bytes += mask_upload_bytes
     upload_prepare_seconds = round(time.time() - prepare_started_at, 3)
     data = {
         "model": get_comet_image_model(),
@@ -888,6 +922,8 @@ def _call_gpt_image_2_edit(
             queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
+            edit_mask=bool(edit_mask),
+            mask_upload_bytes=mask_upload_bytes,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             started_at=_utc_iso(started_at),
@@ -911,6 +947,8 @@ def _call_gpt_image_2_edit(
             queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
+            edit_mask=bool(edit_mask),
+            mask_upload_bytes=mask_upload_bytes,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             started_at=_utc_iso(started_at),
@@ -934,6 +972,8 @@ def _call_gpt_image_2_edit(
             queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
+            edit_mask=bool(edit_mask),
+            mask_upload_bytes=mask_upload_bytes,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=_response_request_id(getattr(e, "response", None)),
@@ -964,6 +1004,8 @@ def _call_gpt_image_2_edit(
             queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
+            edit_mask=bool(edit_mask),
+            mask_upload_bytes=mask_upload_bytes,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=_response_request_id(resp),
@@ -985,6 +1027,8 @@ def _call_gpt_image_2_edit(
             queue_wait_seconds=_current_image_queue_wait_seconds(),
             upload_bytes=upload_bytes,
             upload_profile=upload_profile.label,
+            edit_mask=bool(edit_mask),
+            mask_upload_bytes=mask_upload_bytes,
             upload_prepare_seconds=upload_prepare_seconds,
             idempotency_key=idempotency_key,
             request_id=getattr(exc, "request_id", None) or _response_request_id(resp),
@@ -1003,6 +1047,7 @@ def _generate_real_slide_image(
     resolution: str = "4K",
     aspect_ratio: str = "16:9",
     project_id: str | None = None,
+    edit_mask: Optional[Image.Image] = None,
 ) -> Image.Image:
     if aspect_ratio == "16:9":
         size = "1792x1024"
@@ -1020,10 +1065,14 @@ def _generate_real_slide_image(
             time.sleep(delay)
         try:
             if reference_images:
+                edit_kwargs = {}
+                if edit_mask:
+                    edit_kwargs["edit_mask"] = edit_mask
                 img = _call_gpt_image_2_edit(
                     prompt, reference_images, size=size,
                     idempotency_key=idempotency_key,
                     project_id=project_id,
+                    **edit_kwargs,
                 )
             else:
                 img = _call_gpt_image_2_generate(
@@ -1082,6 +1131,7 @@ def generate_slide_image(
     resolution: str = "4K",
     aspect_ratio: str = "16:9",
     project_id: str | None = None,
+    edit_mask: Optional[Image.Image] = None,
 ) -> Image.Image:
     mode = (settings.IMAGE_GEN_MODE or "real").lower()
     if mode == "mock":
@@ -1089,7 +1139,7 @@ def generate_slide_image(
         return _make_mock_slide_image(prompt)
 
     if mode == "cached":
-        key = _cache_key(prompt, reference_images, resolution, aspect_ratio)
+        key = _cache_key(prompt, reference_images, resolution, aspect_ratio, edit_mask)
         path = _cache_path(key)
         if os.path.exists(path):
             logger.info(f"ImageGen: cache hit {path}")
@@ -1097,7 +1147,7 @@ def generate_slide_image(
 
         _reserve_real_image_call()
         with _image_api_slot():
-            img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id)
+            img = _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id, edit_mask)
         os.makedirs(settings.IMAGE_GEN_CACHE_DIR, exist_ok=True)
         img.save(path, "PNG")
         logger.info(f"ImageGen: cached generated image {path}")
@@ -1108,7 +1158,7 @@ def generate_slide_image(
 
     _reserve_real_image_call()
     with _image_api_slot():
-        return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id)
+        return _generate_real_slide_image(prompt, reference_images, resolution, aspect_ratio, project_id, edit_mask)
 
 
 def save_slide_image(

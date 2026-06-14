@@ -1,5 +1,12 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, DragEvent as ReactDragEvent, MouseEvent as ReactMouseEvent, SyntheticEvent } from "react";
+import type {
+  CSSProperties,
+  DragEvent as ReactDragEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactNode,
+  SyntheticEvent,
+} from "react";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { Node as TiptapNode } from "@tiptap/core";
@@ -133,9 +140,8 @@ import {
   confirmPrototype,
   fetchWorkflowStatus,
   getDownloadUrl,
-  startEditablePptx,
-  getEditableDownloadUrl,
   getContentPlanMarkdownUrl,
+  generatePrompts,
   uploadFile,
   fetchReferenceImages,
   deleteReferenceImage,
@@ -169,14 +175,7 @@ import {
   getSlideVersions,
   deleteSlideVersion,
   restoreSlideVersion,
-  type EditablePptxMode,
 } from "./api/client";
-
-const EDITABLE_PPTX_MODE_OPTIONS: Array<{ value: EditablePptxMode; label: string; hint: string }> = [
-  { value: "standard", label: "标准版（推荐）", hint: "主标题、正文、结论优先，视觉最稳" },
-  { value: "enhanced", label: "增强版", hint: "额外拆卡片标签和图表主要标签" },
-  { value: "aggressive", label: "激进版", hint: "尽量全拆，可能影响画面" },
-];
 
 interface Project {
   id: string;
@@ -313,6 +312,17 @@ interface Slide {
   image_path?: string | null;
   error_msg?: string | null;
   reference_images?: { id: string; role: string; url: string }[];
+}
+
+interface FinetuneRegion {
+  id: string;
+  label: string;
+  bbox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 const slidesForAgentRequestContext = (items: Slide[]) =>
@@ -473,6 +483,7 @@ interface ChatMessage {
   hasStyleProposal?: boolean;
   styleProposals?: StyleProposal[];
   attachments?: ChatAttachment[];
+  finetuneRegions?: FinetuneRegion[];
 }
 
 interface PendingChatRequest {
@@ -1496,6 +1507,148 @@ function SlideImageWithOverlays({
   );
 }
 
+const FINETUNE_REGION_MIN_SIZE = 0.015;
+
+function clampRegionValue(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizeFinetuneRegionBox(region: FinetuneRegion["bbox"]): FinetuneRegion["bbox"] | null {
+  const x1 = clampRegionValue(region.x);
+  const y1 = clampRegionValue(region.y);
+  const x2 = clampRegionValue(region.x + region.width);
+  const y2 = clampRegionValue(region.y + region.height);
+  const left = Math.min(x1, x2);
+  const top = Math.min(y1, y2);
+  const width = Math.abs(x2 - x1);
+  const height = Math.abs(y2 - y1);
+  if (width < FINETUNE_REGION_MIN_SIZE || height < FINETUNE_REGION_MIN_SIZE) return null;
+  return { x: left, y: top, width, height };
+}
+
+function FinetuneRegionSelector({
+  enabled,
+  regions,
+  onAddRegion,
+  onRemoveRegion,
+  children,
+}: {
+  enabled: boolean;
+  regions: FinetuneRegion[];
+  onAddRegion?: (bbox: FinetuneRegion["bbox"]) => void;
+  onRemoveRegion?: (regionId: string) => void;
+  children: ReactNode;
+}) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const startRef = useRef<{ x: number; y: number } | null>(null);
+  const [draftRegion, setDraftRegion] = useState<FinetuneRegion["bbox"] | null>(null);
+
+  const pointFromEvent = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: clampRegionValue((event.clientX - rect.left) / rect.width),
+      y: clampRegionValue((event.clientY - rect.top) / rect.height),
+    };
+  };
+
+  const regionStyle = (bbox: FinetuneRegion["bbox"]): CSSProperties => ({
+    left: `${bbox.x * 100}%`,
+    top: `${bbox.y * 100}%`,
+    width: `${bbox.width * 100}%`,
+    height: `${bbox.height * 100}%`,
+  });
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!enabled || event.button !== 0) return;
+    const point = pointFromEvent(event);
+    if (!point) return;
+    event.preventDefault();
+    event.stopPropagation();
+    startRef.current = point;
+    setDraftRegion({ x: point.x, y: point.y, width: 0, height: 0 });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!enabled || !startRef.current) return;
+    const point = pointFromEvent(event);
+    if (!point) return;
+    const start = startRef.current;
+    const next = normalizeFinetuneRegionBox({
+      x: start.x,
+      y: start.y,
+      width: point.x - start.x,
+      height: point.y - start.y,
+    });
+    setDraftRegion(next || {
+      x: Math.min(start.x, point.x),
+      y: Math.min(start.y, point.y),
+      width: Math.abs(point.x - start.x),
+      height: Math.abs(point.y - start.y),
+    });
+  };
+
+  const finishDraft = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!enabled || !startRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+    const point = pointFromEvent(event);
+    const start = startRef.current;
+    startRef.current = null;
+    setDraftRegion(null);
+    if (!point) return;
+    const next = normalizeFinetuneRegionBox({
+      x: start.x,
+      y: start.y,
+      width: point.x - start.x,
+      height: point.y - start.y,
+    });
+    if (next) onAddRegion?.(next);
+  };
+
+  return (
+    <div
+      ref={rootRef}
+      className={`pg-finetune-region-selector ${enabled ? "is-drawing" : ""}`}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={finishDraft}
+      onPointerCancel={finishDraft}
+    >
+      {children}
+      {regions.map((region) => (
+        <div key={region.id} className="pg-finetune-region-box" style={regionStyle(region.bbox)}>
+          <div className="pg-finetune-region-label">
+            <span>{region.label}</span>
+            <button
+              type="button"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onRemoveRegion?.(region.id);
+              }}
+              aria-label={`移除${region.label}`}
+              title="移除框选"
+            >
+              X
+            </button>
+          </div>
+        </div>
+      ))}
+      {enabled && draftRegion && (
+        <div className="pg-finetune-region-box pg-finetune-region-draft" style={regionStyle(draftRegion)} />
+      )}
+    </div>
+  );
+}
+
 function SlideReadinessIcons({
   hasVisual,
   hasPrompt,
@@ -1566,8 +1719,6 @@ function App() {
   const activeChatRoleRef = useRef<string | null>(null);
   const activeChatGateRef = useRef<string | null>(null);
   const activeChatGateRevisionRef = useRef<number | null>(null);
-  const editableDownloadRunIdRef = useRef<string | null>(null);
-  const editableDownloadModeRef = useRef<EditablePptxMode>("standard");
 
   // 保存最近一次聊天的请求参数，用于切回来后自动恢复
   const pendingChatRef = useRef<PendingChatRequest | null>(null);
@@ -1754,6 +1905,8 @@ function App() {
     setPendingAttachments([]);
     setPendingChatAttachments([]);
     setPendingFinetuneAttachmentsMap({});
+    setFinetuneRegionsMap({});
+    setFinetuneRegionModeSlideId(null);
     setFinetuneChatHistoryMap({});
   };
   const clearSlideStale = (slideId: string, type?: "content" | "visual" | "image") => {
@@ -1788,6 +1941,8 @@ function App() {
   const [pendingAttachments, setPendingAttachments] = useState<string[]>([]);
   const [pendingChatAttachments, setPendingChatAttachments] = useState<ChatAttachment[]>([]);
   const [pendingFinetuneAttachmentsMap, setPendingFinetuneAttachmentsMap] = useState<Record<string, ChatAttachment[]>>({});
+  const [finetuneRegionsMap, setFinetuneRegionsMap] = useState<Record<string, FinetuneRegion[]>>({});
+  const [finetuneRegionModeSlideId, setFinetuneRegionModeSlideId] = useState<string | null>(null);
   const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
   const [editMessageContent, setEditMessageContent] = useState("");
   const [isDragging, setIsDragging] = useState(false);
@@ -2233,6 +2388,7 @@ function App() {
   useEffect(() => {
     if (currentAgentRole !== "finetune") {
       setFinetuneTargetSlideId(null);
+      setFinetuneRegionModeSlideId(null);
     }
   }, [currentAgentRole]);
 
@@ -3391,29 +3547,6 @@ function App() {
     prevActiveRunRef.current = { projectId: pid, runId: activeRunId, kind: activeRun?.kind || null };
   }, [selectedProject?.id, selectedProject?.status, activeRun?.id]);
 
-  useEffect(() => {
-    const projectId = selectedProject?.id;
-    const requestedRunId = editableDownloadRunIdRef.current;
-    if (!projectId || !requestedRunId || hasActiveRun) return;
-    const lastRun = currentProjectStatus?.last_run;
-    if (lastRun?.id !== requestedRunId) return;
-    if (lastRun.status === "succeeded") {
-      const restoreMode = editableDownloadModeRef.current;
-      editableDownloadRunIdRef.current = null;
-      window.location.href = getEditableDownloadUrl(projectId, restoreMode);
-      return;
-    }
-    if (["failed", "cancelled", "stale"].includes(String(lastRun.status || ""))) {
-      editableDownloadRunIdRef.current = null;
-      showToast(lastRun.message || "可编辑版准备失败，请稍后重试。", "error");
-    }
-  }, [
-    selectedProject?.id,
-    hasActiveRun,
-    currentProjectStatus?.last_run?.id,
-    currentProjectStatus?.last_run?.status,
-  ]);
-
   // 最终态补充一份交付前检查，不阻塞生成完成提示和导出动作。
   useEffect(() => {
     const projectId = selectedProject?.id;
@@ -4072,41 +4205,6 @@ function App() {
     }
   };
 
-  const handleEditablePptxExport = async (restoreMode: EditablePptxMode) => {
-    if (!selectedProject) return;
-    const projectId = selectedProject.id;
-    if (hasActiveRun || operatingProjectId === projectId) {
-      showToast("当前已有任务在执行中，请稍后再试", "info");
-      return;
-    }
-    if (selectedProject.status !== "completed" || !currentProjectStatus?.has_pptx) {
-      showToast("请先完成全量 PPT 生成，再下载可编辑版 PPTX。", "info");
-      return;
-    }
-
-    setOperatingProjectId(projectId);
-    try {
-      const result = await startEditablePptx(projectId, restoreMode);
-      if (result?.status === "ready") {
-        window.location.href = getEditableDownloadUrl(projectId, restoreMode);
-        return;
-      }
-      if (result?.run?.id) {
-        handleWorkflowRunStarted(projectId, result.run);
-        const runId = String(result.run.id);
-        editableDownloadRunIdRef.current = runId;
-        editableDownloadModeRef.current = restoreMode;
-        locallyHandledRunIdsRef.current.add(runId);
-      }
-      await refreshWorkflowStatus();
-      showToast("正在准备可编辑版，完成后会自动下载。", "info");
-    } catch (err: any) {
-      showToast("可编辑版准备失败：" + (err.message || "未知错误"), "error");
-    } finally {
-      setOperatingProjectId(null);
-    }
-  };
-
   // 轮询等待后端 active_run 结束
   const pollUntilStatusNotGenerating = async (projectId: string, timeoutMs = 1_200_000) => {
     const start = Date.now();
@@ -4613,6 +4711,10 @@ function App() {
       if (next.size > 0) setAgentScope("selected_slides");
       return next;
     });
+    if (currentAgentRoleRef.current === "finetune") {
+      setFinetuneTargetSlideId(null);
+      setFinetuneRegionModeSlideId(null);
+    }
   };
 
   const clearDeckSelection = () => {
@@ -4768,10 +4870,77 @@ function App() {
     abortActiveChat(true);
     currentAgentRoleRef.current = "finetune";
     setCurrentAgentRole("finetune");
+    setDeckSelectedPages(new Set());
+    setAgentScope("current_slide");
     setFinetuneTargetSlideId(slide.id);
     ensureFinetuneGreetingForSlide(slide.id);
     loadSlideVersions(slide.id);
     return true;
+  };
+
+  const addFinetuneRegion = (slideId: string, bbox: FinetuneRegion["bbox"]) => {
+    const normalized = normalizeFinetuneRegionBox(bbox);
+    if (!normalized) {
+      showToast("框选区域太小，请重新框选。", "info");
+      return;
+    }
+    setFinetuneRegionsMap((prev) => {
+      const current = prev[slideId] || [];
+      const nextIndex = current.length + 1;
+      return {
+        ...prev,
+        [slideId]: [
+          ...current,
+          {
+            id: `region-${Date.now()}-${nextIndex}`,
+            label: `框选 ${nextIndex}`,
+            bbox: normalized,
+          },
+        ],
+      };
+    });
+  };
+
+  const removeFinetuneRegion = (slideId: string, regionId: string) => {
+    setFinetuneRegionsMap((prev) => {
+      const nextRegions = (prev[slideId] || []).filter((region) => region.id !== regionId);
+      const next = { ...prev };
+      if (nextRegions.length > 0) next[slideId] = nextRegions;
+      else delete next[slideId];
+      return next;
+    });
+  };
+
+  const clearFinetuneRegions = (slideId: string) => {
+    setFinetuneRegionsMap((prev) => {
+      const next = { ...prev };
+      delete next[slideId];
+      return next;
+    });
+  };
+
+  const scrollFinetunePreviewIntoView = (slideId: string) => {
+    window.requestAnimationFrame(() => {
+      const preview = document.querySelector(`[data-finetune-preview-slide-id="${slideId}"]`);
+      preview?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  };
+
+  const toggleFinetuneRegionMode = (slideId: string) => {
+    setFinetuneRegionModeSlideId((current) => {
+      const next = current === slideId ? null : slideId;
+      if (next) scrollFinetunePreviewIntoView(slideId);
+      return next;
+    });
+  };
+
+  const openFinetuneRegionMode = (slideId: string) => {
+    const target = slides.find((item) => item.id === slideId);
+    if (target && editingSlideRef.current?.id !== slideId) {
+      setEditingSlide(target);
+    }
+    setFinetuneRegionModeSlideId(slideId);
+    scrollFinetunePreviewIntoView(slideId);
   };
 
   const handleRestoreVersion = async (slideId: string, versionId: string) => {
@@ -4806,6 +4975,7 @@ function App() {
 
   const handleExitEdit = () => {
     setEditingSlide(null);
+    setFinetuneRegionModeSlideId(null);
     setAgentScope(deckSelectedPages.size > 0 ? "selected_slides" : "deck");
   };
 
@@ -5699,24 +5869,112 @@ function App() {
     const requestRoleCanPersist = requestAgentRole === "content" || requestAgentRole === "visual";
     const isRequestVisible = () =>
       selectedProjectIdRef.current === requestProjectId && currentAgentRoleRef.current === requestAgentRole;
-    const isRequestCurrentGate = () => {
+    const isRequestExecutionAllowed = () => {
+      if (selectedProjectIdRef.current !== requestProjectId) return true;
       const latestGate = gateContextRef.current;
       return Boolean(
-        isRequestVisible() &&
         latestGate &&
         latestGate.gate === requestGate &&
         latestGate.gateRevision === requestGateRevision
       );
     };
+    const withRequestGateMeta = (message: ChatMessage): ChatMessage => {
+      if (
+        !message.nextAction &&
+        !message.hasStyleProposal &&
+        message.action !== "propose_plan" &&
+        message.action !== "generate_plan"
+      ) return message;
+      return {
+        ...message,
+        gate: message.gate || requestGate,
+        gateRevision: message.gateRevision ?? requestGateRevision,
+      };
+    };
     const appendRequestMessage = (message: ChatMessage, options: { allowStale?: boolean } = {}) => {
-      if (!options.allowStale && !isRequestCurrentGate()) return false;
-      const normalized = withGateMeta(message);
+      if (!options.allowStale && !isRequestExecutionAllowed()) return false;
+      const normalized = withRequestGateMeta(message);
       if (requestRoleCanPersist) {
         appendProjectChatMessage(requestProjectId, requestAgentRole, normalized);
       } else if (isRequestVisible()) {
         setActiveChatMessages((prev) => [...prev, normalized]);
       }
       return true;
+    };
+    let requestSlidesSnapshot = slides;
+    const refreshRequestSlides = async () => {
+      const freshSlides = await fetchSlides(requestProjectId);
+      requestSlidesSnapshot = freshSlides;
+      slidesCacheRef.current[requestProjectId] = freshSlides;
+      if (selectedProjectIdRef.current === requestProjectId) {
+        setSlidesProjectId(requestProjectId);
+        setSlides(freshSlides);
+        hydrateSlideStaleMap(freshSlides);
+        const activeEditingSlide = editingSlideRef.current;
+        if (activeEditingSlide) {
+          const freshEditingSlide =
+            freshSlides.find((slide: Slide) => slide.id === activeEditingSlide.id) ||
+            freshSlides.find((slide: Slide) => slide.page_num === activeEditingSlide.page_num);
+          if (freshEditingSlide) setEditingSlide(freshEditingSlide);
+        }
+      }
+      return freshSlides;
+    };
+    const syncRequestVisualPrompts = async (
+      targetSlideIds: string[],
+      staleOverride: SlideStaleFlags
+    ) => {
+      const targets = requestSlidesSnapshot.filter((slide) => targetSlideIds.includes(slide.id));
+      if (targets.length === 0) return refreshRequestSlides();
+      const pageNums = Array.from(new Set(targets.map((slide) => slide.page_num)));
+      if (staleOverride.visual && !staleOverride.content) {
+        showToast(`正在同步 ${pageNums.length} 页的生图 Prompt...`, "info");
+        await generatePrompts(requestProjectId, pageNums, buildCrossStageContext("visual"));
+        const freshSlides = await refreshRequestSlides();
+        const freshById = new Map(freshSlides.map((slide: Slide) => [slide.id, slide]));
+        const unfinishedPages = targets
+          .filter((target) => {
+            const fresh = freshById.get(target.id) as Slide | undefined;
+            const freshStale = fresh ? getSlideStaleFlags(fresh) : {};
+            const missingPrompt = !String(fresh?.prompt_text || "").trim();
+            return !fresh || missingPrompt || freshStale.visual;
+          })
+          .map((target) => target.page_num);
+        if (unfinishedPages.length > 0) {
+          throw new Error(`第 ${unfinishedPages.join(", ")} 页更新后仍缺少生图 Prompt，请重试。`);
+        }
+        return freshSlides;
+      }
+      showToast(`正在更新 ${pageNums.length} 页的画面方案...`, "info");
+      let visualPromptRunId: string | null = null;
+      const startResult = await generateVisualPrompts(requestProjectId, pageNums, buildCrossStageContext("visual"));
+      handleWorkflowRunStarted(requestProjectId, startResult.run);
+      if (startResult?.run?.id) {
+        visualPromptRunId = String(startResult.run.id);
+        locallyHandledRunIdsRef.current.add(visualPromptRunId);
+      }
+      const finalWorkflow = await pollUntilStatusNotGenerating(requestProjectId);
+      const finalRun = visualPromptRunId && finalWorkflow?.last_run?.id === visualPromptRunId
+        ? finalWorkflow.last_run
+        : null;
+      if (finalRun && String(finalRun.status || "") !== "succeeded") {
+        throw new Error(userFacingGenerationError(finalRun.error_msg || finalRun.message || "画面方案生成失败"));
+      }
+      const freshSlides = await refreshRequestSlides();
+      const freshById = new Map(freshSlides.map((slide: Slide) => [slide.id, slide]));
+      const unfinishedPages = targets
+        .filter((target) => {
+          const fresh = freshById.get(target.id) as Slide | undefined;
+          const freshStale = fresh ? getSlideStaleFlags(fresh) : {};
+          const missingVisual = Boolean(staleOverride.content) && !String(fresh?.visual_json?.visual_description || "").trim();
+          const missingPrompt = !String(fresh?.prompt_text || "").trim();
+          return !fresh || missingVisual || missingPrompt || freshStale.content || freshStale.visual;
+        })
+        .map((target) => target.page_num);
+      if (unfinishedPages.length > 0) {
+        throw new Error(`第 ${unfinishedPages.join(", ")} 页更新后仍缺少画面方案，请重试。`);
+      }
+      return freshSlides;
     };
     const hasAttachments = pendingAttachments.length > 0;
     const ambientImageAttachments =
@@ -5731,8 +5989,8 @@ function App() {
     const hasChatImageAttachments = chatAttachmentsForRequest.length > 0;
     const hasFinetunePendingAttachments =
       requestAgentRole === "finetune" &&
-      !!finetuneTargetSlideId &&
-      (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length > 0;
+      !!singleFinetuneSlide?.id &&
+      (pendingFinetuneAttachmentsMap[singleFinetuneSlide.id] || []).length > 0;
     if (!userMsg && !hasAttachments && !hasChatImageAttachments && !hasFinetunePendingAttachments) return;
 
     // 构建用户消息展示内容（包含附件引用）
@@ -5784,7 +6042,7 @@ function App() {
       };
 
     if (requestAgentRole === "finetune") {
-      const targetSlideId = finetuneTargetSlideId || editingSlide?.id;
+      const targetSlideId = singleFinetuneSlide?.id || finetuneTargetSlideId || editingSlide?.id;
       const targetSlide = slides.find((s) => s.id === targetSlideId);
       if (!targetSlide || !targetSlideId) {
         setActiveChatMessages((prev) => [
@@ -5803,10 +6061,11 @@ function App() {
 
       const loadingId = `finetune-${Date.now()}`;
       const finetuneAttachments = pendingFinetuneAttachmentsMap[targetSlide.id] || [];
+      const finetuneRegions = finetuneRegionsMap[targetSlide.id] || [];
       if (!isRetry) {
         updateRoleChatMessages(requestProjectId, "finetune", (prev) => [
           ...prev,
-          { ...newMessage, content: userMsg, attachments: finetuneAttachments },
+          { ...newMessage, content: userMsg, attachments: finetuneAttachments, finetuneRegions },
           {
             role: "agent",
             content: `正在微调第 ${targetSlide.page_num} 页...`,
@@ -5822,6 +6081,8 @@ function App() {
           delete next[targetSlide.id];
           return next;
         });
+        clearFinetuneRegions(targetSlide.id);
+        if (finetuneRegionModeSlideId === targetSlide.id) setFinetuneRegionModeSlideId(null);
       }
       setChatLoading(true);
       setThinkingContent("");
@@ -5834,7 +6095,7 @@ function App() {
       chatInProgressRef.current = true;
 
       try {
-        const finetuneResult = await finetuneSlide(selectedProject.id, targetSlide.id, userMsg, finetuneAttachments.map((a) => a.id));
+        const finetuneResult = await finetuneSlide(selectedProject.id, targetSlide.id, userMsg, finetuneAttachments.map((a) => a.id), finetuneRegions);
         const generationRunId = finetuneResult?.run?.id ? String(finetuneResult.run.id) : null;
         await loadSlides(selectedProject.id);
         const finalWorkflow = await pollUntilStatusNotGenerating(selectedProject.id);
@@ -6050,9 +6311,6 @@ function App() {
           }
         } else if (event.type === "result") {
           result = event.data;
-          if (import.meta.env.DEV) {
-            console.debug("[handleSendChat] received result:", result);
-          }
         } else if (event.type === "content") {
           streamedContent += event.delta || "";
         } else if (event.type === "error") {
@@ -6063,7 +6321,7 @@ function App() {
             streamRetryReason = msg;
             break; // 跳出循环，由外层 retry 逻辑处理
           }
-          if (!isRequestCurrentGate()) {
+          if (!isRequestExecutionAllowed()) {
             clearPendingChatRequest(requestProjectId);
             if (isRequestVisible()) setChatLoading(false);
             abortRef.current = null;
@@ -6076,17 +6334,13 @@ function App() {
         }
       }
 
-      if (import.meta.env.DEV) {
-        console.debug("[handleSendChat] stream ended, result=", result, "aborted=", ctrl.signal.aborted, "retryReason=", streamRetryReason);
-      }
-
       // 如果流被浏览器自动中断（切标签页导致），静默标记为重试，不提示用户
       if (ctrl.signal.aborted) {
         streamRetryReason = "连接被浏览器中断";
       }
 
       if ((!chatResultLooksValid(result) || streamRetryReason) && !ctrl.signal.aborted) {
-        if (!isRequestCurrentGate()) {
+        if (!isRequestExecutionAllowed()) {
           clearPendingChatRequest(requestProjectId);
           if (isRequestVisible()) setChatLoading(false);
           return;
@@ -6112,7 +6366,7 @@ function App() {
             } else if (event.type === "content") {
               streamedContent += event.delta || "";
             } else if (event.type === "error") {
-              if (!isRequestCurrentGate()) {
+              if (!isRequestExecutionAllowed()) {
                 clearPendingChatRequest(requestProjectId);
                 if (isRequestVisible()) setChatLoading(false);
                 abortRef.current = null;
@@ -6126,9 +6380,9 @@ function App() {
           }
         } catch {
           // 只要不是用户主动停止，任何异常都要给用户反馈
-          if (!retryCtrl.signal.aborted && isRequestCurrentGate()) {
+          if (!retryCtrl.signal.aborted && isRequestExecutionAllowed()) {
             appendRequestMessage({ role: "agent", content: "请求失败，请重试。", agentRole: requestAgentRole });
-          } else if (!isRequestCurrentGate()) {
+          } else if (!isRequestExecutionAllowed()) {
             clearPendingChatRequest(requestProjectId);
           }
         } finally {
@@ -6144,7 +6398,7 @@ function App() {
       }
 
       if (!chatResultLooksValid(result)) {
-        if (!isRequestCurrentGate()) {
+        if (!isRequestExecutionAllowed()) {
           clearPendingChatRequest(requestProjectId);
           if (isRequestVisible()) setChatLoading(false);
           return;
@@ -6160,22 +6414,22 @@ function App() {
 
       const action = result.action;
       const hasPageTarget = Boolean(result.page_nums?.length || editingSlide);
-      if (!isRequestCurrentGate()) {
+      if (!isRequestExecutionAllowed()) {
         clearPendingChatRequest(requestProjectId);
         return;
       }
-      const frontendWillHandleAgentReply = isRequestVisible() && (
-        action === "confirm_style" ||
-        (action === "regenerate_pages" && result.page_nums?.length > 0) ||
-        action === "retry_failed" ||
+      const frontendWillHandleAgentReply = isRequestExecutionAllowed() && (
+        (isRequestVisible() && action === "confirm_style") ||
+        (isRequestVisible() && action === "regenerate_pages" && result.page_nums?.length > 0) ||
+        (isRequestVisible() && action === "retry_failed") ||
         (action === "reroll_page_visual_plan" && hasPageTarget) ||
         (action === "update_slide_visual" && result.updated_visual) ||
         (action === "update_all_slides_visual" && result.updated_slides_visual?.length > 0) ||
-        action === "request_generate_image" ||
-        (action === "forward_to_visual" && currentAgentRole === "content") ||
-        (action === "forward_to_content" && currentAgentRole === "visual") ||
-        (action === "regenerate_plan" && result.topic) ||
-        ((action === "propose_styles" || action === "adjust_style") && currentAgentRole === "visual" && selectedProject) ||
+        (isRequestVisible() && action === "request_generate_image") ||
+        (isRequestVisible() && action === "forward_to_visual" && requestAgentRole === "content") ||
+        (isRequestVisible() && action === "forward_to_content" && requestAgentRole === "visual") ||
+        (isRequestVisible() && action === "regenerate_plan" && result.topic) ||
+        (isRequestVisible() && (action === "propose_styles" || action === "adjust_style") && requestAgentRole === "visual" && selectedProject) ||
         (action === "update_slide_content" && result.updated_content) ||
         (action === "update_all_slides" && result.updated_slides?.length > 0) ||
         (action === "add_slide_before" && result.new_slide) ||
@@ -6196,7 +6450,7 @@ function App() {
 
       // 如果用户已经切到别的项目/Agent，或回退导致 gateRevision 变化，
       // 后续流程副作用必须停止，避免旧 Agent 响应覆盖新 Gate 状态。
-      if (!isRequestCurrentGate()) {
+      if (!isRequestExecutionAllowed()) {
         return;
       }
 
@@ -6212,49 +6466,43 @@ function App() {
       }
 
         // Agent 在聊天中确认风格，自动保存并推进
-        if (result.action === "confirm_style") {
+        if (isRequestVisible() && result.action === "confirm_style") {
           await dispatchGateAction("confirm_style", { style: result.style || userMsg }, { allowWhileChatLoading: true, source: "agent" });
         }
   
         // Agent 要求重新生成指定页
-        if (result.action === "regenerate_pages" && result.page_nums?.length > 0) {
+        if (isRequestVisible() && result.action === "regenerate_pages" && result.page_nums?.length > 0) {
           const regenPageNums = result.page_nums?.length ? result.page_nums : requestContext.pageNums;
-          const targetSlides = slides.filter((s) => regenPageNums.includes(s.page_num));
+          const targetSlides = requestSlidesSnapshot.filter((s) => regenPageNums.includes(s.page_num));
           targetSlides.forEach((s) => markSlideStale(s.id, "image"));
-          setActiveChatMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: buildChangeReceipt({
-                status: "queued",
-                subject: `已标记${formatPageNumsForReceipt(regenPageNums)}需要重新生成图片`,
-                change: "图片会按当前画面方案重新生成",
-                next: "这会产生生图成本，请进入对应页面检查后点击「确认生成图片」。",
-              }),
-              agentRole: requestAgentRole,
-            },
-          ]);
+          appendRequestMessage({
+            role: "agent",
+            content: buildChangeReceipt({
+              status: "queued",
+              subject: `已标记${formatPageNumsForReceipt(regenPageNums)}需要重新生成图片`,
+              change: "图片会按当前画面方案重新生成",
+              next: "这会产生生图成本，请进入对应页面检查后点击「确认生成图片」。",
+            }),
+            agentRole: requestAgentRole,
+          });
         }
   
         // Agent 要求重试所有失败页
-        if (result.action === "retry_failed") {
-          const failed = slides.filter((s) => s.status === "failed");
+        if (isRequestVisible() && result.action === "retry_failed") {
+          const failed = requestSlidesSnapshot.filter((s) => s.status === "failed");
           failed.forEach((s) => markSlideStale(s.id, "image"));
-          setActiveChatMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: failed.length
-                ? buildChangeReceipt({
-                    status: "queued",
-                    subject: `已找到 ${failed.length} 个失败页面`,
-                    change: "这些页面可以重新生成图片",
-                    next: "重试会产生生图成本，请点击「一键重试失败页」或进入单页确认。",
-                  })
-                : "当前没有失败页面需要重试。",
-              agentRole: requestAgentRole,
-            },
-          ]);
+          appendRequestMessage({
+            role: "agent",
+            content: failed.length
+              ? buildChangeReceipt({
+                  status: "queued",
+                  subject: `已找到 ${failed.length} 个失败页面`,
+                  change: "这些页面可以重新生成图片",
+                  next: "重试会产生生图成本，请点击「一键重试失败页」或进入单页确认。",
+                })
+              : "当前没有失败页面需要重试。",
+            agentRole: requestAgentRole,
+          });
         }
   
         // Agent 要求重新抽一版当前/指定页面画面方案（不生图）
@@ -6266,11 +6514,11 @@ function App() {
             : editingSlide
             ? [editingSlide.page_num]
             : [];
-          const targetIds = slides
+          const targetIds = requestSlidesSnapshot
             .filter((s) => pageNums.includes(s.page_num))
             .map((s) => s.id);
           if (targetIds.length > 0) {
-            await handleUpdateStaleSlides(targetIds, { local: true, silent: true, staleOverride: { content: true }, throwOnError: true });
+            await syncRequestVisualPrompts(targetIds, { content: true });
             appendRequestMessage({
               role: "agent",
               content: buildChangeReceipt({
@@ -6298,24 +6546,14 @@ function App() {
           if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
             pageNum = requestContext.pageNums[0];
           }
-          const targetSlide = slides.find((s) => s.page_num === pageNum);
+          const targetSlide = requestSlidesSnapshot.find((s) => s.page_num === pageNum);
           if (targetSlide) {
             appendRequestMessage({ role: "agent", content: "正在应用视觉描述修改...", agentRole: "visual" });
             try {
-              await updateVisualPlan(selectedProject.id, pageNum, result.updated_visual.visual_json, targetSlide.id);
-              markSlideStale(targetSlide.id, "visual");
-              await loadSlides(selectedProject.id);
-              if (editingSlide && editingSlide.page_num === pageNum) {
-                const updated = await fetchSlides(selectedProject.id);
-                const freshSlide = updated.find((s: Slide) => s.page_num === pageNum);
-                if (freshSlide) setEditingSlide(freshSlide);
-              }
-              await handleUpdateStaleSlides([targetSlide.id], {
-                local: true,
-                silent: true,
-                staleOverride: { visual: true },
-                throwOnError: true,
-              });
+              await updateVisualPlan(requestProjectId, pageNum, result.updated_visual.visual_json, targetSlide.id);
+              if (isRequestVisible()) markSlideStale(targetSlide.id, "visual");
+              await refreshRequestSlides();
+              await syncRequestVisualPrompts([targetSlide.id], { visual: true });
               addSystemLog(`已应用第 ${pageNum} 页视觉描述修改并同步提示词`);
               appendRequestMessage({
                 role: "agent",
@@ -6346,40 +6584,48 @@ function App() {
         // Agent 全局修改多页视觉描述
         if (result.action === "update_all_slides_visual" && result.updated_slides_visual?.length > 0) {
           appendRequestMessage({ role: "agent", content: `正在应用 ${result.updated_slides_visual.length} 页的视觉描述修改...`, agentRole: "visual" });
-          const existingPageNums = new Set(slides.map((s) => s.page_num));
+          const existingPageNums = new Set(requestSlidesSnapshot.map((s) => s.page_num));
+          const allowedPageNums = requestContext.scope === "selected_slides" && requestContext.pageNums.length > 0
+            ? new Set(requestContext.pageNums)
+            : null;
+          const patchesByPage = new Map<number, any>();
+          for (const patch of result.updated_slides_visual) {
+            const pageNum = Number(patch?.page_num);
+            if (!Number.isFinite(pageNum)) continue;
+            if (allowedPageNums && !allowedPageNums.has(pageNum)) continue;
+            patchesByPage.set(pageNum, patch);
+          }
+          if (allowedPageNums) {
+            const fallbackPatch = result.updated_slides_visual.find((patch: any) => patch?.visual_json) || null;
+            allowedPageNums.forEach((pageNum) => {
+              if (!patchesByPage.has(pageNum) && fallbackPatch) {
+                patchesByPage.set(pageNum, { ...fallbackPatch, page_num: pageNum });
+              }
+            });
+          }
           const skipped: number[] = [];
           const updatedPageNums: number[] = [];
           const updatedSlideIds: string[] = [];
-          for (const patch of result.updated_slides_visual) {
+          for (const patch of patchesByPage.values()) {
             const pageNum = patch.page_num;
             if (!existingPageNums.has(pageNum)) {
               skipped.push(pageNum);
               continue;
             }
-            const slide = slides.find((s) => s.page_num === pageNum);
+            const slide = requestSlidesSnapshot.find((s) => s.page_num === pageNum);
             if (!slide) continue;
             try {
-              await updateVisualPlan(selectedProject.id, pageNum, patch.visual_json, slide.id);
-              markSlideStale(slide.id, "visual");
+              await updateVisualPlan(requestProjectId, pageNum, patch.visual_json, slide.id);
+              if (isRequestVisible()) markSlideStale(slide.id, "visual");
               updatedPageNums.push(pageNum);
               updatedSlideIds.push(slide.id);
             } catch {
               // 单页失败继续下一页
             }
           }
-          await loadSlides(selectedProject.id);
-          if (editingSlide && updatedPageNums.includes(editingSlide.page_num)) {
-            const updated = await fetchSlides(selectedProject.id);
-            const freshSlide = updated.find((s: Slide) => s.page_num === editingSlide.page_num);
-            if (freshSlide) setEditingSlide(freshSlide);
-          }
+          await refreshRequestSlides();
           if (updatedSlideIds.length > 0) {
-            await handleUpdateStaleSlides(updatedSlideIds, {
-              local: true,
-              silent: true,
-              staleOverride: { visual: true },
-              throwOnError: true,
-            });
+            await syncRequestVisualPrompts(updatedSlideIds, { visual: true });
             addSystemLog(`已应用 ${updatedSlideIds.length} 页视觉描述修改并同步提示词`);
           } else {
             appendRequestMessage({
@@ -6405,7 +6651,7 @@ function App() {
         }
   
         // Agent 理解用户想生图，但成本动作必须由用户确认
-        if (result.action === "request_generate_image") {
+        if (isRequestVisible() && result.action === "request_generate_image") {
           const pageNums = result.page_nums?.length
             ? result.page_nums
             : requestContext.pageNums.length
@@ -6413,7 +6659,7 @@ function App() {
             : editingSlide
             ? [editingSlide.page_num]
             : [];
-          const targetSlides = slides.filter((s) => pageNums.includes(s.page_num));
+          const targetSlides = requestSlidesSnapshot.filter((s) => pageNums.includes(s.page_num));
           targetSlides.forEach((s) => markSlideStale(s.id, "image"));
           appendRequestMessage({
             role: "agent",
@@ -6430,7 +6676,7 @@ function App() {
         }
   
         // 内容总监识别到内容已确认，自动转接视觉总监
-        if (result.action === "forward_to_visual" && requestAgentRole === "content") {
+        if (isRequestVisible() && result.action === "forward_to_visual" && requestAgentRole === "content") {
           appendRequestMessage({
             role: "agent",
             content: "收到，正在请视觉总监介入。",
@@ -6441,7 +6687,7 @@ function App() {
         }
   
         // 视觉总监识别到内容问题，自动转接内容总监
-        if (result.action === "forward_to_content" && requestAgentRole === "visual") {
+        if (isRequestVisible() && result.action === "forward_to_content" && requestAgentRole === "visual") {
           setCurrentAgentRole("content");
           appendProjectChatMessage(requestProjectId, "content", {
             role: "agent",
@@ -6452,7 +6698,7 @@ function App() {
         }
   
         // Agent 要求重新生成内容规划（页数可能变化）
-        if (result.action === "regenerate_plan" && result.topic) {
+        if (isRequestVisible() && result.action === "regenerate_plan" && result.topic) {
           if (requestAgentRole === "visual") {
             appendRequestMessage({
               role: "agent",
@@ -6487,7 +6733,7 @@ function App() {
         }
   
         // 视觉总监确认素材状态，触发风格提案生成；已进入后续阶段时，风格调整必须仍然落成可确认卡片。
-        if ((result.action === "propose_styles" || result.action === "adjust_style") && requestAgentRole === "visual" && selectedProject) {
+        if (isRequestVisible() && (result.action === "propose_styles" || result.action === "adjust_style") && requestAgentRole === "visual" && selectedProject) {
         const latestGateContext = gateContextRef.current || gateContext;
         const isAdjust = result.action === "adjust_style";
         const isBackendStyleGenerationRequest = isVisualStyleGenerationMessage(userMsg);
@@ -6568,7 +6814,7 @@ function App() {
           let styleRunId: string | null = null;
           try {
             const freshReferenceImages = await fetchReferenceImages(requestProjectId);
-            if (!isRequestCurrentGate()) {
+            if (!isRequestExecutionAllowed()) {
               clearPendingChatRequest(requestProjectId);
               return;
             }
@@ -6586,14 +6832,14 @@ function App() {
                 )
               );
             }
-            if (!isRequestCurrentGate()) {
+            if (!isRequestExecutionAllowed()) {
               clearPendingChatRequest(requestProjectId);
               return;
             }
             if (styleResult.status === "generating") {
               showToast("风格提案后台生成中，请稍候...", "info");
               await pollForStyleProposals(requestProjectId);
-              if (!isRequestCurrentGate()) {
+              if (!isRequestExecutionAllowed()) {
                 clearPendingChatRequest(requestProjectId);
                 return;
               }
@@ -6602,7 +6848,7 @@ function App() {
             }
             await loadProjects();
             const fresh = normalizeProjectsForActiveSelection(await fetchProjects(), selectedProjectIdRef.current);
-            if (!isRequestCurrentGate()) {
+            if (!isRequestExecutionAllowed()) {
               clearPendingChatRequest(requestProjectId);
               return;
             }
@@ -6657,7 +6903,7 @@ function App() {
                     if (styleRunId) {
                       locallyHandledRunIdsRef.current.delete(styleRunId);
                     }
-                    if (!isRequestCurrentGate()) {
+                    if (!isRequestExecutionAllowed()) {
                       clearPendingChatRequest(requestProjectId);
                       return;
                     }
@@ -6676,19 +6922,16 @@ function App() {
               },
             ]);
           } finally {
-            setOperatingProjectId(null);
+            setOperatingProjectId((current) => current === requestProjectId ? null : current);
           }
         }
       }
 
       // Agent 要求修改某一页的文字内容
       if (result.action === "update_slide_content" && result.updated_content) {
-        pushSlidesHistory(slides);
-        setActiveChatMessages((prev) => [
-          ...prev,
-          { role: "agent", content: "正在应用内容修改..." },
-        ]);
-        setOperatingProjectId(selectedProject.id);
+        if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
+        appendRequestMessage({ role: "agent", content: "正在应用内容修改...", agentRole: "content" });
+        setOperatingProjectId(requestProjectId);
         try {
             // 单页模式下强制校正 page_num，防止 LLM 改错页
             let pageNum = result.updated_content.page_num;
@@ -6696,77 +6939,57 @@ function App() {
               pageNum = requestContext.pageNums[0];
               result.updated_content.page_num = pageNum;
             }
-          if (!slides.some((s) => s.page_num === pageNum)) {
+          if (!requestSlidesSnapshot.some((s) => s.page_num === pageNum)) {
             throw new Error(`没有找到第 ${pageNum || "?"} 页，未应用内容修改`);
           }
-          await updateSlideContent(selectedProject.id, pageNum, result.updated_content);
-          const changedSlide = slides.find((s) => s.page_num === pageNum);
-          if (changedSlide) markSlideStale(changedSlide.id, "content");
+          await updateSlideContent(requestProjectId, pageNum, result.updated_content);
+          const changedSlide = requestSlidesSnapshot.find((s) => s.page_num === pageNum);
+          if (changedSlide && isRequestVisible()) markSlideStale(changedSlide.id, "content");
           await loadProjects();
-          await loadSlides(selectedProject.id);
-          // 如果当前正在编辑这页，同步更新 editingSlide
-          if (editingSlide && editingSlide.page_num === pageNum) {
-            const updated = await fetchSlides(selectedProject.id);
-            const freshSlide = updated.find((s: Slide) => s.page_num === pageNum);
-            if (freshSlide) {
-              setEditingSlide(freshSlide);
-            }
-          }
-          setActiveChatMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: buildChangeReceipt({
-                status: "applied",
-                subject: `已更新第 ${pageNum} 页内容`,
-                change: summarizeContentChange(result.updated_content, userMsg),
-                next: "相关画面方案需要重新检查；切到「视觉总监」更新画面后再生成图片。",
-              }),
-            },
-          ]);
+          await refreshRequestSlides();
+          appendRequestMessage({
+            role: "agent",
+            content: buildChangeReceipt({
+              status: "applied",
+              subject: `已更新第 ${pageNum} 页内容`,
+              change: summarizeContentChange(result.updated_content, userMsg),
+              next: "相关画面方案需要重新检查；切到「视觉总监」更新画面后再生成图片。",
+            }),
+            agentRole: "content",
+          });
         } catch (err: any) {
-          setActiveChatMessages((prev) => [
-            ...prev,
-            { role: "agent", content: "应用修改失败：" + (err.message || "未知错误") },
-          ]);
+          appendRequestMessage({ role: "agent", content: "应用修改失败：" + (err.message || "未知错误"), agentRole: "content" });
         } finally {
-          setOperatingProjectId(null);
+          setOperatingProjectId((current) => current === requestProjectId ? null : current);
         }
       }
 
       // Agent 要求全局修改多页文字内容
       if (result.action === "update_all_slides" && result.updated_slides?.length > 0) {
-        pushSlidesHistory(slides);
-        setActiveChatMessages((prev) => [
-          ...prev,
-          { role: "agent", content: `正在应用 ${result.updated_slides.length} 页的内容修改...` },
-        ]);
-        setOperatingProjectId(selectedProject.id);
+        if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
+        appendRequestMessage({ role: "agent", content: `正在应用 ${result.updated_slides.length} 页的内容修改...`, agentRole: "content" });
+        setOperatingProjectId(requestProjectId);
         try {
-          const existingPageNums = new Set(slides.map((s) => s.page_num));
+          const existingPageNums = new Set(requestSlidesSnapshot.map((s) => s.page_num));
+          const allowedPageNums = requestContext.scope === "selected_slides" && requestContext.pageNums.length > 0
+            ? new Set(requestContext.pageNums)
+            : null;
           const skipped: number[] = [];
           const updatedPageNums: number[] = [];
           for (const slidePatch of result.updated_slides) {
             const pageNum = slidePatch.page_num;
+            if (allowedPageNums && !allowedPageNums.has(pageNum)) continue;
             if (!existingPageNums.has(pageNum)) {
               skipped.push(pageNum);
               continue;
             }
-            await updateSlideContent(selectedProject.id, pageNum, slidePatch);
-            const changedSlide = slides.find((s) => s.page_num === pageNum);
-            if (changedSlide) markSlideStale(changedSlide.id, "content");
+            await updateSlideContent(requestProjectId, pageNum, slidePatch);
+            const changedSlide = requestSlidesSnapshot.find((s) => s.page_num === pageNum);
+            if (changedSlide && isRequestVisible()) markSlideStale(changedSlide.id, "content");
             updatedPageNums.push(pageNum);
           }
           await loadProjects();
-          await loadSlides(selectedProject.id);
-          // 如果当前正在编辑的页被修改了，同步更新 editingSlide
-          if (editingSlide && updatedPageNums.includes(editingSlide.page_num)) {
-            const updated = await fetchSlides(selectedProject.id);
-            const freshSlide = updated.find((s: Slide) => s.page_num === editingSlide.page_num);
-            if (freshSlide) {
-              setEditingSlide(freshSlide);
-            }
-          }
+          await refreshRequestSlides();
           const receipt =
             updatedPageNums.length > 0
               ? buildChangeReceipt({
@@ -6781,123 +7004,88 @@ function App() {
                   subject: "没有找到可更新的页面，内容未变化",
                   skipped: skipped.length > 0 ? `第 ${skipped.join(", ")} 页不存在` : "",
                 });
-          setActiveChatMessages((prev) => [...prev, { role: "agent", content: receipt }]);
+          appendRequestMessage({ role: "agent", content: receipt, agentRole: "content" });
         } catch (err: any) {
-          setActiveChatMessages((prev) => [
-            ...prev,
-            { role: "agent", content: "应用修改失败：" + (err.message || "未知错误") },
-          ]);
+          appendRequestMessage({ role: "agent", content: "应用修改失败：" + (err.message || "未知错误"), agentRole: "content" });
         } finally {
-          setOperatingProjectId(null);
+          setOperatingProjectId((current) => current === requestProjectId ? null : current);
         }
       }
 
       // Agent 要求在当前页前面插入新页
       if (result.action === "add_slide_before" && result.new_slide) {
-        pushSlidesHistory(slides);
-        setActiveChatMessages((prev) => [
-          ...prev,
-          { role: "agent", content: "正在插入新页面..." },
-        ]);
-        setOperatingProjectId(selectedProject.id);
+        if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
+        appendRequestMessage({ role: "agent", content: "正在插入新页面...", agentRole: "content" });
+        setOperatingProjectId(requestProjectId);
         try {
             let pageNum = result.new_slide.page_num;
             if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
               pageNum = requestContext.pageNums[0];
               result.new_slide.page_num = pageNum;
             }
-          await createSlide(selectedProject.id, pageNum, result.new_slide);
+          await createSlide(requestProjectId, pageNum, result.new_slide);
           await loadProjects();
-          await loadSlides(selectedProject.id);
-          // 同步更新 editingSlide（如果当前正在编辑，page_num 可能变了）
-          if (editingSlide) {
-            const updated = await fetchSlides(selectedProject.id);
-            const freshSlide = updated.find((s: Slide) => s.id === editingSlide.id);
-            if (freshSlide) {
-              setEditingSlide(freshSlide);
-            }
-          }
-          setActiveChatMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: buildChangeReceipt({
-                status: "applied",
-                subject: `已在第 ${pageNum} 页前插入新页`,
-                change: summarizeInsertedSlide(result.new_slide),
-                next: "请检查新增页内容；需要出图前再生成画面方案。",
-              }),
-            },
-          ]);
+          await refreshRequestSlides();
+          appendRequestMessage({
+            role: "agent",
+            content: buildChangeReceipt({
+              status: "applied",
+              subject: `已在第 ${pageNum} 页前插入新页`,
+              change: summarizeInsertedSlide(result.new_slide),
+              next: "请检查新增页内容；需要出图前再生成画面方案。",
+            }),
+            agentRole: "content",
+          });
         } catch (err: any) {
-          setActiveChatMessages((prev) => [
-            ...prev,
-            { role: "agent", content: "插入页面失败：" + (err.message || "未知错误") },
-          ]);
+          appendRequestMessage({ role: "agent", content: "插入页面失败：" + (err.message || "未知错误"), agentRole: "content" });
         } finally {
-          setOperatingProjectId(null);
+          setOperatingProjectId((current) => current === requestProjectId ? null : current);
         }
       }
 
       // Agent 要求在当前页后面插入新页
       if (result.action === "add_slide_after" && result.new_slide) {
-        pushSlidesHistory(slides);
-        setActiveChatMessages((prev) => [
-          ...prev,
-          { role: "agent", content: "正在插入新页面..." },
-        ]);
-        setOperatingProjectId(selectedProject.id);
+        if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
+        appendRequestMessage({ role: "agent", content: "正在插入新页面...", agentRole: "content" });
+        setOperatingProjectId(requestProjectId);
         try {
             let pageNum = result.new_slide.page_num;
             if (requestContext.scope === "current_slide" && requestContext.pageNums[0]) {
               pageNum = requestContext.pageNums[0] + 1;
               result.new_slide.page_num = pageNum;
             }
-          await createSlide(selectedProject.id, pageNum, result.new_slide);
+          await createSlide(requestProjectId, pageNum, result.new_slide);
           await loadProjects();
-          await loadSlides(selectedProject.id);
-          // 同步更新 editingSlide
-          if (editingSlide) {
-            const updated = await fetchSlides(selectedProject.id);
-            const freshSlide = updated.find((s: Slide) => s.id === editingSlide.id);
-            if (freshSlide) {
-              setEditingSlide(freshSlide);
-            }
-          }
-          setActiveChatMessages((prev) => [
-            ...prev,
-            {
-              role: "agent",
-              content: buildChangeReceipt({
-                status: "applied",
-                subject: `已在第 ${pageNum} 页后插入新页`,
-                change: summarizeInsertedSlide(result.new_slide),
-                next: "请检查新增页内容；需要出图前再生成画面方案。",
-              }),
-            },
-          ]);
+          await refreshRequestSlides();
+          appendRequestMessage({
+            role: "agent",
+            content: buildChangeReceipt({
+              status: "applied",
+              subject: `已在第 ${pageNum} 页后插入新页`,
+              change: summarizeInsertedSlide(result.new_slide),
+              next: "请检查新增页内容；需要出图前再生成画面方案。",
+            }),
+            agentRole: "content",
+          });
         } catch (err: any) {
-          setActiveChatMessages((prev) => [
-            ...prev,
-            { role: "agent", content: "插入页面失败：" + (err.message || "未知错误") },
-          ]);
+          appendRequestMessage({ role: "agent", content: "插入页面失败：" + (err.message || "未知错误"), agentRole: "content" });
         } finally {
-          setOperatingProjectId(null);
+          setOperatingProjectId((current) => current === requestProjectId ? null : current);
         }
       }
     } catch (err: any) {
       // 用户主动停止才显示停止提示；网络中断会自动重试。
       if (err?.name === "AbortError") {
-        if (!silentChatAbortRef.current && isRequestCurrentGate()) {
+        if (!silentChatAbortRef.current && isRequestExecutionAllowed()) {
           appendRequestMessage({
             role: "agent",
             content: "⏹ 已停止生成。",
             agentRole: requestAgentRole,
           });
-        } else if (!isRequestCurrentGate()) {
+        } else if (!isRequestExecutionAllowed()) {
           clearPendingChatRequest(requestProjectId);
         }
-      } else if (isRequestCurrentGate()) {
+      } else if (isRequestExecutionAllowed()) {
         const retryCount = pendingChatRef.current?.retryCount || 0;
         if (retryCount < 2) {
           setChatLoading(true);
@@ -7232,9 +7420,15 @@ function App() {
     switch (nextAction.type) {
       case "generate_content_plan": {
         const topic = nextAction.payload?.topic || sourceMessage?.topic;
+        const chatContext = buildVisualStyleGenerationContext(
+          chatMessages,
+          sourceMessage?.content || "",
+          buildCrossStageContext("content")
+        );
         await dispatchGateAction("generate_content_plan", {
           topic,
           page_count: nextAction.payload?.page_count || sourceMessage?.positioning?.estimated_pages,
+          chat_context: chatContext,
         });
         return;
       }
@@ -7404,8 +7598,9 @@ function App() {
       await uploadBriefFiles(Array.from(files));
       return;
     }
-    if (currentAgentRole === "finetune" && finetuneTargetSlideId) {
-      const targetSlide = slides.find((s) => s.id === finetuneTargetSlideId);
+    const finetuneAttachmentTargetId = singleFinetuneSlide?.id || finetuneTargetSlideId;
+    if (currentAgentRole === "finetune" && finetuneAttachmentTargetId) {
+      const targetSlide = slides.find((s) => s.id === finetuneAttachmentTargetId);
       const imageFiles = Array.from(files).filter(isBriefImageFile);
       if (imageFiles.length > 0) {
         setOperatingProjectId(selectedProject.id);
@@ -7423,7 +7618,7 @@ function App() {
               title: "正在上传本轮参考图",
               fileName: imageFiles.length > 1 ? `${index + 1}/${imageFiles.length} ${file.name}` : file.name,
             });
-            const data = await uploadFile(selectedProject.id, file, "finetune_ref", finetuneTargetSlideId);
+            const data = await uploadFile(selectedProject.id, file, "finetune_ref", finetuneAttachmentTargetId);
             uploaded.push({
               id: data.id,
               name: file.name,
@@ -7433,7 +7628,7 @@ function App() {
           }
           setPendingFinetuneAttachmentsMap((prev) => ({
             ...prev,
-            [finetuneTargetSlideId]: [...(prev[finetuneTargetSlideId] || []), ...uploaded],
+            [finetuneAttachmentTargetId]: [...(prev[finetuneAttachmentTargetId] || []), ...uploaded],
           }));
           showToast(`已加入 ${uploaded.length} 张本轮参考图`, "success");
           addSystemLog(`用户为第 ${targetSlide?.page_num || "?"} 页添加了 ${uploaded.length} 张本轮微调参考图`);
@@ -7560,17 +7755,6 @@ function App() {
   };
 
   const currentStatus = selectedProject?.status || "draft";
-  const isEditablePptxRunActive = Boolean(hasActiveRun && activeRun?.kind === "editable_pptx");
-  const editableExportDisabled = Boolean(
-    !selectedProject ||
-      chatLoading ||
-      isBusy ||
-      hasActiveRun ||
-      operatingProjectId === selectedProject.id ||
-      selectedProject.status !== "completed" ||
-      !currentProjectStatus?.has_pptx
-  );
-  const editableExportLabel = isEditablePptxRunActive ? "准备中..." : "下载可编辑版 PPTX";
   const normalizePageNums = (pageNums?: number[] | null) =>
     Array.isArray(pageNums)
       ? Array.from(new Set(pageNums.map(Number).filter((n) => Number.isFinite(n)))).sort((a, b) => a - b)
@@ -7660,9 +7844,36 @@ function App() {
     const activeAgentScope: AgentRequestScope =
       agentScope === "current_slide" && editingSlide
         ? "current_slide"
-        : agentScope === "selected_slides" && selectedPageNumsForAgent.length > 0
+        : agentScope === "selected_slides" && selectedPageNumsForAgent.length > 1
         ? "selected_slides"
+        : agentScope === "selected_slides" && selectedPageNumsForAgent.length === 1
+        ? "current_slide"
         : "deck";
+    const selectedSlidesForAgent = useMemo(() => {
+      if (selectedPageNumsForAgent.length === 0) return [];
+      const byPage = new Map(slides.map((slide) => [slide.page_num, slide]));
+      return selectedPageNumsForAgent
+        .map((pageNum) => byPage.get(pageNum))
+        .filter((slide): slide is Slide => Boolean(slide));
+    }, [selectedPageNumsForAgent, slides]);
+    const finetuneTargetSlide = useMemo(
+      () => (finetuneTargetSlideId ? slides.find((slide) => slide.id === finetuneTargetSlideId) || null : null),
+      [finetuneTargetSlideId, slides]
+    );
+    const selectedFinetuneSlides = useMemo(() => {
+      if (currentAgentRole !== "finetune") return [];
+      if (selectedSlidesForAgent.length > 0) return selectedSlidesForAgent;
+      return finetuneTargetSlide ? [finetuneTargetSlide] : [];
+    }, [currentAgentRole, finetuneTargetSlide, selectedSlidesForAgent]);
+    const finetunePanelScope: "empty" | "single_slide" | "selected_slides" =
+      selectedFinetuneSlides.length === 0
+        ? "empty"
+        : selectedFinetuneSlides.length === 1
+        ? "single_slide"
+        : "selected_slides";
+    const singleFinetuneSlide = finetunePanelScope === "single_slide" ? selectedFinetuneSlides[0] : null;
+    const isSingleSlideFinetuneRequest =
+      currentAgentRole === "finetune" && finetunePanelScope === "single_slide" && Boolean(singleFinetuneSlide?.id);
     const composerRequestContext = useMemo(
       () =>
         inferAgentRequestContext({
@@ -7697,10 +7908,10 @@ function App() {
     if (!selectedProject?.id) return null;
     if (isBriefStudioActive) return getBriefDraftStorageKey(selectedProject.id);
     const targetSlideId = currentAgentRole === "finetune"
-      ? finetuneTargetSlideId || editingSlide?.id || null
+      ? singleFinetuneSlide?.id || finetuneTargetSlideId || editingSlide?.id || null
       : null;
     return getAgentDraftStorageKey(selectedProject.id, currentAgentRole, targetSlideId);
-  }, [selectedProject?.id, isBriefStudioActive, currentAgentRole, finetuneTargetSlideId, editingSlide?.id]);
+  }, [selectedProject?.id, isBriefStudioActive, currentAgentRole, singleFinetuneSlide?.id, finetuneTargetSlideId, editingSlide?.id]);
 
   useEffect(() => {
     chatInputValueRef.current = chatInput;
@@ -7870,12 +8081,8 @@ function App() {
           ? "画面方案进度"
           : activeRun?.kind === "prototype_generation"
           ? "样张生成进度"
-          : activeRun?.kind === "editable_pptx"
-          ? "可编辑版生成进度"
           : "批量生成进度"));
   const deckSelectedPageNums = Array.from(deckSelectedPages).sort((a, b) => a - b);
-  const agentFinetuneHeadline =
-    editingSlide ? `将微调第 ${editingSlide.page_num} 页画面` : "先选择一页，再告诉我怎么改";
   const agentSecondaryHint =
     composerRequestContext.confidence === "needs_input"
       ? "先在画布中勾选页面，或改说具体页码。"
@@ -7903,20 +8110,26 @@ function App() {
     { value: "notes", label: "备注", hint: "讲稿、备注" },
   ];
   const agentComposerPlaceholder =
-    currentAgentRole === "finetune" && !finetuneTargetSlideId
+    currentAgentRole === "finetune" && finetunePanelScope === "empty"
       ? "请先在左侧点击一页..."
-      : currentStatus === "draft"
+    : currentStatus === "draft"
       ? "输入 PPT 主题或粘贴文档内容..."
+      : currentAgentRole === "finetune" && finetunePanelScope === "selected_slides"
+      ? "例如：把这些页统一改得更商务，保留文字"
       : currentAgentRole === "finetune"
       ? "例如：保留文字，把画面换成更高级的办公室场景"
       : currentAgentRole === "visual"
       ? "例如：把选中页改得更商务，背景更克制"
       : "例如：把第 3 页标题改短，正文更像汇报口吻";
+  const activeFinetuneRegions =
+    currentAgentRole === "finetune" && singleFinetuneSlide?.id
+      ? (finetuneRegionsMap[singleFinetuneSlide.id] || [])
+      : [];
   const agentMaterialCount =
     pendingAttachments.length +
     pendingChatAttachments.length +
-    (currentAgentRole === "finetune" && finetuneTargetSlideId
-      ? (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length
+    (currentAgentRole === "finetune" && singleFinetuneSlide?.id
+      ? (pendingFinetuneAttachmentsMap[singleFinetuneSlide.id] || []).length
       : 0);
   const failedSlidePageNums = slides.filter((s) => s.status === "failed").map((s) => s.page_num);
   const agentContractRows = useMemo(
@@ -8204,7 +8417,7 @@ function App() {
   };
 
   return (
-    <div className="pg-app flex h-screen w-screen bg-gray-50 text-gray-900 overflow-hidden">
+    <div className={`pg-app ${editingSlide ? "is-single-slide-editing" : ""} flex h-screen w-screen bg-gray-50 text-gray-900 overflow-hidden`}>
       {/* 左栏：项目导航 */}
       {!leftCollapsed && (
         <aside
@@ -8364,51 +8577,6 @@ function App() {
               <span className="pg-project-export-link is-disabled" aria-disabled="true">
                 下载图片版 PPTX
               </span>
-            ) : null}
-            {selectedProject ? (
-              <div className="pg-editable-export">
-                {editableExportDisabled ? (
-                  <button
-                    type="button"
-                    className="pg-project-export-link is-disabled"
-                    disabled
-                    aria-disabled="true"
-                    aria-label={isEditablePptxRunActive ? "正在生成可编辑版 PPTX" : "请先完成全量 PPT 生成"}
-                  >
-                    {editableExportLabel}
-                  </button>
-                ) : (
-                  <details className="pg-editable-export-menu">
-                    <summary
-                      className="pg-project-export-link pg-editable-export-trigger"
-                      aria-label="下载可编辑版 PPTX，选择解析强度"
-                    >
-                      <span>{editableExportLabel}</span>
-                      <span className="pg-editable-export-caret" aria-hidden="true">⌄</span>
-                    </summary>
-                    <div className="pg-editable-export-options" role="menu" aria-label="选择解析强度">
-                      <div className="pg-editable-export-help">
-                        选择解析强度：越高拆得越细，视觉风险越高。
-                      </div>
-                      {EDITABLE_PPTX_MODE_OPTIONS.map((option) => (
-                        <button
-                          key={option.value}
-                          type="button"
-                          role="menuitem"
-                          className="pg-editable-export-option"
-                          onClick={(event) => {
-                            event.currentTarget.closest("details")?.removeAttribute("open");
-                            handleEditablePptxExport(option.value);
-                          }}
-                        >
-                          <span className="pg-editable-export-option-title">{option.label}</span>
-                          <span className="pg-editable-export-option-hint">{option.hint}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </details>
-                )}
-              </div>
             ) : null}
           </div>
         </header>
@@ -8848,6 +9016,12 @@ function App() {
                 await handleRetry(slideId, regeneratePrompt);
               }}
               onRegenerateFromEdits={handleRegenerateSlideFromEdits}
+              finetuneRegions={currentAgentRole === "finetune" ? (finetuneRegionsMap[editingSlide.id] || []) : []}
+              finetuneRegionSelectionEnabled={currentAgentRole === "finetune" && finetuneRegionModeSlideId === editingSlide.id}
+              onToggleFinetuneRegionSelection={currentAgentRole === "finetune" ? () => toggleFinetuneRegionMode(editingSlide.id) : undefined}
+              onAddFinetuneRegion={currentAgentRole === "finetune" ? (bbox) => addFinetuneRegion(editingSlide.id, bbox) : undefined}
+              onRemoveFinetuneRegion={currentAgentRole === "finetune" ? (regionId) => removeFinetuneRegion(editingSlide.id, regionId) : undefined}
+              onClearFinetuneRegions={currentAgentRole === "finetune" ? () => clearFinetuneRegions(editingSlide.id) : undefined}
             />
           ) : (
             <>
@@ -10054,6 +10228,18 @@ function App() {
                             return (
                               <div>
                                 {text && <div className="whitespace-pre-wrap">{text}</div>}
+                              {msg.finetuneRegions && msg.finetuneRegions.length > 0 && (
+                                <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-white/20">
+                                  {msg.finetuneRegions.map((region) => (
+                                    <span
+                                      key={region.id}
+                                      className="inline-flex items-center gap-1 text-2xs bg-white/20 text-white px-1.5 py-0.5 rounded"
+                                    >
+                                      {region.label}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
                               {msg.attachments && msg.attachments.length > 0 && (
                                 <div className="flex flex-wrap gap-2 mt-2 pt-2 border-t border-white/20">
                                   {msg.attachments.map((att) => (
@@ -10506,9 +10692,9 @@ function App() {
               ))}
             </div>
           )}
-          {currentAgentRole === "finetune" && finetuneTargetSlideId && (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length > 0 && (
+          {currentAgentRole === "finetune" && singleFinetuneSlide?.id && (pendingFinetuneAttachmentsMap[singleFinetuneSlide.id] || []).length > 0 && (
             <div className="flex flex-wrap gap-2 mb-3">
-              {(pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).map((att) => (
+              {(pendingFinetuneAttachmentsMap[singleFinetuneSlide.id] || []).map((att) => (
                 <div key={att.id} className="pg-attachment-chip inline-flex items-center gap-2 bg-amber-50 text-amber-800 px-2 py-1 rounded border border-amber-200 max-w-full">
                   <img src={att.url} alt={att.name} className="w-10 h-6 rounded object-cover border border-amber-200" />
                   <span className="text-xs truncate max-w-[160px]">{att.name}</span>
@@ -10516,7 +10702,7 @@ function App() {
                     onClick={() => {
                       setPendingFinetuneAttachmentsMap((prev) => ({
                         ...prev,
-                        [finetuneTargetSlideId]: (prev[finetuneTargetSlideId] || []).filter((item) => item.id !== att.id),
+                        [singleFinetuneSlide.id]: (prev[singleFinetuneSlide.id] || []).filter((item) => item.id !== att.id),
                       }));
                     }}
                     className="pg-subtle-link text-amber-500 hover:text-amber-900 ml-0.5 text-xs"
@@ -10528,47 +10714,142 @@ function App() {
               ))}
             </div>
           )}
+          {currentAgentRole === "finetune" && singleFinetuneSlide?.id && activeFinetuneRegions.length > 0 && (
+            <div className="flex flex-wrap gap-2 mb-3">
+              {activeFinetuneRegions.map((region) => (
+                <div key={region.id} className="pg-finetune-region-chip inline-flex items-center gap-1.5 px-2 py-1 rounded border max-w-full">
+                  <span className="text-xs truncate">{region.label}</span>
+                  <button
+                    onClick={() => removeFinetuneRegion(singleFinetuneSlide.id, region.id)}
+                    className="pg-subtle-link ml-0.5 text-xs"
+                    title="移除框选"
+                  >
+                    X
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {currentAgentRole === "finetune" && finetunePanelScope === "selected_slides" && (
+            <div className="pg-finetune-target mb-3">
+              <div className="pg-finetune-target-head">
+                <div className="pg-finetune-target-stack" aria-hidden="true">
+                  {selectedFinetuneSlides.slice(0, 3).map((slide) => (
+                    slide.image_path ? (
+                      <img
+                        key={slide.id}
+                        src={getSlideImageUrl(slide.image_path, slide.status, imageRefreshMap[slide.id])}
+                        alt=""
+                        className="pg-finetune-target-thumb"
+                      />
+                    ) : (
+                      <div key={slide.id} className="pg-finetune-target-empty">P{slide.page_num}</div>
+                    )
+                  ))}
+                </div>
+                <div className="pg-finetune-target-copy">
+                  <div className="pg-finetune-target-title">已选 {selectedFinetuneSlides.length} 页</div>
+                  <div className="pg-finetune-target-desc">同一要求会应用到这些页面</div>
+                </div>
+              </div>
+              <div className="pg-finetune-scope-foot">
+                <span>第 {selectedFinetuneSlides.map((slide) => slide.page_num).join("、")} 页。需要只改局部时，先进入单页再框选。</span>
+              </div>
+            </div>
+          )}
           {/* 单页微调：当前目标页 */}
-          {currentAgentRole === "finetune" && finetuneTargetSlideId && (() => {
-            const finetuneSlide = slides.find((s) => s.id === finetuneTargetSlideId);
-            if (!finetuneSlide) return null;
+          {currentAgentRole === "finetune" && singleFinetuneSlide && (() => {
+            const finetuneSlide = singleFinetuneSlide;
+            const finetuneSlideId = finetuneSlide.id;
+            const hasFinetuneImage = Boolean(finetuneSlide.image_path);
+            const regionModeActive = finetuneRegionModeSlideId === finetuneSlideId;
+            const selectedRegionCount = activeFinetuneRegions.length;
+            const localScopeActive = regionModeActive || selectedRegionCount > 0;
             return (
-              <div className="pg-finetune-target mb-3 p-2 bg-amber-50 border border-amber-200 rounded-lg">
-                <div className="flex items-center gap-2">
-                  {finetuneSlide.image_path ? (
+              <div className="pg-finetune-target mb-3">
+                <div className="pg-finetune-target-head">
+                  {hasFinetuneImage ? (
                     <img
-                      src={getSlideImageUrl(finetuneSlide.image_path, finetuneSlide.status, imageRefreshMap[finetuneSlide.id])}
+                      src={getSlideImageUrl(finetuneSlide.image_path!, finetuneSlide.status, imageRefreshMap[finetuneSlide.id])}
                       alt={`当前微调: 第${finetuneSlide.page_num}页`}
-                      className="w-12 h-7 rounded object-cover border border-amber-300 flex-shrink-0"
+                      className="pg-finetune-target-thumb"
                     />
                   ) : (
-                    <div className="w-12 h-7 rounded bg-slate-200 flex items-center justify-center text-2xs text-slate-400 flex-shrink-0">
+                    <div className="pg-finetune-target-empty">
                       无图
                     </div>
                   )}
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs text-amber-800 font-medium truncate">第 {finetuneSlide.page_num} 页</div>
-                    <div className="text-2xs text-amber-500 truncate">当前页会自动作为底图</div>
+                  <div className="pg-finetune-target-copy">
+                    <div className="pg-finetune-target-title">第 {finetuneSlide.page_num} 页画面</div>
+                    <div className="pg-finetune-target-desc">
+                      {hasFinetuneImage
+                        ? selectedRegionCount > 0
+                          ? `已框选 ${selectedRegionCount} 处，写要求后优先改这些位置`
+                          : "不框选时，会按要求调整整页"
+                        : "图片生成后可选择局部修改"}
+                    </div>
                   </div>
-                  <button
-                    onClick={() => handleUploadPageRef(finetuneTargetSlideId)}
-                    disabled={isBusy || chatLoading}
-                    className="pg-icon-action text-amber-700 hover:bg-amber-100 border-amber-200 disabled:opacity-50 flex-shrink-0"
-                    title="添加参考图到本轮消息"
-                    aria-label="添加参考图到本轮消息"
-                  >
-                    <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                      <path d="M12 5v14" />
-                      <path d="M5 12h14" />
-                    </svg>
-                  </button>
                 </div>
+                {hasFinetuneImage && (
+                  <>
+                    <div className="pg-finetune-scope-control" role="group" aria-label="修改范围">
+                      <span className="pg-finetune-scope-label">修改范围</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          clearFinetuneRegions(finetuneSlideId);
+                          if (regionModeActive) setFinetuneRegionModeSlideId(null);
+                        }}
+                        disabled={isBusy || chatLoading}
+                        className={`pg-finetune-scope-button ${localScopeActive ? "" : "is-active"}`}
+                        title="不框选，直接按输入要求修改整页"
+                        aria-pressed={!localScopeActive}
+                      >
+                        <b>整页修改</b>
+                        <span>默认</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openFinetuneRegionMode(finetuneSlideId)}
+                        disabled={isBusy || chatLoading}
+                        className={`pg-finetune-scope-button pg-finetune-region-target-button ${localScopeActive ? "is-active" : ""}`}
+                        title="在预览里框住要修改的位置"
+                        aria-label="框选局部"
+                        aria-pressed={localScopeActive}
+                      >
+                        <b>框选局部</b>
+                        <span>{selectedRegionCount > 0 ? `${selectedRegionCount} 处` : "先圈位置"}</span>
+                      </button>
+                    </div>
+                    <div className="pg-finetune-scope-foot">
+                      <span>{localScopeActive ? "框选后会尽量保留其他区域。" : "想只改某个区域时，先框选局部，再写要求。"}</span>
+                      <button
+                        onClick={() => handleUploadPageRef(finetuneSlideId)}
+                        disabled={isBusy || chatLoading}
+                        className="pg-finetune-reference-button disabled:opacity-50"
+                        title="添加参考图到本轮微调"
+                        aria-label="添加参考图到本轮微调"
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                          <path d="M12 5v14" />
+                          <path d="M5 12h14" />
+                        </svg>
+                        <span>加参考图</span>
+                      </button>
+                    </div>
+                  </>
+                )}
+                {!hasFinetuneImage && (
+                  <div className="pg-finetune-scope-foot">
+                    <span>当前页还没有可框选的画面。</span>
+                  </div>
+                )}
               </div>
             );
           })()}
-          {currentAgentRole === "finetune" && !finetuneTargetSlideId && (
+          {currentAgentRole === "finetune" && finetunePanelScope === "empty" && (
             <div className="mb-3 p-2 bg-slate-50 border border-dashed border-slate-300 rounded-lg text-center">
-              <span className="text-xs text-slate-400">请先在左侧点击一张幻灯片作为微调目标</span>
+              <span className="text-xs text-slate-400">先选择一页，再告诉我怎么改</span>
             </div>
           )}
           {shouldShowAgentRunControl ? (
@@ -10597,54 +10878,50 @@ function App() {
             </div>
             ) : (
             <div className="pg-composer-shell">
-              <div className="pg-agent-command-bar">
-                <div className="pg-agent-command-summary">
-                  {currentAgentRole === "finetune" ? (
-                    <div className="pg-agent-command-copy">
-                      <b>{agentFinetuneHeadline}</b>
-                      {agentSecondaryHint && <span>{agentSecondaryHint}</span>}
-                    </div>
-                  ) : composerRequestContext.confidence === "needs_input" ? (
-                    <div className="pg-agent-command-copy">
-                      <b>先选页面，或直接说第几页</b>
-                      {agentSecondaryHint && <span>{agentSecondaryHint}</span>}
-                    </div>
-                  ) : (
-                    <div className="pg-agent-command-sentence">
-                      <span>将修改</span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAgentScopePickerOpen((open) => !open);
-                          setAgentMaterialSheetOpen(false);
-                          setAgentAreaPickerOpen(false);
-                        }}
-                        disabled={!selectedProject || slides.length === 0}
-                        className={`pg-agent-command-chip ${agentScopePickerOpen ? "is-active" : ""}`}
-                        aria-expanded={agentScopePickerOpen}
-                        title="调整本次修改范围"
-                      >
-                        {agentScopeButtonLabel}
-                      </button>
-                      <span>的</span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAgentAreaPickerOpen((open) => !open);
-                          setAgentScopePickerOpen(false);
-                          setAgentMaterialSheetOpen(false);
-                        }}
-                        disabled={!selectedProject || slides.length === 0}
-                        className={`pg-agent-command-chip ${agentAreaPickerOpen ? "is-active" : ""}`}
-                        aria-expanded={agentAreaPickerOpen}
-                        title="调整本次修改区域"
-                      >
-                        {agentAreaButtonLabel}
-                      </button>
-                    </div>
-                  )}
-                </div>
-                {currentAgentRole !== "finetune" && slides.length > 0 && agentAreaPickerOpen && (
+              {currentAgentRole !== "finetune" && (
+                <div className="pg-agent-command-bar">
+                  <div className="pg-agent-command-summary">
+                    {composerRequestContext.confidence === "needs_input" ? (
+                      <div className="pg-agent-command-copy">
+                        <b>先选页面，或直接说第几页</b>
+                        {agentSecondaryHint && <span>{agentSecondaryHint}</span>}
+                      </div>
+                    ) : (
+                      <div className="pg-agent-command-sentence">
+                        <span>将修改</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAgentScopePickerOpen((open) => !open);
+                            setAgentMaterialSheetOpen(false);
+                            setAgentAreaPickerOpen(false);
+                          }}
+                          disabled={!selectedProject || slides.length === 0}
+                          className={`pg-agent-command-chip ${agentScopePickerOpen ? "is-active" : ""}`}
+                          aria-expanded={agentScopePickerOpen}
+                          title="调整本次修改范围"
+                        >
+                          {agentScopeButtonLabel}
+                        </button>
+                        <span>的</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAgentAreaPickerOpen((open) => !open);
+                            setAgentScopePickerOpen(false);
+                            setAgentMaterialSheetOpen(false);
+                          }}
+                          disabled={!selectedProject || slides.length === 0}
+                          className={`pg-agent-command-chip ${agentAreaPickerOpen ? "is-active" : ""}`}
+                          aria-expanded={agentAreaPickerOpen}
+                          title="调整本次修改区域"
+                        >
+                          {agentAreaButtonLabel}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                {slides.length > 0 && agentAreaPickerOpen && (
                   <div className="pg-agent-area-panel" role="group" aria-label="调整区域">
                     {agentAreaOptions.map((item) => (
                       <button
@@ -10663,7 +10940,7 @@ function App() {
                     ))}
                   </div>
                 )}
-                {currentAgentRole !== "finetune" && slides.length > 0 && agentScopePickerOpen && (
+                {slides.length > 0 && agentScopePickerOpen && (
                   <div className="pg-agent-scope-panel" role="group" aria-label="调整范围">
                     <button
                       type="button"
@@ -10705,7 +10982,8 @@ function App() {
                     </button>
                   </div>
                 )}
-              </div>
+                </div>
+              )}
               {agentMaterialSheetOpen && (
                 <div className="pg-agent-material-sheet">
                   <div className="pg-agent-material-group">
@@ -10791,7 +11069,7 @@ function App() {
                   e.preventDefault();
                   handleSendChat();
                 }}
-                disabled={!selectedProject || chatLoading || (currentAgentRole === "finetune" && !finetuneTargetSlideId)}
+                disabled={!selectedProject || chatLoading || (currentAgentRole === "finetune" && finetunePanelScope === "empty")}
               />
             </div>
             {chatLoading ? (
@@ -10827,12 +11105,12 @@ function App() {
                 disabled={
                   !selectedProject ||
                   uploadingDoc ||
-                  (!agentComposerValue.trim() && pendingAttachments.length === 0 && pendingChatAttachments.length === 0 && !(currentAgentRole === "finetune" && finetuneTargetSlideId && (pendingFinetuneAttachmentsMap[finetuneTargetSlideId] || []).length > 0)) ||
-                  (currentAgentRole === "finetune" && !finetuneTargetSlideId)
+                  (!agentComposerValue.trim() && pendingAttachments.length === 0 && pendingChatAttachments.length === 0 && !(currentAgentRole === "finetune" && singleFinetuneSlide?.id && (pendingFinetuneAttachmentsMap[singleFinetuneSlide.id] || []).length > 0)) ||
+                  (currentAgentRole === "finetune" && finetunePanelScope === "empty")
                 }
                 className="pg-action pg-action-primary rounded-lg disabled:opacity-50 px-4 py-2.5 text-sm font-medium transition-colors"
               >
-                {currentAgentRole === "finetune" ? "生成" : "发送"}
+                {isSingleSlideFinetuneRequest ? "生成" : "发送"}
               </button>
             )}
           </div>
@@ -11452,6 +11730,12 @@ function SingleSlideEditor({
   onSystemLog,
   onRetry,
   onRegenerateFromEdits,
+  finetuneRegions = [],
+  finetuneRegionSelectionEnabled = false,
+  onToggleFinetuneRegionSelection,
+  onAddFinetuneRegion,
+  onRemoveFinetuneRegion,
+  onClearFinetuneRegions,
 }: {
   slide: Slide;
   projectId: string;
@@ -11483,6 +11767,12 @@ function SingleSlideEditor({
   onSystemLog?: (content: string) => void;
   onRetry?: (slideId: string, regeneratePrompt?: boolean) => Promise<void>;
   onRegenerateFromEdits?: (slideId: string, changes: SlideEditChangeSet) => Promise<void>;
+  finetuneRegions?: FinetuneRegion[];
+  finetuneRegionSelectionEnabled?: boolean;
+  onToggleFinetuneRegionSelection?: () => void;
+  onAddFinetuneRegion?: (bbox: FinetuneRegion["bbox"]) => void;
+  onRemoveFinetuneRegion?: (regionId: string) => void;
+  onClearFinetuneRegions?: () => void;
 }) {
   const content = slide.content_json || {};
   const text = content.text_content || {};
@@ -12119,6 +12409,9 @@ function SingleSlideEditor({
   const routeHelp = (route: string) =>
     ASSET_ROUTE_HELP[ASSET_ROUTE_OPTIONS.includes(route as AssetRoute) ? route as AssetRoute : "blend"];
   const routeLabel = (route: string) => routeHelp(route).label;
+  const showFinetuneRegionControls = Boolean(
+    slide.image_path && (onToggleFinetuneRegionSelection || finetuneRegions.length > 0)
+  );
   const renderAssetRouteButton = (
     target: AssetRoute,
     options: {
@@ -12377,6 +12670,74 @@ function SingleSlideEditor({
   const materialCount = pageReferenceItems.length + blendProjectAssets.length + overlayProjectAssets.length;
   const contentBlockMaterialCount = pageReferenceItems.filter((ref: any) => ref?.asset_analysis?.source === "content_block").length;
 
+  const renderSlidePreview = () => {
+    if (!slide.image_path) return null;
+    return (
+      <div className="pg-single-preview-block mb-6" data-finetune-preview-slide-id={slide.id}>
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <label className="text-xs text-gray-500 block font-medium">画面预览</label>
+          {finetuneRegions.length > 0 && (
+            <span className="pg-finetune-region-preview-count">已框选 {finetuneRegions.length} 个区域</span>
+          )}
+        </div>
+        {finetuneRegionSelectionEnabled && (
+          <div className="pg-finetune-region-hint">框住要改的位置，再到右侧写修改要求。</div>
+        )}
+        <FinetuneRegionSelector
+          enabled={finetuneRegionSelectionEnabled}
+          regions={finetuneRegions}
+          onAddRegion={onAddFinetuneRegion}
+          onRemoveRegion={onRemoveFinetuneRegion}
+        >
+          <SlideImageWithOverlays
+            slide={slide}
+            logo={projectLogo}
+            referenceImages={referenceImages}
+            src={getSlideImageUrl(slide.image_path, slide.status, imageCacheKey)}
+            alt={`Slide ${slide.page_num}`}
+            className={`aspect-video rounded overflow-hidden border border-gray-200 ${
+              finetuneRegionSelectionEnabled ? "" : "cursor-pointer"
+            }`}
+            imgClassName="w-full h-full object-cover"
+            onClick={() => {
+              if (finetuneRegionSelectionEnabled) return;
+              const url = getSlideImageUrl(slide.image_path!, slide.status, imageCacheKey);
+              onImageClick?.(url);
+            }}
+            onError={(e) => {
+              const el = e.target as HTMLImageElement;
+              el.style.display = "none";
+              el.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-400 bg-gray-100">图片加载失败</div>';
+            }}
+          />
+        </FinetuneRegionSelector>
+        {slideVersions && slideVersions.length > 0 && (
+          <div className="mt-2 flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-gray-400">历史版本：</span>
+            {slideVersions.map((v: any) => (
+              <div key={v.id} className="relative group/ver">
+                <img
+                  src={`${API_BASE}${v.image_url}?v=${v.id}`}
+                  alt={`版本 ${v.version_number}`}
+                  className="w-14 h-8 rounded object-cover border border-gray-200 cursor-pointer hover:border-amber-400 hover:ring-1 hover:ring-amber-300 transition-all"
+                  title={`恢复版本 ${v.version_number}`}
+                  onClick={() => onRestoreVersion?.(v.id)}
+                />
+                <button
+                  onClick={() => onDeleteVersion?.(v.id)}
+                  className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full text-[9px] flex items-center justify-center opacity-0 group-hover/ver:opacity-100 transition-opacity"
+                  title="删除此版本"
+                >
+                  X
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="pg-editor pg-single-slide-editor pg-single-slide-layer max-w-3xl mx-auto bg-white rounded border shadow-sm">
       <div className="pg-editor-toolbar pg-single-slide-nav sticky top-0 z-30">
@@ -12388,7 +12749,10 @@ function SingleSlideEditor({
             className="pg-single-nav-back"
             title="保存后返回列表"
           >
-            <span aria-hidden="true">←</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M19 12H5" />
+              <path d="M12 19l-7-7 7-7" />
+            </svg>
             <span>{saving ? "保存中..." : "列表"}</span>
           </button>
 
@@ -12402,7 +12766,9 @@ function SingleSlideEditor({
                 title="上一页"
                 aria-label="上一页"
               >
-                ‹
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M15 18l-6-6 6-6" />
+                </svg>
               </button>
             )}
             <div className="pg-single-page-chip">
@@ -12420,14 +12786,16 @@ function SingleSlideEditor({
                 title="下一页"
                 aria-label="下一页"
               >
-                ›
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
               </button>
             )}
           </div>
         </div>
 
         <div className="pg-single-nav-actions">
-          <div className="pg-single-tool-group" aria-label="撤销和重做">
+          <div className="pg-single-tool-group pg-single-undo-redo" aria-label="撤销和重做">
             <button
               type="button"
               onClick={handleUndo}
@@ -12436,7 +12804,10 @@ function SingleSlideEditor({
               title="撤销 (Ctrl+Z)"
               aria-label="撤销"
             >
-              ↶
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M9 7H5v4" />
+                <path d="M5.5 10.5A7.5 7.5 0 1 1 8.2 18" />
+              </svg>
             </button>
             <button
               type="button"
@@ -12446,7 +12817,10 @@ function SingleSlideEditor({
               title="重做 (Ctrl+Shift+Z)"
               aria-label="重做"
             >
-              ↷
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M15 7h4v4" />
+                <path d="M18.5 10.5A7.5 7.5 0 1 0 15.8 18" />
+              </svg>
             </button>
           </div>
 
@@ -12467,6 +12841,28 @@ function SingleSlideEditor({
                   删除
                 </button>
               )}
+            </div>
+          )}
+
+          {showFinetuneRegionControls && (
+            <div className="pg-single-tool-group pg-single-region-tool" aria-label="框选修改局部画面">
+              {finetuneRegions.length > 0 && (
+                <span className="pg-single-region-count">{finetuneRegions.length} 区域</span>
+              )}
+              {finetuneRegions.length > 0 && (
+                <button type="button" onClick={onClearFinetuneRegions} className="pg-single-text-button">
+                  清空
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onToggleFinetuneRegionSelection}
+                className={`pg-single-text-button pg-single-region-button ${finetuneRegionSelectionEnabled ? "is-active" : ""}`}
+                title={finetuneRegionSelectionEnabled ? "退出框选修改" : "框选修改局部画面"}
+                aria-pressed={finetuneRegionSelectionEnabled}
+              >
+                {finetuneRegionSelectionEnabled ? "退出框选" : "框选修改"}
+              </button>
             </div>
           )}
 
@@ -12571,6 +12967,8 @@ function SingleSlideEditor({
           </p>
         </div>
       )}
+
+      {renderSlidePreview()}
 
       {/* 标题 */}
       <div className="mb-4">
@@ -13107,53 +13505,6 @@ function SingleSlideEditor({
         </div>
       )}
 
-      {/* 单页图片预览 */}
-      {slide.image_path && (
-        <div className="mb-6">
-          <label className="text-xs text-gray-500 mb-1 block font-medium">画面预览</label>
-          <SlideImageWithOverlays
-            slide={slide}
-            logo={projectLogo}
-            referenceImages={referenceImages}
-            src={getSlideImageUrl(slide.image_path, slide.status, imageCacheKey)}
-            alt={`Slide ${slide.page_num}`}
-            className="aspect-video rounded overflow-hidden cursor-pointer border border-gray-200"
-            imgClassName="w-full h-full object-cover"
-            onClick={() => {
-              const url = getSlideImageUrl(slide.image_path!, slide.status, imageCacheKey);
-              onImageClick?.(url);
-            }}
-            onError={(e) => {
-              const el = e.target as HTMLImageElement;
-              el.style.display = "none";
-              el.parentElement!.innerHTML = '<div class="w-full h-full flex items-center justify-center text-xs text-gray-400 bg-gray-100">图片加载失败</div>';
-            }}
-          />
-          {slideVersions && slideVersions.length > 0 && (
-            <div className="mt-2 flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-gray-400">历史版本：</span>
-              {slideVersions.map((v: any) => (
-                <div key={v.id} className="relative group/ver">
-                  <img
-                    src={`${API_BASE}${v.image_url}?v=${v.id}`}
-                    alt={`版本 ${v.version_number}`}
-                    className="w-14 h-8 rounded object-cover border border-gray-200 cursor-pointer hover:border-amber-400 hover:ring-1 hover:ring-amber-300 transition-all"
-                    title={`恢复版本 ${v.version_number}`}
-                    onClick={() => onRestoreVersion?.(v.id)}
-                  />
-                  <button
-                    onClick={() => onDeleteVersion?.(v.id)}
-                    className="absolute -top-1 -right-1 w-4 h-4 bg-red-500 text-white rounded-full text-[9px] flex items-center justify-center opacity-0 group-hover/ver:opacity-100 transition-opacity"
-                    title="删除此版本"
-                  >
-                    X
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
       </div>
     </div>
   );

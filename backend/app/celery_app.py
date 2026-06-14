@@ -30,11 +30,6 @@ celery_app.conf.update(
             "exchange": text_queue,
             "routing_key": text_queue,
         },
-        "app.tasks.generate_editable_pptx_task": {
-            "queue": text_queue,
-            "exchange": text_queue,
-            "routing_key": text_queue,
-        },
         "app.tasks.generate_slides_task": {
             "queue": image_queue,
             "exchange": image_queue,

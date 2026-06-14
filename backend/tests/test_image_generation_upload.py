@@ -41,6 +41,51 @@ def test_build_reference_upload_files_falls_back_only_after_budget_check(monkeyp
     assert upload_bytes == 10 * 1024
 
 
+def test_edit_api_uploads_region_mask_as_mask_file(monkeypatch):
+    image_generation.reset_image_call_events()
+    result_buf = io.BytesIO()
+    Image.new("RGB", (32, 18), "blue").save(result_buf, "PNG")
+    result_b64 = image_generation.base64.b64encode(result_buf.getvalue()).decode("ascii")
+    captured = {}
+
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(
+        image_generation,
+        "get_provider_credentials",
+        lambda: SimpleNamespace(comet_api_key="test-key", comet_api_base="https://example.test/v1"),
+    )
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": [{"b64_json": result_b64}]}
+
+    def fake_post(*_args, **kwargs):
+        captured["files"] = kwargs.get("files") or []
+        return FakeResponse()
+
+    edit_mask = Image.new("RGBA", (32, 18), (0, 0, 0, 255))
+    edit_mask.putpixel((8, 6), (0, 0, 0, 0))
+    monkeypatch.setattr(image_generation.requests, "post", fake_post)
+
+    image_generation._call_gpt_image_2_edit(
+        "prompt",
+        [Image.new("RGB", (32, 18), "white")],
+        edit_mask=edit_mask,
+    )
+
+    fields = [field for field, _payload in captured["files"]]
+    assert fields == ["image", "mask"]
+    _filename, mask_buffer, mime_type = captured["files"][1][1]
+    assert mime_type == "image/png"
+    uploaded_mask = Image.open(mask_buffer).convert("RGBA")
+    assert uploaded_mask.size == (32, 18)
+    assert uploaded_mask.getpixel((8, 6))[3] == 0
+    assert uploaded_mask.getpixel((0, 0))[3] == 255
+
+
 def test_reference_upload_timeout_is_not_retryable():
     error = image_generation.ReferenceUploadTimeoutError("图片接口上传超时")
 

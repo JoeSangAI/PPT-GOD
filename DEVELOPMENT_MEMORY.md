@@ -66,6 +66,7 @@ Recorded 2026-05-12 from user direction.
 Recorded 2026-05-14 from user direction.
 
 - For every serious defect, trace the root cause and fix it at the source. Do not stop at symptom cleanup, downstream normalization, UI wording, or case-specific guards when the upstream intent, source parsing, state transition, or prompt contract is wrong.
+- Prefer source fixes over added acceptance gates: when a product behavior is weak because the upstream intent contract, source profile, or generation prompt is wrong, repair that source contract instead of adding a heavier post-generation validation layer.
 - Always eliminate failures at the source; do not treat post-hoc checking, filtering, or validation as the primary solution when the source can be made clean.
 - Design workflows so bad intermediate artifacts cannot enter the next generation step in the first place. For generation bugs, fix input eligibility, prompt construction, state transitions, and source-of-truth boundaries before adding result cleanup.
 - General generation paths must not contain project-specific, demo-specific, or stale business-context defaults. Prompt inputs and deterministic drafts should come only from the current user intent, current project state, uploaded materials, and intentionally global templates.

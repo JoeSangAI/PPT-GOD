@@ -55,7 +55,7 @@ Every fallback path must satisfy these gates before it can become user-visible g
 | `content_plan.generate_content_page_map` | Source page map fills missing model pages | Yes, only if source-derived | Can be high quality when based on real documents; skeleton fallback caused major degradation | Fixed: skeleton placeholders are rejected and partial model output continues |
 | `content_plan.build_long_deck_skeleton` | Editable long-deck skeleton | Only as transient scaffolding | Low quality if saved as final content | Must never be accepted as completed content |
 | `content_plan._fallback_deck_blueprint` | Deterministic section blueprint | Yes, as planning scaffold | Low risk if used only to structure prompts | Keep, but do not treat as content quality |
-| `api.slides._generate_long_content_plan_incrementally` | Saves skeleton before enrichment | Historically protected against 0-page plans | High risk if re-enabled with sync enrichment disabled | Keep unused or rework before use; skeleton completion must be `needs_review`, not success |
+| `api.slides` obsolete incremental skeleton path | Removed from the API module | No | Avoids reconnecting a skeleton-as-complete path | Use the current `generate_content_plan` background entrypoint |
 | `api.slides` reference-analysis placeholders | Queued/failed analysis placeholder and fallback reference summary | Yes, keeps uploads non-blocking | Medium: prompt quality drops if placeholder is treated as real analysis | Keep only with explicit queued/failed status and concise labels |
 | `visual_plan._fallback_visual_plan` | Deterministic visual draft for tests/tools | Yes for tests and explicit tools | Lower than LLM visual planning | Production LLM failures should surface, as current docstring states |
 | `visual_plan` logo-placeholder cleanup | Fills visual evidence only when a logo exists | Yes | Low if logo state is correct | Keep; fail when no-logo pages contain only logo placeholder language |
@@ -129,6 +129,5 @@ These paths must not become final generated PPT artifacts:
 ## Open Follow-Ups
 
 - Rename deterministic source-driven builders that currently include `fallback` in the function name when they are not quality-degrading fallback paths.
-- Add a guard around `_generate_long_content_plan_incrementally` before it is ever reconnected: with sync enrichment disabled, it must mark skeleton pages as `needs_review` or fail visibly.
 - Add narrow tests for chat fallback actions that currently coerce `answer` into executable actions after parse failures.
 - Review frontend local style adjustment UX so it cannot be mistaken for a fully regenerated backend proposal.

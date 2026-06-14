@@ -83,9 +83,15 @@ const parseChinesePageCount = (value: string) => {
 
 const normalizePageCountTokens = (value: string) => {
   const chineseCount = "[一二两三四五六七八九十]{1,4}";
+  const chineseDigit = "[一二两三四五六七八九]";
   const pageUnit = "(?:页|頁|张|張|pages?|slides?)";
   const countLabel = "(?:页数|頁数|页面数|頁面数|张数|張数|slide\\s*count|page\\s*count|slides?|pages?)";
   return normalizeNumberToken(value)
+    .replace(new RegExp(`(${chineseDigit})(${chineseDigit})十\\s*(${pageUnit})`, "gi"), (match, start, end, unit) => {
+      const startValue = parseChinesePageCount(start);
+      const endValue = parseChinesePageCount(end);
+      return startValue && endValue ? `${startValue * 10}-${endValue * 10}${unit}` : match;
+    })
     .replace(
       new RegExp(`(${chineseCount})\\s*(-|~|～|—|–|－|到|至|to)\\s*(${chineseCount})\\s*(${pageUnit})`, "gi"),
       (match, start, sep, end, unit) => {
@@ -113,6 +119,15 @@ const PAGE_COUNT_CONTEXT_RE =
 const hasPageCountContext = (message: string, start: number, end: number) => {
   const snippet = message.slice(Math.max(0, start - 24), Math.min(message.length, end + 24));
   return PAGE_COUNT_CONTEXT_RE.test(snippet);
+};
+
+const isPerPageCountExpression = (message: string, start: number, end: number) => {
+  const before = message.slice(Math.max(0, start - 8), start);
+  const after = message.slice(end, Math.min(message.length, end + 12));
+  const pageUnit = "(?:页|頁|张|張|pages?|slides?)";
+  return (
+    /每\s*$/i.test(before) && new RegExp(`^\\s*${pageUnit}`, "i").test(after)
+  ) || new RegExp(`每\\s*${pageUnit}\\s*$`, "i").test(before);
 };
 
 export function inferRequestedPageCount(message: string): number | undefined {
@@ -173,6 +188,9 @@ export function inferRequestedPageCount(message: string): number | undefined {
   let exactMatch: RegExpExecArray | null;
   while ((exactMatch = exactPattern.exec(text))) {
     if (isSlideReferencePrefix(text, exactMatch.index)) continue;
+    const countStart = exactMatch.index + exactMatch[0].indexOf(exactMatch[1]);
+    const countEnd = countStart + exactMatch[1].length;
+    if (isPerPageCountExpression(text, countStart, countEnd)) continue;
     const value = parsePageCountNumber(exactMatch[1]);
     if (value && hasPageCountContext(text, exactMatch.index, exactPattern.lastIndex)) return value;
   }
@@ -415,7 +433,10 @@ export function inferAgentRequestContext(input: InferAgentRequestContextInput): 
 
   let targetRole = input.activeAgentRole;
   let routeReason = "active_agent";
-  if (
+  if (input.activeAgentRole === "finetune" && scope !== "current_slide") {
+    targetRole = visualRoleAvailable ? "visual" : "content";
+    routeReason = "multi_page_visual_scope";
+  } else if (
     input.activeAgentRole === "finetune" &&
     (input.hasGeneratedImage || input.projectStatus === "completed" || input.projectStatus === "prototype_ready") &&
     (scope === "current_slide" || input.editingPageNum)

@@ -1,19 +1,14 @@
 from datetime import timedelta
-from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from PIL import Image
-from pptx import Presentation
-from pptx.util import Inches
 
 from app.api import slides as slides_api
 from app.celery_app import celery_app
 from app.core.config import settings
 from app.models.base import Base
-from app.models.models import Project, ProjectRun, Slide
+from app.models.models import Project, Slide
 from app import tasks as image_tasks
-from app.services.editable_pptx_diagnostics import EditablePptxDiagnostics, EditablePptxPageDiagnostics
 from app.services import generation_pipeline
 from app.services.run_state import create_project_run, utc_now
 
@@ -30,24 +25,8 @@ def test_celery_routes_text_and_image_tasks_to_separate_queues():
 
     assert routes["app.tasks.generate_style_proposals_task"]["queue"] == settings.CELERY_TEXT_QUEUE
     assert routes["app.tasks.generate_style_proposals_task"]["routing_key"] == settings.CELERY_TEXT_QUEUE
-    assert routes["app.tasks.generate_editable_pptx_task"]["queue"] == settings.CELERY_TEXT_QUEUE
-    assert routes["app.tasks.generate_editable_pptx_task"]["routing_key"] == settings.CELERY_TEXT_QUEUE
     assert routes["app.tasks.generate_slides_task"]["queue"] == settings.CELERY_IMAGE_QUEUE
     assert routes["app.tasks.generate_slides_task"]["routing_key"] == settings.CELERY_IMAGE_QUEUE
-
-
-def test_editable_pptx_worker_check_targets_text_queue(monkeypatch):
-    captured = {}
-
-    def fake_ensure_worker(*, queue=None):
-        captured["queue"] = queue
-        return True
-
-    monkeypatch.setattr(slides_api, "ensure_celery_worker", fake_ensure_worker)
-
-    slides_api.ensure_editable_pptx_worker_ready()
-
-    assert captured["queue"] == settings.CELERY_TEXT_QUEUE
 
 
 def test_generation_worker_check_targets_image_queue(monkeypatch):
@@ -62,215 +41,6 @@ def test_generation_worker_check_targets_image_queue(monkeypatch):
     slides_api.ensure_generation_worker_ready()
 
     assert captured["queue"] == settings.CELERY_IMAGE_QUEUE
-
-
-def test_start_editable_pptx_export_queues_text_task(tmp_path, monkeypatch):
-    db = make_session()
-    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
-    project = Project(title="Editable export", status="completed", content_plan_confirmed=True)
-    db.add(project)
-    db.flush()
-    output_dir = tmp_path / project.id
-    output_dir.mkdir(parents=True)
-    Presentation().save(output_dir / "presentation.pptx")
-    Presentation().save(output_dir / "editable_presentation.pptx")
-    slide_path = output_dir / "slide_01.png"
-    Image.new("RGB", (1280, 720), "white").save(slide_path)
-    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
-    db.flush()
-
-    captured = {}
-
-    class FakeTask:
-        id = "editable-task-1"
-
-    class FakeEditablePptxTask:
-        def delay(self, project_id, run_id=None, credential_id=None, restore_mode=None):
-            captured.update(project_id=project_id, run_id=run_id, credential_id=credential_id, restore_mode=restore_mode)
-            return FakeTask()
-
-    class FakeRedis:
-        def set(self, key, value, ex=None):
-            captured.setdefault("redis_sets", []).append((key, value, ex))
-            return True
-
-    monkeypatch.setattr(slides_api, "ensure_editable_pptx_worker_ready", lambda: None)
-    monkeypatch.setattr(slides_api, "store_current_provider_credentials", lambda _redis: "credential-1")
-    monkeypatch.setattr(slides_api, "redis_client", FakeRedis())
-    monkeypatch.setattr(slides_api, "generate_editable_pptx_task", FakeEditablePptxTask())
-
-    result = slides_api.start_editable_pptx_export(
-        project.id,
-        request=slides_api.EditablePptxExportRequest(restore_mode="standard"),
-        db=db,
-    )
-
-    assert result["status"] == "generating"
-    assert result["run"]["kind"] == "editable_pptx"
-    assert captured["project_id"] == project.id
-    assert captured["run_id"] == result["run"]["id"]
-    assert captured["credential_id"] == "credential-1"
-    assert captured["restore_mode"] == "standard"
-    assert (f"project:{project.id}:task_id", "editable-task-1", 3600) in captured["redis_sets"]
-
-
-def _save_one_slide_pptx(path):
-    prs = Presentation()
-    prs.slides.add_slide(prs.slide_layouts[6])
-    prs.save(path)
-
-
-def _save_image_only_pptx(path, image_path):
-    prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    slide.shapes.add_picture(str(image_path), 0, 0, width=Inches(13.333), height=Inches(7.5))
-    prs.save(path)
-
-
-def _save_text_pptx(path):
-    prs = Presentation()
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
-    box.text_frame.text = "editable text"
-    prs.save(path)
-
-
-def test_has_current_editable_pptx_rejects_image_only_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
-    project_id = "project-1"
-    output_dir = tmp_path / project_id
-    output_dir.mkdir(parents=True)
-    final_path = output_dir / "presentation.pptx"
-    editable_path = output_dir / "editable_presentation.pptx"
-    image_path = output_dir / "slide_01.png"
-    Image.new("RGB", (1280, 720), "white").save(image_path)
-    _save_one_slide_pptx(final_path)
-    _save_image_only_pptx(editable_path, image_path)
-
-    has_editable, path = slides_api._has_current_editable_pptx(project_id, str(final_path), True, "standard")
-
-    assert path == str(editable_path)
-    assert has_editable is False
-
-
-def test_has_current_editable_pptx_accepts_text_shapes(tmp_path, monkeypatch):
-    monkeypatch.setattr(slides_api.settings, "OUTPUT_DIR", str(tmp_path))
-    project_id = "project-1"
-    output_dir = tmp_path / project_id
-    output_dir.mkdir(parents=True)
-    final_path = output_dir / "presentation.pptx"
-    editable_path = output_dir / "editable_presentation.pptx"
-    _save_one_slide_pptx(final_path)
-    _save_text_pptx(editable_path)
-
-    has_editable, _path = slides_api._has_current_editable_pptx(project_id, str(final_path), True, "standard")
-
-    assert has_editable is True
-
-
-def test_editable_pptx_task_fails_when_no_text_boxes_are_restored(tmp_path, monkeypatch):
-    db = make_session()
-    monkeypatch.setattr(image_tasks.settings, "OUTPUT_DIR", str(tmp_path))
-    project = Project(title="No editable text", status="completed", content_plan_confirmed=True)
-    db.add(project)
-    db.flush()
-    output_dir = tmp_path / project.id
-    output_dir.mkdir(parents=True)
-    slide_path = output_dir / "slide_01.png"
-    Image.new("RGB", (1280, 720), "white").save(slide_path)
-    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
-    run = create_project_run(db, project.id, kind="editable_pptx", stage="editable_pptx", total_count=1)
-    run_id = run.id
-    db.commit()
-
-    def fake_build_editable_pptx(*, output_path, **_kwargs):
-        _save_image_only_pptx(output_path, slide_path)
-        return SimpleNamespace(
-            output_path=output_path,
-            slide_count=1,
-            text_box_count=0,
-            visual_asset_count=1,
-            ocr_failed_pages=[1],
-            qa_retry_pages=[],
-            quality_fallback_pages=[],
-            quality_warning_pages=[],
-            diagnostics=EditablePptxDiagnostics(
-                restore_mode="standard",
-                pages=[
-                    EditablePptxPageDiagnostics(
-                        page_num=1,
-                        raw_region_count=0,
-                        restored_text_count=0,
-                        ocr_failed=True,
-                    )
-                ],
-            ),
-        )
-
-    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
-    monkeypatch.setattr(image_tasks, "build_editable_pptx", fake_build_editable_pptx)
-
-    result = image_tasks._generate_editable_pptx_task_inner(project.id, run_id=run_id, restore_mode="standard")
-
-    updated_run = db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
-    assert result["status"] == "failed"
-    assert result["text_box_count"] == 0
-    assert updated_run.status == "failed"
-    assert updated_run.error_msg == "editable_pptx_no_text_boxes"
-    assert not (output_dir / "editable_presentation.pptx").exists()
-    assert (output_dir / "editable_presentation_diagnostics.json").exists()
-
-
-def test_editable_pptx_task_warns_when_many_pages_need_review(tmp_path, monkeypatch):
-    db = make_session()
-    monkeypatch.setattr(image_tasks.settings, "OUTPUT_DIR", str(tmp_path))
-    monkeypatch.setattr(image_tasks.settings, "EDITABLE_PPTX_WARNING_PAGE_RATIO", 0.5)
-    monkeypatch.setattr(image_tasks.settings, "EDITABLE_PPTX_FAIL_ON_WARNING", False)
-    project = Project(title="Warn editable text", status="completed", content_plan_confirmed=True)
-    db.add(project)
-    db.flush()
-    output_dir = tmp_path / project.id
-    output_dir.mkdir(parents=True)
-    slide_path = output_dir / "slide_01.png"
-    Image.new("RGB", (1280, 720), "white").save(slide_path)
-    db.add(Slide(project_id=project.id, page_num=1, status="completed", image_path=str(slide_path)))
-    db.add(Slide(project_id=project.id, page_num=2, status="completed", image_path=str(slide_path)))
-    run = create_project_run(db, project.id, kind="editable_pptx", stage="editable_pptx", total_count=2)
-    run_id = run.id
-    db.commit()
-
-    def fake_build_editable_pptx(*, output_path, **_kwargs):
-        _save_text_pptx(output_path)
-        return SimpleNamespace(
-            output_path=output_path,
-            slide_count=2,
-            text_box_count=2,
-            visual_asset_count=0,
-            ocr_failed_pages=[],
-            qa_retry_pages=[1, 2],
-            quality_fallback_pages=[],
-            quality_warning_pages=[1, 2],
-            diagnostics=EditablePptxDiagnostics(
-                restore_mode="standard",
-                pages=[
-                    EditablePptxPageDiagnostics(page_num=1, raw_region_count=2, restored_text_count=1, quality_warning=True),
-                    EditablePptxPageDiagnostics(page_num=2, raw_region_count=2, restored_text_count=1, quality_warning=True),
-                ],
-            ),
-        )
-
-    monkeypatch.setattr(image_tasks, "SessionLocal", lambda: db)
-    monkeypatch.setattr(image_tasks, "build_editable_pptx", fake_build_editable_pptx)
-
-    result = image_tasks._generate_editable_pptx_task_inner(project.id, run_id=run_id, restore_mode="standard")
-
-    updated_run = db.query(ProjectRun).filter(ProjectRun.id == run_id).first()
-    assert result["status"] == "completed"
-    assert result["quality_status"] == "warn"
-    assert result["quality_reason"] == "many_pages_need_review"
-    assert updated_run.status == "succeeded"
-    assert updated_run.message == "可编辑版已生成，但多数页面建议复核"
-    assert (output_dir / "editable_presentation_diagnostics.json").exists()
 
 
 def test_stop_generation_releases_page_locks(monkeypatch):
@@ -780,6 +550,55 @@ def test_pending_celery_task_stales_quickly_when_worker_is_offline(monkeypatch):
     assert stale is True
     assert run.status == "stale"
     assert "后台生成服务未在线" in run.error_msg
+    assert slide.status == "prompt_ready"
+
+
+def test_pending_celery_task_stales_when_online_worker_does_not_receive_task(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Queued but not received",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Style"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        prompt_text="prompt",
+    )
+    db.add(slide)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="prototype_generation",
+        stage="prototype_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.task_id = "missing-online-task"
+    timeout = slides_api._queued_celery_timeout_seconds()
+    run.started_at = utc_now() - timedelta(seconds=timeout + 30)
+    db.flush()
+
+    monkeypatch.setattr(slides_api, "_celery_result_state", lambda task_id: "PENDING")
+    monkeypatch.setattr(slides_api, "_celery_workers_online", lambda: True)
+    monkeypatch.setattr(slides_api, "_celery_task_present_in_worker", lambda task_id: False)
+    monkeypatch.setattr(
+        slides_api,
+        "_task_age_seconds",
+        lambda project_id, active_run: timeout + 30,
+    )
+    monkeypatch.setattr(slides_api.redis_client, "delete", lambda *_args, **_kwargs: 1)
+
+    stale = slides_api._stale_missing_celery_task_if_needed(project, db, run)
+
+    assert stale is True
+    assert run.status == "stale"
+    assert "没有接收本次任务" in run.error_msg
     assert slide.status == "prompt_ready"
 
 

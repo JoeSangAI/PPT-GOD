@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import time
-import zipfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import List, Optional
 from urllib.parse import quote
@@ -61,19 +60,12 @@ def _resolve_file_path(file_path: str) -> str:
 
 from app.core.config import settings
 from app.services.content_plan import (
-    LONG_DECK_CHUNK_SIZE,
-    LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT,
-    LOW_CONTENT_DRAFT_STATUSES,
     PAGE_MAP_DOCUMENT_LIMIT,
-    build_document_driven_long_deck_draft,
-    build_long_deck_skeleton,
     generate_content_plan,
-    generate_long_deck_outline_chunk,
     infer_page_count_from_single_ppt,
+    content_plan_topic_with_chat_context,
     resolve_content_plan_page_target,
     resolve_requested_content_plan_page_count,
-    should_generate_incremental_long_deck,
-    _fallback_deck_blueprint,
     _auto_reclassify_page_type,
 )
 from app.services.source_context import (
@@ -122,8 +114,7 @@ from app.services.visual_block_renderer import (
 from app.services.visual_directives import extract_visual_directives
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
 from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
-from app.tasks import generate_editable_pptx_task, generate_slides_task, redis_client
-from app.services.editable_pptx_export import normalize_editable_pptx_restore_mode
+from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import (
     apply_project_rollback,
@@ -154,18 +145,9 @@ router = APIRouter(prefix="/projects", tags=["slides"])
 logger = logging.getLogger(__name__)
 
 
-class EditablePptxExportRequest(BaseModel):
-    restore_mode: str = "standard"
-
-
 def ensure_generation_worker_ready():
     if not ensure_celery_worker(queue=settings.CELERY_IMAGE_QUEUE):
         raise HTTPException(status_code=503, detail="图片生成服务未启动，任务没有开始。请启动 worker 后重试。")
-
-
-def ensure_editable_pptx_worker_ready():
-    if not ensure_celery_worker(queue=settings.CELERY_TEXT_QUEUE):
-        raise HTTPException(status_code=503, detail="可编辑版处理服务未启动，任务没有开始。请启动 worker 后重试。")
 
 
 def _enqueue_generation_task(
@@ -210,32 +192,12 @@ def _final_pptx_path(project_id: str) -> str:
     return os.path.join(_project_output_dir(project_id), "presentation.pptx")
 
 
-def _editable_pptx_path(project_id: str, restore_mode: str | None = None) -> str:
-    mode = normalize_editable_pptx_restore_mode(restore_mode)
-    filename = "editable_presentation.pptx" if mode == "standard" else f"editable_presentation_{mode}.pptx"
-    return os.path.join(_project_output_dir(project_id), filename)
-
-
 def _pptx_slide_count(path: str) -> int | None:
     try:
         return len(Presentation(path).slides)
     except Exception as exc:
         logger.warning("Unable to inspect PPTX slide count: path=%s error=%s", path, exc)
         return None
-
-
-def _pptx_has_editable_text(path: str) -> bool:
-    try:
-        with zipfile.ZipFile(path) as archive:
-            for name in archive.namelist():
-                if not re.fullmatch(r"ppt/slides/slide\d+\.xml", name):
-                    continue
-                xml = archive.read(name).decode("utf-8", errors="ignore")
-                if "<p:txBody>" in xml and "<a:t>" in xml:
-                    return True
-    except Exception as exc:
-        logger.warning("Unable to inspect editable PPTX text: path=%s error=%s", path, exc)
-    return False
 
 
 def _completed_slide_image_count(slides: list[Slide]) -> int:
@@ -258,17 +220,6 @@ def _final_pptx_matches_completed_slides(pptx_path: str, slides: list[Slide]) ->
     return _pptx_slide_count(pptx_path) == completed_count
 
 
-def _has_current_editable_pptx(project_id: str, final_pptx_path: str, has_final_pptx: bool, restore_mode: str | None = None) -> tuple[bool, str]:
-    editable_path = _editable_pptx_path(project_id, restore_mode)
-    has_editable = (
-        has_final_pptx
-        and os.path.exists(editable_path)
-        and os.path.getmtime(editable_path) >= os.path.getmtime(final_pptx_path)
-        and _pptx_has_editable_text(editable_path)
-    )
-    return has_editable, editable_path
-
-
 def _has_completed_final_pptx(project: Project, slides: list[Slide]) -> tuple[bool, str]:
     pptx_path = _final_pptx_path(project.id)
     has_pptx = (
@@ -280,38 +231,6 @@ def _has_completed_final_pptx(project: Project, slides: list[Slide]) -> tuple[bo
     return has_pptx, pptx_path
 
 
-def _editable_export_missing_pages(slides: list[Slide]) -> list[int]:
-    missing_pages = []
-    for slide in slides:
-        image_path = _existing_output_path(slide.image_path)
-        if slide.status != "completed" or not image_path or not os.path.exists(image_path):
-            missing_pages.append(int(slide.page_num))
-    return missing_pages
-
-
-def _enqueue_editable_pptx_task(db: Session, project_id: str, *, run, restore_mode: str = "standard"):
-    try:
-        credential_id = store_current_provider_credentials(redis_client)
-        task = generate_editable_pptx_task.delay(
-            project_id,
-            run.id,
-            credential_id=credential_id,
-            restore_mode=restore_mode,
-        )
-        set_run_task(db, run.id, task.id)
-        db.commit()
-    except Exception as exc:
-        logger.exception("Failed to enqueue editable PPTX task for project %s", project_id)
-        message = "可编辑版处理队列暂时不可用。请确认后台服务正常运行后重试。"
-        finish_run(db, run.id, status="stale", message=message, error_msg=str(exc)[:500])
-        db.commit()
-        raise HTTPException(status_code=503, detail=message) from exc
-    try:
-        redis_client.set(f"project:{project_id}:task_id", task.id, ex=3600)
-        redis_client.set(f"project:{project_id}:task_started_at", str(time.time()), ex=3600)
-    except Exception as exc:
-        logger.warning("Redis 写入可编辑版任务跟踪信息失败，不影响已分发任务: project=%s task=%s error=%s", project_id, task.id, exc)
-    return task
 # 上传限制常量
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20MB
 MAX_REFERENCE_IMAGES_PER_PAGE = 10
@@ -1757,7 +1676,7 @@ def _ensure_completed_final_pptx(project: Project, slides: list[Slide]) -> tuple
         project.status != "completed"
         or not slides
         or _project_has_stale_artifacts(slides)
-        or _editable_export_missing_pages(slides)
+        or any(s.status != "completed" or not s.image_path for s in slides)
     ):
         return False, pptx_path
     if _final_pptx_matches_completed_slides(pptx_path, slides):
@@ -2183,7 +2102,9 @@ def _stale_missing_celery_task_if_needed(project: Project | None, db: Session, a
             if present is False:
                 reason = "后台生成服务中断，本次生成已停止。请重试未完成页面。"
         elif task_age > _queued_celery_timeout_seconds():
-            reason = "后台生成服务长时间没有接收本次任务，已停止本次生成。请重试未完成页面。"
+            present = _celery_task_present_in_worker(task_id)
+            if present is not True:
+                reason = "后台生成服务长时间没有接收本次任务，已停止本次生成。请重试未完成页面。"
     elif state in {"STARTED", "RETRY"} and inactive_for > timeout:
         present = _celery_task_present_in_worker(task_id)
         if present is False:
@@ -2622,281 +2543,6 @@ def _content_plan_attachment_context(db: Session, project_id: str, attachment_id
     return "\n\n".join(parts).strip()
 
 
-def _upsert_content_plan_pages(
-    db: Session,
-    project_id: str,
-    pages: list[dict],
-    *,
-    replace_all: bool = False,
-) -> None:
-    if replace_all:
-        pptx_refs = db.query(ReferenceImage).filter(
-            ReferenceImage.project_id == project_id,
-            ReferenceImage.role == "content_ref",
-        ).all()
-        for ref in pptx_refs:
-            if _asset_source_page_num(ref):
-                ref.slide_id = None
-        db.flush()
-        db.query(Slide).filter(Slide.project_id == project_id).delete()
-        db.flush()
-
-    existing = {
-        slide.page_num: slide
-        for slide in db.query(Slide).filter(Slide.project_id == project_id).all()
-    }
-    for item in pages:
-        page_num = int(item.get("page_num") or 0)
-        if page_num <= 0:
-            continue
-        item = copy.deepcopy(item)
-        item["page_num"] = page_num
-        slide = existing.get(page_num)
-        if slide:
-            slide.type = item.get("type", slide.type or "content")
-            slide.content_json = item
-        else:
-            slide = Slide(
-                project_id=project_id,
-                page_num=page_num,
-                type=item.get("type", "content"),
-                content_json=item,
-            )
-            db.add(slide)
-            existing[page_num] = slide
-
-
-def _mark_skeleton_pages_need_review(pages: list[dict], reason: str) -> list[dict]:
-    marked: list[dict] = []
-    for page in pages:
-        item = copy.deepcopy(page)
-        item["generation_status"] = "needs_review"
-        item["generation_warning"] = reason[:240]
-        notes = str(item.get("speaker_notes") or "").strip()
-        review_note = f"本页仍是可编辑骨架：{reason[:120]}"
-        item["speaker_notes"] = f"{notes}\n\n{review_note}".strip() if notes else review_note
-        marked.append(item)
-    return marked
-
-
-def _finalize_incremental_content_plan_project(
-    db: Session,
-    project_id: str,
-    topic: str,
-    outline: list[dict],
-) -> Project | None:
-    pending_pptx_assets = _pending_pptx_asset_extractions(project_id)
-    if pending_pptx_assets:
-        pending_pptx_assets = _soft_wait_for_pptx_asset_extractions(project_id, timeout_seconds=4.0)
-        if pending_pptx_assets:
-            logger.info(
-                "[ContentPlan BG] %s PPTX asset extraction task(s) still running; continuing without hard gate",
-                pending_pptx_assets,
-            )
-    _link_pending_pptx_page_refs(project_id, db)
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if project:
-        project.status = "planning"
-        project.content_plan_confirmed = False
-        project.style_proposal = None
-        project.selected_style = None
-        if _should_autoname_project(project):
-            derived_title = _derive_project_title(topic, outline)
-            if derived_title:
-                project.title = derived_title
-        project.has_unread_notification = True
-        project.unread_notification_message = "内容规划已生成"
-    return project
-
-
-def _generate_long_content_plan_incrementally(
-    db: Session,
-    *,
-    project_id: str,
-    topic: str,
-    page_count: int,
-    documents: str,
-    run_id: str | None,
-) -> list[dict]:
-    target_count, min_pages, max_pages = resolve_content_plan_page_target(topic, page_count, documents)
-    fallback_blueprint = _fallback_deck_blueprint(target_count, min_pages, max_pages)
-    skeleton = build_document_driven_long_deck_draft(
-        topic=topic,
-        documents=documents,
-        target_count=target_count,
-        min_pages=min_pages,
-        max_pages=max_pages,
-        deck_blueprint=fallback_blueprint,
-    )
-
-    update_run_progress(
-        db,
-        run_id,
-        stage="skeleton",
-        message=f"已生成 {target_count} 页内容草稿，正在检查页面完整性...",
-        total_count=target_count,
-        completed_count=0,
-    )
-    _upsert_content_plan_pages(db, project_id, skeleton, replace_all=True)
-    _finalize_incremental_content_plan_project(db, project_id, topic, skeleton)
-    db.commit()
-    _update_progress(project_id, {
-        "stage": "skeleton",
-        "message": f"已生成 {target_count} 页内容草稿，正在检查页面完整性...",
-        "current_page": 0,
-        "total_pages": target_count,
-    }, run_id)
-
-    deck_blueprint = fallback_blueprint
-
-    outline_by_page = {int(page["page_num"]): copy.deepcopy(page) for page in skeleton}
-    if LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT <= 0:
-        update_run_progress(
-            db,
-            run_id,
-            stage="complete",
-            message=f"已生成 {target_count} 页内容规划，请检查标题、页数和顺序。",
-            total_count=target_count,
-            completed_count=target_count,
-        )
-        db.commit()
-        _update_progress(project_id, {
-            "stage": "complete",
-            "message": f"已生成 {target_count} 页内容规划，请检查标题、页数和顺序。",
-            "current_page": target_count,
-            "total_pages": target_count,
-        }, run_id)
-        return [outline_by_page[idx] for idx in range(1, target_count + 1)]
-
-    enriched_count = 0
-    failed_count = 0
-    consecutive_failures = 0
-
-    for start_page in range(1, target_count + 1, LONG_DECK_CHUNK_SIZE):
-        if start_page > LONG_DECK_SYNC_ENRICHMENT_PAGE_LIMIT:
-            enriched_count = target_count
-            break
-        end_page = min(target_count, start_page + LONG_DECK_CHUNK_SIZE - 1)
-        db.expire_all()
-        if not is_run_active(db, run_id):
-            logger.info(f"[ContentPlan BG] Run {run_id} stopped during incremental content plan")
-            return [outline_by_page[idx] for idx in range(1, target_count + 1)]
-
-        message = f"正在补齐第 {start_page}-{end_page}/{target_count} 页内容..."
-        update_run_progress(
-            db,
-            run_id,
-            stage="generating",
-            message=message,
-            total_count=target_count,
-            completed_count=enriched_count,
-            failed_count=failed_count,
-        )
-        db.commit()
-        _update_progress(project_id, {
-            "stage": "generating",
-            "message": message,
-            "current_page": enriched_count,
-            "total_pages": target_count,
-        }, run_id)
-
-        skeleton_chunk = [outline_by_page[idx] for idx in range(start_page, end_page + 1)]
-        existing_outline = [outline_by_page[idx] for idx in range(1, start_page)]
-        try:
-            chunk = generate_long_deck_outline_chunk(
-                topic=topic,
-                documents=documents,
-                deck_blueprint=deck_blueprint,
-                existing_outline=existing_outline,
-                skeleton_chunk=skeleton_chunk,
-                target_count=target_count,
-                start_page=start_page,
-                end_page=end_page,
-            )
-            for page in chunk:
-                outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
-            _upsert_content_plan_pages(db, project_id, chunk)
-            enriched_count = end_page
-            consecutive_failures = 0
-        except Exception as e:
-            reason = str(e) or "模型响应超时"
-            logger.warning(
-                "[ContentPlan BG] Incremental chunk %s-%s failed for project=%s: %s",
-                start_page,
-                end_page,
-                project_id,
-                reason,
-            )
-            low_content_chunk = all(
-                str(page.get("generation_status") or "") in LOW_CONTENT_DRAFT_STATUSES
-                for page in skeleton_chunk
-            )
-            if low_content_chunk:
-                marked = _mark_skeleton_pages_need_review(skeleton_chunk, reason)
-                failed_count += len(marked)
-            else:
-                marked = []
-                for page in skeleton_chunk:
-                    item = copy.deepcopy(page)
-                    item["generation_warning"] = f"模型润色超时，当前保留基于上传材料生成的素材初稿：{reason[:160]}"
-                    marked.append(item)
-            for page in marked:
-                outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
-            _upsert_content_plan_pages(db, project_id, marked)
-            enriched_count = end_page
-            consecutive_failures += 1
-            if consecutive_failures >= 2:
-                remaining_start = end_page + 1
-                if remaining_start <= target_count:
-                    remaining = [
-                        outline_by_page[idx]
-                        for idx in range(remaining_start, target_count + 1)
-                    ]
-                    low_content_remaining = all(
-                        str(page.get("generation_status") or "") in LOW_CONTENT_DRAFT_STATUSES
-                        for page in remaining
-                    )
-                    if low_content_remaining:
-                        remaining_marked = _mark_skeleton_pages_need_review(
-                            remaining,
-                            "连续分段生成超时，已先保留完整可编辑骨架，避免任务回到 0 页。",
-                        )
-                        failed_count += len(remaining_marked)
-                    else:
-                        remaining_marked = []
-                        for page in remaining:
-                            item = copy.deepcopy(page)
-                            item["generation_warning"] = "连续分段生成超时，当前保留基于上传材料生成的素材初稿，可继续细化。"
-                            remaining_marked.append(item)
-                    for page in remaining_marked:
-                        outline_by_page[int(page["page_num"])] = copy.deepcopy(page)
-                    _upsert_content_plan_pages(db, project_id, remaining_marked)
-                    enriched_count = target_count
-                db.commit()
-                break
-
-        outline = [outline_by_page[idx] for idx in range(1, target_count + 1)]
-        _finalize_incremental_content_plan_project(db, project_id, topic, outline)
-        update_run_progress(
-            db,
-            run_id,
-            stage="generating",
-            message=f"已处理到第 {enriched_count}/{target_count} 页...",
-            total_count=target_count,
-            completed_count=enriched_count,
-            failed_count=failed_count,
-        )
-        db.commit()
-        _update_progress(project_id, {
-            "stage": "generating",
-            "message": f"已处理到第 {enriched_count}/{target_count} 页...",
-            "current_page": enriched_count,
-            "total_pages": target_count,
-        }, run_id)
-
-    return [outline_by_page[idx] for idx in range(1, target_count + 1)]
-
-
 def _generate_content_plan_bg(
     project_id: str,
     topic: str,
@@ -3036,7 +2682,8 @@ def _generate_content_plan_bg(
                 db.commit()
                 logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
 
-        target_page_count, _, _ = resolve_content_plan_page_target(topic, page_count, documents)
+        intent_topic = content_plan_topic_with_chat_context(topic, chat_context)
+        target_page_count, _, _ = resolve_content_plan_page_target(intent_topic, page_count, documents)
         update_run_progress(db, run_id, total_count=target_page_count)
         db.commit()
 
@@ -3169,8 +2816,10 @@ def create_content_plan(
 
     # 优先使用用户传入的 topic，否则用项目标题
     topic = body.topic.strip() if body.topic else project.title
-    page_count = resolve_requested_content_plan_page_count(topic, body.page_count)
-    target_page_count, _, _ = resolve_content_plan_page_target(topic, page_count)
+    chat_context = (body.chat_context or "").strip() or None
+    intent_topic = content_plan_topic_with_chat_context(topic, chat_context)
+    page_count = resolve_requested_content_plan_page_count(intent_topic, body.page_count)
+    target_page_count, _, _ = resolve_content_plan_page_target(intent_topic, page_count)
 
     try:
         run = create_project_run(
@@ -3192,7 +2841,7 @@ def create_content_plan(
         page_count,
         run.id,
         body.attachment_ids or [],
-        (body.chat_context or "").strip() or None,
+        chat_context,
     )
     return {"message": "Content plan generation started", "status": project.status, "run": serialize_run(run)}
 
@@ -4244,12 +3893,6 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         has_pptx, pptx_path = _has_completed_final_pptx(project, slides)
     else:
         has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
-    has_editable_pptx, editable_pptx_path = _has_current_editable_pptx(
-        project_id,
-        pptx_path,
-        project.status == "completed" and has_pptx,
-    )
-
     target_count, target_completed, target_failed = target_counts(active_run, slides)
     progress = generation_progress.get(project_id, {})
     return {
@@ -4265,8 +3908,6 @@ def get_project_status(project_id: str, db: Session = Depends(get_db)):
         "active_run": serialize_run(active_run, slides),
         "has_pptx": has_pptx,
         "pptx_path": pptx_path if has_pptx else None,
-        "has_editable_pptx": has_editable_pptx,
-        "editable_pptx_path": editable_pptx_path if has_editable_pptx else None,
         "slides": slide_status,
     }
 
@@ -4304,11 +3945,6 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         has_pptx, pptx_path = _has_completed_final_pptx(project, slides)
     else:
         has_pptx = os.path.exists(pptx_path) and not _project_has_stale_artifacts(slides)
-    has_editable_pptx, editable_pptx_path = _has_current_editable_pptx(
-        project_id,
-        pptx_path,
-        project.status == "completed" and has_pptx,
-    )
     quality_report = (
         build_project_quality_report(project, slides, has_pptx=has_pptx, pptx_path=pptx_path)
         if not active_run
@@ -4322,8 +3958,6 @@ def get_project_workflow_status(project_id: str, db: Session = Depends(get_db)):
         latest_run=latest_run,
         has_pptx=has_pptx,
         pptx_path=pptx_path,
-        has_editable_pptx=has_editable_pptx,
-        editable_pptx_path=editable_pptx_path,
         quality_report=quality_report,
     )
 
@@ -4408,75 +4042,6 @@ def download_pptx(project_id: str, prototype: bool = False, db: Session = Depend
     return FileResponse(
         path=pptx_path,
         filename=display_name,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    )
-
-
-@router.post("/{project_id}/editable-pptx")
-def start_editable_pptx_export(
-    project_id: str,
-    request: EditablePptxExportRequest | None = Body(default=None),
-    db: Session = Depends(get_db),
-):
-    """启动可编辑版 PPTX 后处理。"""
-    restore_mode = normalize_editable_pptx_restore_mode(request.restore_mode if request else "standard")
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    active_run = _active_run_for_project_action(project, db)
-    if active_run:
-        raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再下载可编辑版。")
-
-    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
-    has_final_pptx, final_pptx_path = _ensure_completed_final_pptx(project, slides)
-    if not has_final_pptx:
-        raise HTTPException(status_code=409, detail="请先完成全量 PPT 生成，再下载可编辑版。")
-
-    missing_pages = _editable_export_missing_pages(slides)
-    if missing_pages:
-        raise HTTPException(
-            status_code=409,
-            detail=f"第 {', '.join(map(str, missing_pages))} 页还没有完整生成，请先完成全量 PPT。",
-        )
-
-    ensure_editable_pptx_worker_ready()
-    run = create_project_run(
-        db,
-        project_id,
-        kind="editable_pptx",
-        stage="editable_pptx",
-        total_count=len(slides),
-        message="可编辑版已开始准备",
-    )
-    db.commit()
-    task = _enqueue_editable_pptx_task(db, project_id, run=run, restore_mode=restore_mode)
-
-    return {
-        "status": "generating",
-        "project_id": project_id,
-        "restore_mode": restore_mode,
-        "task_id": task.id,
-        "run": serialize_run(run, slides),
-    }
-
-
-@router.get("/{project_id}/download-editable")
-def download_editable_pptx(project_id: str, restore_mode: str = "standard", db: Session = Depends(get_db)):
-    """下载已生成的可编辑版 PPTX。"""
-    mode = normalize_editable_pptx_restore_mode(restore_mode)
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    slides = db.query(Slide).filter(Slide.project_id == project_id).order_by(Slide.page_num).all()
-    has_final_pptx, final_pptx_path = _ensure_completed_final_pptx(project, slides)
-    has_editable, editable_path = _has_current_editable_pptx(project_id, final_pptx_path, has_final_pptx, mode)
-    if not has_editable:
-        raise HTTPException(status_code=404, detail="可编辑版还没有准备好，请先点击下载可编辑版。")
-
-    return FileResponse(
-        path=editable_path,
-        filename=f"{project.title}_可编辑版.pptx" if mode == "standard" else f"{project.title}_可编辑版_{mode}.pptx",
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
     )
 
@@ -5454,6 +5019,19 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
     return prompt
 
 
+class FinetuneRegionBox(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class FinetuneRegionRequest(BaseModel):
+    id: Optional[str] = None
+    label: Optional[str] = None
+    bbox: FinetuneRegionBox
+
+
 class FinetuneRequest(BaseModel):
     # Backward compatible: older frontend versions send a fully composed prompt.
     new_prompt: Optional[str] = None
@@ -5461,6 +5039,7 @@ class FinetuneRequest(BaseModel):
     # edit the current slide image directly.
     instruction: Optional[str] = None
     attachment_ids: Optional[List[str]] = None
+    regions: Optional[List[FinetuneRegionRequest]] = None
 
 
 def _finetune_should_attach_project_product_assets(instruction: str) -> bool:
@@ -5499,11 +5078,78 @@ def _project_visual_asset_ids_for_finetune(project: Project, slide: Slide, instr
     return [str(ref.id) for ref in candidate_refs[:3]]
 
 
+def _finetune_region_to_dict(region) -> dict:
+    if isinstance(region, dict):
+        return region
+    if hasattr(region, "model_dump"):
+        return region.model_dump()
+    if hasattr(region, "dict"):
+        return region.dict()
+    return {}
+
+
+def _normalize_finetune_regions(regions: Optional[List[object]]) -> List[dict]:
+    normalized: List[dict] = []
+    for index, raw_region in enumerate(regions or []):
+        region = _finetune_region_to_dict(raw_region)
+        raw_bbox = region.get("bbox") if isinstance(region, dict) else None
+        bbox = _finetune_region_to_dict(raw_bbox)
+        try:
+            x = max(0.0, min(1.0, float(bbox.get("x", 0))))
+            y = max(0.0, min(1.0, float(bbox.get("y", 0))))
+            width = max(0.0, min(1.0 - x, float(bbox.get("width", 0))))
+            height = max(0.0, min(1.0 - y, float(bbox.get("height", 0))))
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        normalized.append({
+            "id": str(region.get("id") or f"region-{index + 1}"),
+            "label": str(region.get("label") or f"Region {index + 1}"),
+            "bbox": {
+                "x": round(x, 4),
+                "y": round(y, 4),
+                "width": round(width, 4),
+                "height": round(height, 4),
+            },
+        })
+        if len(normalized) >= 8:
+            break
+    return normalized
+
+
+def _format_finetune_regions_note(regions: Optional[List[object]]) -> str:
+    normalized_regions = _normalize_finetune_regions(regions)
+    if not normalized_regions:
+        return ""
+    lines = ["\nSelected edit regions (normalized to the full 16:9 slide image):"]
+    for index, region in enumerate(normalized_regions, start=1):
+        bbox = region["bbox"]
+        label = region.get("label") or f"Region {index}"
+        lines.append(
+            "- Region "
+            f"{index} ({label}): "
+            f"x={bbox['x'] * 100:.1f}%, "
+            f"y={bbox['y'] * 100:.1f}%, "
+            f"width={bbox['width'] * 100:.1f}%, "
+            f"height={bbox['height'] * 100:.1f}%."
+        )
+    lines.append(
+        "These selected region(s) are supplied to the image edit request as an edit mask. "
+        "When available, an additional marked copy of the slide shows the same region(s) with red outlines; "
+        "use those red outlines only as a location guide and do not draw them in the result. "
+        "Only the selected/masked region(s) may change. Keep everything outside the selected region(s) unchanged. "
+        "Keep every same-looking or same-word item outside the selected region(s) unchanged unless the user explicitly asks otherwise."
+    )
+    return "\n".join(lines)
+
+
 def _build_direct_finetune_prompt(
     slide: Slide,
     instruction: str,
     attachment_count: int = 0,
     project_visual_asset_count: int = 0,
+    regions: Optional[List[object]] = None,
 ) -> str:
     """Compose a direct image-edit prompt for single-slide finetuning."""
     content = slide.content_json or {}
@@ -5537,15 +5183,18 @@ def _build_direct_finetune_prompt(
         if project_visual_asset_count
         else ""
     )
+    region_note = _format_finetune_regions_note(regions)
 
     return f"""Edit the FIRST supplied image, which is the current PPT slide.
 
 User edit request:
 {instruction.strip()}
+{region_note}
 
 Rules:
 - Apply the request immediately. Do not ask clarifying questions.
 - Preserve all unmentioned text, layout, colors, typography, icons, charts, image areas, and background exactly as much as possible.
+- If selected edit regions are provided, apply the request inside those regions first and keep the rest of the slide stable.
 - If the user supplied extra reference images, they are the current-turn references. Integrate or borrow from them only where the request implies it.
 - Do not copy people or illustrations printed on product packaging unless the user explicitly asks for the packaging artwork.
 - Keep the final result as a polished 16:9 presentation slide, not a mockup.
@@ -5584,6 +5233,7 @@ def finetune_slide(
     instruction = (body.instruction or "").strip()
     new_prompt = (body.new_prompt or "").strip()
     attachment_ids = body.attachment_ids or []
+    finetune_regions = _normalize_finetune_regions(body.regions or [])
     if not instruction and not new_prompt:
         raise HTTPException(status_code=400, detail="instruction 不能为空")
 
@@ -5614,12 +5264,14 @@ def finetune_slide(
             instruction,
             len(valid_attachment_ids),
             len(project_visual_asset_ids),
+            regions=finetune_regions,
         )
         visual_json = copy.deepcopy(slide.visual_json) or {}
         visual_json["finetune_base_image_path"] = archived_version.image_path
         visual_json["finetune_instruction"] = instruction
         visual_json["finetune_attachment_ids"] = valid_attachment_ids
         visual_json["finetune_visual_asset_ids"] = project_visual_asset_ids
+        visual_json["finetune_regions"] = finetune_regions
         slide.visual_json = visual_json
         flag_modified(slide, "visual_json")
     else:

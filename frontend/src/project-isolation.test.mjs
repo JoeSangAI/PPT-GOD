@@ -43,23 +43,23 @@ assert.match(
 );
 assert.match(
   source,
-  /const appendRequestMessage = \(message: ChatMessage[\s\S]*if \(!options\.allowStale && !isRequestCurrentGate\(\)\) return false;/,
-  "request-scoped messages must be blocked once the gate is stale"
+  /const appendRequestMessage = \(message: ChatMessage[\s\S]*if \(!options\.allowStale && !isRequestExecutionAllowed\(\)\) return false;/,
+  "request-scoped messages must be blocked only when the original request can no longer execute"
 );
 assert.match(
   source,
-  /if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*const frontendWillHandleAgentReply/,
-  "stale Agent responses must be dropped before replies or actions are applied"
+  /if \(!isRequestExecutionAllowed\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*const frontendWillHandleAgentReply/,
+  "stale same-project Agent responses must be dropped before replies or actions are applied"
 );
 assert.match(
   source,
-  /if \(\(!chatResultLooksValid\(result\) \|\| streamRetryReason\)[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;/,
-  "stale incomplete Agent streams must be dropped before retrying or warning"
+  /if \(\(!chatResultLooksValid\(result\) \|\| streamRetryReason\)[\s\S]*if \(!isRequestExecutionAllowed\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;/,
+  "same-project stale incomplete Agent streams must be dropped before retrying or warning"
 );
 assert.match(
   source,
-  /if \(!chatResultLooksValid\(result\)\) \{[\s\S]*if \(!isRequestCurrentGate\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*响应未返回完整结果/,
-  "incomplete result warnings must only be shown for the current gate"
+  /if \(!chatResultLooksValid\(result\)\) \{[\s\S]*if \(!isRequestExecutionAllowed\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*响应未返回完整结果/,
+  "incomplete result warnings must only be shown while the original request can still execute"
 );
 assert.match(
   source,
@@ -196,63 +196,146 @@ assert.match(
   /generateContentPlan\(projectId: string, topic\?: string, pageCount\?: number, attachmentIds\?: string\[\][^)]*\)[\s\S]*body\.attachment_ids = attachmentIds/,
   "content-plan API requests must support explicit attachment ids"
 );
+const removedEditableApiPattern = new RegExp(
+  [
+    ["editable", "-pptx"].join(""),
+    ["download", "editable"].join("-"),
+    ["Editable", "Pptx"].join(""),
+  ].join("|")
+);
+const removedEditableControlsPattern = new RegExp(
+  [
+    ["下载可编辑", "版 PPTX"].join(""),
+    "handle" + ["Editable", "Pptx"].join("") + "Export",
+    ["pg", "editable", "export"].join("-"),
+  ].join("|")
+);
+const removedEditableWorkflowPattern = new RegExp(
+  [
+    ["editable", "_pptx"].join(""),
+    ["可编辑", "版"].join(""),
+  ].join("|")
+);
+assert.doesNotMatch(client, removedEditableApiPattern, "editable PPTX export API must not remain in the client");
 assert.match(
   client,
-  /export async function startEditablePptx\(projectId: string,\s*restoreMode[\s\S]*\/projects\/\$\{projectId\}\/editable-pptx[\s\S]*body:\s*JSON\.stringify\(\{\s*restore_mode:\s*restoreMode\s*\}\)/,
-  "editable PPTX export must start through the dedicated post-processing endpoint with the selected editability level"
+  /export interface FinetuneRegion[\s\S]*bbox:\s*\{[\s\S]*x:\s*number[\s\S]*width:\s*number[\s\S]*height:\s*number/,
+  "single-slide finetune API must define selectable edit regions"
 );
 assert.match(
   client,
-  /export function getEditableDownloadUrl\(projectId: string,\s*restoreMode[\s\S]*\/projects\/\$\{projectId\}\/download-editable[\s\S]*restore_mode/,
-  "editable PPTX export must have a dedicated mode-aware download URL"
+  /finetuneSlide\(projectId: string, slideId: string, instruction: string, attachmentIds\?: string\[\], regions\?: FinetuneRegion\[\]\)[\s\S]*regions:\s*regions \|\| \[\]/,
+  "single-slide finetune API must send selected regions with the edit request"
 );
 assert.match(
   source,
-  /editableDownloadRunIdRef[\s\S]*editableDownloadModeRef[\s\S]*handleEditablePptxExport[\s\S]*下载可编辑版 PPTX/,
-  "editable PPTX export must keep a user-facing button, selected level, and track the run that should auto-download"
+  /interface FinetuneRegion[\s\S]*bbox:\s*\{[\s\S]*x:\s*number[\s\S]*width:\s*number[\s\S]*height:\s*number/,
+  "single-slide finetune state must store normalized edit regions"
+);
+assert.match(
+  source,
+  /function FinetuneRegionSelector[\s\S]*onAddRegion[\s\S]*pg-finetune-region-box/,
+  "single-slide finetune preview must support drawing selected edit regions"
+);
+assert.doesNotMatch(
+  source,
+  /pg-finetune-region-overlay-actions/,
+  "single-slide finetune controls must not overlay buttons on top of the slide image"
+);
+assert.match(
+  source,
+  /is-single-slide-editing/,
+  "single-slide editing must expose a root layout state for compact workbench chrome"
+);
+assert.match(
+  source,
+  /showFinetuneRegionControls\s*=\s*Boolean\([\s\S]*slide\.image_path[\s\S]*onToggleFinetuneRegionSelection[\s\S]*finetuneRegions\.length/,
+  "single-slide editor region selection must only appear when the slide already has an image to select"
+);
+assert.match(
+  source,
+  /pg-single-region-tool[\s\S]*框选修改/,
+  "single-slide finetune region selection must use explicit copy in the editor toolbar instead of covering the image"
+);
+assert.match(
+  source,
+  /pg-single-undo-redo[\s\S]*aria-label="撤销"[\s\S]*<svg[\s\S]*aria-label="重做"[\s\S]*<svg/,
+  "single-slide undo and redo controls must use a WPS-style icon pill instead of font glyph arrows"
+);
+assert.match(
+  css,
+  /\.pg-single-slide-nav\s*\{[\s\S]*--pg-single-nav-height[\s\S]*--pg-single-nav-shell-bg/,
+  "single-slide editor nav must define shared WPS-style toolbar tokens"
+);
+assert.match(
+  css,
+  /\.pg-single-nav-back,\s*[\r\n]+\.pg-single-page-control,\s*[\r\n]+\.pg-single-tool-group,\s*[\r\n]+\.pg-single-save-group\s*\{[\s\S]*min-height:\s*var\(--pg-single-nav-height\)[\s\S]*background:\s*var\(--pg-single-nav-shell-bg\)/,
+  "single-slide editor nav groups must share the same pill shell instead of mixed button styles"
+);
+assert.doesNotMatch(
+  css,
+  /\.pg-single-region-tool\s*\{[\s\S]*rgba\(255,\s*247,\s*237/,
+  "region selection must use the same neutral toolbar shell and reserve red for active state"
+);
+assert.match(
+  source,
+  /const renderSlidePreview = \(\)[\s\S]*\{renderSlidePreview\(\)\}[\s\S]*\/\* 标题 \*\//,
+  "single-slide editor must put the slide preview before the text editing fields"
+);
+assert.match(
+  source,
+  /openFinetuneRegionMode[\s\S]*scrollFinetunePreviewIntoView/,
+  "right-side finetune target card must be able to open and scroll to region selection"
+);
+assert.match(
+  source,
+  /hasFinetuneImage\s*&&\s*\([\s\S]*pg-finetune-scope-control[\s\S]*修改范围[\s\S]*整页修改[\s\S]*框选局部/,
+  "right-side finetune target card must explain the region mechanism as a modification-scope choice"
+);
+assert.match(
+  source,
+  /hasFinetuneImage\s*&&\s*\([\s\S]*pg-finetune-region-target-button[\s\S]*框选局部/,
+  "right-side finetune target card must expose local selection only after an image exists"
+);
+assert.match(
+  source,
+  /selectedFinetuneSlides[\s\S]*finetunePanelScope[\s\S]*selected_slides/,
+  "right-side finetune target card must derive page range before deciding whether local selection is available"
+);
+assert.match(
+  source,
+  /finetunePanelScope === "selected_slides"[\s\S]*已选 \{selectedFinetuneSlides\.length\} 页[\s\S]*同一要求会应用到这些页面/,
+  "right-side finetune target card must summarize multi-page scope in user terms"
+);
+assert.match(
+  source,
+  /singleFinetuneSlide[\s\S]*hasFinetuneImage[\s\S]*pg-finetune-scope-control/,
+  "right-side finetune target card must keep local selection controls scoped to one generated slide"
+);
+assert.match(
+  source,
+  /pg-finetune-reference-button[\s\S]*加参考图/,
+  "right-side finetune target card must label the reference-image action instead of showing only a plus icon"
+);
+assert.match(
+  css,
+  /\.pg-app\.is-single-slide-editing[\s\S]*\.pg-workflow[\s\S]*\.pg-workbench-modulebar[\s\S]*\.pg-style-bar/,
+  "single-slide editing must compact project-level status, material, and style bars"
+);
+assert.match(
+  source,
+  /finetuneSlide\(selectedProject\.id, targetSlide\.id, userMsg, finetuneAttachments\.map\(\(a\) => a\.id\), finetuneRegions\)/,
+  "single-slide finetune requests must include selected regions from the current target slide"
 );
 assert.match(
   source,
   /下载规划 MD/,
-  "download actions should use consistent labels for planning MD, image PPTX, and editable PPTX"
+  "download actions should use consistent labels for planning MD and image PPTX"
 );
 assert.match(source, /下载图片版 PPTX/, "image PPTX download action should be clearly labeled");
-assert.match(source, /下载可编辑版 PPTX/, "editable PPTX download action should be clearly labeled");
-assert.match(
-  source,
-  /EDITABLE_PPTX_MODE_OPTIONS[\s\S]*标准[\s\S]*推荐[\s\S]*增强[\s\S]*激进[\s\S]*pg-editable-export-menu/,
-  "editable PPTX export UI must expose standard, enhanced, and aggressive levels inside the download menu"
-);
-assert.doesNotMatch(
-  source,
-  /selectedEditablePptxMode/,
-  "editable PPTX export must not show parsing strength as a persistent top-bar segmented control"
-);
-assert.match(
-  workflow,
-  /WORKFLOW_STEPS[\s\S]*可编辑版/,
-  "editable PPTX export must appear as its own workflow step"
-);
-assert.match(
-  workflow,
-  /case "editable_pptx":[\s\S]*return 5;/,
-  "editable PPTX export runs must advance the workflow to the dedicated editable step"
-);
-assert.match(
-  workflow,
-  /editable_pptx:[\s\S]*可编辑版生成进度[\s\S]*正在生成可编辑版/,
-  "editable PPTX export must use dedicated progress copy instead of batch-generation fallback"
-);
-assert.match(
-  source,
-  /aria-label="下载可编辑版 PPTX，选择解析强度"[\s\S]*选择解析强度[\s\S]*越高拆得越细/,
-  "editable PPTX export controls must explain the selected parsing level inside the download menu"
-);
-assert.doesNotMatch(
-  source,
-  /pg-editable-export[\s\S]*title=\{option\.hint\}|title="解析强度越高|title="会重新解析整套 PPT/,
-  "editable PPTX export menu must not duplicate inline explanations as hover-only tooltips"
-);
+assert.doesNotMatch(source, removedEditableControlsPattern, "editable PPTX export controls must not remain in the app");
+assert.doesNotMatch(workflow, removedEditableWorkflowPattern, "editable PPTX export must not remain in workflow copy or steps");
+assert.doesNotMatch(css, removedEditableControlsPattern, "editable PPTX export styles must not remain");
 assert.match(
   css,
   /\.pg-topbar\.pg-project-header\s*\{[\s\S]*z-index:\s*80;[\s\S]*overflow:\s*visible;/,
@@ -367,6 +450,87 @@ assert.match(
   source,
   /const reportBlockedAction = \([\s\S]*options\.source === "agent"[\s\S]*appendProjectChatMessage[\s\S]*return \{ ok: false, reason, message \};/,
   "blocked agent actions must produce visible chat feedback"
+);
+assert.match(
+  source,
+  /const isRequestExecutionAllowed = \(\) => \{[\s\S]*selectedProjectIdRef\.current !== requestProjectId[\s\S]*return true[\s\S]*latestGate\.gate === requestGate[\s\S]*latestGate\.gateRevision === requestGateRevision/,
+  "Agent request execution must use the request snapshot so switching projects does not drop the original project action"
+);
+assert.match(
+  source,
+  /const appendRequestMessage = \([\s\S]*!isRequestExecutionAllowed\(\)[\s\S]*withRequestGateMeta\(message\)[\s\S]*appendProjectChatMessage\(requestProjectId, requestAgentRole, normalized\)/,
+  "request-scoped Agent replies must persist to the original project even when it is no longer visible"
+);
+assert.match(
+  source,
+  /const frontendWillHandleAgentReply = isRequestExecutionAllowed\(\) && \(/,
+  "frontend-handled Agent actions must still execute for hidden original projects"
+);
+assert.match(
+  source,
+  /const refreshRequestSlides = async \(\) => \{[\s\S]*const freshSlides = await fetchSlides\(requestProjectId\)[\s\S]*slidesCacheRef\.current\[requestProjectId\] = freshSlides[\s\S]*selectedProjectIdRef\.current === requestProjectId/,
+  "request-scoped Agent actions must refresh the original project without requiring it to be visible"
+);
+const syncRequestVisualPromptsStart = source.indexOf("const syncRequestVisualPrompts = async");
+const syncRequestVisualPromptsEnd = source.indexOf("const hasAttachments =", syncRequestVisualPromptsStart);
+assert.ok(
+  syncRequestVisualPromptsStart >= 0 && syncRequestVisualPromptsEnd > syncRequestVisualPromptsStart,
+  "must find request-scoped visual prompt sync helper"
+);
+const syncRequestVisualPromptsSource = source.slice(syncRequestVisualPromptsStart, syncRequestVisualPromptsEnd);
+assert.match(
+  syncRequestVisualPromptsSource,
+  /if \(staleOverride\.visual && !staleOverride\.content\) \{[\s\S]*await generatePrompts\(requestProjectId, pageNums, buildCrossStageContext\("visual"\)\)[\s\S]*return freshSlides;/,
+  "manual visual-description edits must only regenerate prompts, not overwrite the edited visual plan"
+);
+const multiPageVisualUpdateStart = source.indexOf('if (result.action === "update_all_slides_visual"');
+const multiPageVisualUpdateEnd = source.indexOf("// Agent 理解用户想生图", multiPageVisualUpdateStart);
+assert.ok(
+  multiPageVisualUpdateStart >= 0 && multiPageVisualUpdateEnd > multiPageVisualUpdateStart,
+  "must find multi-page visual update handler"
+);
+const multiPageVisualUpdateSource = source.slice(multiPageVisualUpdateStart, multiPageVisualUpdateEnd);
+assert.doesNotMatch(
+  multiPageVisualUpdateSource,
+  /setActiveChatMessages/,
+  "multi-page visual update execution status must persist in project-scoped chat when the user switches away"
+);
+assert.match(
+  multiPageVisualUpdateSource,
+  /const allowedPageNums = requestContext\.scope === "selected_slides"[\s\S]*requestContext\.pageNums[\s\S]*allowedPageNums\.has\(pageNum\)/,
+  "selected-scope multi-page visual updates must stay limited to the pages captured at submit time"
+);
+assert.doesNotMatch(
+  multiPageVisualUpdateSource,
+  /selectedProject\.id/,
+  "multi-page visual updates must write to the request project, not the currently visible project"
+);
+assert.match(
+  multiPageVisualUpdateSource,
+  /await updateVisualPlan\(requestProjectId, pageNum, patch\.visual_json, slide\.id\)[\s\S]*await refreshRequestSlides\(\)/,
+  "multi-page visual updates must persist and refresh through the request-scoped project snapshot"
+);
+const multiPageContentUpdateStart = source.indexOf('if (result.action === "update_all_slides"');
+const multiPageContentUpdateEnd = source.indexOf("// Agent 要求在当前页前面插入新页", multiPageContentUpdateStart);
+assert.ok(
+  multiPageContentUpdateStart >= 0 && multiPageContentUpdateEnd > multiPageContentUpdateStart,
+  "must find multi-page content update handler"
+);
+const multiPageContentUpdateSource = source.slice(multiPageContentUpdateStart, multiPageContentUpdateEnd);
+assert.doesNotMatch(
+  multiPageContentUpdateSource,
+  /selectedProject\.id/,
+  "multi-page content updates must write to the request project, not the currently visible project"
+);
+assert.match(
+  multiPageContentUpdateSource,
+  /const allowedPageNums = requestContext\.scope === "selected_slides"[\s\S]*requestContext\.pageNums[\s\S]*allowedPageNums\.has\(pageNum\)/,
+  "selected-scope multi-page content updates must stay limited to the pages captured at submit time"
+);
+assert.match(
+  multiPageContentUpdateSource,
+  /await updateSlideContent\(requestProjectId, pageNum, slidePatch\)[\s\S]*await refreshRequestSlides\(\)/,
+  "multi-page content updates must persist and refresh through the request-scoped project snapshot"
 );
 assert.match(
   source,
@@ -684,8 +848,18 @@ assert.match(
 );
 assert.match(
   source,
+  /currentAgentRole !== "finetune"\s*&&\s*\([\s\S]{0,500}<div className="pg-agent-command-bar">/,
+  "single-page finetune must not show a duplicate command status bar once the target card explains the page and scope"
+);
+assert.match(
+  source,
   /if \(currentProjectStatus\?\.active_run\) \{\s*updateProjectChatMessages\(projectId,\s*"visual",\s*\(prevMsgs\) => \{[\s\S]*return prevMsgs\.filter\(\(m\) => !isQualityReportChatMessage\(m\)\);[\s\S]*\}\);\s*return;\s*\}/,
   "active workflow runs must remove stale quality-report next-step guidance from the Agent panel"
+);
+assert.match(
+  source,
+  /case "generate_content_plan": \{[\s\S]*const chatContext = buildVisualStyleGenerationContext\([\s\S]*await dispatchGateAction\("generate_content_plan", \{[\s\S]*chat_context: chatContext,/,
+  "Agent next-action content-plan starts must pass chat context so summarized topics do not lose the original page-count request"
 );
 const updateStaleStart = source.indexOf("const handleUpdateStaleSlides = async");
 const updateStaleEnd = source.indexOf("// 用户确认后，重新生成 image 标记的页面。", updateStaleStart);
