@@ -1611,6 +1611,7 @@ def test_prompt_includes_selected_global_visual_asset():
                 "process_mode": "crop",
                 "asset_name": "胡姬花花生油瓶",
                 "asset_kind": "product",
+                "asset_route_mode": "double_blend",
                 "description": "subject=胡姬花花生油瓶; features=红色瓶盖、黄色标签",
             }
         ],
@@ -1619,7 +1620,9 @@ def test_prompt_includes_selected_global_visual_asset():
 
     assert "Product slot: 胡姬花花生油瓶" in prompt
     assert "uploaded product image as the product source" in prompt
-    assert "hidden refinement pass" in prompt
+    assert "preserve product identity and visible details" in prompt
+    assert "hidden refinement pass" not in prompt
+    assert "refinement pass" not in prompt
     assert "Place the uploaded product image in the right side area" in prompt
     assert "红色瓶盖" not in prompt
     assert "黄色标签" not in prompt
@@ -1692,6 +1695,8 @@ def test_visual_plan_source_prompt_avoids_asset_detail_production():
 
     assert "visual_asset_usage 只能写位置和画面占比" in prompt
     assert "不要在 visual_evidence、visual_description、visual_asset_usage 里复述外观" in prompt
+    assert "给用户阅读" not in prompt
+    assert "下游 pipeline" not in prompt
     assert "保真要求" not in prompt
 
 
@@ -2277,6 +2282,124 @@ def test_direct_finetune_prompt_distinguishes_project_visual_assets():
     assert "conflicting brand/product already visible" in prompt
 
 
+def test_direct_finetune_prompt_scopes_selected_regions():
+    slide = Slide(
+        page_num=3,
+        content_json={
+            "text_content": {
+                "headline": "项目进展",
+                "subhead": "重点区域需要更醒目",
+                "body": "保持其他信息不变",
+            }
+        },
+    )
+
+    prompt = slides_api._build_direct_finetune_prompt(
+        slide,
+        "把框选位置的数字改成红色",
+        regions=[
+            {
+                "id": "region-1",
+                "label": "框选 1",
+                "bbox": {"x": 0.125, "y": 0.25, "width": 0.5, "height": 0.2},
+            }
+        ],
+    )
+
+    assert "Selected edit regions" in prompt
+    assert "Region 1" in prompt
+    assert "x=12.5%" in prompt
+    assert "width=50.0%" in prompt
+    assert "Keep everything outside the selected region" in prompt
+
+
+def test_direct_finetune_regions_pass_mask_and_restore_unselected_pixels(tmp_path, monkeypatch):
+    calls = []
+    base = Image.new("RGB", (100, 60), "black")
+    base.putpixel((90, 50), (12, 34, 56))
+
+    def fake_generate_slide_image(
+        prompt,
+        reference_images=None,
+        resolution="4K",
+        aspect_ratio="16:9",
+        project_id=None,
+        edit_mask=None,
+    ):
+        calls.append({
+            "prompt": prompt,
+            "reference_count": len(reference_images or []),
+            "edit_mask": edit_mask.copy() if edit_mask else None,
+        })
+        return Image.new("RGB", base.size, "red")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    slide = Slide(
+        page_num=1,
+        prompt_text="direct finetune prompt",
+        visual_json={
+            "finetune_base_image_path": str(tmp_path / "base.png"),
+            "finetune_regions": [
+                {
+                    "id": "region-1",
+                    "label": "框选 1",
+                    "bbox": {"x": 0.1, "y": 0.2, "width": 0.2, "height": 0.2},
+                }
+            ],
+        },
+    )
+    ref_data = [
+        {
+            "role": "finetune_base",
+            "label": "Current Slide Image",
+            "process_mode": "original",
+            "image": base.copy(),
+            "file_path": str(tmp_path / "base.png"),
+        }
+    ]
+
+    result = _generate_one_slide(slide, "project-1", str(tmp_path), ref_data)
+
+    assert result["error"] is None
+    assert len(calls) == 1
+    mask = calls[0]["edit_mask"]
+    assert mask is not None
+    assert mask.mode == "RGBA"
+    assert mask.size == base.size
+    assert mask.getpixel((15, 15))[3] == 0
+    assert mask.getpixel((90, 50))[3] == 255
+
+    final_img = Image.open(result["image_path"]).convert("RGB")
+    assert final_img.getpixel((15, 15)) == (255, 0, 0)
+    assert final_img.getpixel((90, 50)) == (12, 34, 56)
+
+
+def test_direct_finetune_regions_add_visual_guide_reference(tmp_path):
+    base_path = tmp_path / "base.png"
+    Image.new("RGB", (100, 60), "black").save(base_path)
+    slide = Slide(
+        page_num=1,
+        visual_json={
+            "finetune_base_image_path": str(base_path),
+            "finetune_regions": [
+                {
+                    "id": "region-1",
+                    "label": "框选 1",
+                    "bbox": {"x": 0.1, "y": 0.2, "width": 0.2, "height": 0.2},
+                }
+            ],
+        },
+    )
+
+    refs = _load_reference_images(slide)
+
+    assert [ref.get("role") for ref in refs[:2]] == ["finetune_base", "finetune_region_guide"]
+    guide = refs[1]["image"].convert("RGB")
+    assert guide.getpixel((10, 12)) == (255, 0, 0)
+    assert guide.getpixel((90, 50)) == (0, 0, 0)
+
+
 def test_generate_one_slide_uses_single_pass_by_default(tmp_path, monkeypatch):
     calls = []
 
@@ -2351,7 +2474,7 @@ def test_overlay_route_material_ref_does_not_trigger_refinement(tmp_path, monkey
     assert not (tmp_path / "project-overlay-route" / "slide_04_base.png").exists()
 
 
-def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkeypatch):
+def test_generate_one_slide_uses_reference_fidelity_product_refinement_pass(tmp_path, monkeypatch):
     calls = []
 
     def fake_generate_slide_image(prompt, reference_images=None, resolution="4K", aspect_ratio="16:9", project_id=None):
@@ -2393,7 +2516,8 @@ def test_generate_one_slide_uses_hidden_product_refinement_pass(tmp_path, monkey
 
     assert result["error"] is None
     assert len(calls) == 2
-    assert "FIRST PASS" in calls[0]["prompt"]
+    assert "Reference fidelity" in calls[0]["prompt"]
+    assert "FIRST PASS" not in calls[0]["prompt"]
     assert "Use the uploaded product/material image as the source" in calls[0]["prompt"]
     assert "visible text, labels, logos, and small markings" in calls[0]["prompt"]
     assert "fidelity can be approximate" not in calls[0]["prompt"]

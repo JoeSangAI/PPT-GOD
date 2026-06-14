@@ -746,7 +746,7 @@ def _build_batch_prompt(
 为每一页生成五个字段：
 0. visual_evidence：这一页最应该出现的“画面证据/配图对象”（20-45字）。它必须是可被看见的场景、物件、图表、对比结构或商业证据，不能只写风格。
 1. visual_summary：一句话画面意向（20-30字；有参考图时 20-35 字），用于全局预览页快速理解。如"全屏深色背景，中央 DNA 双螺旋光纹"
-2. visual_description：围绕 visual_evidence 写画面方案——**给用户阅读**，也会进入下游 pipeline。**不含**任何必须在页面上逐字渲染的正文（正文由单独约束）。
+2. visual_description：围绕 visual_evidence 写可执行画面方案，只描述画面证据、构图、主次、色调与文字/配图区关系。**不含**任何必须在页面上逐字渲染的正文（正文由单独约束）。
 3. visual_asset_ids：本页需要使用的全局视觉资产 id 数组；无关页面输出 []，最多 3 个
 4. visual_asset_usage：对象，key 为 asset_id，value 为一句中文说明，只说明该资产在本页的用途、位置和叙事作用；无资产输出 {{}}
 {logo_policy_rule}

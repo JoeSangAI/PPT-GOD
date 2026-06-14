@@ -2,7 +2,8 @@ from PIL import Image
 
 from app.models.models import Slide
 from app.services import generation_pipeline
-from app.services.prompt_engine import generate_prompt_for_page
+from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
+from app.services.style_pack import style_pack_from_selected_style
 
 
 def test_seed_ref_layout_instruction_stays_compact(monkeypatch, tmp_path):
@@ -66,6 +67,81 @@ def test_crop_page_references_and_product_assets_trigger_product_refinement():
     ])
 
     assert [ref["role"] for ref in refs] == ["content_ref", "visual_asset"]
+
+
+def test_background_pass_prompt_keeps_reference_fidelity_without_hidden_process_language():
+    prompt = generation_pipeline._background_pass_prompt(
+        "Base prompt.",
+        [{"asset_name": "产品瓶", "role": "visual_asset", "asset_kind": "product"}],
+    )
+
+    assert "Reference fidelity" in prompt
+    assert "Use the uploaded product/material image as the source" in prompt
+    assert "Preserve the referenced people, objects, screenshots, charts" in prompt
+    assert "FIRST PASS" not in prompt
+    assert "hidden" not in prompt.lower()
+    assert "second" not in prompt.lower()
+
+
+def test_manual_visual_edit_prompt_does_not_reapply_global_style_override():
+    prompts = generate_prompts_for_all_pages(
+        visual_plan=[
+            {
+                "page_num": 1,
+                "_artifact": {"kind": "manual_visual_edit"},
+                "style_pack_snapshot": "Style: deep navy black deck\nPalette: #0B1220 dark background",
+                "visual_description": (
+                    "Use a light warm-white background with pale blue panels, dark ink text, "
+                    "and small amber accents."
+                ),
+            }
+        ],
+        content_plan=[
+            {
+                "page_num": 1,
+                "text_content": {"headline": "Manual visual override"},
+            }
+        ],
+        style_text_override="Style: force deep navy black background\nPalette: black and amber",
+    )
+
+    prompt = prompts[0]["prompt"]
+    assert "light warm-white background" in prompt
+    assert "force deep navy black background" not in prompt
+    assert "#0B1220 dark background" not in prompt
+
+
+def test_seed_and_template_hints_do_not_expose_internal_style_pack_language(monkeypatch, tmp_path):
+    captured = []
+
+    def fake_generate_slide_image(*, prompt, **kwargs):
+        captured.append(prompt)
+        return Image.new("RGB", (1792, 1024), "white")
+
+    monkeypatch.setattr(generation_pipeline, "generate_slide_image", fake_generate_slide_image)
+
+    for role in ("seed_ref_hint", "template_hint"):
+        slide = Slide(
+            id=f"slide-{role}",
+            project_id="project",
+            page_num=3,
+            type="content",
+            prompt_text="Base prompt.",
+            visual_json={},
+        )
+        generation_pipeline._generate_one_slide(
+            slide,
+            project_id="project",
+            output_dir=str(tmp_path),
+            preloaded_ref_data=[{"role": role}],
+            run_id="run",
+        )
+
+    appended = "\n".join(prompt.replace("Base prompt.", "") for prompt in captured)
+    assert "grid, hierarchy, palette" in appended
+    assert "style pack" not in appended.lower()
+    assert "already summarized in the prompt" not in appended
+    assert "not attached" not in appended
 
 
 def test_prompt_engine_injects_exact_overlay_reservation_once():
@@ -458,3 +534,96 @@ def test_prompt_engine_assigns_body_to_info_block_for_intro_text_clause():
     assert 'Body: "一份用于商务接待的巴黎及法国重点目的地导览。"' not in prompt
     assert "右下浅黄色信息块承载副标题与简介文字" not in prompt
     assert "右下浅黄色信息块" in prompt
+
+
+def test_final_prompt_omits_selected_style_choice_rationale():
+    style_pack = style_pack_from_selected_style({
+        "name": "深空蓝黑 + 琥珀光点",
+        "palette": [
+            {"name": "深空蓝黑", "hex": "#0B1220"},
+            {"name": "琥珀金", "hex": "#E6A957"},
+            {"name": "近白", "hex": "#F4F4EF"},
+        ],
+        "mood": "深静、科幻感、商务",
+        "font": "无衬线黑体，标题加粗",
+        "description": (
+            "选它如果你更看重：想让观众第一眼记住这份 PPT 在讲'AI 时代的新增长公式'，"
+            "并感受到品牌/讲者的专业前瞻感 视觉重点是深色封面 + 浅色正文页的强对比节奏，"
+            "用琥珀光高亮关键公式和转折点 需要接受的取舍是封面和章节页视觉冲击强，"
+            "但需要克制正文页的装饰密度，否则 10 页下来会视觉疲劳。"
+        ),
+        "best_for": "想让观众第一眼记住这份 PPT 在讲'AI 时代的新增长公式'。",
+        "tradeoff": "封面和章节页视觉冲击强，但正文页装饰密度需要克制。",
+        "visual_focus": "深色封面 + 浅色正文页的强对比节奏，用琥珀光高亮关键公式和转折点。",
+        "content_style_hint": "深色封面 + 浅色正文页的强对比节奏，用琥珀光高亮关键公式和转折点。",
+    })
+
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 6,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "ChatGPT 多轮问答流程 vs 右侧 Agent 一句话触发 5 步自主拆解的对比结构",
+            "visual_description": "左半区放多轮问答气泡，右半区用中心请求连接 5 个放射状子步骤节点。",
+        },
+        content_text={
+            "headline": '从"问问题"切换到"给任务"',
+            "body": [
+                "指挥能力一·规划：你给目标，它自己拆步骤。",
+                "指挥能力二·工具使用：联网搜索、读写文件、执行脚本。",
+            ],
+        },
+        reference_images=[],
+        style_text_override=style_pack,
+    )
+
+    assert "深色封面 + 浅色正文页的强对比节奏" in prompt
+    assert "琥珀光高亮关键公式和转折点" in prompt
+    assert "选它如果" not in prompt
+    assert "更看重" not in prompt
+    assert "需要接受的取舍" not in prompt
+    assert "第一眼记住" not in prompt
+
+
+def test_prompt_engine_strips_visual_plan_field_instructions_from_page_intent():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 1,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "增长曲线；visual_evidence 字段用于全局预览页快速理解",
+            "visual_description": (
+                "右侧画增长曲线；这段给用户阅读，也会进入下游 pipeline；"
+                "visual_description 字段不要写正文原句"
+            ),
+        },
+        content_text={"headline": "增长公式", "body": "用 Agentic AI 改写增长路径"},
+        reference_images=[],
+        style_text_override="Style: 深色科技\nPalette: #0B1220, #E6A957",
+    )
+
+    assert "增长曲线" in prompt
+    assert "右侧画增长曲线" in prompt
+    assert "给用户阅读" not in prompt
+    assert "下游 pipeline" not in prompt
+    assert "visual_description 字段" not in prompt
+    assert "visual_evidence 字段" not in prompt
+    assert "全局预览页" not in prompt
+
+
+def test_prompt_engine_preserves_legitimate_json_field_visual_subjects():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 2,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "API JSON 字段结构图",
+            "visual_description": "左侧画 API JSON 字段关系图，右侧放三层数据流卡片",
+        },
+        content_text={"headline": "接口数据结构", "body": "用字段映射解释系统如何传递数据"},
+        reference_images=[],
+        style_text_override="Style: 技术文档\nPalette: #101820, #E8F0F8",
+    )
+
+    assert "API JSON 字段结构图" in prompt
+    assert "左侧画 API JSON 字段关系图" in prompt

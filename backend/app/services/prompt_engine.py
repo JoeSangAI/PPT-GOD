@@ -7,6 +7,7 @@ from app.services.overlay_layers import (
     overlay_reservation_instruction,
 )
 from app.services.section_text import sanitize_section_visual_numbering, should_render_section_title
+from app.services.style_pack import clean_image_prompt_style_text
 from app.services.visual_directives import (
     extract_visual_directives,
     normalize_visual_requirements,
@@ -116,8 +117,12 @@ def _compact_style_pack(style_text: str, max_lines: int = 6, max_chars: int = 76
                 if keyword == "Typography:":
                     cleaned = _image_typography_line(line)
                 else:
+                    payload = clean_image_prompt_style_text(line[len(keyword):].strip())
+                    if not payload:
+                        break
+                    cleaned_line = f"{keyword} {payload}"
                     cleaned = _remove_brand_mark_drawing_language(
-                        _remove_microcopy_clauses(_remove_negative_clauses(line))
+                        _remove_microcopy_clauses(_remove_negative_clauses(cleaned_line))
                     )
                 if cleaned and keyword not in priority_by_key:
                     priority_by_key[keyword] = cleaned
@@ -464,12 +469,53 @@ _REFERENCE_METADATA_MARKERS = (
     "tags=", "usage=", "group=", "ppt_page_", ".pptx", "AI参考", "AI 参考",
 )
 
+_PROMPT_PROCESS_FIELD_MARKERS = (
+    "visual_evidence", "visualsummary", "visual_summary", "visualdescription",
+    "visual_description", "visual_asset_ids", "visualassetids", "visual_asset_usage",
+    "visualassetusage", "logo_policy", "logopolicy", "overlay_layout",
+    "overlaylayout", "reference_context", "referencecontext", "prompt_text",
+    "style_pack", "stylepack", "must_consider_visual_assets",
+)
+
+_PROMPT_PROCESS_PHRASES = (
+    "给用户阅读", "下游pipeline", "下游 prompt", "进入下游", "进入prompt",
+    "全局预览页", "用于全局预览", "输出格式", "严格输出json", "输出json",
+)
+
 
 def _looks_like_internal_reference_metadata(clause: str) -> bool:
     compact = re.sub(r"\s+", "", str(clause or "")).lower()
     if re.search(r"参考图\d+", compact):
         return True
     return any(marker.lower().replace(" ", "") in compact for marker in _REFERENCE_METADATA_MARKERS)
+
+
+def _looks_like_prompt_process_metadata(clause: str) -> bool:
+    raw = str(clause or "")
+    compact = re.sub(r"\s+", "", raw).lower()
+    if not compact:
+        return False
+    if any(marker.lower().replace(" ", "") in compact for marker in _PROMPT_PROCESS_FIELD_MARKERS):
+        return True
+    if any(phrase.lower().replace(" ", "") in compact for phrase in _PROMPT_PROCESS_PHRASES):
+        return True
+    if ("字段" in raw or "field" in compact) and any(
+        token in compact
+        for token in ("输出", "格式", "page_num", "对象", "key为", "prompt")
+    ):
+        return True
+    return False
+
+
+def _strip_prompt_process_metadata(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    clauses = _split_clauses(raw)
+    if not clauses:
+        return raw
+    kept = [clause for clause in clauses if not _looks_like_prompt_process_metadata(clause)]
+    return "；".join(kept).strip()
 
 
 def _strip_internal_reference_metadata(text: str) -> str:
@@ -579,6 +625,7 @@ def _sanitize_product_reference_text(text: str) -> str:
 def _compact_visual_evidence(page_intent: Dict, reference_images: Optional[List[Dict]] = None) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     visual_evidence = _strip_internal_reference_metadata(visual_evidence)
+    visual_evidence = _strip_prompt_process_metadata(visual_evidence)
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
@@ -594,6 +641,7 @@ def _compact_visual_evidence_with_style(
 ) -> str:
     visual_evidence = str(page_intent.get("visual_evidence", "") or "").strip()
     visual_evidence = _strip_internal_reference_metadata(visual_evidence)
+    visual_evidence = _strip_prompt_process_metadata(visual_evidence)
     if _has_product_ref(reference_images):
         visual_evidence = _sanitize_product_reference_text(visual_evidence)
     visual_evidence = _remove_brand_mark_drawing_language(visual_evidence)
@@ -614,6 +662,7 @@ def _compact_layout_intent(
     layout = page_intent.get("layout") or page_intent.get("type", "content")
     visual_desc = " ".join(str(page_intent.get("visual_description", "")).split())
     visual_desc = _strip_internal_reference_metadata(visual_desc)
+    visual_desc = _strip_prompt_process_metadata(visual_desc)
     visual_desc = _remove_negative_clauses(visual_desc)
     if _has_product_ref(reference_images):
         visual_desc = _sanitize_product_reference_text(visual_desc)
@@ -639,6 +688,7 @@ def _compact_reference_text(text: str, max_chars: int = 260) -> str:
 
 def _reference_context_text(text: str, max_chars: int = 180) -> str:
     cleaned = _strip_internal_reference_metadata(text)
+    cleaned = _strip_prompt_process_metadata(cleaned)
     return _compact_reference_text(cleaned, max_chars) if cleaned else ""
 
 
@@ -737,7 +787,7 @@ def _protected_assets_block(reference_images: Optional[List[Dict]]) -> str:
             if str(ref.get("asset_route_mode") or "").lower() == "blend":
                 rule = "use the uploaded product image as a natural scene reference."
             else:
-                rule = "use the uploaded product image as the product source; a hidden refinement pass strengthens fidelity."
+                rule = "use the uploaded product image as the product source; preserve product identity and visible details."
         lines.append(f"{idx}. {label} — {rule}")
 
     return "Assets:\n" + "\n".join(lines)
@@ -810,7 +860,7 @@ def _reference_descriptions_for_prompt(
                     page_usage = str(usage_map.get(img.get("id")) or "")
                 if route_mode == "double_blend":
                     rule = (
-                        f"Product slot: {asset_name}. Use the uploaded product image as the product source; product fidelity is reinforced in a hidden refinement pass."
+                        f"Product slot: {asset_name}. Use the uploaded product image as the product source; preserve product identity and visible details."
                     )
                 elif str(asset_kind).lower() in {"product", "material"}:
                     rule = (
@@ -867,7 +917,17 @@ def generate_prompt_for_page(
     logger.info(f"PromptEngine: 为第 {page_intent.get('page_num')} 页生成 Final Prompt")
     content_text, visual_intents, diagram_labels = _content_visual_contract(content_text or {})
 
-    if style_text_override is not None:
+    artifact = page_intent.get("_artifact") if isinstance(page_intent, dict) else {}
+    artifact_kind = str(artifact.get("kind") or "") if isinstance(artifact, dict) else ""
+    if artifact_kind == "manual_visual_edit":
+        style_text = (
+            "Style: follow this page's manually edited visual_description and design_notes\n"
+            "Palette: use the page-specific colors named in visual_description\n"
+            "Mood: preserve the edited page intent over project-level defaults\n"
+            "Typography: keep the project typeface feel unless the manual edit says otherwise\n"
+            "Visual rhythm: follow the edited page layout and contrast"
+        )
+    elif style_text_override is not None:
         style_text = style_text_override
     elif isinstance(page_intent, dict) and page_intent.get("style_pack_snapshot"):
         style_text = str(page_intent.get("style_pack_snapshot") or "")

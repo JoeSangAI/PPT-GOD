@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 import redis
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
@@ -632,6 +632,19 @@ def _load_reference_images(
         else:
             logger.warning(f"微调底图文件不存在: {finetune_base_path}")
 
+    finetune_regions = _finetune_regions_for_slide(slide)
+    if finetune_base_path and refs and finetune_regions:
+        guide = _finetune_region_guide_image(refs[0]["image"], finetune_regions)
+        if guide:
+            guide.info["pptgod_reference_role"] = "finetune_region_guide"
+            refs.append({
+                "image": guide,
+                "process_mode": "original",
+                "role": "finetune_region_guide",
+                "label": "Selected Region Visual Guide",
+            })
+            logger.info(f"Slide {slide.page_num}: 已添加微调框选区域视觉标注图，共 {len(finetune_regions)} 个区域")
+
     finetune_visual_asset_ids = []
     if finetune_base_path and slide.visual_json and isinstance(slide.visual_json, dict):
         raw_asset_ids = slide.visual_json.get("finetune_visual_asset_ids") or []
@@ -1059,6 +1072,96 @@ def _uses_direct_finetune_ref(ref_data: List[Dict]) -> bool:
     return any(ref.get("role") == "finetune_base" for ref in ref_data)
 
 
+def _finetune_regions_for_slide(slide: Slide) -> List[Dict]:
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    regions = visual.get("finetune_regions") or []
+    normalized: List[Dict] = []
+    if not isinstance(regions, list):
+        return normalized
+    for index, region in enumerate(regions):
+        if not isinstance(region, dict):
+            continue
+        bbox = region.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+        try:
+            x = max(0.0, min(1.0, float(bbox.get("x", 0))))
+            y = max(0.0, min(1.0, float(bbox.get("y", 0))))
+            width = max(0.0, min(1.0 - x, float(bbox.get("width", 0))))
+            height = max(0.0, min(1.0 - y, float(bbox.get("height", 0))))
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        normalized.append({
+            "id": str(region.get("id") or f"region-{index + 1}"),
+            "label": str(region.get("label") or f"Region {index + 1}"),
+            "bbox": {"x": x, "y": y, "width": width, "height": height},
+        })
+    return normalized
+
+
+def _region_pixel_bounds(bbox: Dict, width: int, height: int) -> tuple[int, int, int, int]:
+    x1 = max(0, min(width, int(round(float(bbox["x"]) * width))))
+    y1 = max(0, min(height, int(round(float(bbox["y"]) * height))))
+    x2 = max(0, min(width, int(round((float(bbox["x"]) + float(bbox["width"])) * width))))
+    y2 = max(0, min(height, int(round((float(bbox["y"]) + float(bbox["height"])) * height))))
+    return x1, y1, x2, y2
+
+
+def _finetune_region_edit_mask(base_image: Image.Image, regions: List[Dict]) -> Image.Image | None:
+    if not regions:
+        return None
+    width, height = base_image.size
+    mask = Image.new("RGBA", (width, height), (0, 0, 0, 255))
+    draw = ImageDraw.Draw(mask, "RGBA")
+    for region in regions:
+        x1, y1, x2, y2 = _region_pixel_bounds(region["bbox"], width, height)
+        if x2 > x1 and y2 > y1:
+            draw.rectangle((x1, y1, x2, y2), fill=(0, 0, 0, 0))
+    return mask
+
+
+def _finetune_region_composite_mask(size: tuple[int, int], regions: List[Dict]) -> Image.Image | None:
+    if not regions:
+        return None
+    width, height = size
+    mask = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask)
+    for region in regions:
+        x1, y1, x2, y2 = _region_pixel_bounds(region["bbox"], width, height)
+        if x2 > x1 and y2 > y1:
+            draw.rectangle((x1, y1, x2, y2), fill=255)
+    return mask.filter(ImageFilter.GaussianBlur(1.2))
+
+
+def _restore_unselected_finetune_pixels(base_image: Image.Image, edited_image: Image.Image, regions: List[Dict]) -> Image.Image:
+    composite_mask = _finetune_region_composite_mask(edited_image.size, regions)
+    if composite_mask is None:
+        return edited_image
+    base = ImageOps.exif_transpose(base_image).convert("RGB")
+    edited = ImageOps.exif_transpose(edited_image).convert("RGB")
+    if base.size != edited.size:
+        base = base.resize(edited.size, Image.Resampling.LANCZOS)
+    return Image.composite(edited, base, composite_mask)
+
+
+def _finetune_region_guide_image(base_image: Image.Image, regions: List[Dict]) -> Image.Image | None:
+    if not regions:
+        return None
+    guide = ImageOps.exif_transpose(base_image).convert("RGBA")
+    overlay = Image.new("RGBA", guide.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    width, height = guide.size
+    stroke = max(4, round(min(width, height) * 0.006))
+    for region in regions:
+        x1, y1, x2, y2 = _region_pixel_bounds(region["bbox"], width, height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        draw.rectangle((x1, y1, x2, y2), fill=(255, 0, 0, 28), outline=(255, 0, 0, 255), width=stroke)
+    return Image.alpha_composite(guide, overlay).convert("RGB")
+
+
 def _product_refinement_refs(ref_data: List[Dict]) -> List[Dict]:
     refs = []
     for ref in ref_data:
@@ -1088,12 +1191,11 @@ def _background_pass_prompt(prompt: str, product_refs: List[Dict]) -> str:
     ref_label = " / ".join(ref_names[:3]) if ref_names else "the uploaded reference material"
     return (
         prompt
-        + "\n\nFIRST PASS: generate the complete slide using the supplied reference material, including "
+        + "\n\nReference fidelity: generate the complete slide using the supplied reference material, including "
         f"{ref_label}. Use the uploaded product/material image as the source for the corresponding object. "
         "Preserve the referenced people, objects, screenshots, charts, shape, color blocks, visible text, "
-        "labels, logos, and small markings as much as possible already in this pass. Do not invent a "
-        "different subject or reduce it to generic shapes. "
-        "A second hidden refinement pass will further strengthen the same reference-material details."
+        "labels, logos, and small markings as much as possible. Do not invent a different subject or reduce it "
+        "to generic shapes."
     )
 
 
@@ -1185,9 +1287,9 @@ def _detect_local_refinement_slots(base_path: str, product_refs: list[Dict]) -> 
     if len(product_refs) <= 1:
         return []
     try:
-        from app.services.editable_pptx_export import detect_image_blocks
+        from app.services.visual_slot_detection import detect_image_blocks
 
-        blocks = detect_image_blocks(base_path, [])
+        blocks = detect_image_blocks(base_path, [], max_assets=6)
     except Exception as exc:
         logger.warning("Pipeline: local slot detection failed for %s: %s", base_path, exc)
         return []
@@ -1351,6 +1453,19 @@ def _generate_one_slide(
         first_pass_ref_data = list(ref_data)
         ref_images = [r["image"] for r in first_pass_ref_data if r.get("image") is not None]
         prompt = slide.prompt_text
+        finetune_regions = _finetune_regions_for_slide(slide)
+        finetune_base_ref = next(
+            (
+                ref for ref in first_pass_ref_data
+                if ref.get("role") == "finetune_base" and ref.get("image") is not None
+            ),
+            None,
+        )
+        edit_mask = (
+            _finetune_region_edit_mask(finetune_base_ref["image"], finetune_regions)
+            if finetune_base_ref and finetune_regions
+            else None
+        )
 
         # 当本页带有种子参考图时，在 prompt 末尾追加一行明确告知模型，
         # 让它把同家族种子页当作版式锚点 — 不复制内容、只复用视觉系统。
@@ -1370,8 +1485,8 @@ def _generate_one_slide(
             prompt = prompt + seed_instruction
         elif seed_hint_count > 0:
             prompt = prompt + (
-                "\n\nSAME-FAMILY VISUAL CONTINUITY: Seed slides exist but are not attached. "
-                "Follow the selected style pack's grid, hierarchy, palette, typography scale, and ornament language. "
+                "\n\nSAME-FAMILY VISUAL CONTINUITY: Follow the deck's established grid, hierarchy, palette, "
+                "typography scale, and ornament language. "
                 "Keep this slide's own text and visual evidence."
             )
         elif template_ref_count > 0:
@@ -1379,7 +1494,7 @@ def _generate_one_slide(
         elif template_hint_count > 0:
             prompt = prompt + (
                 "\n\nTEMPLATE STYLE MEMORY: Use only the template-derived layout, spacing, hierarchy, "
-                "palette relationship, typography rhythm, and ornament language already summarized in the prompt. "
+                "palette relationship, typography rhythm, and ornament language. "
                 "Do not copy old template text, images, products, logos, portraits, people, or scene subjects."
             )
         if page_reference_fidelity:
@@ -1402,16 +1517,27 @@ def _generate_one_slide(
             template_uploaded_reference_count=template_ref_count,
             template_hint_count=template_hint_count,
             product_refinement=use_product_refinement,
+            finetune_region_count=len(finetune_regions),
+            edit_mask=bool(edit_mask),
             **_prompt_audit(prompt),
         )
 
-        img = generate_slide_image(
-            prompt=prompt,
-            reference_images=ref_images if ref_images else None,
-            resolution="4K",
-            aspect_ratio="16:9",
-            project_id=project_id,
-        )
+        image_generation_kwargs = {
+            "prompt": prompt,
+            "reference_images": ref_images if ref_images else None,
+            "resolution": "4K",
+            "aspect_ratio": "16:9",
+            "project_id": project_id,
+        }
+        if edit_mask:
+            image_generation_kwargs["edit_mask"] = edit_mask
+        img = generate_slide_image(**image_generation_kwargs)
+        if edit_mask and finetune_base_ref:
+            img = _restore_unselected_finetune_pixels(
+                finetune_base_ref["image"],
+                img,
+                finetune_regions,
+            )
 
         if use_product_refinement:
             base_path = save_slide_image(
@@ -1721,6 +1847,7 @@ def run_generation_pipeline(
                         "finetune_instruction",
                         "finetune_attachment_ids",
                         "finetune_visual_asset_ids",
+                        "finetune_regions",
                     }
                 }
                 flag_modified(slide, "visual_json")

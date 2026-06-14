@@ -337,25 +337,6 @@ export function getDownloadUrl(projectId: string, prototype?: boolean) {
   return url.toString();
 }
 
-export type EditablePptxMode = "standard" | "enhanced" | "aggressive";
-
-export async function startEditablePptx(projectId: string, restoreMode: EditablePptxMode = "standard") {
-  const res = await apiFetch(`${API_BASE}/projects/${projectId}/editable-pptx`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ restore_mode: restoreMode }),
-  });
-  return (await checkRes(res)).json();
-}
-
-export function getEditableDownloadUrl(projectId: string, restoreMode: EditablePptxMode = "standard") {
-  const url = makeApiUrl(`/projects/${projectId}/download-editable`);
-  url.searchParams.set("restore_mode", restoreMode);
-  const testerId = getStoredAuth()?.testerId;
-  if (testerId) url.searchParams.set("tester_id", testerId);
-  return url.toString();
-}
-
 export function getContentPlanMarkdownUrl(projectId: string) {
   const url = makeApiUrl(`/projects/${projectId}/slides/export-markdown`);
   const testerId = getStoredAuth()?.testerId;
@@ -497,11 +478,22 @@ export async function restoreSlideVersion(projectId: string, slideId: string, ve
   return (await checkRes(res)).json();
 }
 
-export async function finetuneSlide(projectId: string, slideId: string, instruction: string, attachmentIds?: string[]) {
+export interface FinetuneRegion {
+  id?: string;
+  label?: string;
+  bbox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
+
+export async function finetuneSlide(projectId: string, slideId: string, instruction: string, attachmentIds?: string[], regions?: FinetuneRegion[]) {
   const res = await apiFetch(`${API_BASE}/projects/${projectId}/slides/${slideId}/finetune`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ instruction, attachment_ids: attachmentIds || [] }),
+    body: JSON.stringify({ instruction, attachment_ids: attachmentIds || [], regions: regions || [] }),
   });
   return (await checkRes(res)).json();
 }
@@ -563,9 +555,6 @@ export async function* chatWithAgentStream(
         if (normalizedLine.startsWith("data: ")) {
           try {
             const data = JSON.parse(normalizedLine.slice(6));
-            if (import.meta.env.DEV) {
-              console.debug("[chatWithAgentStream] yield event:", data.type);
-            }
             yield data;
           } catch {
             // ignore malformed lines

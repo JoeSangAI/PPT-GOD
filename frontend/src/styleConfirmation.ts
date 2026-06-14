@@ -10,7 +10,7 @@ export interface StyleConfirmationResult {
 
 function normalizeChoiceText(value: any): string {
   return String(value || "")
-    .replace(/[\s。.!！?？,，、:：;；~～"'“”‘’（）()【】\[\]_-]+/g, "")
+    .replace(/[\s。.!！?？,，、:：;；~～"'“”‘’（）()【】[\]_-]+/g, "")
     .toLowerCase();
 }
 

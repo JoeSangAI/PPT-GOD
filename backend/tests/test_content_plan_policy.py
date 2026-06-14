@@ -113,6 +113,96 @@ def test_explicit_chinese_one_page_request_is_preserved():
     assert resolve_content_plan_page_target("做成一页 PPT：恒河猴实验", 1) == (1, 1, 2)
 
 
+def test_per_page_feedback_is_not_treated_as_one_page_request():
+    topic = "原来演讲的体量每一页的 ppt 内容要更有深度一些。每一页的内容可以再增加一点。"
+
+    assert content_plan_module.infer_page_count_from_topic(topic) is None
+    assert resolve_requested_content_plan_page_count(topic, 60) == 60
+
+
+def test_colloquial_chinese_page_range_survives_numbered_brief_items():
+    topic = """我要做一个完整的《增长黑客》这本书的 PPT。
+
+你先去搜一下这本书的全文内容，然后再把它做成一个 PPT，要求如下：
+1. 篇幅大概三四十页
+2. 内容要详实，要让人家看完这个 PPT 就能大概知道《增长黑客》这本书讲了什么"""
+
+    assert content_plan_module.infer_page_count_range_from_topic(topic) == (30, 40)
+    assert content_plan_module.infer_page_count_from_topic(topic) == 40
+    assert resolve_content_plan_page_target(topic, None) == (40, 30, 40)
+
+    job = content_plan_module._build_content_plan_job(topic=topic, documents="")
+    assert job.page_count == 40
+    assert job.min_pages == 30
+    assert job.max_pages == 40
+
+    brief_documents = f'--- SOURCE filename="brief" kind="brief" pages="1" ---\n--- PAGE 1 ---\n{topic}'
+    assert resolve_content_plan_page_target(topic, 40, brief_documents) == (40, 30, 40)
+
+
+def test_page_unit_before_numbered_list_item_is_not_page_count():
+    topic = """做成一个 PPT，要求如下：
+1. 篇幅尽量多页
+2. 内容要详实"""
+
+    assert content_plan_module.infer_page_count_from_topic(topic) is None
+    assert resolve_content_plan_page_target(topic, None) == (10, 9, 11)
+
+
+def test_low_confidence_tiny_target_does_not_trim_model_expanded_outline():
+    def outline(page_total: int) -> list[dict]:
+        return [
+            {
+                "page_num": idx,
+                "type": "cover" if idx == 1 else "ending" if idx == page_total else "content",
+                "section_title": "增长黑客",
+                "text_content": {
+                    "headline": f"第 {idx} 页",
+                    "body": "" if idx == 1 else f"- 具体内容 {idx}",
+                },
+                "speaker_notes": f"讲解第 {idx} 页",
+            }
+            for idx in range(1, page_total + 1)
+        ]
+
+    preserved = content_plan_module._normalize_outline_page_count(
+        outline(32),
+        2,
+        strict_page_count=False,
+        allow_expanded_outline_override=True,
+    )
+    trimmed = content_plan_module._normalize_outline_page_count(
+        outline(32),
+        2,
+        strict_page_count=False,
+        allow_expanded_outline_override=False,
+    )
+    strict_trimmed = content_plan_module._normalize_outline_page_count(
+        outline(32),
+        2,
+        strict_page_count=True,
+        allow_expanded_outline_override=True,
+    )
+
+    assert len(preserved) == 32
+    assert preserved[0]["type"] == "cover"
+    assert preserved[-1]["type"] == "ending"
+    assert [page["page_num"] for page in preserved] == list(range(1, 33))
+    assert len(trimmed) == 3
+    assert len(strict_trimmed) == 2
+
+
+def test_explicit_chinese_one_page_request_disables_expanded_outline_override():
+    job = content_plan_module._build_content_plan_job(
+        topic="做成一页 PPT：恒河猴实验",
+        page_count=1,
+        documents="",
+    )
+
+    assert job.page_count == 1
+    assert job.allow_expanded_outline_override is False
+
+
 def test_long_page_target_uses_deck_blueprint():
     assert _should_generate_deck_blueprint((60, 80), 80, "课程材料")
     assert _should_generate_deck_blueprint(None, 60, "课程材料")
@@ -1084,6 +1174,156 @@ def test_source_capacity_contract_expands_without_keyword_matching():
     assert should_generate_incremental_long_deck("请做成一份 PPT", None, documents, intent_contract=contract)
 
 
+def test_latest_per_page_depth_feedback_no_longer_translates_contract():
+    """用户说'加深'不应再被翻译成 contract 字段；原话应进 topic（标记"必须采纳"）。"""
+    documents = _medium_length_course_manuscript()
+    legacy_contract = {
+        "task_type": "polish",
+        "rewrite_level": "light",
+        "page_order_policy": "preserve",
+        "page_count_policy": "same",
+        "source_fidelity": "faithful",
+        "visual_source_use": "page_reference",
+        "confidence": 0.82,
+        "evidence": ["已上传讲稿"],
+    }
+    chat_context_text = (
+        "原来演讲的体量每一页的 ppt 内容要更有深度一些。"
+        "每一页的内容可以再增加一点。"
+    )
+
+    job = content_plan_module._build_content_plan_job(
+        topic="张帆 AI 与企业战略融合",
+        documents=documents,
+        intent_contract=legacy_contract,
+        chat_context=chat_context_text,
+    )
+
+    # contract.depth 不再被翻译成 "deep"（保持原 contract 状态）
+    assert job.intent_contract.get("depth") != "deep"
+    # 用户原话进 topic，且被显式标记为"必须采纳"
+    assert "深度" in job.topic
+    assert "必须采纳" in job.topic
+    assert chat_context_text in job.topic
+
+
+def test_agent_chat_context_restores_page_count_when_topic_is_summarized():
+    topic = "《增长黑客》读书分享 PPT"
+    chat_context = """用户：我要做一个完整的《增长黑客》这本书的 PPT。
+
+你先去搜一下这本书的全文内容，然后再把它做成一个 PPT，要求如下：
+1. 篇幅大概三四十页
+2. 内容要详实，要让人家看完这个 PPT 就能大概知道《增长黑客》这本书讲了什么"""
+
+    combined_topic = content_plan_module.content_plan_topic_with_chat_context(topic, chat_context)
+
+    assert resolve_content_plan_page_target(combined_topic, 3) == (40, 30, 40)
+
+
+def test_explicit_page_count_survives_latest_depth_feedback_same_source_contract():
+    documents = _medium_length_course_manuscript()
+    legacy_contract = {
+        "task_type": "polish",
+        "rewrite_level": "light",
+        "page_order_policy": "preserve",
+        "page_count_policy": "same",
+        "source_fidelity": "faithful",
+        "visual_source_use": "page_reference",
+        "confidence": 0.82,
+        "evidence": ["已上传讲稿"],
+    }
+
+    job = content_plan_module._build_content_plan_job(
+        topic="张帆 AI 与企业战略融合",
+        documents=documents,
+        page_count=60,
+        intent_contract=legacy_contract,
+        chat_context=(
+            "原来演讲的体量每一页的 ppt 内容要更有深度一些。"
+            "每一页的内容可以再增加一点。"
+        ),
+    )
+
+    assert job.page_count == 60
+    assert job.min_pages > 1
+    assert content_plan_module._select_content_plan_strategy(job) == "page_map"
+
+
+def test_abstract_quality_constraints_injected_into_page_map_prompt(monkeypatch):
+    """abstract constraints 应注入到 page_map prompt；旧硬编码 bullet 模板不再出现。"""
+    captured = {}
+    contract = {
+        "task_type": "teaching_deck",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "source_capacity",
+        "structure_policy": "source_order",
+        "confidence": 0.9,
+        "evidence": ["每页内容再增加一点"],
+    }
+
+    class FakeMessage:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = FakeMessage(content)
+
+    class FakeResponse:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            prompt = kwargs["messages"][1]["content"]
+            captured["prompt"] = prompt
+            return FakeResponse(
+                "P1｜cover｜封面｜张帆 AI 与企业战略融合\n"
+                "备注：开场。\n"
+                "视觉：封面\n\n"
+                "P2｜content｜内容｜为什么这场课不一样\n"
+                "- 企业家正在既兴奋又焦虑的状态中学习 AI\n"
+                "- 工具层出不穷但少有沉淀，需要回到第一性\n"
+                "- 本页要把从工具焦虑到战略重构的转场讲清楚\n"
+                "- 听众需要意识到 AI 不是工具清单，而是业务系统变量\n"
+                "备注：先承接现场焦虑，再把讨论拉回不变的底层逻辑。\n"
+                "视觉：内容页"
+            )
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: FakeClient())
+
+    content_plan_module._generate_model_page_map(
+        topic="张帆 AI 与企业战略融合",
+        audience="企业家",
+        documents="## 为什么这场课不一样\n企业家既兴奋又焦虑。",
+        page_goal_text="生成 2 页",
+        target_count=2,
+        min_pages=2,
+        max_pages=2,
+        intent_contract=contract,
+    )
+
+    # 新输出视角信号
+    assert "产出目标" in captured["prompt"]
+    assert "PPT 应当准确体现用户的真实意图" in captured["prompt"]
+    assert "好 PPT 的特征" in captured["prompt"]
+    assert "避免的输出形态" in captured["prompt"]
+    assert "label: content" in captured["prompt"]
+    # 旧硬编码 bullet 模板不再出现
+    assert "每页 4-6 个具体 bullet" not in captured["prompt"]
+    assert "判断、依据、案例" not in captured["prompt"]
+    assert "2-3 个具体 bullet" not in captured["prompt"]
+
+
 def test_compact_summary_contract_stays_compact_for_same_document():
     documents = _medium_length_course_manuscript()
     contract = {
@@ -1110,7 +1350,8 @@ def test_compact_summary_contract_stays_compact_for_same_document():
     assert not should_generate_incremental_long_deck("请做成一份 PPT", None, documents, intent_contract=contract)
 
 
-def test_director_contract_policy_text_describes_restoration_requirements():
+def test_intent_contract_policy_text_returns_abstract_quality_constraints():
+    """director_policy 应返回 abstract constraints，不再读 contract 字段做翻译。"""
     text = content_plan_module._intent_contract_policy_text({
         "task_type": "teaching_deck",
         "source_use": "faithful",
@@ -1123,9 +1364,17 @@ def test_director_contract_policy_text_describes_restoration_requirements():
         "evidence": ["尽量完整"],
     })
 
-    assert "尽量完整覆盖上传材料" in text
-    assert "不要压缩成摘要" in text
-    assert "保留原文结构和讲述顺序" in text
+    # 新输出视角信号
+    assert "产出目标" in text
+    assert "PPT 应当准确体现用户的真实意图" in text
+    assert "好 PPT 的特征" in text
+    assert "避免的输出形态" in text
+    assert "label: content" in text
+    assert "标题必须是判断句" in text
+    # 旧的 contract 字段翻译不再出现
+    assert "尽量完整覆盖上传材料" not in text
+    assert "不要压缩成摘要" not in text
+    assert "保留原文结构和讲述顺序" not in text
 
 
 def test_restoration_priority_does_not_override_explicit_short_page_count():
@@ -2874,7 +3123,9 @@ def test_long_deck_outline_generates_in_blueprint_chunks(monkeypatch):
             assert "封面标题必须使用真实课程主题" in prompt
             assert "演讲备注必须具体" in prompt
             assert "text_content.body 是页面卡片/PPT 上可见的正文区域" in prompt
-            assert "content/data 页的 text_content.body 必须写 2-4 行具体正文或 bullet" in prompt
+            assert "text_content.body 必须写得言之有物" in prompt
+            assert "PPT 应当准确体现当前用户的真实意图" in prompt
+            assert "label: content" in prompt
             assert "headline 不得与【已生成页面摘要】中的任何 headline 重复" in prompt
             match = re.search(r"只生成第 (\d+) 页到第 (\d+) 页", prompt)
             assert match
@@ -3038,7 +3289,9 @@ def test_long_deck_single_chunk_normalizes_page_numbers(monkeypatch):
             assert "不要使用“续2”“续3”" in prompt
             assert "演讲备注必须具体" in prompt
             assert "text_content.body 是页面卡片/PPT 上可见的正文区域" in prompt
-            assert "content/data 页的 text_content.body 必须写 2-4 行具体正文或 bullet" in prompt
+            assert "text_content.body 必须写得言之有物" in prompt
+            assert "PPT 应当准确体现当前用户的真实意图" in prompt
+            assert "label: content" in prompt
             assert "headline 不得与【已生成页面摘要】中的任何 headline 重复" in prompt
             return FakeResponse()
 

@@ -827,6 +827,7 @@ def test_topic_style_proposals_are_actionable_decision_choices():
         assert proposal.get("best_for")
         assert proposal.get("tradeoff")
         assert proposal.get("visual_focus")
+        assert proposal.get("content_style_hint")
         assert "选它如果" in proposal["description"]
 
 
@@ -854,6 +855,7 @@ def test_content_derived_style_pack_keeps_ancient_rome_subject(monkeypatch):
                 "mood": "史诗、粗粝、古典、戏剧化",
                 "font": "衬线体，标题加粗",
                 "description": "以古罗马竞技场为灵感的史诗风格，深炭黑配琥珀金与暗红，呈现角斗士的血腥舞台。",
+                "content_style_hint": "每页画面证据必须来自古罗马角斗士主题：斗兽场、短剑、盾牌、盔甲、雕塑、石柱、观众席。",
             }
         ]
 
@@ -918,7 +920,7 @@ def test_prompt_inherits_ancient_rome_style_pack_subject():
     assert "Visual rhythm:" in prompt
 
 
-def test_selected_style_description_survives_as_visual_rhythm():
+def test_selected_style_content_style_hint_survives_as_visual_rhythm():
     selected_style = {
         "name": "古罗马竞技史诗风",
         "palette": [
@@ -927,7 +929,8 @@ def test_selected_style_description_survives_as_visual_rhythm():
         ],
         "mood": "史诗、粗粝、古典",
         "font": "标题用古典衬线，正文用高可读黑体。",
-        "description": "配图优先斗兽场、盾牌、短剑、雕塑和观众席，整体保持历史史诗与古典材质方向。",
+        "description": "这套风格适合古罗马主题展示。",
+        "content_style_hint": "配图优先斗兽场、盾牌、短剑、雕塑和观众席，整体保持历史史诗与古典材质方向。",
     }
 
     style_pack = style_pack_from_selected_style(selected_style)
@@ -936,3 +939,89 @@ def test_selected_style_description_survives_as_visual_rhythm():
     assert "Visual rhythm:" in compact
     assert "斗兽场" in compact
     assert "短剑" in compact
+
+
+def test_selected_style_pack_ignores_decision_fields_without_image_facing_hint():
+    selected_style = {
+        "name": "深空蓝黑 + 琥珀光点",
+        "palette": [
+            {"name": "深空蓝黑", "hex": "#0B1220"},
+            {"name": "琥珀金", "hex": "#E6A957"},
+        ],
+        "mood": "深静、科幻感、商务",
+        "font": "无衬线黑体，标题加粗",
+        "description": (
+            "选它如果你更看重：想让观众第一眼记住这份 PPT 在讲'AI 时代的新增长公式'，"
+            "并感受到品牌/讲者的专业前瞻感 视觉重点是深色封面 + 浅色正文页的强对比节奏，"
+            "用琥珀光高亮关键公式和转折点 需要接受的取舍是封面和章节页视觉冲击强，"
+            "但需要克制正文页的装饰密度，否则 10 页下来会视觉疲劳。"
+        ),
+        "best_for": "想让观众第一眼记住这份 PPT 在讲'AI 时代的新增长公式'。",
+        "tradeoff": "封面和章节页视觉冲击强，但正文页装饰密度需要克制。",
+        "visual_focus": "深色封面 + 浅色正文页的强对比节奏，用琥珀光高亮关键公式和转折点。",
+    }
+
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "选它如果" not in style_pack
+    assert "更看重" not in style_pack
+    assert "需要接受的取舍" not in style_pack
+    assert "第一眼记住" not in style_pack
+    assert "深色封面 + 浅色正文页的强对比节奏" not in style_pack
+
+
+def test_selected_style_pack_does_not_use_description_as_visual_rhythm_source():
+    selected_style = {
+        "name": "深空蓝黑 + 琥珀光点",
+        "palette": [
+            {"name": "深空蓝黑", "hex": "#0B1220"},
+            {"name": "琥珀金", "hex": "#E6A957"},
+        ],
+        "mood": "深静、科幻感、商务",
+        "font": "无衬线黑体，标题加粗",
+        "description": (
+            "推荐此方案的原因是它能让观众理解管理层汇报的专业前瞻感。"
+            "这里即使写了深色封面、琥珀光，也不应该成为生图节奏来源。"
+        ),
+    }
+
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "推荐此方案的原因" not in style_pack
+    assert "专业前瞻感" not in style_pack
+
+
+def test_compact_style_pack_preserves_clean_visual_rhythm_source():
+    compact = _compact_style_pack(
+        "\n".join([
+            "Style: 深空蓝黑 + 琥珀光点",
+            "Palette: #0B1220, #E6A957, #F4F4EF",
+            "Mood: 深静、科幻感、商务",
+            "Visual rhythm: 深色封面 + 浅色正文页的强对比节奏，用琥珀光高亮关键公式和转折点",
+            "Typography: 无衬线黑体，标题加粗",
+        ])
+    )
+
+    assert "Visual rhythm: 深色封面 + 浅色正文页的强对比节奏，用琥珀光高亮关键公式和转折点" in compact
+
+
+def test_selected_style_pack_does_not_use_style_library_choice_rationale_as_rhythm():
+    selected_style = {
+        "name": "Apple Keynote 极简主义",
+        "palette": [{"name": "白", "hex": "#FFFFFF"}, {"name": "黑", "hex": "#111111"}],
+        "mood": "克制、清晰、高级",
+        "font": "无衬线黑体，标题加粗",
+        "description": (
+            "我从风格库中选择了『Apple Keynote 极简主义』，因为它原本的设计定位是高端商务发布，"
+            "非常适合这份 PPT 的管理层汇报需求。"
+        ),
+    }
+
+    style_pack = style_pack_from_selected_style(selected_style)
+
+    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "我从风格库中选择" not in style_pack
+    assert "原本的设计定位" not in style_pack
+    assert "非常适合这份 PPT" not in style_pack

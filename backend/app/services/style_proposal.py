@@ -17,6 +17,7 @@ from app.services.visual_strategy import build_visual_strategy
 logger = logging.getLogger(__name__)
 
 STYLE_PROPOSAL_POLICY_VERSION = "2026-05-15-style-source-priority-v1"
+DEFAULT_CONTENT_STYLE_HINT = "每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
 
 
 def _parse_llm_json(raw: str, *, expected_type: type, context: str):
@@ -471,18 +472,21 @@ def _decision_archetypes(summary: Dict) -> List[Dict]:
             "best_for": f"想让观众第一眼记住{topic}的气质、场景和品牌/主题识别。",
             "tradeoff": "强视觉页更有存在感，正文页需要控制装饰密度。",
             "visual_focus": "用更明确的主色、场景化画面和统一装饰语言建立整套 PPT 的第一印象。",
+            "content_style_hint": "用明确主色、场景化画面和统一装饰语言建立整套 PPT 的第一印象；正文页控制装饰密度。",
         },
         {
             "decision_label": information_label,
             "best_for": "页数、文字或数据较多，希望阅读效率、可信感和汇报稳定性优先。",
             "tradeoff": "画面冲击力更克制，但更适合长时间讲解和逐页阅读。",
             "visual_focus": "浅底、清晰层级、图表/卡片秩序和少量强调色，降低理解成本。",
+            "content_style_hint": "内容页优先浅底或低干扰基底、清晰层级、图表/卡片秩序和少量强调色，降低理解成本。",
         },
         {
             "decision_label": "表达冲击",
             "best_for": "希望提案更有态度，适合路演、发布、竞标或需要快速抓住注意力的场景。",
             "tradeoff": "视觉个性更强，需要接受更高对比和更鲜明的版式节奏。",
             "visual_focus": "高对比色块、大标题、强节奏分区和更鲜明的视觉符号。",
+            "content_style_hint": "使用高对比色块、大标题、强节奏分区和鲜明视觉符号；内容页仍保持阅读层级。",
         },
     ]
 
@@ -499,6 +503,12 @@ def _ensure_decision_metadata(proposals: List[Dict], summary: Dict) -> List[Dict
         for key in ("decision_label", "best_for", "tradeoff", "visual_focus"):
             if not proposal.get(key):
                 proposal[key] = archetype.get(key, "")
+        if not proposal.get("content_style_hint"):
+            proposal["content_style_hint"] = (
+                proposal.get("visual_rhythm")
+                or archetype.get("content_style_hint")
+                or ""
+            )
 
         description = str(proposal.get("description") or "").strip()
         best_for = str(proposal.get("best_for") or "").strip()
@@ -542,6 +552,11 @@ def _finalize_style_proposals(proposals: List[Dict], summary: Dict) -> List[Dict
             ),
         )
         p.setdefault("page_type_adaptation", _page_type_adaptation_rules(p.get("palette") or [], p.get("visual_strategy")))
+        if not p.get("content_style_hint"):
+            p["content_style_hint"] = (
+                p.get("visual_rhythm")
+                or DEFAULT_CONTENT_STYLE_HINT
+            )
 
     return proposals[:3]
 
@@ -1093,6 +1108,7 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
   "best_for": "选它如果用户更看重什么结果，必须具体到这份 PPT",
   "tradeoff": "选择它需要接受什么取舍，必须能帮助用户排除不适合的方案",
   "visual_focus": "这套方案最主要的画面差异和页面处理方式",
+  "content_style_hint": "给生图 Prompt 使用的视觉节奏约束；只写可执行画面语言，不写选择理由、推荐原因、适合人群、取舍或给用户看的说明",
   "source": "original（第1套）或 风格库id（第2、3套）"
 }}
 
@@ -1127,6 +1143,11 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 4. **要像在给客户讲方案**：客户关心的是"我的PPT用这个风格会不会更好看、更专业、更能说服听众"。所以你要解释的是：**这个风格如何解决这个PPT的具体问题**（文字多怎么办、数据多怎么办、需要品牌感怎么办）。
 
 5. **情绪氛围关键词放在最后**，3-5 个词即可，不要展开解释。
+
+【content_style_hint 写作要求——给生图，不给用户看】
+- 这是后续每页生图 Prompt 的全局风格约束，只写画面如何生成：色彩节奏、材质、装饰强度、页面类型适配、配图证据选择原则。
+- 不要写"选它如果"、"更看重"、"推荐此方案"、"原因是"、"非常适合"、"需要接受的取舍"等决策说明。
+- 不要复述客户收益、讲者专业感、方案说服力或选择理由；这些只属于 description、best_for、tradeoff。
 """
 
     response = client.chat.completions.create(
@@ -1275,7 +1296,8 @@ def _generate_asset_based_proposal(
   ],
   "mood": "氛围标签（忠实来自参考图，不发明新风格）",
   "font": "字体建议（延续参考图字体气质，同时保证正文可读）",
-  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清风格基因和页面类型调节即可。版式特征如'参考图本身是三栏布局'可以在这里说明：'在合适的页面会复用这种分栏感'）"
+  "description": "风格说明（80-120字，不要出现色号，用直观颜色名，说清风格基因和页面类型调节即可。版式特征如'参考图本身是三栏布局'可以在这里说明：'在合适的页面会复用这种分栏感'）",
+  "content_style_hint": "给生图 Prompt 使用的视觉节奏约束；只写参考资料中可执行的色彩、材质、装饰、字体层级和页面类型适配，不写选择理由或给用户看的说明"
 }}
 
 【核心原则】
@@ -1283,7 +1305,12 @@ def _generate_asset_based_proposal(
 2. **不是逐页照搬**：参考图只提供风格基因，不是每一页的画面模板
 3. **先定整套基底，再按页面类型调强度**：封面/章节/转场/金句页可以更强烈使用主色和装饰；内容/数据/表格/长文页必须优先可读，但要在同一视觉语言内通过卡片、内容区、字号层级和留白解决，不要机械切成另一套浅底风格
 4. **内容决定配图**：地图、图表、业务场景、产品场景和人物/物件选择由该页文案决定，不机械复制参考图里的画面对象
-5. **命名不跑偏**：风格名只取调性，不混入行业词，也不混入版式词（参考输出格式 name 字段的示范）"""
+5. **命名不跑偏**：风格名只取调性，不混入行业词，也不混入版式词（参考输出格式 name 字段的示范）
+
+【content_style_hint 写作要求——给生图，不给用户看】
+- 只写可执行的画面生成约束：主色关系、背景/内容页节奏、材质纹理、装饰强度、参考图复用边界、配图对象由每页文案决定。
+- 不要写"推荐此方案"、"原因是"、"非常适合"、"需要接受的取舍"、"客户会感受到"等解释性语言。
+- 不要复述用户上传了什么素材或为什么选择这套素材；只把素材转成最终画面的风格约束。"""
 
     response = client.chat.completions.create(
         model=get_minimax_llm_model(),
@@ -1321,6 +1348,8 @@ def _generate_asset_based_proposal(
     if len(proposal.get("description", "")) < 60:
         first_name = proposal["palette"][0].get("name", "主色") if proposal["palette"] and isinstance(proposal["palette"][0], dict) else "主色"
         proposal["description"] = f"「{proposal['name']}」是一套{proposal['mood']}的视觉方案。以{first_name}定调，封面可放大使用，内容页在同一视觉语言内保证可读性与留白。"
+    if not proposal.get("content_style_hint"):
+        proposal["content_style_hint"] = proposal.get("visual_rhythm") or DEFAULT_CONTENT_STYLE_HINT
 
     proposal["visual_strategy"] = build_visual_strategy(
         summary=summary,
