@@ -57,11 +57,22 @@ def hash_passcode(passcode: str, salt: str) -> str:
     return hashlib.sha256(f"{salt}:{passcode}".encode("utf-8")).hexdigest()
 
 
+def verify_passcode(passcode_hash: str, passcode: str) -> bool:
+    try:
+        salt, expected_hash = str(passcode_hash or "").split(":", 1)
+    except ValueError:
+        return False
+    actual_hash = hash_passcode((passcode or "").strip(), salt)
+    return secrets.compare_digest(expected_hash, actual_hash)
+
+
 def get_or_create_tester(db: Session, display_name: str, passcode: str = "") -> TesterUser:
     cleaned_name = (display_name or "").strip()
     login_key = normalize_login_key(cleaned_name)
     tester = db.query(TesterUser).filter(TesterUser.login_key == login_key).first()
     if tester:
+        if not verify_passcode(tester.passcode_hash, passcode):
+            raise HTTPException(status_code=401, detail="测试账号密码不正确，请重新输入")
         tester.display_name = cleaned_name
         tester.last_login_at = utc_now()
         db.commit()

@@ -23,6 +23,7 @@ from app.utils.project_docs import (
     read_document_source_pack,
     read_document_source_status,
     read_document_parse_status,
+    sanitize_document_filename,
     write_document_parse_status,
 )
 from app.utils.reference_image import default_visual_asset_process_mode
@@ -61,7 +62,8 @@ def _get_pptx_assets_dir(project_id: str) -> str:
 
 
 def _asset_status_path(project_id: str, filename: str) -> str:
-    return os.path.join(_get_docs_dir(project_id), f"{filename}.assets.json")
+    safe_filename = sanitize_document_filename(filename)
+    return os.path.join(_get_docs_dir(project_id), f"{safe_filename}.assets.json")
 
 
 def _write_asset_status(
@@ -558,12 +560,17 @@ def upload_document(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    try:
+        filename = sanitize_document_filename(file.filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="文件名无效，请重新选择文件")
+
     # 读取文件内容
     file_bytes = file.file.read()
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="上传的文件为空")
     # 验证文件扩展名
-    ext = os.path.splitext(file.filename.lower())[1]
+    ext = os.path.splitext(filename.lower())[1]
     if ext not in ALLOWED_DOC_EXTENSIONS:
         raise HTTPException(
             status_code=400,
@@ -573,14 +580,14 @@ def upload_document(
     docs_dir = _get_docs_dir(project_id)
 
     # 保存原始文件
-    original_path = os.path.join(docs_dir, file.filename)
+    original_path = os.path.join(docs_dir, filename)
     with open(original_path, "wb") as f:
         f.write(file_bytes)
 
     for stale_path in [
-        document_text_path(project_id, file.filename),
-        document_source_pack_path(project_id, file.filename),
-        _asset_status_path(project_id, file.filename),
+        document_text_path(project_id, filename),
+        document_source_pack_path(project_id, filename),
+        _asset_status_path(project_id, filename),
     ]:
         if os.path.exists(stale_path):
             try:
@@ -590,16 +597,16 @@ def upload_document(
 
     extracted_stats = {"logos": 0, "page_refs": 0, "visual_assets": 0, "total": 0}
     asset_extraction_status = "not_applicable"
-    write_document_parse_status(project_id, file.filename, "queued")
+    write_document_parse_status(project_id, filename, "queued")
     if ext in {".pdf", ".pptx"}:
-        _write_asset_status(project_id, file.filename, "queued")
+        _write_asset_status(project_id, filename, "queued")
         asset_extraction_status = "queued"
 
     if background_tasks is not None:
-        _dispatch_document_processing(project_id, original_path, file.filename, ext)
+        _dispatch_document_processing(project_id, original_path, filename, ext)
 
     return {
-        "filename": file.filename,
+        "filename": filename,
         "char_count": 0,
         "text_parse_status": "queued",
         "text_preview": "",
@@ -653,8 +660,9 @@ def delete_document(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 防止路径遍历攻击
-    if ".." in filename or "/" in filename or "\\" in filename:
+    try:
+        filename = sanitize_document_filename(filename)
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     docs_dir = _get_docs_dir(project_id)

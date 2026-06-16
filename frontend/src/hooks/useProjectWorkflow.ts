@@ -100,7 +100,8 @@ export function useProjectWorkflow(projectId?: string | null) {
     };
   }, [projectId]);
 
-  const activeRun = workflowStatus?.active_run || null;
+  const scopedWorkflowStatus = workflowStatus?.project_id === projectId ? workflowStatus : null;
+  const activeRun = scopedWorkflowStatus?.active_run || null;
   const hasActiveRun = isActiveRun(activeRun);
 
   useEffect(() => {
@@ -130,7 +131,7 @@ export function useProjectWorkflow(projectId?: string | null) {
   }, [projectId, hasActiveRun, activeRun?.id, activeRun?.status]);
 
   return {
-    workflowStatus,
+    workflowStatus: scopedWorkflowStatus,
     setWorkflowStatus,
     refreshWorkflowStatus,
     adoptWorkflowRun,

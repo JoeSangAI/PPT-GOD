@@ -12,7 +12,7 @@ export interface UploadStatus {
 export interface ReferenceImage {
   id: string;
   role: "logo" | "style_ref" | "template" | "visual_asset" | "content_ref" | "chart_ref";
-  url: string;
+  url?: string | null;
   overlay_url?: string | null;
   symbol_overlay_url?: string | null;
   page_num?: number | null;
@@ -80,7 +80,8 @@ interface VisualAssetsPanelProps {
   uploadDisabled?: boolean;
 }
 
-function getImageUrl(apiBase: string, url: string) {
+function getImageUrl(apiBase: string, url?: string | null) {
+  if (!url) return "";
   return url.startsWith("http") ? url : `${apiBase}${url}`;
 }
 
@@ -254,7 +255,7 @@ export default function VisualAssetsPanel({
 
   const Thumb = ({ item, className = "" }: { item: ReferenceImage; className?: string }) => {
     const displayUrl = item.overlay_url || item.url;
-    const canPreview = item.file_exists !== false || Boolean(item.overlay_url);
+    const canPreview = Boolean(displayUrl) && (item.file_exists !== false || Boolean(item.overlay_url));
     const title = item.file_exists === false
       ? "原文件缺失，请删除后重新上传"
       : item.asset_name || item.asset_analysis?.subject || "查看素材";

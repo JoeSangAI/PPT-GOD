@@ -1696,6 +1696,9 @@ function App() {
   const [slidesRedoHistory, setSlidesRedoHistory] = useState<Slide[][]>([]);
   const isGlobalUndoingRef = useRef(false);
   const [operatingProjectId, setOperatingProjectId] = useState<string | null>(null);
+  const clearOperatingProject = (projectId: string) => {
+    setOperatingProjectId((current) => current === projectId ? null : current);
+  };
   const gateContextRef = useRef<GateContext | null>(null);
   const {
     workflowStatus: projectStatus,
@@ -1961,6 +1964,9 @@ function App() {
   const contentPlanStartingProjectRef = useRef<string | null>(null);
   const contentPlanStartingAtRef = useRef(0);
   const loadingProjectIdRef = useRef<string | null>(null);
+  const canApplyProjectLoadResult = (projectId: string) =>
+    selectedProjectIdRef.current === projectId &&
+    loadingProjectIdRef.current === projectId;
   const missingProjectHandledRef = useRef<Set<string>>(new Set());
   const softLockWarnedRef = useRef(false);
   const generationLoadingIdRef = useRef<string | null>(null);
@@ -2602,7 +2608,7 @@ function App() {
     }
     try {
       const data = await fetchSlides(projectId);
-      if (loadingProjectIdRef.current !== projectId) return slidesCacheRef.current[projectId] || [];
+      if (!canApplyProjectLoadResult(projectId)) return slidesCacheRef.current[projectId] || [];
       slidesCacheRef.current[projectId] = data;
       setSlidesProjectId(projectId);
       setSlides(data);
@@ -2724,7 +2730,7 @@ function App() {
     } catch (err: any) {
       showToast("回退保存失败：" + (err.message || "未知错误"), "error");
     } finally {
-      setOperatingProjectId(null);
+      clearOperatingProject(projectId);
     }
   };
 
@@ -2772,7 +2778,7 @@ function App() {
       const data = selectedProjectIdRef.current === projectId
         ? await refreshWorkflowStatus()
         : await fetchWorkflowStatus(projectId);
-      if (loadingProjectIdRef.current !== projectId) return;
+      if (!canApplyProjectLoadResult(projectId)) return;
       setProjectStatus(data?.project_id === projectId ? data : null);
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
@@ -2809,7 +2815,7 @@ function App() {
   const loadReferenceImages = async (projectId: string) => {
     try {
       const data = await fetchReferenceImages(projectId);
-      if (loadingProjectIdRef.current !== projectId) return;
+      if (!canApplyProjectLoadResult(projectId)) return;
       setReferenceImages(data || []);
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
@@ -2823,7 +2829,7 @@ function App() {
   const loadDocuments = async (projectId: string) => {
     try {
       const data = await fetchDocuments(projectId);
-      if (loadingProjectIdRef.current !== projectId) return;
+      if (!canApplyProjectLoadResult(projectId)) return;
       setDocuments(data || []);
     } catch (err: any) {
       if (isProjectNotFoundError(err)) {
@@ -2837,7 +2843,7 @@ function App() {
   const loadTemplatePages = async (projectId: string) => {
     try {
       const data = await fetchTemplatePages(projectId);
-      if (loadingProjectIdRef.current !== projectId) return;
+      if (!canApplyProjectLoadResult(projectId)) return;
       const pages = (data || []).map((ref: any, idx: number) => ({
         page_num: ref.page_num || idx + 1,
         url: resolveAssetUrl(API_BASE, ref.url),
@@ -2859,7 +2865,7 @@ function App() {
         return;
       }
       showToast("加载模板页面失败：" + (err.message || "未知错误"), "error");
-      if (loadingProjectIdRef.current === projectId) setTemplatePages([]);
+      if (canApplyProjectLoadResult(projectId)) setTemplatePages([]);
     }
   };
 
@@ -2994,7 +3000,7 @@ function App() {
           contentPlanStartingProjectRef.current = null;
           contentPlanStartingAtRef.current = 0;
         }
-        setOperatingProjectId(null);
+        clearOperatingProject(projectId);
         removeLoadingMsg();
       };
       const failContentPlanPoll = (message: string) => {
@@ -4000,7 +4006,7 @@ function App() {
         clearInterval(visualPromptIntervalRef.current);
         visualPromptIntervalRef.current = null;
       }
-      setOperatingProjectId(null);
+      clearOperatingProject(projectId);
     }
   };
 
@@ -4088,7 +4094,7 @@ function App() {
         },
       ]);
     } finally {
-      setOperatingProjectId(null);
+      clearOperatingProject(projectId);
     }
   };
 
@@ -5870,7 +5876,7 @@ function App() {
     const isRequestVisible = () =>
       selectedProjectIdRef.current === requestProjectId && currentAgentRoleRef.current === requestAgentRole;
     const isRequestExecutionAllowed = () => {
-      if (selectedProjectIdRef.current !== requestProjectId) return true;
+      if (selectedProjectIdRef.current !== requestProjectId) return false;
       const latestGate = gateContextRef.current;
       return Boolean(
         latestGate &&
@@ -6395,6 +6401,22 @@ function App() {
         if (chatResultLooksValid(fallbackResult)) {
           result = fallbackResult;
         }
+      }
+
+      if (ctrl.signal.aborted) {
+        if (!silentChatAbortRef.current && isRequestExecutionAllowed()) {
+          appendRequestMessage({
+            role: "agent",
+            content: "⏹ 已停止生成。",
+            agentRole: requestAgentRole,
+          });
+        } else if (!isRequestExecutionAllowed()) {
+          clearPendingChatRequest(requestProjectId);
+        }
+        clearPendingChatRequest(requestProjectId);
+        if (isRequestVisible()) setChatLoading(false);
+        abortRef.current = null;
+        return;
       }
 
       if (!chatResultLooksValid(result)) {
