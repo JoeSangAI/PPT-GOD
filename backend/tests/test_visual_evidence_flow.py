@@ -961,6 +961,44 @@ def test_visual_prompt_run_fails_when_any_page_prompt_generation_fails(monkeypat
     assert refreshed_slides[1].status == "visual_ready"
 
 
+def test_old_visual_prompt_task_cleanup_keeps_newer_registry_task(monkeypatch):
+    Session = make_shared_sessionmaker()
+    db = Session()
+    project = Project(title="No slides", status="planning")
+    db.add(project)
+    db.flush()
+    run = slides_api.create_project_run(
+        db,
+        project.id,
+        kind="visual_prompts",
+        stage="visual_planning",
+        total_count=0,
+    )
+    db.commit()
+    project_id = project.id
+    run_id = run.id
+    db.close()
+
+    monkeypatch.setattr(slides_api, "SessionLocal", Session)
+    slides_api._running_tasks.pop(project_id, None)
+
+    async def run_old_cleanup_with_new_task_registered():
+        newer_task = asyncio.create_task(asyncio.sleep(60))
+        slides_api._running_tasks[project_id] = newer_task
+        try:
+            await slides_api._do_generate_visual_and_prompts(project_id, None, run_id)
+            assert slides_api._running_tasks.get(project_id) is newer_task
+        finally:
+            newer_task.cancel()
+            try:
+                await newer_task
+            except asyncio.CancelledError:
+                pass
+            slides_api._running_tasks.pop(project_id, None)
+
+    asyncio.run(run_old_cleanup_with_new_task_registered())
+
+
 def test_pipeline_does_not_retry_slide_after_inner_image_retries_are_exhausted(monkeypatch, tmp_path):
     db = make_session()
     project = Project(title="No duplicate image retry", status="prompt_ready", content_plan_confirmed=True)

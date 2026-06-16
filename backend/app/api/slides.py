@@ -3546,8 +3546,13 @@ async def _do_generate_visual_and_prompts(
         }, run_id)
     finally:
         db.close()
-        _running_tasks.pop(project_id, None)
-        generation_progress.pop(project_id, None)
+        current_task = asyncio.current_task()
+        async with _running_tasks_lock:
+            owns_registry_entry = _running_tasks.get(project_id) is current_task
+            if owns_registry_entry:
+                _running_tasks.pop(project_id, None)
+        if owns_registry_entry or project_id not in _running_tasks:
+            generation_progress.pop(project_id, None)
 
 
 @router.get("/{project_id}/generation-status")

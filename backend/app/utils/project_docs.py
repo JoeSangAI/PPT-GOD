@@ -23,6 +23,16 @@ DOCUMENT_PARSE_STALE_SECONDS = 90
 DocumentProgressCallback = Callable[[dict], None]
 
 
+def sanitize_document_filename(filename: str | None) -> str:
+    safe_name = str(filename or "").replace("\\", "/").split("/")[-1].strip()
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise ValueError("invalid document filename")
+    if is_document_metadata_filename(safe_name):
+        raise ValueError("document filename conflicts with system metadata")
+    return safe_name
+
+
 def get_project_docs_dir(project_id: str, *, create: bool = False) -> str:
     docs_dir = os.path.join(settings.UPLOAD_DIR, project_id, "docs")
     if create:

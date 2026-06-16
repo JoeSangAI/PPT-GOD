@@ -27,6 +27,23 @@ def test_same_name_login_reuses_same_tester_space():
     assert second.display_name == "阿桑"
 
 
+def test_same_name_login_requires_matching_passcode():
+    db = make_session()
+
+    first = get_or_create_tester(db, "阿桑", "123456")
+    second = get_or_create_tester(db, "  阿桑  ", "123456")
+
+    assert second.id == first.id
+
+    try:
+        get_or_create_tester(db, "阿桑", "wrong-passcode")
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert "密码不正确" in str(exc.detail)
+    else:
+        raise AssertionError("expected wrong passcode to be rejected")
+
+
 def test_project_access_is_scoped_by_tester_id():
     db = make_session()
     asang = get_or_create_tester(db, "阿桑")

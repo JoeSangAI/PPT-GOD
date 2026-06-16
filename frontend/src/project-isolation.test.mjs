@@ -6,6 +6,7 @@ const sourcePath = join(import.meta.dirname, "App.tsx");
 const source = readFileSync(sourcePath, "utf8");
 const css = readFileSync(join(import.meta.dirname, "index.css"), "utf8");
 const workflow = readFileSync(join(import.meta.dirname, "workflow.ts"), "utf8");
+const workflowHook = readFileSync(join(import.meta.dirname, "hooks/useProjectWorkflow.ts"), "utf8");
 const client = readFileSync(join(import.meta.dirname, "api/client.ts"), "utf8");
 const lines = source.split(/\r?\n/);
 
@@ -60,6 +61,11 @@ assert.match(
   source,
   /if \(!chatResultLooksValid\(result\)\) \{[\s\S]*if \(!isRequestExecutionAllowed\(\)\) \{[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*响应未返回完整结果/,
   "incomplete result warnings must only be shown while the original request can still execute"
+);
+assert.match(
+  source,
+  /if \(ctrl\.signal\.aborted\) \{[\s\S]*已停止生成[\s\S]*clearPendingChatRequest\(requestProjectId\);[\s\S]*return;[\s\S]*if \(!chatResultLooksValid\(result\)\) \{/,
+  "user-stopped chat streams must return before the incomplete-response fallback"
 );
 assert.match(
   source,
@@ -146,6 +152,40 @@ assert.match(
   /const clearTransientProjectState[\s\S]*setReferenceImages\(\[\]\);[\s\S]*setDocuments\(\[\]\);[\s\S]*setTemplatePages\(\[\]\);/,
   "project switches must clear uploaded document state before loading the next project"
 );
+assert.match(
+  source,
+  /const canApplyProjectLoadResult = \(projectId: string\) =>[\s\S]*selectedProjectIdRef\.current === projectId[\s\S]*loadingProjectIdRef\.current === projectId/,
+  "project data loaders must require both the current project and the current load owner before painting visible state"
+);
+assert.match(
+  source,
+  /const clearOperatingProject = \(projectId: string\) =>[\s\S]*setOperatingProjectId\(\(current\) => current === projectId \? null : current\);/,
+  "async project operations must only clear their own busy lock"
+);
+assert.match(
+  source,
+  /const loadSlides = async \(projectId: string\) => \{[\s\S]*if \(!canApplyProjectLoadResult\(projectId\)\) return slidesCacheRef\.current\[projectId\] \|\| \[\];[\s\S]*setSlidesProjectId\(projectId\);[\s\S]*setSlides\(data\);/,
+  "slow slide responses from a previous project must not paint into the active project"
+);
+for (const operationName of ["restoreSlidesToBackend", "handleGeneratePrompts", "handleStartGeneration"]) {
+  assert.match(
+    source,
+    new RegExp(`const ${operationName} = async[\\s\\S]*finally \\{[\\s\\S]*clearOperatingProject\\(projectId\\);`),
+    `${operationName} must not clear a newer project's busy lock`
+  );
+}
+for (const [loaderName, setterName] of [
+  ["loadStatus", "setProjectStatus"],
+  ["loadReferenceImages", "setReferenceImages"],
+  ["loadDocuments", "setDocuments"],
+  ["loadTemplatePages", "setTemplatePages"],
+]) {
+  assert.match(
+    source,
+    new RegExp(`const ${loaderName} = async \\(projectId: string\\) => \\{[\\s\\S]*if \\(!canApplyProjectLoadResult\\(projectId\\)\\) return;[\\s\\S]*${setterName}\\(`),
+    `${loaderName} must ignore stale project responses before ${setterName}`
+  );
+}
 assert.match(
   source,
   /if \(selectedProject\) \{[\s\S]*setReferenceImages\(\[\]\);[\s\S]*setDocuments\(\[\]\);[\s\S]*loadDocuments\(selectedProject\.id\);/,
@@ -453,8 +493,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const isRequestExecutionAllowed = \(\) => \{[\s\S]*selectedProjectIdRef\.current !== requestProjectId[\s\S]*return true[\s\S]*latestGate\.gate === requestGate[\s\S]*latestGate\.gateRevision === requestGateRevision/,
-  "Agent request execution must use the request snapshot so switching projects does not drop the original project action"
+  /const isRequestExecutionAllowed = \(\) => \{[\s\S]*selectedProjectIdRef\.current !== requestProjectId[\s\S]*return false[\s\S]*latestGate\.gate === requestGate[\s\S]*latestGate\.gateRevision === requestGateRevision/,
+  "Agent request execution must stop after switching projects so old streams cannot mutate the active workspace"
 );
 assert.match(
   source,
@@ -464,7 +504,7 @@ assert.match(
 assert.match(
   source,
   /const frontendWillHandleAgentReply = isRequestExecutionAllowed\(\) && \(/,
-  "frontend-handled Agent actions must still execute for hidden original projects"
+  "frontend-handled Agent actions must only execute while the request is still current"
 );
 assert.match(
   source,
@@ -1057,6 +1097,11 @@ assert.doesNotMatch(
   source,
   /localStorage\.setItem\(`ppt_god_chat_(?:content|visual)_\$\{selectedProject\.id\}`,[\s\S]{0,180}allowLegacy:\s*true/,
   "persisted selected-project chat must not accept legacy/unowned messages"
+);
+assert.match(
+  workflowHook,
+  /const scopedWorkflowStatus = workflowStatus\?\.project_id === projectId \? workflowStatus : null;[\s\S]*const activeRun = scopedWorkflowStatus\?\.active_run \|\| null;/,
+  "workflow active run state must be scoped to the active project id"
 );
 
 assert.match(
