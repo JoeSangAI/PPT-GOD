@@ -65,6 +65,17 @@ function feedbackTemplate(auth: MvpAuth | null) {
   ].join("\n");
 }
 
+function userFacingLoginError(message?: string) {
+  const text = String(message || "").trim();
+  if (/failed to fetch|networkerror|network request failed|load failed/i.test(text)) {
+    return "无法连接后端服务。请确认 PPT God 服务已启动后重试。";
+  }
+  if (/unauthorized|forbidden|401|403/i.test(text)) {
+    return "登录状态没有通过校验，请重新输入固定用户名。";
+  }
+  return text || "登录失败，请稍后重试。";
+}
+
 function ProviderSetup({
   value,
   onChange,
@@ -281,7 +292,7 @@ export default function AuthGate() {
       saveStoredAuth(nextAuth);
       setAuth(nextAuth);
     } catch (e: any) {
-      setError(e?.message || "登录失败");
+      setError(userFacingLoginError(e?.message));
     } finally {
       setBusy(false);
     }
@@ -467,7 +478,7 @@ export default function AuthGate() {
 
             {!SERVER_MANAGED_PROVIDERS && <ProviderSetup value={provider} onChange={setProvider} />}
 
-            {error && <div className="pg-auth-error">{error}</div>}
+            {error && <div className="pg-auth-error" role="alert">{error}</div>}
             <button disabled={!canEnter || busy} className="pg-primary-button pg-login-submit">
               {busy ? "正在进入..." : "进入 PPT God"}
             </button>

@@ -169,6 +169,11 @@ def stale_inactive_run_if_needed(
         heartbeat_timeout = 0
 
     if run.status == "running" and heartbeat_timeout > 0:
+        if run.kind == "content_plan" and heartbeat_timeout_seconds is None:
+            try:
+                heartbeat_timeout = max(heartbeat_timeout, int(settings.CONTENT_PLAN_HEARTBEAT_TIMEOUT_SECONDS or 0))
+            except (TypeError, ValueError):
+                pass
         if run.task_id and heartbeat_timeout_seconds is None:
             heartbeat_timeout = max(heartbeat_timeout, int(settings.CELERY_TASK_TIME_LIMIT or 0) + 120)
         inactive_for = _seconds_since(run.updated_at or run.started_at)

@@ -136,6 +136,7 @@ def test_upper_bound_page_count_still_trims_at_upper_bound():
 def test_agent_action_contract_includes_handoffs_and_content_regeneration():
     assert "forward_to_visual" in CONTENT_ACTIONS
     assert "regenerate_plan" in CONTENT_ACTIONS
+    assert "merge_slides" in CONTENT_ACTIONS
     assert "forward_to_content" in VISUAL_ACTIONS
     assert "refine_slide" in FINETUNE_ACTIONS
 
@@ -677,6 +678,14 @@ def test_content_contract_prefers_targeted_preservation_edit_over_deck_regenerat
     assert "投放点" not in prompt
 
 
+def test_content_action_contract_prompt_is_generated_from_action_catalog():
+    prompt = _build_content_contract_prompt()
+
+    assert "内容动作目录" in prompt
+    assert "merge_slides" in prompt
+    assert "delete_page_nums" in prompt
+
+
 def test_local_preservation_edit_policy_is_generalized_from_scope_transform_and_preservation():
     policy = _infer_content_edit_policy(
         user_message="把第 3 到 5 页的关键风险提到标题里，正文里的案例和数据都别删",
@@ -714,6 +723,61 @@ def test_local_preservation_edit_does_not_fallback_to_regenerate_plan_when_paylo
 
     assert compiled["action"] == "answer"
     assert compiled["no_change_reason"] == "local_preservation_contract_failed"
+    assert "没有修改 PPT" in compiled["response"]
+
+
+def test_selected_slide_merge_compiled_payload_is_accepted():
+    page_context = {
+        "mode": "global",
+        "scope": "selected_slides",
+        "target_page_nums": [3, 4, 5, 6],
+        "target_area": "whole",
+    }
+
+    compiled = _enforce_content_action_contract(
+        result={"action": "regenerate_plan", "topic": "AI 时代品牌课。重新生成内容规划。", "response": "收到，正在重新生成。"},
+        user_message="这里几页的内容有点重复，合并成3页去说即可",
+        project_context={"title": "AI 时代品牌课", "total_slides": 46, "content_plan_confirmed": False},
+        page_context=page_context,
+        compiler=lambda **_: {
+            "action": "merge_slides",
+            "updated_slides": [
+                {"page_num": 3, "text_content": {"headline": "合并后的第一页", "subhead": "", "body": "正文"}},
+                {"page_num": 4, "text_content": {"headline": "合并后的第二页", "subhead": "", "body": "正文"}},
+                {"page_num": 5, "text_content": {"headline": "合并后的第三页", "subhead": "", "body": "正文"}},
+            ],
+            "delete_page_nums": [6],
+            "response": "已把第 3-6 页合并为 3 页。",
+        },
+    )
+
+    assert compiled["action"] == "merge_slides"
+    assert [item["page_num"] for item in compiled["updated_slides"]] == [3, 4, 5]
+    assert compiled["delete_page_nums"] == [6]
+
+
+def test_selected_slide_merge_never_falls_back_to_deck_replan():
+    page_context = {
+        "mode": "global",
+        "scope": "selected_slides",
+        "target_page_nums": [3, 4, 5, 6],
+        "target_area": "whole",
+    }
+
+    compiled = _enforce_content_action_contract(
+        result={"action": "regenerate_plan", "topic": "AI 时代品牌课。重新生成内容规划。", "response": "收到，正在重新生成。"},
+        user_message="这里几页的内容有点重复，合并成3页去说即可",
+        project_context={"title": "AI 时代品牌课", "total_slides": 46, "content_plan_confirmed": False},
+        page_context=page_context,
+        compiler=lambda **_: {
+            "action": "regenerate_plan",
+            "topic": "AI 时代品牌课。重新生成内容规划。",
+            "response": "收到，正在重新生成。",
+        },
+    )
+
+    assert compiled["action"] == "answer"
+    assert compiled["no_change_reason"] == "content_action_scope_conflict"
     assert "没有修改 PPT" in compiled["response"]
 
 

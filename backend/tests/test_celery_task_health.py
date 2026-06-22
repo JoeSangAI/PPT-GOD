@@ -258,6 +258,44 @@ def test_deferred_generation_chunk_keeps_run_active(monkeypatch):
     assert [s.status for s in refreshed_slides] == ["completed", "completed", "prompt_ready"]
 
 
+def test_generation_pipeline_does_not_render_stale_page_after_enqueue(monkeypatch):
+    db = make_session()
+    project = Project(title="Stale queued page", status="prompt_ready", content_plan_confirmed=True)
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        prompt_text="prompt",
+        visual_json={"_artifact": {"stale": {"content": True}}},
+    )
+    db.add(slide)
+    db.flush()
+    run = create_project_run(
+        db,
+        project.id,
+        kind="page_generation",
+        stage="page_generation",
+        target_page_nums=[1],
+        total_count=1,
+    )
+    run.status = "running"
+    db.commit()
+
+    def fail_generate(*_args, **_kwargs):
+        raise AssertionError("stale page must not call image generation")
+
+    monkeypatch.setattr(generation_pipeline, "_load_reference_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generation_pipeline, "_generate_one_slide", fail_generate)
+
+    generation_pipeline.run_generation_pipeline(project.id, db, page_nums=[1], run_id=run.id)
+
+    refreshed = db.query(Slide).filter(Slide.id == slide.id).one()
+    assert refreshed.status == "failed"
+    assert "重新生成画面方案" in refreshed.error_msg
+
+
 def test_final_generation_chunk_finishes_shared_run(tmp_path, monkeypatch):
     db = make_session()
     project = Project(title="Final chunk", status="prompt_ready", content_plan_confirmed=True)

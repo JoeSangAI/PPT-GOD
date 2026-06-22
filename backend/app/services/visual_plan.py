@@ -12,6 +12,7 @@ from app.core.provider_credentials import get_minimax_llm_model, get_raw_provide
 from app.services.logo_policy import logo_policy_for_page
 from app.services.overlay_layers import apply_llm_overlay_layout, normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
+from app.services.section_text import sanitize_section_visual_numbering
 from app.services.style_pack import derive_style_pack_from_content
 from app.services.visual_strategy import visual_language_group
 from app.utils.text_cleaning import clean_llm_output
@@ -60,9 +61,186 @@ LOGO_RESERVATION_TERMS = (
 )
 BRAND_MARK_DRAWING_TERMS = ("品牌抽象", "展翅", "翅膀", "翼形", "飞翼")
 WATERMARK_TERMS = ("虎课", "虎课网", "watermark", "水印", "stock")
+SECTION_DECIMAL_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,3}[.．]\d{1,3})(?!\d)")
+STRUCTURAL_SECTION_LABEL_RE = re.compile(
+    r"(?:第\s*(?:0?\d{1,3}|[零〇一二两三四五六七八九十百千万]+)\s*(?:章|章节|部分|篇|节|部)|"
+    r"模块\s*(?:0?\d{1,3}|[零〇一二两三四五六七八九十百千万]+)|"
+    r"(?:Chapter|Part)\s*0?\d{1,3})",
+    flags=re.IGNORECASE,
+)
+SECTION_DECIMAL_CONTEXT_TERMS = ("序号", "编号", "章节", "小节", "节标题", "入口")
+GUIDANCE_QUOTED_LABEL_RE = re.compile(r"[「『“\"]([^」』”\"]{2,40})[」』”\"]")
+GUIDANCE_LIST_CONTEXT_RE = re.compile(r"(?:讲|对照|分别承担|入口提示|小标题|标签|大字|字样|写)[^。；\n]{0,80}")
+LATIN_ENTITY_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9&.-]{1,}\b")
+VISIBLE_COPY_HINT_TERMS = (
+    "小标题", "文案", "文字", "标签", "入口", "编号", "序号", "章节",
+    "大字", "字样", "讲", "对照", "分别承担", "入口提示",
+)
+GENERIC_VISUAL_LABEL_PREFIXES = (
+    "上方", "下方", "左侧", "右侧", "中央", "中间", "页面", "画面", "整体",
+    "形成", "使用", "采用", "以", "用", "不", "无", "其下", "顶部", "底部",
+)
+GENERIC_VISUAL_LABEL_TERMS = (
+    "主标题", "副标题", "标题", "正文", "小字", "大字", "短句", "标签",
+    "节点", "线条", "细线", "卡片", "图标", "区块", "画面", "视觉",
+    "步骤名", "章节标题", "核心追问短句", "无衬线", "英文字", "中文字",
+    "英文", "中文", "字体", "字号", "对话气泡",
+)
+
 
 class VisualPlanGenerationError(RuntimeError):
     """Raised when visual planning cannot produce complete page-level intent."""
+
+
+def _flatten_visible_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return "\n".join(_flatten_visible_text(item) for item in value)
+    if isinstance(value, dict):
+        return "\n".join(
+            _flatten_visible_text(value.get(key))
+            for key in ("title", "headline", "subhead", "body", "text", "content", "label")
+        )
+    return str(value)
+
+
+def _page_visible_copy_text(page: Dict) -> str:
+    text = page.get("text_content") if isinstance(page.get("text_content"), dict) else {}
+    visible_parts = [
+        page.get("title"),
+        page.get("section_title"),
+        text.get("headline"),
+        text.get("subhead"),
+        text.get("body"),
+    ]
+    return "\n".join(_flatten_visible_text(part) for part in visible_parts if part is not None).replace("．", ".")
+
+
+def _flatten_guidance_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return "\n".join(_flatten_guidance_text(item) for item in value)
+    if isinstance(value, dict):
+        return "\n".join(_flatten_guidance_text(item) for item in value.values())
+    return str(value)
+
+
+def _clean_sensitive_label_candidate(value: str, *, allow_short: bool = False) -> str:
+    label = re.sub(r"[「」『』“”\"'（）()【】\[\]：:;；。]", "", str(value or "")).strip()
+    label = re.sub(r"\s+", "", label)
+    label = label.strip("，,、/|+＋-—")
+    if not label:
+        return ""
+    if re.fullmatch(r"#[0-9A-Fa-f]{3,8}", label) or re.fullmatch(r"[0-9A-Fa-f]{4,8}", label):
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:%|亿|万|[kKmMbB])?", label):
+        return ""
+    if re.fullmatch(r"[A-Z]{2,3}", label):
+        return ""
+    if label.isdigit():
+        return ""
+    if any(label.startswith(prefix) for prefix in GENERIC_VISUAL_LABEL_PREFIXES):
+        return ""
+    if any(term in label for term in GENERIC_VISUAL_LABEL_TERMS):
+        return ""
+    min_len = 2 if allow_short else 4
+    if len(label) < min_len or len(label) > 24:
+        return ""
+    return label.replace("．", ".")
+
+
+def _looks_like_sensitive_label_list(fragment: str) -> bool:
+    return bool(re.search(r"[/、+＋|]", fragment))
+
+
+def _guidance_sensitive_tokens(value) -> set[str]:
+    if not value:
+        return set()
+    text = _flatten_guidance_text(value)
+    structural_labels = {
+        re.sub(r"\s+", "", match.group(0)).replace("．", ".")
+        for match in STRUCTURAL_SECTION_LABEL_RE.finditer(text)
+    }
+    decimal_tokens = set()
+    for match in SECTION_DECIMAL_TOKEN_RE.finditer(text):
+        window = text[max(0, match.start() - 30): match.end() + 30]
+        if any(term in window for term in SECTION_DECIMAL_CONTEXT_TERMS):
+            decimal_tokens.add(match.group(1).replace("．", "."))
+    quoted_labels = set()
+    if any(term in text for term in VISIBLE_COPY_HINT_TERMS):
+        quoted_labels = {
+            _clean_sensitive_label_candidate(label.strip())
+            for label in GUIDANCE_QUOTED_LABEL_RE.findall(text)
+            if _clean_sensitive_label_candidate(label.strip())
+        }
+    list_labels: set[str] = set()
+    for match in GUIDANCE_LIST_CONTEXT_RE.finditer(text):
+        fragment = match.group(0)
+        for token in LATIN_ENTITY_RE.findall(fragment):
+            cleaned = _clean_sensitive_label_candidate(token, allow_short=False)
+            if cleaned:
+                list_labels.add(cleaned)
+        if _looks_like_sensitive_label_list(fragment):
+            for part in re.split(r"[/、+＋|]", fragment):
+                tail = re.split(r"(?:讲|对照|分别承担|入口提示|小标题|标签|大字|字样|写)", part)[-1]
+                cleaned = _clean_sensitive_label_candidate(tail, allow_short=True)
+                if cleaned:
+                    list_labels.add(cleaned)
+        for write_match in re.finditer(r"(?:写|呈现|标注)\s*([^，,。；;\n]{2,24})", fragment):
+            cleaned = _clean_sensitive_label_candidate(write_match.group(1), allow_short=False)
+            if cleaned:
+                list_labels.add(cleaned)
+    return structural_labels | decimal_tokens | quoted_labels | list_labels
+
+
+def _token_supported_by_visible_copy(token: str, visible_text: str) -> bool:
+    normalized_token = str(token or "").strip().replace("．", ".")
+    normalized_visible = str(visible_text or "").replace("．", ".")
+    if not normalized_token:
+        return True
+    if normalized_token in normalized_visible:
+        return True
+    if normalized_token.lower() in normalized_visible.lower():
+        return True
+    cjk = "".join(re.findall(r"[\u4e00-\u9fff]", normalized_token))
+    if len(cjk) >= 4:
+        return any(cjk[idx:idx + 4] in normalized_visible for idx in range(0, len(cjk) - 3))
+    return False
+
+
+def _guidance_mentions_absent_visible_copy(value, visible_text: str) -> bool:
+    tokens = _guidance_sensitive_tokens(value)
+    if not tokens:
+        return False
+    return any(not _token_supported_by_visible_copy(token, visible_text) for token in tokens)
+
+
+def _current_visual_suggestion(page: Dict) -> str:
+    suggestion = str(page.get("visual_suggestion") or "")
+    if not suggestion.strip():
+        return ""
+    if _guidance_mentions_absent_visible_copy(suggestion, _page_visible_copy_text(page)):
+        return ""
+    return suggestion
+
+
+def _current_visual_requirements(page: Dict) -> list:
+    requirements = page.get("visual_requirements")
+    if not isinstance(requirements, list):
+        return []
+    if _guidance_mentions_absent_visible_copy(requirements, _page_visible_copy_text(page)):
+        return []
+    return requirements
 
 
 def _is_punchline_page_type(page_type: str) -> bool:
@@ -205,7 +383,7 @@ def _fallback_visual_evidence(page: Dict) -> str:
     if _is_punchline_page_type(page_type):
         return f"围绕「{headline}」的金句排版、可选署名/上下文与象征性背景"
     if page_type == "section":
-        return f"围绕「{headline}」的章节标题、序号和转场氛围"
+        return f"围绕「{headline}」的章节主标题和转场氛围"
     if page_type in ("cover", "ending"):
         return f"围绕「{headline}」的品牌主视觉和核心记忆符号"
     return f"支撑「{headline}」这一页观点的核心场景、物件或结构图"
@@ -221,7 +399,7 @@ def _fallback_visual_description(page: Dict, visual_evidence: str) -> str:
         )
     if page_type == "section":
         return (
-            f"以「{visual_evidence}」作为章节分隔页主视觉，突出章节名、编号或一句转场判断；"
+            f"以「{visual_evidence}」作为章节分隔页主视觉，突出章节主标题或一句转场判断；"
             "正文信息极少，版面可以更强烈使用主色、留白、材质或象征物来建立段落节奏，"
             "但必须沿用整套 deck 的字体气质和视觉语言。"
         )
@@ -235,7 +413,7 @@ def _page_search_text(page: Dict) -> str:
     text = page.get("text_content", {}) or {}
     chunks = [
         str(page.get("type", "")),
-        str(page.get("visual_suggestion", "")),
+        _current_visual_suggestion(page),
         str(text.get("headline", "")),
         str(text.get("subhead", "")),
     ]
@@ -605,6 +783,20 @@ def _build_batch_prompt(
     has_any_ref = False
     for p in pages_summary:
         page_copy = dict(p)
+        page_type = str(page_copy.get("type") or "").strip().lower()
+        if page_type == "section":
+            page_copy.pop("section_title", None)
+            raw_suggestion = page_copy.pop("visual_suggestion", None)
+            if raw_suggestion is not None and not page_copy.get("existing_visual_suggestion"):
+                page_copy["existing_visual_suggestion"] = raw_suggestion
+            suggestion = _current_visual_suggestion({
+                **page_copy,
+                "visual_suggestion": page_copy.get("existing_visual_suggestion") or "",
+            })
+            if suggestion:
+                page_copy["existing_visual_suggestion"] = sanitize_section_visual_numbering(suggestion)
+            else:
+                page_copy.pop("existing_visual_suggestion", None)
         if (page_copy.get("reference_context") or "").strip():
             has_any_ref = True
         else:
@@ -687,7 +879,7 @@ def _build_batch_prompt(
 - cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
 - cover / 封面：只负责定调和命名，不承载正文论证；标题、副标题和主视觉必须形成单一焦点，避免信息堆叠。
 - toc / 目录页：只有导航功能，不承担内容论证。画面必须像清爽的路线图：3-6 个短章节名、明确编号、足够留白、少装饰；不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
-- section / 章节页：只负责章节切换、段落节奏和仪式感。画面应突出章节名、序号或一句转场判断；不要塞正文论证、三点列表、数据图或复杂商业证据。
+- section / 章节页：只负责章节切换、段落节奏和仪式感。画面应突出章节主标题或一句转场判断；不要渲染独立章号、章节编号、三点列表、数据图或复杂商业证据。只有当章号、章节编号或序号出现在 headline、subhead 或 body 的用户可见文案中，才允许把它作为可见文字；section_title 只作为结构元数据，不等于可见章节编码。
 - data / 数据页：只有当页面正文给出真实数字、标签或表格时才画图；必须围绕这些数据做大数字、简单图表或高可读表格，不要编造数值、趋势或坐标轴。
 - ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
 - hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
@@ -756,7 +948,7 @@ def _build_batch_prompt(
 【质量标准】
 1. visual_evidence 必须具体。优先选择白皮书、直播间、达人矩阵、终端货架、企业楼宇、地图、增长曲线、VS 对比、产品/工艺场景等能证明观点的对象。
    - toc / 目录页例外：visual_evidence 应写成「章节路线图 / 导航结构」，不要编造商业证据或场景图。
-   - section / 章节页例外：visual_evidence 应写成「章节标题 / 编号 / 转场氛围」，不要写正文证据或信息图。
+   - section / 章节页例外：visual_evidence 应写成「章节主标题 / 转场氛围」，不要写独立章号、章节编号、正文证据或信息图；只有当章号、章节编号或序号出现在 headline、subhead 或 body 的用户可见文案中，才允许把它作为画面文字。
    - data / 数据页例外：visual_evidence 应写成「正文给出的具体数字/图表对象」，不要写没有数据支撑的抽象增长曲线。
    - ending / 封底例外：visual_evidence 应写成「收束画面 / CTA / 联系方式区域」，不要引入新的证明素材。
    - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠。
@@ -999,8 +1191,8 @@ def _do_generate_visual_plan(
             "headline": text.get("headline", ""),
             "subhead": text.get("subhead", ""),
             "body_preview": text.get("body", [])[:3] if isinstance(text.get("body"), list) else (text.get("body", "")[:120] if isinstance(text.get("body"), str) else ""),
-            "existing_visual_suggestion": page.get("visual_suggestion", ""),
-            "visual_requirements": page.get("visual_requirements", []),
+            "existing_visual_suggestion": _current_visual_suggestion(page),
+            "visual_requirements": _current_visual_requirements(page),
             "reference_context": page.get("reference_context", ""),
             "reference_user_hint": page.get("reference_user_hint", ""),
             "global_user_requirements": page.get("global_user_requirements", ""),
@@ -1279,6 +1471,11 @@ def _do_generate_visual_plan(
                 visual_evidence = _fallback_visual_evidence(page)
             if not visual_desc:
                 visual_desc = _fallback_visual_description(page, visual_evidence)
+
+        if str(page_type or "").strip().lower() == "section":
+            visual_evidence = sanitize_section_visual_numbering(visual_evidence)
+            visual_summary = sanitize_section_visual_numbering(visual_summary) or visual_evidence
+            visual_desc = sanitize_section_visual_numbering(visual_desc)
 
         text_content = page.get("text_content", {})
         intent = {

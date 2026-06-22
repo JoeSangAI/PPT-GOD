@@ -6,12 +6,14 @@ from pptx import Presentation
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.core.config import settings
 from app.models.base import Base
-from app.models.models import Project, Slide
+from app.models.models import Project, ProjectRun, Slide
 from app.services.artifact_versions import artifact_stale, dependency_signature, with_artifact_meta
 from app.services.run_state import (
     apply_project_rollback,
     create_project_run,
+    finish_run,
     image_generation_run_stage,
     normalize_confirmed_project_stage,
     reconcile_project_state,
@@ -23,6 +25,7 @@ from app.services.run_state import (
     target_counts,
     update_run_progress,
 )
+from app.api import slides as slides_api
 
 
 def make_session():
@@ -150,6 +153,134 @@ def test_stale_running_run_without_heartbeat():
 
     assert run.status == "stale"
     assert "没有进度更新" in run.error_msg
+
+
+def test_content_plan_running_run_uses_longer_default_heartbeat(monkeypatch):
+    db = make_session()
+    project = Project(title="Long manuscript", status="planning")
+    db.add(project)
+    db.flush()
+    monkeypatch.setattr(settings, "RUN_HEARTBEAT_TIMEOUT_SECONDS", 300)
+    monkeypatch.setattr(settings, "CONTENT_PLAN_HEARTBEAT_TIMEOUT_SECONDS", 1800)
+
+    run = create_project_run(db, project.id, kind="content_plan", stage="analyzing", total_count=50)
+    update_run_progress(db, run.id, message="正在读取材料")
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    stale_inactive_run_if_needed(db, project.id)
+
+    assert run.status == "running"
+
+
+def test_non_content_plan_running_run_keeps_default_heartbeat(monkeypatch):
+    db = make_session()
+    project = Project(title="Visual planning", status="visual_ready")
+    db.add(project)
+    db.flush()
+    monkeypatch.setattr(settings, "RUN_HEARTBEAT_TIMEOUT_SECONDS", 300)
+    monkeypatch.setattr(settings, "CONTENT_PLAN_HEARTBEAT_TIMEOUT_SECONDS", 1800)
+
+    run = create_project_run(db, project.id, kind="visual_prompts", stage="visual_planning", total_count=10)
+    update_run_progress(db, run.id, completed_count=1, message="正在生成视觉方案")
+    run.updated_at = utc_now() - timedelta(seconds=600)
+    db.flush()
+
+    stale_inactive_run_if_needed(db, project.id)
+
+    assert run.status == "stale"
+
+
+def test_content_plan_writeback_guard_rejects_cancelled_run():
+    db = make_session()
+    project = Project(title="Cancelled content plan", status="planning")
+    db.add(project)
+    db.flush()
+
+    run = create_project_run(db, project.id, kind="content_plan", stage="content_plan", total_count=10)
+    finish_run(db, run.id, status="cancelled", message="任务被取消", error_msg="任务被取消")
+    db.flush()
+
+    class Logger:
+        def info(self, *_args):
+            return None
+
+    assert not slides_api._content_plan_run_is_active_for_writeback(
+        db,
+        run.id,
+        Logger(),
+        project.id,
+        "before_slide_replace",
+    )
+
+
+def test_content_plan_writeback_guard_rejects_superseded_active_run():
+    db = make_session()
+    project = Project(title="Superseded content plan", status="planning")
+    db.add(project)
+    db.flush()
+
+    older = create_project_run(db, project.id, kind="content_plan", stage="content_plan", total_count=50)
+    older.status = "running"
+    older.started_at = utc_now() - timedelta(seconds=30)
+    newer = ProjectRun(
+        project_id=project.id,
+        kind="content_plan",
+        status="running",
+        stage="content_plan",
+        total_count=50,
+        started_at=utc_now(),
+    )
+    db.add(newer)
+    db.flush()
+
+    class Logger:
+        def info(self, *_args):
+            return None
+
+    assert not slides_api._content_plan_run_is_active_for_writeback(
+        db,
+        older.id,
+        Logger(),
+        project.id,
+        "before_slide_replace",
+    )
+    assert slides_api._content_plan_run_is_active_for_writeback(
+        db,
+        newer.id,
+        Logger(),
+        project.id,
+        "before_slide_replace",
+    )
+
+
+def test_cancelled_content_plan_exception_does_not_reset_project_status(monkeypatch):
+    db = make_session()
+    project = Project(title="Cancelled late failure", status="planning")
+    db.add(project)
+    db.flush()
+    run = create_project_run(db, project.id, kind="content_plan", stage="content_plan", total_count=50)
+    finish_run(db, run.id, status="cancelled", message="任务被取消", error_msg="任务被取消")
+    db.commit()
+
+    def fail_load_source_packs(*_args, **_kwargs):
+        raise RuntimeError("late background failure")
+
+    monkeypatch.setattr(slides_api, "SessionLocal", lambda: db)
+    monkeypatch.setattr(db, "close", lambda: None)
+    monkeypatch.setattr(slides_api, "load_project_source_packs", fail_load_source_packs)
+
+    slides_api._generate_content_plan_bg(
+        project.id,
+        "取消后旧后台任务失败",
+        page_count=50,
+        run_id=run.id,
+    )
+
+    db.refresh(project)
+    db.refresh(run)
+    assert project.status == "planning"
+    assert run.status == "cancelled"
 
 
 def test_serialize_run_marks_naive_datetimes_as_utc_for_browser_math():
@@ -510,6 +641,99 @@ def test_start_generation_blocks_pages_with_unapplied_plan_changes():
         assert "未应用的内容或画面修改" in exc.detail
     else:
         raise AssertionError("expected stale page to block direct generation")
+
+
+def test_start_generation_blocks_visual_guidance_with_old_visible_labels():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Old visual labels guard",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(
+            project_id=project.id,
+            page_num=9,
+            status="prompt_ready",
+            content_json={
+                "page_num": 9,
+                "type": "content",
+                "visual_suggestion": "下方三栏讲山姆/胖东来/Costco，底部大字写个人外脑。",
+                "text_content": {
+                    "headline": "消费者雇了一个“全知全能”的私人买手",
+                    "body": "过去搜索防晒霜：自己翻几百个商品、几千条评价",
+                },
+            },
+            visual_json={
+                "visual_description": "根据当前正文做极简信息页。",
+            },
+            prompt_text=(
+                "Visible Text:\n"
+                "Headline: \"消费者雇了一个“全知全能”的私人买手\"\n"
+                "Body: \"过去搜索防晒霜：自己翻几百个商品、几千条评价\"\n"
+                "\n\nStyle: test"
+            ),
+        )
+    )
+    db.commit()
+
+    try:
+        slides_api.start_generation(project.id, slides_api.PageNumsRequest(page_nums=[9]), db)
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert "当前内容不一致" in exc.detail
+    else:
+        raise AssertionError("expected old visual labels to block direct generation")
+
+
+def test_start_generation_blocks_prompt_visible_text_from_old_content():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Old prompt visible text guard",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    db.add(
+        Slide(
+            project_id=project.id,
+            page_num=1,
+            status="prompt_ready",
+            content_json={
+                "page_num": 1,
+                "type": "content",
+                "text_content": {
+                    "headline": "当前标题",
+                    "body": "这是最终确认的正文",
+                },
+            },
+            visual_json={"visual_description": "根据当前正文做极简信息页。"},
+            prompt_text=(
+                "Visible Text:\n"
+                "Headline: \"当前标题\"\n"
+                "Body: \"这是上一版已经删除的正文\"\n"
+                "\n\nStyle: test"
+            ),
+        )
+    )
+    db.commit()
+
+    try:
+        slides_api.start_generation(project.id, slides_api.PageNumsRequest(page_nums=[1]), db)
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert "生图 Prompt 不是基于最新内容" in exc.detail
+    else:
+        raise AssertionError("expected stale prompt visible text to block direct generation")
 
 
 def test_download_exports_partial_deck_with_blank_pages(tmp_path, monkeypatch):

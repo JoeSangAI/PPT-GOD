@@ -37,6 +37,7 @@ CONTENT_DIRECTOR_DEFAULT_CONTRACT: dict[str, Any] = {
     "depth": "standard",
     "page_budget_policy": "auto",
     "structure_policy": "source_order",
+    "delivery_intent": "",
     "requires_clarification": False,
     "confidence": 0.55,
     "rationale": "",
@@ -69,7 +70,11 @@ def _clamp_confidence(value: Any, default: float) -> float:
 def _has_director_shape(value: dict | None) -> bool:
     if not isinstance(value, dict):
         return False
-    return any(key in value for key in ALLOWED_CONTENT_DIRECTOR_VALUES) or "requires_clarification" in value
+    return (
+        any(key in value for key in ALLOWED_CONTENT_DIRECTOR_VALUES)
+        or "delivery_intent" in value
+        or "requires_clarification" in value
+    )
 
 
 def normalize_content_director_contract(value: dict | None) -> dict[str, Any]:
@@ -85,6 +90,7 @@ def normalize_content_director_contract(value: dict | None) -> dict[str, Any]:
     contract["requires_clarification"] = bool(value.get("requires_clarification"))
     contract["confidence"] = _clamp_confidence(value.get("confidence"), contract["confidence"])
     contract["rationale"] = str(value.get("rationale") or "").strip()[:600]
+    contract["delivery_intent"] = str(value.get("delivery_intent") or "").strip()[:320]
 
     evidence = value.get("evidence")
     if isinstance(evidence, list):
@@ -130,6 +136,24 @@ def _fallback_contract() -> dict[str, Any]:
     return contract
 
 
+def _derive_delivery_intent_from_brief(brief: str, *, limit: int = 240) -> str:
+    text = re.sub(r"\s+", " ", str(brief or "")).strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[:limit].rstrip(" ，,。；;") + "..."
+    return f"根据用户原始需求生成 PPT：{text}"
+
+
+def _ensure_delivery_intent(contract: dict[str, Any], brief: str) -> dict[str, Any]:
+    if str(contract.get("delivery_intent") or "").strip():
+        return contract
+    delivery_intent = _derive_delivery_intent_from_brief(brief)
+    if delivery_intent:
+        contract["delivery_intent"] = delivery_intent
+    return contract
+
+
 def infer_content_director_contract(
     *,
     brief: str,
@@ -142,7 +166,8 @@ def infer_content_director_contract(
         "你是内容总监。你的任务不是生成 PPT 页面，而是理解用户真正想要的内容任务契约。\n"
         "只输出 JSON，不要输出解释。\n\n"
         "判断维度：task_type, source_use, coverage, compression, depth, page_budget_policy, structure_policy, "
-        "requires_clarification, confidence, rationale, evidence。\n"
+        "delivery_intent, requires_clarification, confidence, rationale, evidence。\n"
+        "delivery_intent 用一句自然语言概括最终 PPT 应服务的场景、读者/听众和表达目标；不要使用固定分类枚举。\n"
         "如果用户要求尽量完整还原严肃材料，应倾向 coverage=near_complete 或 complete, "
         "compression=low, page_budget_policy=source_capacity。\n"
         "如果用户要求总结、提炼、汇报，应倾向 compression=medium/high, page_budget_policy=compact 或 explicit。\n"
@@ -161,9 +186,13 @@ def infer_content_director_contract(
             ],
             temperature=0.1,
             timeout=timeout,
+            extra_body={
+                "thinking": {"type": "adaptive"},
+                "reasoning_split": True,
+            },
         )
         raw = response.choices[0].message.content
-        return normalize_content_director_contract(_parse_contract_json(raw))
+        return _ensure_delivery_intent(normalize_content_director_contract(_parse_contract_json(raw)), brief)
     except Exception:
         return _fallback_contract()
 

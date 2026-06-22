@@ -62,6 +62,7 @@ from app.core.config import settings
 from app.services.content_plan import (
     PAGE_MAP_DOCUMENT_LIMIT,
     generate_content_plan,
+    infer_effective_content_intent_contract,
     infer_page_count_from_single_ppt,
     content_plan_topic_with_chat_context,
     resolve_content_plan_page_target,
@@ -75,7 +76,6 @@ from app.services.source_context import (
 )
 from app.services.source_intent import (
     infer_intent_contract,
-    merge_intent_contract,
     source_diagnostics_from_documents,
 )
 from app.services.logo_policy import (
@@ -97,8 +97,21 @@ from app.services.overlay_layers import (
     normalize_overlay_layers,
     remove_asset_from_overlay_layers,
 )
-from app.services.visual_plan import VisualPlanGenerationError, generate_visual_plan, _recall_visual_assets_for_page
-from app.services.prompt_engine import generate_prompt_for_page, generate_prompts_for_all_pages
+from app.services.visual_plan import (
+    VisualPlanGenerationError,
+    generate_visual_plan,
+    _current_visual_requirements,
+    _current_visual_suggestion,
+    _guidance_mentions_absent_visible_copy,
+    _page_visible_copy_text,
+    _recall_visual_assets_for_page,
+)
+from app.services.prompt_engine import (
+    _content_visual_contract,
+    _strip_markdown,
+    generate_prompt_for_page,
+    generate_prompts_for_all_pages,
+)
 from app.services.pptx_assembler import assemble_pptx
 from app.services.style_pack import derive_style_pack_from_content, style_pack_from_selected_style
 from app.services.visual_strategy import detect_logo_tone_from_image
@@ -113,7 +126,7 @@ from app.services.visual_block_renderer import (
 )
 from app.services.visual_directives import extract_visual_directives
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
-from app.services.artifact_versions import dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
+from app.services.artifact_versions import artifact_meta, dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
 from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import (
@@ -1493,6 +1506,193 @@ def _project_has_stale_artifacts(slides: list[Slide]) -> bool:
     return any(has_stale_flags(slide.visual_json) for slide in slides)
 
 
+_PROMPT_VISIBLE_LABELS = {
+    "headline": "headline",
+    "subhead": "subhead",
+    "body": "body",
+    "info block body": "body",
+    "linked caption body": "body",
+}
+
+
+def _content_page_for_generation_check(slide: Slide) -> dict:
+    content = copy.deepcopy(slide.content_json) if isinstance(slide.content_json, dict) else {}
+    content.setdefault("page_num", slide.page_num)
+    content.setdefault("type", slide.type or "content")
+    if slide.type:
+        content["type"] = slide.type
+    return content
+
+
+def _normalize_visible_copy_for_generation(value) -> str:
+    cleaned = _strip_markdown(str(value or ""))
+    cleaned = cleaned.replace("\\", "")
+    cleaned = re.sub(r"^[\s•·\-*]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"^(?:\[表格\]\s*){2,}", "[表格] ", cleaned)
+    return cleaned.strip()
+
+
+def _content_body_lines_for_generation(body) -> list[str]:
+    if isinstance(body, str):
+        return [line.strip() for line in body.splitlines() if line.strip()]
+    if isinstance(body, list):
+        lines = []
+        for item in body:
+            value = item.get("content") if isinstance(item, dict) else item
+            if str(value or "").strip():
+                lines.append(str(value).strip())
+        return lines
+    return []
+
+
+def _expected_prompt_visible_slots(slide: Slide) -> dict[str, list[str]]:
+    content = slide.content_json if isinstance(slide.content_json, dict) else {}
+    raw_text = content.get("text_content") if isinstance(content.get("text_content"), dict) else {}
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    page_type = str(visual.get("type") or slide.type or content.get("type") or "").strip().lower()
+    layout = str(visual.get("layout") or "").strip().lower()
+    is_punchline = page_type in {"hero", "quote"} or layout == "hero"
+    content_text, _visual_intents, _diagram_labels = _content_visual_contract(raw_text or {})
+
+    expected: dict[str, list[str]] = {"headline": [], "subhead": [], "body": []}
+    for slot in ("headline", "subhead"):
+        normalized = _normalize_visible_copy_for_generation(content_text.get(slot))
+        if normalized:
+            expected[slot].append(normalized)
+    if not is_punchline:
+        for line in _content_body_lines_for_generation(content_text.get("body")):
+            normalized = _normalize_visible_copy_for_generation(line)
+            if normalized:
+                expected["body"].append(normalized)
+    return expected
+
+
+def _prompt_visible_slots(prompt_text: str | None) -> dict[str, list[str]]:
+    prompt = str(prompt_text or "")
+    match = re.search(r"Visible Text:\s*\n(?P<section>.*?)(?:\n\s*\n|$)", prompt, flags=re.S)
+    if not match:
+        return {}
+    slots: dict[str, list[str]] = {"headline": [], "subhead": [], "body": []}
+    section = match.group("section")
+    directive_re = re.compile(
+        r'^(Headline|Subhead|Body|Info block body|Linked caption body):\s*"(?P<value>.*?)"'
+        r'(?=\n(?:Headline|Subhead|Body|Info block body|Linked caption body|Visible text rule:)|\s*$)',
+        flags=re.M | re.S,
+    )
+    for item in directive_re.finditer(section):
+        label = item.group(1)
+        slot = _PROMPT_VISIBLE_LABELS.get(label.strip().lower())
+        if not slot:
+            continue
+        value = item.group("value").strip()
+        normalized = _normalize_visible_copy_for_generation(value)
+        if normalized:
+            slots.setdefault(slot, []).append(normalized)
+    return {slot: values for slot, values in slots.items() if values}
+
+
+def _slide_prompt_visible_text_is_current(slide: Slide) -> bool:
+    expected = _expected_prompt_visible_slots(slide)
+    expected_all = {
+        value
+        for values in expected.values()
+        for value in values
+    }
+    prompt_slots = _prompt_visible_slots(slide.prompt_text)
+    if expected_all and not prompt_slots:
+        return False
+    for slot, values in expected.items():
+        for value in values:
+            if value not in prompt_slots.get(slot, []):
+                return False
+    for slot, values in prompt_slots.items():
+        if slot not in {"headline", "subhead", "body"}:
+            continue
+        for value in values:
+            if value not in expected_all:
+                return False
+    return True
+
+
+def _slide_generation_guidance_matches_current_content(slide: Slide) -> bool:
+    page = _content_page_for_generation_check(slide)
+    visible_text = _page_visible_copy_text(page)
+    content = slide.content_json if isinstance(slide.content_json, dict) else {}
+    guidance_sources = [
+        content.get("visual_suggestion"),
+        content.get("visual_requirements"),
+    ]
+    return not any(
+        _guidance_mentions_absent_visible_copy(source, visible_text)
+        for source in guidance_sources
+        if source
+    )
+
+
+def _slide_prompt_dependencies_match_generation_sources(slide: Slide, current_deps: dict[str, str]) -> bool:
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    meta = artifact_meta(visual)
+    prompt_deps = meta.get("prompt_dependencies") if isinstance(meta.get("prompt_dependencies"), dict) else None
+    if not prompt_deps:
+        return True
+    for key in ("content", "selected_style", "style_assets", "visual_assets"):
+        if prompt_deps.get(key) != current_deps.get(key):
+            return False
+    return True
+
+
+def _slide_prompt_text_matches_current_generation_context(slide: Slide) -> bool:
+    return _slide_prompt_visible_text_is_current(slide)
+
+
+def _raise_if_generation_inputs_not_current(project: Project, slides: list[Slide], target_slides: list[Slide]) -> None:
+    stale_plan_pages = [
+        s.page_num
+        for s in target_slides
+        if has_stale_flags(s.visual_json, "content", "visual")
+    ]
+    if stale_plan_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
+        )
+
+    stale_guidance_pages = [
+        s.page_num
+        for s in target_slides
+        if not _slide_generation_guidance_matches_current_content(s)
+    ]
+    if stale_guidance_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, stale_guidance_pages))} 页的画面方案与当前内容不一致，请先更新画面方案。"
+        )
+
+    current_deps = dependency_signature(project, slides)
+    dependency_stale_pages = [
+        s.page_num
+        for s in target_slides
+        if s.prompt_text and not _slide_prompt_dependencies_match_generation_sources(s, current_deps)
+    ]
+    if dependency_stale_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, dependency_stale_pages))} 页的生图 Prompt 不是基于最新风格或素材，请先更新画面方案。"
+        )
+
+    prompt_stale_pages = [
+        s.page_num
+        for s in target_slides
+        if s.prompt_text and not _slide_prompt_text_matches_current_generation_context(s)
+    ]
+    if prompt_stale_pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"第 {', '.join(map(str, prompt_stale_pages))} 页的生图 Prompt 不是基于最新内容，请先更新画面方案。"
+        )
+
+
 def _invalidate_content_dependent_outputs(project: Project):
     """Content changes make downstream page artifacts stale without deleting them."""
     slides = list(project.slides or [])
@@ -1721,6 +1921,33 @@ def _normalize_content_json_markdown(content_json: dict) -> dict:
             text_content = {}
         text_content["body"] = normalize_markdown_content(body_from_blocks)
         content["text_content"] = text_content
+    return content
+
+
+def _json_equivalent(left, right) -> bool:
+    try:
+        return json.dumps(left, ensure_ascii=False, sort_keys=True, default=str) == json.dumps(
+            right,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    except TypeError:
+        return left == right
+
+
+def _content_json_for_generation(slide: Slide) -> dict:
+    content = copy.deepcopy(slide.content_json) if isinstance(slide.content_json, dict) else {}
+    changed = False
+    if content.get("visual_suggestion") != "":
+        content["visual_suggestion"] = ""
+        changed = True
+    if content.get("visual_requirements") != []:
+        content["visual_requirements"] = []
+        changed = True
+    if changed:
+        slide.content_json = content
+        flag_modified(slide, "content_json")
     return content
 
 
@@ -2543,6 +2770,30 @@ def _content_plan_attachment_context(db: Session, project_id: str, attachment_id
     return "\n\n".join(parts).strip()
 
 
+def _content_plan_run_is_active_for_writeback(db: Session, run_id: str | None, logger, project_id: str, phase: str) -> bool:
+    db.expire_all()
+    if not run_id:
+        return True
+    if is_run_active(db, run_id):
+        latest_active = get_active_run(db, project_id)
+        if latest_active and str(latest_active.id) == str(run_id):
+            return True
+        logger.info(
+            "[ContentPlan BG] Run %s was superseded during %s; skipping writeback for project=%s",
+            run_id,
+            phase,
+            project_id,
+        )
+        return False
+    logger.info(
+        "[ContentPlan BG] Run %s is no longer active during %s; skipping writeback for project=%s",
+        run_id,
+        phase,
+        project_id,
+    )
+    return False
+
+
 def _generate_content_plan_bg(
     project_id: str,
     topic: str,
@@ -2659,31 +2910,37 @@ def _generate_content_plan_bg(
         if image_context_parts:
             image_context = "\n\n".join(image_context_parts)
             documents = "\n\n".join(part for part in [documents, image_context] if part)
+        intent_topic = content_plan_topic_with_chat_context(topic, chat_context)
         intent_contract = None
         project_for_intent = db.query(Project).filter(Project.id == project_id).first()
         if project_for_intent:
-            inferred_contract = infer_intent_contract(
-                topic,
+            legacy_contract = infer_intent_contract(
+                intent_topic,
                 source_diagnostics=source_diagnostics_from_documents(documents),
             )
-            project_for_intent.intent_contract = merge_intent_contract(
-                project_for_intent.intent_contract,
-                inferred_contract,
+            intent_contract = infer_effective_content_intent_contract(
+                intent_topic,
+                documents,
+                legacy_contract,
             )
+            project_for_intent.intent_contract = intent_contract
             flag_modified(project_for_intent, "intent_contract")
-            intent_contract = project_for_intent.intent_contract
             db.commit()
         if documents:
             logger.info(f"[ContentPlan BG] Loaded documents, length={len(documents)}")
-            inferred_page_count = infer_page_count_from_single_ppt(documents, topic, intent_contract=intent_contract)
+            inferred_page_count = infer_page_count_from_single_ppt(documents, intent_topic, intent_contract=intent_contract)
             if page_count is None and inferred_page_count:
                 page_count = inferred_page_count
                 update_run_progress(db, run_id, total_count=page_count)
                 db.commit()
                 logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
 
-        intent_topic = content_plan_topic_with_chat_context(topic, chat_context)
-        target_page_count, _, _ = resolve_content_plan_page_target(intent_topic, page_count, documents)
+        target_page_count, _, _ = resolve_content_plan_page_target(
+            intent_topic,
+            page_count,
+            documents,
+            intent_contract=intent_contract,
+        )
         update_run_progress(db, run_id, total_count=target_page_count)
         db.commit()
 
@@ -2702,9 +2959,7 @@ def _generate_content_plan_bg(
             intent_contract=intent_contract,
             chat_context=chat_context,
         )
-        db.expire_all()
-        if not is_run_active(db, run_id):
-            logger.info(f"[ContentPlan BG] Run {run_id} is no longer active; skipping stale writeback")
+        if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "model_return"):
             return
         logger.info(f"[ContentPlan BG] Generated {len(outline)} pages")
         update_run_progress(
@@ -2717,6 +2972,8 @@ def _generate_content_plan_bg(
         )
         db.commit()
         _update_progress(project_id, {"stage": "saving", "message": "正在保存结果...", "current_page": len(outline), "total_pages": len(outline)}, run_id)
+        if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "before_slide_replace"):
+            return
         # PPT 上传早于/晚于内容规划都要能重新挂回新生成的页面。
         # 生成新 slides 前，先把从 PPT 拆出的页面参考图解绑，避免旧 slide 被删除后素材丢失在孤儿关系里。
         pptx_refs = db.query(ReferenceImage).filter(
@@ -2767,6 +3024,9 @@ def _generate_content_plan_bg(
                 derived_title = _derive_project_title(topic, outline)
                 if derived_title:
                     project.title = derived_title
+        if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "before_final_commit"):
+            db.rollback()
+            return
         finish_run(
             db,
             run_id,
@@ -2783,6 +3043,8 @@ def _generate_content_plan_bg(
     except Exception as e:
         db.rollback()
         logger.error(f"[ContentPlan BG] Failed for project={project_id}: {e}")
+        if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "failure"):
+            return
         _update_progress(project_id, {"stage": "error", "message": f"生成失败：{str(e)[:100]}"}, run_id)
         # 标记项目状态为失败，让前端可以检测
         try:
@@ -2965,7 +3227,7 @@ def create_visual_plan(
     stage_context = (body.stage_context or "").strip()[:4000]
     content_plan = []
     for s in slides:
-        item = copy.deepcopy(s.content_json) or {}
+        item = _content_json_for_generation(s)
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
@@ -3022,11 +3284,11 @@ def create_visual_plan(
             ),
             existing_visual,
         )
-        if slide.prompt_text or slide.image_path or has_stale_flags(existing_visual, "content", "visual"):
-            next_visual = with_stale_flags(next_visual, content=False, visual=True)
         slide.visual_json = next_visual
-        if slide.status in ("pending", "planning"):
-            slide.status = "visual_ready"
+        slide.prompt_text = None
+        slide.image_path = None
+        slide.error_msg = None
+        slide.status = "visual_ready"
 
     # 如果全部都有 visual，项目状态推进
     if all(s.visual_json for s in slides):
@@ -3080,7 +3342,7 @@ def create_prompts(
     stage_context = (body.stage_context or "").strip()[:4000]
     content_plan = []
     for s in target_slides:
-        item = copy.deepcopy(s.content_json) or {}
+        item = _content_json_for_generation(s)
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
@@ -3145,7 +3407,9 @@ def create_prompts(
                 dependencies=artifact_deps,
                 prompt_dependencies=artifact_deps,
             )
-            slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+            slide.image_path = None
+            slide.error_msg = None
+            slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=False)
             flag_modified(slide, "visual_json")
             slide.status = "prompt_ready"
 
@@ -3183,7 +3447,7 @@ async def create_visual_and_prompts(
 
     content_plan = []
     for s in target_slides:
-        item = copy.deepcopy(s.content_json) or {}
+        item = _content_json_for_generation(s)
         item["page_num"] = s.page_num
         item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
         item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
@@ -3291,7 +3555,7 @@ async def _do_generate_visual_and_prompts(
         content_plan = []
         stage_context = (stage_context or "").strip()[:4000]
         for s in target_slides:
-            item = copy.deepcopy(s.content_json) or {}
+            item = _content_json_for_generation(s)
             item["page_num"] = s.page_num
             item["manual_visual_asset_ids"] = _manual_asset_ids(s.visual_json)
             item["manual_visual_asset_usage"] = _manual_asset_usage(s.visual_json)
@@ -3359,12 +3623,12 @@ async def _do_generate_visual_and_prompts(
                 ),
                 existing_visual,
             )
-            if slide.prompt_text or slide.image_path or has_stale_flags(existing_visual, "content", "visual"):
-                next_visual = with_stale_flags(next_visual, content=False, visual=True)
             slide.visual_json = next_visual
+            slide.prompt_text = None
+            slide.image_path = None
+            slide.error_msg = None
             flag_modified(slide, "visual_json")
-            if slide.status in ("pending", "planning"):
-                slide.status = "visual_ready"
+            slide.status = "visual_ready"
         db.commit()
 
         # Step 2: 并发生成 Prompts（最多 5 个并发，避免 API 限流）
@@ -3461,7 +3725,9 @@ async def _do_generate_visual_and_prompts(
                     dependencies=artifact_deps,
                     prompt_dependencies=artifact_deps,
                 )
-                slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+                slide.image_path = None
+                slide.error_msg = None
+                slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=False)
                 flag_modified(slide, "visual_json")
                 slide.status = "prompt_ready"
 
@@ -3632,16 +3898,7 @@ def start_generation(
             status_code=400,
             detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
         )
-    stale_plan_pages = [
-        s.page_num
-        for s in target_slides
-        if has_stale_flags(s.visual_json, "content", "visual")
-    ]
-    if stale_plan_pages:
-        raise HTTPException(
-            status_code=400,
-            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
-        )
+    _raise_if_generation_inputs_not_current(project, slides, target_slides)
     missing_prompt_pages = [
         s.page_num
         for s in target_slides
@@ -3727,24 +3984,26 @@ def confirm_prototype(
         return {"message": "All slides already completed", "status": "completed"}
 
     target_slides = pending_slides + failed_slides
-    stale_plan_pages = [
-        s.page_num
-        for s in target_slides
-        if has_stale_flags(s.visual_json, "content", "visual")
-    ]
-    if stale_plan_pages:
-        raise HTTPException(
-            status_code=400,
-            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
-        )
     missing_prompt_slides = [
         s
         for s in target_slides
         if not s.prompt_text or not str(s.prompt_text).strip()
     ]
+    stale_prompt_slides = [
+        s
+        for s in target_slides
+        if s.prompt_text and str(s.prompt_text).strip() and not _slide_prompt_text_matches_current_generation_context(s)
+    ]
+    prompt_refresh_slides = []
+    seen_prompt_refresh = set()
+    for slide in [*missing_prompt_slides, *stale_prompt_slides]:
+        if slide.id in seen_prompt_refresh:
+            continue
+        seen_prompt_refresh.add(slide.id)
+        prompt_refresh_slides.append(slide)
     missing_visual_pages = [
         s.page_num
-        for s in missing_prompt_slides
+        for s in prompt_refresh_slides
         if not isinstance(s.visual_json, dict) or not str(s.visual_json.get("visual_description") or "").strip()
     ]
     if missing_visual_pages:
@@ -3753,16 +4012,36 @@ def confirm_prototype(
             detail=f"第 {', '.join(map(str, missing_visual_pages))} 页缺少画面描述，请先生成画面方案。"
         )
 
-    if missing_prompt_slides:
+    if prompt_refresh_slides:
         logger.info(
-            "ConfirmPrototype: project=%s 自动补齐缺失 Prompt pages=%s",
+            "ConfirmPrototype: project=%s 自动刷新缺失或过期 Prompt pages=%s",
             project_id,
-            [s.page_num for s in missing_prompt_slides],
+            [s.page_num for s in prompt_refresh_slides],
         )
-        for slide in missing_prompt_slides:
+        for slide in prompt_refresh_slides:
             prompt = _regenerate_slide_prompt(slide, project, db)
             if prompt:
                 slide.status = "prompt_ready"
+        refreshed_slides = (
+            db.query(Slide)
+            .filter(Slide.project_id == project_id)
+            .order_by(Slide.page_num)
+            .all()
+        )
+        refreshed_deps = dependency_signature(project, refreshed_slides)
+        refresh_ids = {slide.id for slide in prompt_refresh_slides}
+        for refreshed_slide in refreshed_slides:
+            if refreshed_slide.id not in refresh_ids or not refreshed_slide.prompt_text:
+                continue
+            refreshed_slide.visual_json = with_artifact_meta(
+                refreshed_slide.visual_json,
+                kind="visual_plan",
+                dependencies=refreshed_deps,
+                prompt_dependencies=refreshed_deps,
+            )
+            flag_modified(refreshed_slide, "visual_json")
+        slides = refreshed_slides
+        target_slides = [s for s in refreshed_slides if s.page_num in target_page_nums]
         db.flush()
 
     missing_prompt_pages = [
@@ -3775,6 +4054,7 @@ def confirm_prototype(
             status_code=400,
             detail=f"第 {', '.join(map(str, missing_prompt_pages))} 页缺少生图 Prompt，请先生成画面描述。"
         )
+    _raise_if_generation_inputs_not_current(project, slides, target_slides)
 
     ensure_generation_worker_ready()
     run = create_project_run(
@@ -4886,16 +5166,13 @@ def retry_failed_slides(
             detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
         )
 
-    stale_plan_pages = [
-        slide.page_num
-        for slide in failed_slides
-        if has_stale_flags(slide.visual_json, "content", "visual")
-    ]
-    if stale_plan_pages:
-        raise HTTPException(
-            status_code=400,
-            detail=f"第 {', '.join(map(str, stale_plan_pages))} 页有未应用的内容或画面修改，请先更新画面方案。"
-        )
+    project_slides = (
+        db.query(Slide)
+        .filter(Slide.project_id == project_id)
+        .order_by(Slide.page_num)
+        .all()
+    )
+    _raise_if_generation_inputs_not_current(project, project_slides, failed_slides)
 
     # 过滤掉正在生成中的 slide，避免重复触发
     page_nums = []
@@ -4959,7 +5236,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
         key=_reference_image_sort_key,
     )
     _sync_exact_page_reference_overlay_layers(slide)
-    content_json = slide.content_json or {}
+    content_json = _content_json_for_generation(slide)
     visual_json = slide.visual_json or {}
 
     page_intent = {
@@ -5017,7 +5294,9 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
         dependencies=artifact_deps,
         prompt_dependencies=artifact_deps,
     )
-    slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=bool(slide.image_path))
+    slide.image_path = None
+    slide.error_msg = None
+    slide.visual_json = with_stale_flags(slide.visual_json, content=False, visual=False, image=False)
     flag_modified(slide, "visual_json")
     db.commit()
     logger.info(f"RetrySlide: 已重新生成第 {slide.page_num} 页 prompt")
@@ -5345,8 +5624,13 @@ def retry_slide(
                 detail="该页面有原样保留素材，请先重新生成画面描述以预留位置。",
             )
 
-    if has_stale_flags(slide.visual_json, "content", "visual"):
-        raise HTTPException(status_code=400, detail="该页面有未应用的内容或画面修改，请先更新画面方案。")
+    project_slides = (
+        db.query(Slide)
+        .filter(Slide.project_id == project_id)
+        .order_by(Slide.page_num)
+        .all()
+    )
+    _raise_if_generation_inputs_not_current(project, project_slides, [slide])
 
     if not slide.prompt_text:
         raise HTTPException(status_code=400, detail="Slide has no prompt. Generate prompts first.")
@@ -5407,6 +5691,10 @@ def update_slide_content(
     # 必须用深拷贝，否则 SQLAlchemy 检测不到 JSON 字段的变更
     existing = copy.deepcopy(slide.content_json) or {}
     new_content = _normalize_content_json_markdown(body.content_json)
+    original_text = existing.get("text_content") if isinstance(existing.get("text_content"), dict) else {}
+    original_text = copy.deepcopy(original_text)
+    original_visual_suggestion = existing.get("visual_suggestion")
+    original_visual_requirements = copy.deepcopy(existing.get("visual_requirements"))
 
     # 安全 merge：只替换 text_content 和 speaker_notes，保留其他字段
     if "text_content" in new_content:
@@ -5415,12 +5703,31 @@ def update_slide_content(
             existing_text = {}
         existing_text.update(new_content["text_content"])
         existing["text_content"] = existing_text
+    merged_text = existing.get("text_content") if isinstance(existing.get("text_content"), dict) else {}
+    text_content_changed = any(
+        not _json_equivalent(original_text.get(key), merged_text.get(key))
+        for key in ("headline", "subhead", "body")
+    )
     if "speaker_notes" in new_content:
         existing["speaker_notes"] = new_content["speaker_notes"]
     if "visual_suggestion" in new_content:
-        existing["visual_suggestion"] = new_content["visual_suggestion"]
+        if text_content_changed and _json_equivalent(new_content["visual_suggestion"], original_visual_suggestion):
+            existing["visual_suggestion"] = ""
+        else:
+            existing["visual_suggestion"] = new_content["visual_suggestion"]
+    elif text_content_changed:
+        existing["visual_suggestion"] = ""
     if "visual_requirements" in new_content:
-        existing["visual_requirements"] = new_content["visual_requirements"]
+        if text_content_changed and _json_equivalent(new_content["visual_requirements"], original_visual_requirements):
+            existing["visual_requirements"] = []
+        else:
+            existing["visual_requirements"] = new_content["visual_requirements"]
+    elif text_content_changed:
+        existing["visual_requirements"] = []
+    if existing.get("visual_suggestion"):
+        existing["visual_suggestion"] = _current_visual_suggestion(existing)
+    if existing.get("visual_requirements"):
+        existing["visual_requirements"] = _current_visual_requirements(existing)
     if "content_blocks" in new_content:
         existing["content_blocks"] = new_content["content_blocks"]
 

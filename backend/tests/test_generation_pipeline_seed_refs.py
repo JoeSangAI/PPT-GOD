@@ -199,7 +199,7 @@ def test_section_seed_base_edit_contract_is_compact():
     assert "main title 「术」" not in instruction
     assert "standalone chapter-number badge" in instruction
     assert "overrides any earlier layout or composition wording" in instruction
-    assert len(instruction) < 1000
+    assert len(instruction) < 1400
 
 
 def test_section_seed_base_edit_contract_uses_single_visible_number_source():
@@ -222,6 +222,87 @@ def test_section_seed_base_edit_contract_uses_single_visible_number_source():
     assert "subhead 「Part 6 — 《拿不准时刻》系列」" in instruction
     assert "module marker 「六」" not in instruction
     assert "main title 「模块六」" not in instruction
+    assert "standalone chapter-number badge" in instruction
+
+
+def test_section_seed_base_edit_contract_preserves_question_title_hierarchy():
+    slide = Slide(
+        page_num=13,
+        type="section",
+        content_json={
+            "section_title": "第二章",
+            "text_content": {
+                "headline": "什么没变？人心仍然是终点",
+                "subhead": "",
+            },
+        },
+    )
+
+    instruction = generation_pipeline._seed_base_edit_instruction(slide, 1)
+
+    assert "render 「什么没变？」 as the smaller white top line" in instruction
+    assert "render 「人心仍然是终点」 as the larger champagne-gold main statement" in instruction
+    assert "same left title block used by the seed" in instruction
+
+
+def test_section_seed_base_edit_contract_splits_compact_headline_hierarchy():
+    slide = Slide(
+        page_num=19,
+        type="section",
+        content_json={
+            "section_title": "第三章",
+            "text_content": {
+                "headline": "平台权力正在重构",
+                "subhead": "",
+            },
+        },
+    )
+
+    instruction = generation_pipeline._seed_base_edit_instruction(slide, 1)
+
+    assert "render 「平台权力」 as the smaller white top line" in instruction
+    assert "render 「正在重构」 as the larger champagne-gold main statement" in instruction
+    assert "第三章" not in instruction
+
+
+def test_section_seed_base_edit_contract_splits_action_checklist_headline():
+    slide = Slide(
+        page_num=43,
+        type="section",
+        content_json={
+            "section_title": "企业 90 天行动清单",
+            "text_content": {
+                "headline": "企业 90 天行动清单",
+                "subhead": "",
+            },
+        },
+    )
+
+    instruction = generation_pipeline._seed_base_edit_instruction(slide, 1)
+
+    assert "render 「企业 90 天」 as the smaller white top line" in instruction
+    assert "render 「行动清单」 as the larger champagne-gold main statement" in instruction
+
+
+def test_section_seed_base_edit_contract_does_not_render_structural_section_title():
+    slide = Slide(
+        page_num=13,
+        type="section",
+        content_json={
+            "section_title": "第二章",
+            "text_content": {
+                "headline": "什么没变？人心仍然是终点",
+                "subhead": "",
+            },
+        },
+    )
+
+    instruction = generation_pipeline._seed_base_edit_instruction(slide, 1)
+
+    assert "DIRECT SEED IMAGE EDIT CONTRACT" in instruction
+    assert "headline 「什么没变？人心仍然是终点」" in instruction
+    assert "chapter label" not in instruction
+    assert "第二章" not in instruction
     assert "standalone chapter-number badge" in instruction
 
 

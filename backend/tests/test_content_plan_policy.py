@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 
 import pytest
@@ -30,6 +31,7 @@ from app.services.content_plan import (
     should_generate_incremental_long_deck,
     _soft_page_bounds,
 )
+from app.services.source_intent import infer_intent_contract
 
 
 @pytest.fixture(autouse=True)
@@ -76,6 +78,11 @@ def assert_no_internal_source_markers(value):
     assert leaked == []
 
 
+def _test_talk_notes(*parts: str) -> str:
+    content = "；".join(part for part in parts if part)
+    return f"讲稿内容：{content or '围绕本页材料讲出具体事实、判断和结论。'}"
+
+
 def test_short_uploaded_text_defaults_to_faithful_mode():
     documents = "这是用户写好的完整段落。\n\n关键判断：保持原文表达，不要重写。"
 
@@ -118,6 +125,13 @@ def test_per_page_feedback_is_not_treated_as_one_page_request():
 
     assert content_plan_module.infer_page_count_from_topic(topic) is None
     assert resolve_requested_content_plan_page_count(topic, 60) == 60
+
+
+def test_content_plan_page_types_keep_quote_as_legacy_hero_alias():
+    assert "quote" not in content_plan_module.CANONICAL_CONTENT_PLAN_TYPES
+    assert content_plan_module._canonical_content_plan_type("quote") == "hero"
+    assert content_plan_module._canonical_content_plan_type("金句") == "hero"
+    assert "cover、toc、section、content、data、hero、quote、ending" not in inspect.getsource(content_plan_module)
 
 
 def test_colloquial_chinese_page_range_survives_numbered_brief_items():
@@ -829,7 +843,7 @@ def test_generate_content_plan_routes_long_course_to_page_map(monkeypatch):
                 "headline": "赢利与天龙十部" if page_num == 1 else f"第 {page_num} 页课程判断",
                 "subhead": "",
                 "bullets": [] if page_num in {1, 60} else [f"原文依据 {page_num}", f"课堂讲解 {page_num}"],
-                "speaker_notes": f"围绕第 {page_num} 页展开讲解。",
+                "speaker_notes": _test_talk_notes(f"第 {page_num} 页围绕原文依据和课堂讲解展开。"),
                 "visual_suggestion": f"第 {page_num} 页课程视觉建议。",
                 "source_refs": [],
                 "generation_status": "page_map_model",
@@ -994,7 +1008,7 @@ def test_long_course_generation_failure_does_not_save_source_draft_as_success(mo
             documents=documents,
             page_count=60,
         )
-    assert "failed before producing usable pages" in str(exc_info.value) or "质量不足" in str(exc_info.value)
+    assert "failed before producing usable model pages" in str(exc_info.value) or "质量不足" in str(exc_info.value)
 
 
 def test_short_soft_page_target_stays_close_to_requested_count():
@@ -1117,6 +1131,85 @@ def test_build_content_plan_job_uses_content_director_contract(monkeypatch):
     assert content_plan_module._select_content_plan_strategy(job) == "page_map"
 
 
+def test_source_preserve_synonyms_strengthen_director_contract(monkeypatch):
+    documents = """# 企业增长课
+
+## 第一章：增长不是拉新
+正文
+
+## 第二章：留存才是复利
+正文
+"""
+
+    monkeypatch.setattr(content_plan_module, "infer_content_director_contract", lambda **_kwargs: {
+        "task_type": "summary",
+        "source_use": "synthesized",
+        "coverage": "selective",
+        "compression": "high",
+        "depth": "brief",
+        "page_budget_policy": "compact",
+        "structure_policy": "reorganize",
+        "confidence": 0.8,
+        "evidence": ["模型误判成摘要"],
+    })
+
+    contract = content_plan_module.infer_effective_content_intent_contract(
+        "请逐章讲清楚，不要遗漏全部章节，做成 20 页课程",
+        documents,
+    )
+
+    assert contract["task_type"] == "teaching_deck"
+    assert contract["source_use"] == "faithful"
+    assert contract["coverage"] == "near_complete"
+    assert contract["compression"] == "low"
+    assert contract["depth"] == "deep"
+    assert contract["page_budget_policy"] == "explicit"
+    assert contract["structure_policy"] == "source_order"
+    assert "保留源材料结构" in contract["delivery_intent"]
+    assert _document_preservation_mode(documents, "请逐章讲清楚，不要遗漏全部章节") == "faithful"
+
+
+def test_weak_legacy_contract_does_not_bypass_content_director(monkeypatch):
+    documents = _medium_length_course_manuscript()
+    calls = {"director": 0}
+
+    def fake_director(**_kwargs):
+        calls["director"] += 1
+        return {
+            "task_type": "summary",
+            "source_use": "synthesized",
+            "coverage": "selective",
+            "compression": "high",
+            "depth": "brief",
+            "page_budget_policy": "compact",
+            "structure_policy": "reorganize",
+            "confidence": 0.88,
+            "evidence": ["用户要求总结提炼"],
+        }
+
+    weak_legacy_contract = {
+        "task_type": "polish",
+        "rewrite_level": "light",
+        "page_order_policy": "preserve",
+        "page_count_policy": "same",
+        "source_fidelity": "faithful",
+        "visual_source_use": "page_reference",
+        "confidence": 0.55,
+        "evidence": [],
+    }
+    monkeypatch.setattr(content_plan_module, "infer_content_director_contract", fake_director)
+
+    job = content_plan_module._build_content_plan_job(
+        topic="请把这份材料总结成一份高管汇报 PPT",
+        documents=documents,
+        intent_contract=weak_legacy_contract,
+    )
+
+    assert calls["director"] == 1
+    assert job.intent_contract["task_type"] == "summary"
+    assert job.intent_contract["page_budget_policy"] == "compact"
+
+
 def test_real_manuscript_prompt_routes_to_long_deck_through_content_director(monkeypatch):
     documents = _medium_length_course_manuscript()
 
@@ -1172,6 +1265,53 @@ def test_source_capacity_contract_expands_without_keyword_matching():
     assert min_pages >= 40
     assert max_pages == target
     assert should_generate_incremental_long_deck("请做成一份 PPT", None, documents, intent_contract=contract)
+
+
+def test_source_capacity_uses_structural_capacity_below_char_threshold():
+    documents = "# 结构清楚的短讲稿\n\n" + "\n\n".join(
+        f"## 第 {idx} 章：关键问题 {idx}\n\n"
+        f"核心判断：AI 时代的业务变化不是工具替换，而是决策链条被重新分配。\n"
+        f"关键证据：第 {idx} 组案例说明，用户会先比较、再验证、最后才购买。\n"
+        f"讲述要求：保留这一章的判断、证据和行动提醒，形成单独页面展开。"
+        for idx in range(1, 13)
+    )
+    contract = {
+        "task_type": "teaching_deck",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "source_capacity",
+        "structure_policy": "source_order",
+        "confidence": 0.9,
+        "evidence": ["按源材料容量展开"],
+    }
+
+    assert len(documents) < content_plan_module.AUTO_DOCUMENT_PAGE_MIN_CHARS
+
+    target, min_pages, max_pages = resolve_content_plan_page_target(
+        "请按材料结构做成一份 PPT",
+        None,
+        documents,
+        intent_contract=contract,
+    )
+
+    assert target >= 18
+    assert target < content_plan_module.LONG_DECK_INCREMENTAL_THRESHOLD
+    assert min_pages >= 1
+    assert max_pages == target
+
+
+def test_upper_bound_only_page_request_is_cap_not_target():
+    target, min_pages, max_pages = resolve_content_plan_page_target(
+        "请做一份不超过 20 页的高管摘要 PPT",
+        None,
+        "",
+    )
+
+    assert min_pages == 1
+    assert max_pages == 20
+    assert target < 20
 
 
 def test_latest_per_page_depth_feedback_no_longer_translates_contract():
@@ -1280,6 +1420,7 @@ def test_abstract_quality_constraints_injected_into_page_map_prompt(monkeypatch)
         def create(self, **kwargs):
             prompt = kwargs["messages"][1]["content"]
             captured["prompt"] = prompt
+            captured["extra_body"] = kwargs.get("extra_body")
             return FakeResponse(
                 "P1｜cover｜封面｜张帆 AI 与企业战略融合\n"
                 "备注：开场。\n"
@@ -1318,6 +1459,8 @@ def test_abstract_quality_constraints_injected_into_page_map_prompt(monkeypatch)
     assert "好 PPT 的特征" in captured["prompt"]
     assert "避免的输出形态" in captured["prompt"]
     assert "label: content" in captured["prompt"]
+    assert captured["extra_body"]["thinking"]["type"] == "adaptive"
+    assert captured["extra_body"]["reasoning_split"] is True
     # 旧硬编码 bullet 模板不再出现
     assert "每页 4-6 个具体 bullet" not in captured["prompt"]
     assert "判断、依据、案例" not in captured["prompt"]
@@ -1370,11 +1513,47 @@ def test_intent_contract_policy_text_returns_abstract_quality_constraints():
     assert "好 PPT 的特征" in text
     assert "避免的输出形态" in text
     assert "label: content" in text
-    assert "标题必须是判断句" in text
+    assert "标题必须承载具体判断、问题或原文概念" in text
+    assert "金句 / 课程动作" not in text
+    assert "转场、互动" not in text
     # 旧的 contract 字段翻译不再出现
     assert "尽量完整覆盖上传材料" not in text
     assert "不要压缩成摘要" not in text
     assert "保留原文结构和讲述顺序" not in text
+
+
+def test_intent_contract_policy_text_uses_open_delivery_intent_not_type_branches():
+    text = content_plan_module._intent_contract_policy_text({
+        "task_type": "teaching_deck",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "source_capacity",
+        "structure_policy": "source_order",
+        "delivery_intent": "面向一小时课程演讲，保留原文结构和关键表达。",
+        "confidence": 0.9,
+        "evidence": ["课程"],
+    })
+    ignored_legacy_type_text = content_plan_module._intent_contract_policy_text({
+        "task_type": "summary",
+        "source_use": "optimized",
+        "coverage": "selective",
+        "compression": "high",
+        "depth": "brief",
+        "page_budget_policy": "compact",
+        "structure_policy": "reorganize",
+        "legacy_output_type": "fixed_report_type",
+        "delivery_intent": "面向管理层快速判断的决策简报。",
+        "confidence": 0.9,
+        "evidence": ["高管汇报"],
+    })
+
+    assert "交付理解" in text
+    assert "面向一小时课程演讲，保留原文结构和关键表达。" in text
+    assert "面向管理层快速判断的决策简报。" in ignored_legacy_type_text
+    assert "交付类型" not in text
+    assert "legacy_output_type" not in ignored_legacy_type_text
 
 
 def test_restoration_priority_does_not_override_explicit_short_page_count():
@@ -1473,6 +1652,11 @@ def test_document_driven_long_deck_draft_uses_uploaded_material():
     assert "不被 AI 推荐约等于不存在" in bodies
     assert "零售" in headlines or "零售" in bodies
     assert "系统会继续根据 Brief" not in bodies
+
+    notes = "\n".join(str(page.get("speaker_notes") or "") for page in draft)
+    assert "这一页口头展开" not in notes
+    assert "讲稿内容：" in notes
+    assert "转场提示" in notes
 
 
 def test_plain_pdf_text_infers_source_headings_without_upload_marker():
@@ -1942,6 +2126,486 @@ FIGURE figure_id="book.pdf:p47:x1:1" source_document="book.pdf" source_type="pdf
     assert {"book.pdf:p20:x1:1", "book.pdf:p47:x1:1"} <= outline_figure_ids
 
 
+def test_source_draft_condenses_full_source_instead_of_truncating_tail():
+    documents = """# AI 时代品牌课
+
+## 第一章：问题从哪里来
+- 第一章原文句子 1
+- 第一章原文句子 2
+- 第一章原文句子 3
+- 第一章原文句子 4
+- 第一章原文句子 5
+- 第一章原文句子 6
+
+## 第二章：消费者如何变化
+- 第二章原文句子 1
+- 第二章原文句子 2
+- 第二章原文句子 3
+- 第二章原文句子 4
+- 第二章原文句子 5
+- 第二章原文句子 6
+
+## 第三章：平台如何变化
+- 第三章原文句子 1
+- 第三章原文句子 2
+- 第三章原文句子 3
+- 第三章原文句子 4
+- 第三章原文句子 5
+- 第三章原文句子 6
+
+## 第四章：品牌如何分化
+- 第四章原文句子 1
+- 第四章原文句子 2
+- 第四章原文句子 3
+- 第四章原文句子 4
+- 第四章原文句子 5
+- 第四章原文句子 6
+
+## 第五章：品牌怎么做
+- 第五章原文句子 1
+- 第五章原文句子 2
+- 第五章原文句子 3
+- 第五章原文句子 4
+- 第五章原文句子 5
+- 第五章原文句子 6
+
+## 第六章：九十天行动
+- 第六章原文句子 1
+- 第六章原文句子 2
+- 第六章原文句子 3
+- 第六章原文句子 4
+- 第六章原文句子 5
+- 第六章原文句子 6
+
+【想法】这里是制作备注，不应该进入内容规划。
+"""
+
+    draft = build_document_driven_long_deck_draft(
+        topic="严格 8 页，保持原文顺序",
+        documents=documents,
+        target_count=8,
+        min_pages=8,
+        max_pages=8,
+    )
+    text = json.dumps(draft, ensure_ascii=False)
+
+    assert len(draft) == 8
+    assert "第一章原文句子 1" in text
+    assert "第六章原文句子 6" in text
+    assert "制作备注" not in text
+    assert "互动与复盘" not in text
+    assert "围绕本页材料设计一个提问" not in text
+
+
+def test_source_draft_marks_numbered_chapter_entries_as_section_pages():
+    documents = """# AI 时代品牌课
+
+## 第一章：问题从哪里来
+- 第一章原文句子 1
+- 第一章原文句子 2
+
+## 第二章：消费者如何变化
+- 第二章原文句子 1
+- 第二章原文句子 2
+
+## 第三章：平台如何变化
+- 第三章原文句子 1
+- 第三章原文句子 2
+
+## 第四章：品牌如何分化
+- 第四章原文句子 1
+- 第四章原文句子 2
+
+## 第五章：品牌怎么做
+- 第五章原文句子 1
+- 第五章原文句子 2
+
+## 第六章：企业 90 天行动清单
+- 查：检查 AI、平台、达人和消费者如何描述你的品牌。
+- 定：确定最希望被记住、被调用、被推荐的核心价值。
+
+## 复盘与下一步
+- 今天开始检查证据货架。
+- 下周完成第一轮修订。
+"""
+
+    draft = build_document_driven_long_deck_draft(
+        topic="做成 9 页 PPT，保持原文顺序",
+        documents=documents,
+        target_count=9,
+        min_pages=9,
+        max_pages=9,
+    )
+
+    chapter_page = next(
+        page for page in draft if page["text_content"]["headline"] == "第六章：企业 90 天行动清单"
+    )
+    assert chapter_page["type"] == "section"
+
+
+def test_markdown_source_context_uses_outline_units_instead_of_repeating_page_one():
+    documents = """--- SOURCE filename="AI时代品牌营销课题研究-讨论记录.md" kind="markdown" pages="1" ---
+--- PAGE 1 ---
+# 《AI时代消费者决策路径与品牌策略》
+
+## 混沌 AI 院，为什么要重新讲品牌营销？
+- 混沌 AI 院，为什么要讲一门品牌营销课？
+- 不是因为我们还缺一门教大家用 AI 写文案、做海报、剪视频、提效率的课。
+- AI 时代真正值得追问的是品牌和商家真正的底牌是什么。
+
+## 两张图看清这个时代
+- 经典营销时代争夺注意力。
+- 移动互联网时代争夺匹配效率。
+- AI 时代争夺推荐资格。
+
+## 企业 90 天行动
+- 查：AI 和平台现在如何描述你。
+- 定：找到品牌那个 1。
+- 建：搭建结构化证据资产。
+"""
+
+    draft = build_document_driven_long_deck_draft(
+        topic="做成 8 页 PPT",
+        documents=documents,
+        target_count=8,
+        min_pages=7,
+        max_pages=9,
+    )
+    text = json.dumps(draft, ensure_ascii=False)
+    headlines = [
+        str((page.get("text_content") or {}).get("headline") or "")
+        for page in draft
+        if page.get("type") in {"content", "data"}
+    ]
+
+    assert len(draft) == 8
+    assert "两张图看清这个时代" in text
+    assert "企业 90 天行动" in text
+    assert headlines.count("混沌 AI 院，为什么要讲一门品牌营销课？") <= 1
+
+
+def test_source_draft_separates_screen_copy_from_speaker_notes():
+    long_sentence = (
+        "AI 介入后最关键的变化不是信息更多速度更快，而是消费者开始把一部分信息处理权让渡出去，"
+        "过去消费者自己看自己比自己判断，现在 AI 先读比筛总结再把少数候选交给消费者。"
+    )
+    documents = f"""# AI 时代消费者决策路径与品牌策略
+
+## 第一章：什么变了
+- 核心能力：重复 核心能力：精准 核心能力：对齐
+- {long_sentence}
+- 信息到达消费者之前，已经被压缩过一遍。
+- 品牌不再只争曝光，还要争取被 AI 理解、纳入候选、形成推荐。
+"""
+
+    draft = build_document_driven_long_deck_draft(
+        topic="把讲稿做成 5 页 PPT，尽量保持原文内容和原文字眼",
+        documents=documents,
+        target_count=5,
+        min_pages=5,
+        max_pages=5,
+    )
+    content_pages = draft[2:]
+    text = json.dumps(content_pages, ensure_ascii=False)
+
+    assert all(page["text_content"]["subhead"] == "" for page in content_pages)
+    assert "AI 时代消费者决策路径与品牌策略" not in "\n".join(
+        page["text_content"]["subhead"] for page in content_pages
+    )
+    assert long_sentence in text
+    assert long_sentence in "\n".join(page["speaker_notes"] for page in content_pages)
+    assert long_sentence not in "\n".join(page["text_content"]["body"] for page in content_pages)
+    headlines = "\n".join(page["text_content"]["headline"] for page in content_pages)
+    body_and_notes = "\n".join(
+        f"{page['text_content']['body']}\n{page['speaker_notes']}"
+        for page in content_pages
+    )
+    assert "重复 核心能力" not in headlines
+    assert "核心能力：重复" in body_and_notes
+    assert "核心能力：精准" in body_and_notes
+    assert "核心能力：对齐" in body_and_notes
+    assert "重复核心能力" not in text
+    assert "讲述重点：先复述本页判断" not in text
+
+
+def test_weak_legacy_contract_does_not_force_source_preserve_page_map(monkeypatch):
+    documents = """# AI 时代品牌课
+
+## 开场
+- 原文开场第一句
+- 原文开场第二句
+
+## 结尾
+- 原文结尾第一句
+- 原文结尾第二句
+"""
+    weak_legacy_contract = {
+        "task_type": "polish",
+        "rewrite_level": "light",
+        "page_order_policy": "preserve",
+        "page_count_policy": "same",
+        "source_fidelity": "faithful",
+        "visual_source_use": "page_reference",
+        "confidence": 0.55,
+        "evidence": [],
+    }
+    calls = {"page_map": 0}
+
+    def fake_model_page_map(**_kwargs):
+        calls["page_map"] += 1
+        return [
+            {
+                "page_num": 1,
+                "type": "cover",
+                "section_title": "封面",
+                "headline": "AI 时代品牌课",
+                "bullets": [],
+                "speaker_notes": "开场。",
+                "visual_suggestion": "封面。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 2,
+                "type": "content",
+                "section_title": "内容",
+                "headline": "从材料到观点",
+                "bullets": ["保留开场的核心判断", "把结尾观点提前形成主线"],
+                    "speaker_notes": _test_talk_notes("开场材料说明问题起点，结尾材料给出面向证据的行动提醒。"),
+                "visual_suggestion": "结构图。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 3,
+                "type": "ending",
+                "section_title": "收束",
+                "headline": "真正的差异来自证据",
+                "bullets": ["用源材料的结尾形成行动提醒"],
+                "speaker_notes": "收束。",
+                "visual_suggestion": "结束页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+        ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    page_map = generate_content_page_map(
+        topic="把这份材料做成 3 页高管汇报 PPT",
+        documents=documents,
+        page_count=3,
+        intent_contract=weak_legacy_contract,
+    )
+
+    assert calls["page_map"] == 1
+    assert len(page_map) == 3
+    assert any(page["generation_status"] != "page_map_source" for page in page_map)
+
+
+def test_source_preserve_page_map_uses_model_with_source_draft(monkeypatch):
+    documents = """# AI 时代品牌课
+
+## 开场
+- 原文开场第一句
+- 原文开场第二句
+
+## 结尾
+- 原文结尾第一句
+- 原文结尾第二句
+"""
+    contract = {
+        "task_type": "teaching_deck",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.9,
+        "evidence": [],
+    }
+
+    calls = {"page_map": 0, "source_page_map_markdown": ""}
+
+    def fake_model_page_map(**kwargs):
+        calls["page_map"] += 1
+        calls["source_page_map_markdown"] = kwargs.get("source_page_map_markdown") or ""
+        return [
+            {
+                "page_num": 1,
+                "type": "cover",
+                "section_title": "封面",
+                "headline": "AI 时代品牌课",
+                "bullets": [],
+                "speaker_notes": "开场。",
+                "visual_suggestion": "封面。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 2,
+                "type": "content",
+                "section_title": "开场",
+                "headline": "开场先保留原文问题",
+                "bullets": ["原文开场第一句", "原文开场第二句"],
+                "speaker_notes": _test_talk_notes("原文开场第一句和第二句共同建立问题。"),
+                "visual_suggestion": "问题页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 3,
+                "type": "content",
+                "section_title": "开场",
+                "headline": "把开场判断拆成听众能进入的问题",
+                "bullets": ["原文开场第一句", "原文开场第二句"],
+                "speaker_notes": _test_talk_notes("继续解释原文开场，让听众进入核心问题。"),
+                "visual_suggestion": "对比页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 4,
+                "type": "content",
+                "section_title": "结尾",
+                "headline": "结尾第一句成为行动提醒",
+                "bullets": ["原文结尾第一句", "原文结尾第二句"],
+                "speaker_notes": _test_talk_notes("原文结尾第一句成为行动提醒。"),
+                "visual_suggestion": "行动页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 5,
+                "type": "content",
+                "section_title": "结尾",
+                "headline": "结尾第二句收住主线",
+                "bullets": ["原文结尾第一句", "原文结尾第二句"],
+                "speaker_notes": _test_talk_notes("原文结尾第二句收住整份内容主线。"),
+                "visual_suggestion": "总结页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 6,
+                "type": "ending",
+                "section_title": "结束",
+                "headline": "回到 AI 时代品牌课",
+                "bullets": ["原文结尾第一句", "原文结尾第二句"],
+                "speaker_notes": "结束。",
+                "visual_suggestion": "封底。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            },
+        ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    page_map = generate_content_page_map(
+        topic="严格 6 页，尽量保持原文内容和原文字眼",
+        documents=documents,
+        page_count=6,
+        intent_contract=contract,
+    )
+    text = json.dumps(page_map, ensure_ascii=False)
+
+    assert calls["page_map"] == 1
+    assert "原文开场第一句" in calls["source_page_map_markdown"]
+    assert "原文结尾第二句" in calls["source_page_map_markdown"]
+    assert len(page_map) == 6
+    assert all(page["generation_status"] != "page_map_source" for page in page_map)
+    assert "原文开场第一句" in text
+    assert "原文结尾第二句" in text
+    assert "互动" not in text
+    assert "金句合集" not in text
+
+
+def test_source_preserve_target_count_overrides_restructure_intent(monkeypatch):
+    documents = """# AI 时代品牌课
+
+## 开场
+- 原文开场第一句
+- 原文开场第二句
+
+## 5.4 把证据做成资产：让人和 AI 都能相信你
+- 适合谁：哪类人、哪类场景、哪类预算最适合你？
+- 不适合谁：哪些人不该买你？
+- 凭什么相信：真实评价、长测、认证、案例、售后是什么？
+
+## 第六章：企业 90 天行动清单
+- 查：AI 和平台现在如何描述你
+- 定：找到品牌那个 1
+- 建：搭建结构化证据资产
+- 放：规模化转化成内容、销售话术、客服问答
+
+## 最后一页
+- AI 时代会加速淘汰伪品牌，也会让真正有差异、有证据的品牌更值钱。
+"""
+    topic = "把讲稿做成 8 页 PPT。尽量保持原文内容和原文字眼，完整还原原文结构与顺序。严格 8 页。"
+    legacy_contract = infer_intent_contract(topic)
+
+    assert legacy_contract["source_fidelity"] == "faithful"
+    assert legacy_contract["rewrite_level"] == "light"
+    assert _document_preservation_mode(documents, topic) == "faithful"
+
+    calls = {"page_map": 0, "source_page_map_markdown": ""}
+
+    def fake_model_page_map(**kwargs):
+        calls["page_map"] += 1
+        calls["source_page_map_markdown"] = kwargs.get("source_page_map_markdown") or ""
+        return [
+            {
+                "page_num": idx,
+                "type": "ending" if idx == 8 else "cover" if idx == 1 else "content",
+                "section_title": "AI 时代品牌课",
+                "headline": f"源文档主线第 {idx} 页",
+                "bullets": [] if idx == 1 else [
+                    "5.4 把证据做成资产：让人和 AI 都能相信你",
+                    "第六章：企业 90 天行动清单",
+                    "最后一页",
+                ],
+                "speaker_notes": _test_talk_notes("保留 5.4 证据资产、第六章行动清单和最后一页主线。"),
+                "visual_suggestion": "课程页。",
+                "source_refs": [],
+                "figure_refs": [],
+                "generation_status": "page_map_model",
+            }
+            for idx in range(1, 9)
+        ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    page_map = generate_content_page_map(
+        topic=topic,
+        documents=documents,
+        page_count=8,
+        intent_contract=legacy_contract,
+    )
+    text = json.dumps(page_map, ensure_ascii=False)
+
+    assert calls["page_map"] == 1
+    assert "5.4 把证据做成资产" in calls["source_page_map_markdown"]
+    assert "第六章：企业 90 天行动清单" in calls["source_page_map_markdown"]
+    assert len(page_map) == 8
+    assert any(page["generation_status"] == "page_map_source" for page in page_map)
+    assert "5.4 把证据做成资产" in text
+    assert "第六章：企业 90 天行动清单" in text
+    assert "最后一页" in text
+    assert "AI 时代会加速淘汰伪品牌，也会让真正有差异、有证据的品牌更值钱。" in text
+    assert "互动" not in text
+    assert "金句合集" not in text
+
+
 def test_page_map_merge_preserves_source_draft_figures_when_model_keeps_body():
     model_page_map = [
         {
@@ -2359,7 +3023,52 @@ def test_page_map_normalization_drops_format_placeholder_bullets():
     assert page_map[0]["bullets"] == ["一、核心创意", "二、执行节奏"]
 
 
-def test_page_map_placeholder_model_output_uses_source_draft(monkeypatch):
+def test_page_map_usefulness_rejects_body_replay_speaker_notes():
+    page_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "AI 时代品牌课",
+            "bullets": [],
+            "speaker_notes": "开场说明主题。",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "第一章",
+            "headline": "消费者开始把信息处理交给 AI",
+            "bullets": [
+                "消费者把测评、参数、优惠和差评交给 AI 先读一遍",
+                "品牌不只争曝光，还要争取被 AI 理解成合适答案",
+            ],
+            "speaker_notes": (
+                "这一页口头展开：\n"
+                "- 消费者把测评、参数、优惠和差评交给 AI 先读一遍\n"
+                "- 品牌不只争曝光，还要争取被 AI 理解成合适答案"
+            ),
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "section_title": "第二章",
+            "headline": "品牌要建设可被读取的证据系统",
+            "bullets": [
+                "详情页、评价、问答和内容资产都要回答同一个核心承诺",
+                "证据越结构化，越容易进入平台和 AI 的推荐理由",
+            ],
+            "speaker_notes": (
+                "这一页口头展开：\n"
+                "- 详情页、评价、问答和内容资产都要回答同一个核心承诺\n"
+                "- 证据越结构化，越容易进入平台和 AI 的推荐理由"
+            ),
+        },
+    ]
+
+    assert not content_plan_module._page_map_is_useful(page_map, target_count=3, min_pages=3, strict=False)
+
+
+def test_page_map_placeholder_model_output_is_rejected_instead_of_using_source_draft(monkeypatch):
     placeholder_map = [
         {"page_num": 1, "type": "cover", "section_title": "封面", "headline": "标题", "bullets": []},
         {"page_num": 2, "type": "content", "section_title": "主体", "headline": "标题", "bullets": ["bullet", "bullet"]},
@@ -2374,14 +3083,14 @@ def test_page_map_placeholder_model_output_uses_source_draft(monkeypatch):
     monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: placeholder_map)
     monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
 
-    page_map = generate_content_page_map(
-        topic="把脚本整理成 3 页提案 PPT",
-        documents="真实脚本材料",
-        page_count=3,
-    )
+    with pytest.raises(ValueError) as exc_info:
+        generate_content_page_map(
+            topic="把脚本整理成 3 页提案 PPT",
+            documents="真实脚本材料",
+            page_count=3,
+        )
 
-    assert [page["headline"] for page in page_map] == ["真实项目标题", "真实执行节奏", "真实下一步"]
-    assert "bullet" not in "\n".join("\n".join(page.get("bullets") or []) for page in page_map)
+    assert "model output contained format placeholders" in str(exc_info.value)
 
 
 def test_long_deck_contract_rejects_empty_content_body_instead_of_patching_from_notes():
@@ -2642,7 +3351,7 @@ def test_generate_content_plan_uses_model_page_map_before_json(monkeypatch):
 P2｜content｜背景｜增长为什么变难
 - 流量红利变薄
 - 用户决策链路变长
-备注：解释经营问题。
+备注：讲稿内容：增长变难来自获客效率下降和决策周期拉长，需要重新组织经营动作。
 
 P3｜ending｜总结｜下一步
 - 回到增长动作
@@ -2687,11 +3396,14 @@ P3｜ending｜总结｜下一步
 def test_generate_content_plan_trims_page_map_to_strict_requested_count(monkeypatch):
     page_map = "\n\n".join(
         [
-            "P1｜cover｜封面｜夏日水果和甜品大探险\n备注：开场。\n视觉：封面主视觉",
-            *[
-                f"P{idx}｜content｜内容｜第 {idx} 页主题\n- 具体内容 {idx}\n备注：讲解第 {idx} 页。\n视觉：内容画面 {idx}"
-                for idx in range(2, 16)
-            ],
+                "P1｜cover｜封面｜夏日水果和甜品大探险\n备注：开场。\n视觉：封面主视觉",
+                *[
+                    f"P{idx}｜content｜内容｜第 {idx} 页主题\n"
+                    f"- 具体内容 {idx} 的观察\n"
+                    f"- 具体内容 {idx} 的行动\n"
+                    f"备注：讲稿内容：第 {idx} 页用一个具体观察说明甜品冰箱贴的制作动作。\n视觉：内容画面 {idx}"
+                    for idx in range(2, 16)
+                ],
             "P16｜ending｜结束｜甜品冰箱贴完成啦\n- 展示大家做好的甜品冰箱贴\n备注：收束并表扬孩子。\n视觉：甜品冰箱贴作品墙",
         ]
     )
@@ -2732,7 +3444,7 @@ def test_generate_content_plan_trims_page_map_to_strict_requested_count(monkeypa
     assert "甜品冰箱贴" in outline[-1]["text_content"]["headline"]
 
 
-def test_page_map_falls_back_to_source_draft_when_model_fails(monkeypatch):
+def test_page_map_retries_model_generation_when_first_call_fails(monkeypatch):
     documents = """# 面向AI时代，企业营与销该如何布局
 
 ## 模块一：道
@@ -2740,18 +3452,52 @@ def test_page_map_falls_back_to_source_draft_when_model_fails(monkeypatch):
 - ChatGPT 达到 1 亿规模只用了 2 个月
 - AI 正在成为消费决策的新中介
 """
+    calls = {"count": 0}
 
-    class FakeCompletions:
-        def create(self, **_kwargs):
+    def fake_model_page_map(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
             raise TimeoutError("timeout")
+        return [
+            {
+                "page_num": 1,
+                "type": "cover",
+                "section_title": "封面",
+                "headline": "面向AI时代，企业营与销该如何布局",
+                "bullets": [],
+                "speaker_notes": "开场。",
+                "visual_suggestion": "封面。",
+                "generation_status": "page_map_model",
+            },
+            *[
+                {
+                    "page_num": idx,
+                    "type": "content",
+                    "section_title": "模块一：道",
+                    "headline": f"AI 时代课程第 {idx} 页",
+                    "bullets": [
+                        "ChatGPT 达到 1 亿规模只用了 2 个月",
+                        "AI 正在成为消费决策的新中介",
+                    ],
+                    "speaker_notes": _test_talk_notes("ChatGPT 两个月达到 1 亿规模，说明 AI 正在进入消费决策入口。"),
+                    "visual_suggestion": "结构页。",
+                    "generation_status": "page_map_model",
+                }
+                for idx in range(2, 10)
+            ],
+            {
+                "page_num": 10,
+                "type": "ending",
+                "section_title": "结束",
+                "headline": "回到企业营与销的行动",
+                "bullets": ["把材料转成下一步行动"],
+                "speaker_notes": "收束。",
+                "visual_suggestion": "封底。",
+                "generation_status": "page_map_model",
+            },
+        ]
 
-    class FakeChat:
-        completions = FakeCompletions()
-
-    class FakeClient:
-        chat = FakeChat()
-
-    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
 
     page_map = generate_content_page_map(
         topic="做成 10 页课程",
@@ -2759,13 +3505,728 @@ def test_page_map_falls_back_to_source_draft_when_model_fails(monkeypatch):
         page_count=10,
     )
 
-    rendered = "\n".join(
-        "\n".join(str(item) for item in (page.get("bullets") or []))
-        for page in page_map
-    )
+    rendered = "\n".join("\n".join(str(item) for item in (page.get("bullets") or [])) for page in page_map)
+    assert calls["count"] == 2
     assert len(page_map) == 10
     assert "ChatGPT 达到 1 亿规模只用了 2 个月" in rendered
-    assert all(page["generation_status"] == "page_map_source" for page in page_map)
+    assert all(page["generation_status"] != "page_map_source" for page in page_map)
+
+
+def test_page_map_does_not_fallback_to_source_draft_when_model_keeps_failing(monkeypatch):
+    documents = """# 面向AI时代，企业营与销该如何布局
+
+## 模块一：道
+
+- ChatGPT 达到 1 亿规模只用了 2 个月
+- AI 正在成为消费决策的新中介
+"""
+    calls = {"count": 0}
+
+    def fake_model_page_map(**_kwargs):
+        calls["count"] += 1
+        raise TimeoutError("timeout")
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    with pytest.raises(ValueError) as exc_info:
+        generate_content_page_map(
+            topic="做成 10 页课程",
+            documents=documents,
+            page_count=10,
+        )
+
+    assert calls["count"] == 2
+    assert "failed before producing usable model pages" in str(exc_info.value)
+
+
+def test_partial_model_page_map_does_not_succeed_by_filling_missing_pages_from_source_draft(monkeypatch):
+    documents = """# 面向AI时代，企业营与销该如何布局
+
+## 模块一：道
+
+- ChatGPT 达到 1 亿规模只用了 2 个月
+- AI 正在成为消费决策的新中介
+"""
+    source_draft = [
+        {
+            "page_num": idx,
+            "type": "content",
+            "section_title": "源稿补齐",
+            "headline": f"源稿第 {idx} 页",
+            "bullets": ["源稿要点"],
+            "speaker_notes": "源稿备注。",
+            "visual_suggestion": "源稿画面。",
+            "generation_status": "page_map_source",
+        }
+        for idx in range(1, 11)
+    ]
+    partial_model_map = [
+        {
+            "page_num": idx,
+            "type": "content",
+            "section_title": "模型规划",
+            "headline": f"模型第 {idx} 页",
+            "bullets": ["ChatGPT 达到 1 亿规模只用了 2 个月"],
+            "speaker_notes": "模型备注。",
+            "visual_suggestion": "模型画面。",
+            "generation_status": "page_map_model",
+        }
+        for idx in range(1, 7)
+    ]
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: partial_model_map)
+
+    with pytest.raises(ValueError) as exc_info:
+        generate_content_page_map(
+            topic="做成 10 页课程",
+            documents=documents,
+            page_count=10,
+        )
+
+    assert "failed before producing usable model pages" in str(exc_info.value)
+
+
+def test_page_map_rejects_inline_page_markers_inside_body(monkeypatch):
+    model_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "AI 时代消费者决策路径与品牌策略",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "证据货架",
+            "headline": "未来的详情页，是给 AI 读的",
+            "bullets": [
+                "AI 时代品牌需要一张证据货架",
+                'P52｜content｜证据货架 + "不适合谁"的逆向价值｜',
+            ],
+            "speaker_notes": "讲证据货架。",
+            "visual_suggestion": "表格页。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 3,
+            "type": "ending",
+            "section_title": "结尾",
+            "headline": "结语",
+            "bullets": ["在人心里有位置，在平台里有流量，在 AI 里有推荐"],
+            "speaker_notes": "收束。",
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_model",
+        },
+    ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: model_map)
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: [])
+
+    with pytest.raises(ValueError) as exc_info:
+        generate_content_page_map(
+            topic="做成 3 页课程",
+            documents="AI 时代消费者决策路径与品牌策略",
+            page_count=3,
+        )
+
+    assert "page markers" in str(exc_info.value)
+
+
+def test_source_preserve_page_map_repairs_missing_source_tail(monkeypatch):
+    source_draft = [
+        {
+            "page_num": idx,
+            "type": "content",
+            "section_title": "前文",
+            "headline": f"前文第 {idx} 页",
+            "bullets": ["消费者正在让渡信息处理权"],
+            "speaker_notes": _test_talk_notes("用户把信息筛选交给 AI，平台因此获得新的决策影响力。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_source",
+        }
+        for idx in range(1, 9)
+    ] + [
+        {
+            "page_num": 9,
+            "type": "content",
+            "section_title": "第六章",
+            "headline": "第六章：企业 90 天行动清单",
+            "bullets": ["查 -> 定 -> 建 -> 放", "没有建，AI 抓不到可引用的结构化证据"],
+            "speaker_notes": _test_talk_notes("90 天行动清单包括查、定、建、放和结构化证据。"),
+            "visual_suggestion": "行动清单表。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 10,
+            "type": "ending",
+            "section_title": "结语",
+            "headline": "在人心里有位置，在平台里有流量，在 AI 里有推荐",
+            "bullets": ["当客户的 AI 凝视你的品牌时，它到底能看到什么？"],
+            "speaker_notes": "收束。",
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_source",
+        },
+    ]
+    model_map = [
+        {
+            "page_num": idx,
+            "type": "content" if idx not in {1, 10} else ("cover" if idx == 1 else "ending"),
+            "section_title": "前文",
+            "headline": f"模型前文第 {idx} 页",
+            "bullets": ["消费者正在让渡信息处理权", "平台权力正在重构"],
+            "speaker_notes": _test_talk_notes("用户把信息筛选交给 AI，平台因此获得新的决策影响力。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        }
+        for idx in range(1, 11)
+    ]
+    contract = {
+        "task_type": "source_to_ppt",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.95,
+        "evidence": ["保留原文结构和金句"],
+    }
+
+    calls = {"model": 0}
+
+    def fake_model_page_map(**_kwargs):
+        calls["model"] += 1
+        return model_map
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    result = generate_content_page_map(
+        topic="保留原文结构和金句，做成 10 页课程",
+        documents="第六章：企业 90 天行动清单\n在人心里有位置，在平台里有流量，在 AI 里有推荐",
+        page_count=10,
+        intent_contract=contract,
+    )
+
+    assert calls["model"] == 1
+    assert result[8]["headline"] == "第六章：企业 90 天行动清单"
+    assert result[9]["headline"] == "在人心里有位置，在平台里有流量，在 AI 里有推荐"
+
+
+def test_source_preserve_page_map_repairs_missing_source_structure_anchor(monkeypatch):
+    source_draft = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "AI 时代品牌课",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 2,
+            "type": "section",
+            "section_title": "第一章",
+            "headline": "第一章：什么变了？决策不再只发生在人脑里",
+            "bullets": ["消费者正在让渡信息处理权"],
+            "speaker_notes": _test_talk_notes("第一章说明消费者正在让渡信息处理权。"),
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 3,
+            "type": "section",
+            "section_title": "第二章",
+            "headline": "第二章：什么没变？人心仍然是终点",
+            "bullets": ["人还是为自己的待办任务而买"],
+            "speaker_notes": "讲第二章。",
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 4,
+            "type": "section",
+            "section_title": "第三章",
+            "headline": "第三章：平台权力正在重构",
+            "bullets": ["平台争夺的是 AI 超级入口"],
+            "speaker_notes": "讲第三章。",
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 5,
+            "type": "section",
+            "section_title": "第四章",
+            "headline": "第四章：品牌会如何分化？从被比价到被指名",
+            "bullets": ["从被比价到被指名"],
+            "speaker_notes": "讲第四章。",
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 6,
+            "type": "section",
+            "section_title": "第五章",
+            "headline": "第五章：品牌怎么做？先判断战场，再确定打法",
+            "bullets": ["先判断战场，再确定打法"],
+            "speaker_notes": "讲第五章。",
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 7,
+            "type": "content",
+            "section_title": "第六章",
+            "headline": "第六章：企业 90 天行动清单",
+            "bullets": ["查 -> 定 -> 建 -> 放"],
+            "speaker_notes": "讲第六章。",
+            "visual_suggestion": "行动清单。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 8,
+            "type": "ending",
+            "section_title": "结语",
+            "headline": "结语",
+            "bullets": ["在人心里有位置，在平台里有流量，在 AI 里有推荐"],
+            "speaker_notes": "收束。",
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_source",
+        },
+    ]
+    model_map = [
+        {
+            "page_num": idx,
+            "type": "content" if idx not in {1, 8} else ("cover" if idx == 1 else "ending"),
+            "section_title": "模型规划",
+            "headline": f"模型第 {idx} 页",
+            "bullets": [
+                "第一章：什么变了？决策不再只发生在人脑里",
+                "第二章：什么没变？人心仍然是终点",
+                "第四章：品牌会如何分化？从被比价到被指名",
+                "第五章：品牌怎么做？先判断战场，再确定打法",
+                "第六章：企业 90 天行动清单",
+            ],
+            "speaker_notes": "按原文结构讲。结尾收束到：在人心里有位置，在平台里有流量，在 AI 里有推荐。",
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        }
+        for idx in range(1, 9)
+    ]
+    contract = {
+        "task_type": "source_to_ppt",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.95,
+        "evidence": ["完整还原原文结构"],
+    }
+
+    calls = {"model": 0}
+
+    def fake_model_page_map(**_kwargs):
+        calls["model"] += 1
+        return model_map
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    result = generate_content_page_map(
+        topic="完整保留原文结构，做成 5 页课程",
+        documents="第一章\n第二章\n第三章：平台权力正在重构\n第四章\n第五章\n第六章\n结语",
+        page_count=8,
+        intent_contract=contract,
+    )
+
+    assert calls["model"] == 1
+    assert result[3]["headline"] == "第三章：平台权力正在重构"
+
+
+def test_source_preserve_page_map_repairs_misaligned_source_structure_anchor(monkeypatch):
+    source_draft = [
+        {
+            "page_num": idx,
+            "type": "content",
+            "section_title": "原文章节",
+            "headline": f"原文铺垫第 {idx} 页",
+            "bullets": ["消费者正在让渡信息处理权", "AI 正在改变信息处理链路"],
+            "speaker_notes": _test_talk_notes("消费者正在让渡信息处理权，AI 正在改变信息处理链路。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_source",
+        }
+        for idx in range(1, 10)
+    ] + [
+        {
+            "page_num": 24,
+            "type": "section",
+            "section_title": "第三章",
+            "headline": "3.6 品牌会被上下夹击",
+            "bullets": [
+                "上游是掌握超级入口的平台",
+                "下游是越来越会比较、会提问的消费者",
+            ],
+            "speaker_notes": "这一节必须保留，因为它承接第四章。",
+            "visual_suggestion": "上下夹击结构图。",
+            "generation_status": "page_map_source",
+        },
+    ]
+    model_map = [
+        {
+            "page_num": idx,
+            "type": "content" if idx not in {1, 10} else ("cover" if idx == 1 else "ending"),
+            "section_title": "模型规划",
+            "headline": f"模型第 {idx} 页",
+            "bullets": [
+                "消费者正在让渡信息处理权",
+                "AI 正在改变信息处理链路",
+            ],
+            "speaker_notes": _test_talk_notes("消费者让渡信息处理权，AI 改变信息处理链路。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        }
+        for idx in range(1, 11)
+    ]
+    contract = {
+        "task_type": "source_to_ppt",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.95,
+        "evidence": ["完整还原原文结构和金句"],
+    }
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: model_map)
+
+    result = generate_content_page_map(
+        topic="完整保留原文结构，做成 10 页课程",
+        documents="3.6 品牌会被上下夹击",
+        page_count=10,
+        intent_contract=contract,
+    )
+
+    assert content_plan_module._compact_coverage_text("3.6 品牌会被上下夹击") in content_plan_module._page_map_coverage_text(result)
+    assert len(result) == 10
+
+
+def test_source_preserve_page_map_repairs_non_keyword_final_section(monkeypatch):
+    source_draft = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "增长训练营",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "开场",
+            "headline": "增长不是拉新，而是连续改善决策",
+            "bullets": ["先找到阻碍用户行动的关键摩擦"],
+            "speaker_notes": _test_talk_notes("增长开场要说明关键摩擦如何阻碍用户行动。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "section_title": "方法",
+            "headline": "把实验做成组织动作",
+            "bullets": ["每个实验都要对应一个业务假设"],
+            "speaker_notes": _test_talk_notes("方法部分要说明实验必须对应业务假设。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 4,
+            "type": "content",
+            "section_title": "案例",
+            "headline": "从单点优化到系统增长",
+            "bullets": ["增长团队要同时看转化、留存和复购"],
+            "speaker_notes": _test_talk_notes("案例部分要说明增长团队同时看转化、留存和复购。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 5,
+            "type": "ending",
+            "section_title": "复盘与下一步",
+            "headline": "复盘与下一步：从今天开始的三件事",
+            "bullets": ["把今天的三个动作写进下周例会，而不是停留在启发里"],
+            "speaker_notes": _test_talk_notes("下一步要把三个动作写进下周例会。"),
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_source",
+        },
+    ]
+    model_map = [
+        {
+            "page_num": idx,
+            "type": "content" if idx not in {1, 5} else ("cover" if idx == 1 else "ending"),
+            "section_title": "模型章节",
+            "headline": f"模型只讲前半段第 {idx} 页",
+            "bullets": ["先找到阻碍用户行动的关键摩擦", "每个实验都要对应一个业务假设"],
+            "speaker_notes": _test_talk_notes("前半段说明关键摩擦和业务假设。"),
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        }
+        for idx in range(1, 6)
+    ]
+    contract = {
+        "task_type": "teaching_deck",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "low",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.95,
+        "evidence": ["逐章讲清楚，不要遗漏"],
+    }
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: model_map)
+
+    result = generate_content_page_map(
+        topic="逐章讲清楚，不要遗漏，做成 5 页课程",
+        documents="复盘与下一步：从今天开始的三件事",
+        page_count=5,
+        intent_contract=contract,
+    )
+
+    assert result[4]["headline"] == "复盘与下一步：从今天开始的三件事"
+
+
+def test_page_map_merge_restores_chinese_gold_sentence_when_model_paraphrases():
+    source_ref = {
+        "source_document": "brand.md",
+        "source_page_num": 2,
+        "source_type": "markdown",
+        "reason": "source_draft",
+    }
+    source_draft = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "品牌增长课",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "source_refs": [],
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "核心判断",
+            "headline": "真正的品牌，是在人心里被点名",
+            "bullets": ["真正的品牌，是在人心里被点名，而不是在货架上被看见。", "品牌资产必须能同时被人和 AI 识别。"],
+            "speaker_notes": "讲核心判断。",
+            "visual_suggestion": "内容页。",
+            "source_refs": [source_ref],
+            "generation_status": "page_map_source",
+        },
+    ]
+    model_map = [
+        source_draft[0],
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "核心判断",
+            "headline": "品牌要被消费者主动选择",
+            "bullets": ["品牌需要在消费者心智中形成明确位置。", "也要让 AI 理解自己的差异化证据。"],
+            "speaker_notes": "讲核心判断。",
+            "visual_suggestion": "内容页。",
+            "source_refs": [source_ref],
+            "generation_status": "page_map_model",
+        },
+    ]
+
+    merged = content_plan_module._merge_page_map_with_source_draft(
+        model_map,
+        source_draft,
+        target_count=2,
+    )
+
+    assert "真正的品牌，是在人心里被点名，而不是在货架上被看见。" in merged[1]["bullets"]
+    assert merged[1]["generation_status"] == "page_map_model_with_source_body"
+
+
+def test_source_structure_checklist_uses_uploaded_document_headings(monkeypatch):
+    documents = """# AI 时代品牌课
+
+## 第一章：什么变了？决策不再只发生在人脑里
+### 1.1 消费者正在让渡信息处理权
+### 1.2 消费者决策旅程正在被重写
+
+## 结语
+- 在人心里有位置，在平台里有流量，在 AI 里有推荐
+"""
+    source_draft = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "AI 时代品牌课",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 2,
+            "type": "section",
+            "section_title": "第一章",
+            "headline": "第一章：什么变了？决策不再只发生在人脑里",
+            "bullets": ["消费者正在让渡信息处理权"],
+            "speaker_notes": _test_talk_notes("第一章包括 1.1 信息处理权和 1.2 决策旅程重写。"),
+            "visual_suggestion": "章节页。",
+            "generation_status": "page_map_source",
+        },
+        {
+            "page_num": 3,
+            "type": "ending",
+            "section_title": "结语",
+            "headline": "结语",
+            "bullets": ["在人心里有位置，在平台里有流量，在 AI 里有推荐"],
+            "speaker_notes": "收束。",
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_source",
+        },
+    ]
+    captured = {"checklist": ""}
+
+    def fake_model_page_map(**kwargs):
+        captured["checklist"] = kwargs.get("source_structure_checklist") or ""
+        return [
+            {
+                "page_num": 1,
+                "type": "cover",
+                "section_title": "封面",
+                "headline": "AI 时代品牌课",
+                "bullets": [],
+                "speaker_notes": "开场。",
+                "visual_suggestion": "封面。",
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 2,
+                "type": "content",
+                "section_title": "第一章",
+                "headline": "第一章：什么变了？决策不再只发生在人脑里",
+                "bullets": ["1.1 消费者正在让渡信息处理权", "1.2 消费者决策旅程正在被重写"],
+                "speaker_notes": _test_talk_notes("第一章先讲 1.1 信息处理权，再讲 1.2 决策旅程重写。"),
+                "visual_suggestion": "内容页。",
+                "generation_status": "page_map_model",
+            },
+            {
+                "page_num": 3,
+                "type": "ending",
+                "section_title": "结语",
+                "headline": "结语",
+                "bullets": ["在人心里有位置，在平台里有流量，在 AI 里有推荐"],
+                "speaker_notes": "收束。",
+                "visual_suggestion": "结束页。",
+                "generation_status": "page_map_model",
+            },
+        ]
+
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: source_draft)
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", fake_model_page_map)
+
+    generate_content_page_map(
+        topic="保留原文结构，做成 3 页课程",
+        documents=documents,
+        page_count=3,
+        intent_contract={
+            "task_type": "source_to_ppt",
+            "source_use": "faithful",
+            "coverage": "near_complete",
+            "compression": "low",
+            "depth": "deep",
+            "page_budget_policy": "explicit",
+            "structure_policy": "source_order",
+            "confidence": 0.95,
+            "evidence": ["保留原文结构"],
+        },
+    )
+
+    assert "1.2 消费者决策旅程正在被重写" in captured["checklist"]
+    assert "结语" in captured["checklist"]
+
+
+def test_page_map_rejects_duplicate_substantive_headlines(monkeypatch):
+    model_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "AI 时代品牌课",
+            "bullets": [],
+            "speaker_notes": "开场。",
+            "visual_suggestion": "封面。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "任务语言",
+            "headline": "品牌是在给大模型写说明书",
+            "bullets": ["把商品语言翻译成任务语言"],
+            "speaker_notes": "讲任务语言。",
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "section_title": "任务语言",
+            "headline": "品牌是在给大模型写说明书",
+            "bullets": ["从大需求到细分赛道，再到长尾任务"],
+            "speaker_notes": "讲长尾任务。",
+            "visual_suggestion": "内容页。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 4,
+            "type": "ending",
+            "section_title": "结尾",
+            "headline": "结语",
+            "bullets": ["在人心里有位置，在平台里有流量，在 AI 里有推荐"],
+            "speaker_notes": "收束。",
+            "visual_suggestion": "结束页。",
+            "generation_status": "page_map_model",
+        },
+    ]
+
+    monkeypatch.setattr(content_plan_module, "_generate_model_page_map", lambda **_kwargs: model_map)
+    monkeypatch.setattr(content_plan_module, "_source_draft_page_map", lambda **_kwargs: [])
+
+    with pytest.raises(ValueError) as exc_info:
+        generate_content_page_map(
+            topic="做成 4 页课程",
+            documents="品牌是在给大模型写说明书",
+            page_count=4,
+        )
+
+    assert "duplicate headlines" in str(exc_info.value)
 
 
 def test_page_map_without_bullets_keeps_source_draft_body(monkeypatch):
@@ -2792,7 +4253,17 @@ P2｜content｜道｜AI时代，客户已经变了
 视觉：全屏数据可视化
 来源：模块一
 
-P3｜ending｜总结｜下一步
+P3｜content｜道｜AI 正在成为消费决策的新中介
+备注：展开消费者决策工具变化。
+视觉：决策链路变化图
+来源：模块一
+
+P4｜content｜术｜内容要同时给人看，也给 AI 读
+备注：展开内容生产的新要求。
+视觉：人机双通道信息结构
+来源：模块二
+
+P5｜ending｜总结｜下一步
 备注：收束。
 视觉：总结页"""
 
@@ -2893,7 +4364,45 @@ def test_partial_page_map_does_not_save_skeleton_placeholders(monkeypatch):
             page_count=16,
         )
 
-    assert "低于本轮最低要求" in str(exc_info.value)
+    assert "failed before producing usable model pages" in str(exc_info.value)
+
+
+def test_page_map_generation_scales_output_budget_for_long_decks(monkeypatch):
+    captured_kwargs: dict = {}
+
+    class FakeMessage:
+        content = "P1｜cover｜封面｜AI 时代消费者决策路径与品牌策略\n备注：开场。\n视觉：封面"
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    monkeypatch.setattr(content_plan_module, "get_llm_client", lambda: FakeClient())
+
+    content_plan_module._generate_model_page_map(
+        topic="做成 50 页课程",
+        audience="通用受众",
+        documents="AI 时代消费者决策路径与品牌策略",
+        page_goal_text="优先生成约 50 页。",
+        target_count=50,
+        min_pages=40,
+        max_pages=60,
+    )
+
+    assert captured_kwargs["max_tokens"] >= 30000
 
 
 def test_source_draft_page_map_does_not_create_skeleton_without_documents():
@@ -2913,7 +4422,7 @@ def test_skeleton_source_draft_is_not_sent_to_model_prompt(monkeypatch):
         [
             "P1｜cover｜封面｜达尔文进化论\n备注：开场。",
             *[
-                f"P{idx}｜content｜达尔文｜第 {idx} 页内容\n- 真实要点 {idx}\n备注：讲解第 {idx} 页。"
+                f"P{idx}｜content｜达尔文｜第 {idx} 页内容\n- 真实要点 {idx}\n备注：讲稿内容：真实要点 {idx} 是本页需要讲出的核心内容。"
                 for idx in range(2, 17)
             ],
         ]
@@ -3122,6 +4631,7 @@ def test_long_deck_outline_generates_in_blueprint_chunks(monkeypatch):
             assert "不要使用“续2”“续3”" in prompt
             assert "封面标题必须使用真实课程主题" in prompt
             assert "演讲备注必须具体" in prompt
+            assert "演讲备注必须先写出这一页需要讲什么" in prompt
             assert "text_content.body 是页面卡片/PPT 上可见的正文区域" in prompt
             assert "text_content.body 必须写得言之有物" in prompt
             assert "PPT 应当准确体现当前用户的真实意图" in prompt
@@ -3251,6 +4761,331 @@ def test_long_deck_chunk_rejects_duplicate_content_headline_against_existing_pag
         raise AssertionError("long deck generation must reject duplicate content headlines")
 
 
+def test_final_content_plan_dedupes_duplicate_headlines_when_body_differs():
+    outline = [
+        {
+            "page_num": 1,
+            "type": "content",
+            "section_title": "品牌营销课",
+            "text_content": {
+                "headline": "混沌 AI 院，为什么要讲一门品牌营销课？",
+                "subhead": "",
+                "body": "- AI 时代的品牌课不是工具清单，而是重新定义品牌资产的入口。",
+            },
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "品牌营销课",
+            "text_content": {
+                "headline": "混沌 AI 院，为什么要讲一门品牌营销课？",
+                "subhead": "",
+                "body": "- 课程要回答企业如何从流量运营转向 AI 可理解的证据系统。",
+            },
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+    ]
+
+    fixed = content_plan_module._dedupe_content_headlines(outline)
+
+    assert content_plan_module._duplicate_content_headline_pages(fixed) == []
+    assert fixed[1]["text_content"]["headline"] == "课程要回答企业如何从流量运营转向 AI 可理解的证据系统"
+
+
+def test_final_content_plan_keeps_duplicate_failure_when_body_is_same():
+    outline = [
+        {
+            "page_num": 1,
+            "type": "content",
+            "section_title": "品牌营销课",
+            "text_content": {
+                "headline": "定价必须组织化",
+                "subhead": "",
+                "body": "同一段正文",
+            },
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "品牌营销课",
+            "text_content": {
+                "headline": "定价必须组织化",
+                "subhead": "",
+                "body": "同一段正文",
+            },
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+    ]
+
+    fixed = content_plan_module._dedupe_content_headlines(outline)
+
+    assert content_plan_module._duplicate_content_headline_pages(fixed)
+
+
+def test_page_map_finalization_repairs_unrecoverable_duplicate_headlines_from_source():
+    documents = """# AI 时代品牌课
+
+## 开场
+- AI 时代的品牌课不是工具清单，而是重新定义品牌资产的入口。
+- 品牌要同时成为 AI 的首选和人的首选。
+
+## 两张图看清这个时代
+- 经典营销时代争夺注意力。
+- 移动互联网时代争夺匹配效率。
+- AI 时代争夺推荐资格。
+
+## 企业 90 天行动
+- 查：AI 和平台现在如何描述你。
+- 定：找到品牌那个 1。
+- 建：搭建结构化证据资产。
+"""
+    duplicate_outline = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "text_content": {"headline": "AI 时代品牌课", "subhead": "", "body": ""},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "开场",
+            "text_content": {"headline": "混沌 AI 院，为什么要讲一门品牌营销课？", "subhead": "", "body": "重复正文"},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "section_title": "开场",
+            "text_content": {"headline": "混沌 AI 院，为什么要讲一门品牌营销课？", "subhead": "", "body": "重复正文"},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 4,
+            "type": "content",
+            "section_title": "时代线",
+            "text_content": {"headline": "两张图看清这个时代", "subhead": "", "body": "时代线正文"},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+        {
+            "page_num": 5,
+            "type": "ending",
+            "section_title": "结尾",
+            "text_content": {"headline": "行动收束", "subhead": "", "body": ""},
+            "speaker_notes": "",
+            "visual_suggestion": "",
+            "source_refs": [],
+        },
+    ]
+    contract = {
+        "task_type": "source_to_ppt",
+        "source_use": "faithful",
+        "coverage": "balanced",
+        "compression": "medium",
+        "depth": "standard",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.8,
+        "evidence": ["5 页"],
+    }
+    job = content_plan_module.ContentPlanJob(
+        topic="做成 5 页 PPT",
+        audience="通用受众",
+        page_count=5,
+        min_pages=5,
+        max_pages=5,
+        documents=documents,
+        has_docs=True,
+        requested_page_range=None,
+        strict_page_count=True,
+        allow_expanded_outline_override=False,
+        intent_contract=contract,
+        ppt_sources=[],
+        planning_policy={},
+        mode="default",
+    )
+
+    finalized = content_plan_module._finalize_generated_content_plan(
+        duplicate_outline,
+        job,
+        strategy=content_plan_module.CONTENT_PLAN_STRATEGY_PAGE_MAP,
+    )
+
+    assert len(finalized) == 5
+    assert content_plan_module._duplicate_content_headline_pages(finalized) == []
+    assert "AI 时代的品牌课不是工具清单" in json.dumps(finalized, ensure_ascii=False)
+
+
+def test_source_chunk_headline_skips_short_command_fragments():
+    headline = content_plan_module._source_chunk_headline(
+        "3.1 平台争夺的是 AI 超级入口",
+        [
+            "帮我订",
+            "帮我买",
+            "帮我安排",
+            "未来所有平台都想做同一件事：",
+            "让用户有事先问我。",
+        ],
+        1,
+    )
+
+    assert headline == "未来所有平台都想做同一件事："
+
+
+def test_source_draft_splits_dense_single_lines_before_quality_gate():
+    documents = """# AI时代消费者决策路径与品牌策略
+
+## 两张图看清这个时代
+平台与消费者：消费者想要更省心的选择，平台想要把选择留在自己这里完成。平台越能替消费者省心，越有能力影响消费者看见什么、相信什么、买什么。
+
+## 第二章：什么没变？人心仍然是终点
+AI 改变了消费者处理信息的方式，但没有改写两件事：人为什么买，最后怎么判断。
+
+## 3.1 平台争夺的是 AI 超级入口
+帮我订
+帮我买
+帮我安排
+未来所有平台都想做同一件事：
+让用户有事先问我。
+
+## 3.2 字节：从信息找人，到需求找货
+品牌在字节生态里，不能只做“被刷到”，还要做“被问到”。短视频、直播、达人、测评、商品卡、体验分、价格、库存和评价，都会成为豆包理解品牌的材料。
+
+## 3.4 腾讯：从关系连接，到服务调用
+这件事的重点是：小程序不再只是一个页面，而是会变成可被 AI 调用的服务单元。品牌不能只想“我有没有小程序”，而要想商品、门店、库存、会员权益、客服和支付，能不能被微信 AI 准确调用。
+
+## 第六章：企业 90 天行动清单
+建 / 搭建结构化证据资产 / 建好体系：产品信息、适用/不适用人群、真实评价、第三方资质、客户案例、FAQ、竞品对比和风险说明
+放 / 用 AI 放大核心价值 / 用 AI 和 AIGC 把品牌的核心价值、典型场景、用户证据和选择理由，规模化转化成内容、销售话术、客服问答
+"""
+    contract = {
+        "task_type": "source_to_ppt",
+        "source_use": "faithful",
+        "coverage": "near_complete",
+        "compression": "medium",
+        "depth": "deep",
+        "page_budget_policy": "explicit",
+        "structure_policy": "source_order",
+        "confidence": 0.9,
+        "evidence": ["10 页左右"],
+    }
+
+    page_map = content_plan_module._source_draft_page_map(
+        topic="做成 10 页左右的 ppt",
+        documents=documents,
+        target_count=10,
+        min_pages=8,
+        max_pages=12,
+        intent_contract=contract,
+    )
+    outline = content_plan_from_page_map(page_map, source_context=documents)
+    outline = content_plan_module._dedupe_content_headlines(outline)
+
+    headlines = [page["text_content"]["headline"] for page in outline]
+    assert "帮我安排" not in headlines
+    assert any("未来所有平台都想做同一件事" in json.dumps(page, ensure_ascii=False) for page in outline)
+    assert content_plan_module._thin_required_content_body_pages(outline) == []
+    assert content_plan_module._duplicate_content_headline_pages(outline) == []
+
+
+def test_source_speaker_notes_prioritize_talk_content_over_delivery_cues():
+    notes = content_plan_module._source_speaker_notes_from_lines(
+        headline="品牌要进入 AI 的答案链路",
+        lines=[
+            "用户不再只在搜索框里找信息，而是把比较、判断和推荐交给 AI。",
+            "品牌需要准备可被引用的证据：产品差异、真实案例、第三方评价和可核验数据。",
+            "如果这些证据缺席，AI 很难把品牌推荐成合适答案。",
+        ],
+    )
+
+    assert notes.startswith("讲稿内容：")
+    assert "用户不再只在搜索框里找信息" in notes
+    assert "产品差异、真实案例、第三方评价" in notes
+    assert "讲法：先用" not in notes
+
+
+def test_finalize_rejects_thin_model_page_map_body():
+    outline = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "text_content": {"headline": "AI 品牌课", "body": ""},
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "text_content": {"headline": "消费者决策正在变化", "body": "AI 正在改变消费者决策"},
+            "speaker_notes": "从购买前研究、比较和判断三个动作展开讲清楚。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "text_content": {"headline": "品牌需要新的证据资产", "body": "品牌要建立可被 AI 调用的证据"},
+            "speaker_notes": "先讲证据资产，再转向企业应该如何补齐。",
+            "generation_status": "page_map_model",
+        },
+        {
+            "page_num": 4,
+            "type": "ending",
+            "text_content": {"headline": "行动收束", "body": ""},
+            "generation_status": "page_map_model",
+        },
+    ]
+    job = content_plan_module.ContentPlanJob(
+        topic="做成 4 页 PPT",
+        audience="通用受众",
+        page_count=4,
+        min_pages=4,
+        max_pages=4,
+        documents="",
+        has_docs=False,
+        requested_page_range=None,
+        strict_page_count=True,
+        allow_expanded_outline_override=False,
+        intent_contract={
+            "task_type": "source_to_ppt",
+            "source_use": "optimized",
+            "coverage": "balanced",
+            "compression": "medium",
+            "depth": "standard",
+            "page_budget_policy": "explicit",
+            "structure_policy": "reorganize",
+            "confidence": 0.8,
+            "evidence": ["4 页"],
+        },
+        ppt_sources=[],
+        planning_policy={},
+    )
+
+    with pytest.raises(ValueError, match="信息量过薄"):
+        content_plan_module._finalize_generated_content_plan(
+            outline,
+            job,
+            strategy=content_plan_module.CONTENT_PLAN_STRATEGY_PAGE_MAP,
+        )
+
+
 def test_long_deck_single_chunk_normalizes_page_numbers(monkeypatch):
     class FakeMessage:
         content = json.dumps([
@@ -3288,6 +5123,7 @@ def test_long_deck_single_chunk_normalizes_page_numbers(monkeypatch):
             assert "【本组已有骨架】" in prompt
             assert "不要使用“续2”“续3”" in prompt
             assert "演讲备注必须具体" in prompt
+            assert "演讲备注必须先写出这一页需要讲什么" in prompt
             assert "text_content.body 是页面卡片/PPT 上可见的正文区域" in prompt
             assert "text_content.body 必须写得言之有物" in prompt
             assert "PPT 应当准确体现当前用户的真实意图" in prompt

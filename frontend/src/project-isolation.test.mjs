@@ -594,6 +594,11 @@ assert.match(
 );
 assert.match(
   source,
+  /pendingRunKind:\s*contentPlanStartingProjectRef\.current === selectedProject\?\.id \? "content_plan" : null/,
+  "content-plan startup must hold the main canvas in the content stage before backend active_run hydration"
+);
+assert.match(
+  source,
   /\["failed", "stale", "cancelled"\]\.includes\(String\(workflow\.last_run\.status \|\| ""\)\)/,
   "content-plan polling must surface stale/cancelled runs as visible failures"
 );
@@ -601,6 +606,16 @@ assert.match(
   source,
   /const deferContentPlanPoll = \(message: string\)[\s\S]*内容规划仍在后台生成：/,
   "content-plan polling timeouts must not be presented as generation failures when the backend may still finish"
+);
+assert.match(
+  source,
+  /const deferContentPlanPoll = \(message: string\)[\s\S]*if \(contentPlanRunId\) \{[\s\S]*locallyHandledRunIdsRef\.current\.delete\(contentPlanRunId\);[\s\S]*\}/,
+  "deferred content-plan polling must release local ownership so the generic run-completion effect can announce the final result"
+);
+assert.doesNotMatch(
+  source,
+  /deferContentPlanPoll\("[^"]*请稍后刷新页面查看结果/,
+  "deferred content-plan polling should not tell users to refresh when the app can observe the run completion"
 );
 assert.match(
   source,
@@ -863,6 +878,11 @@ assert.match(
 );
 assert.doesNotMatch(
   source.slice(source.indexOf("const handleRegenerateSlideFromEdits = async"), source.indexOf("// 更新画面方案：只更新画面描述/提示词", source.indexOf("const handleRegenerateSlideFromEdits = async"))),
+  /if \(needsPrompt\)|const needsPrompt|const needsVisualPlan/,
+  "save-and-regenerate must always refresh page visual description and prompt, even when an old prompt already exists"
+);
+assert.doesNotMatch(
+  source.slice(source.indexOf("const handleRegenerateSlideFromEdits = async"), source.indexOf("// 更新画面方案：只更新画面描述/提示词", source.indexOf("const handleRegenerateSlideFromEdits = async"))),
   /await generateVisualPlan\(projectId|await generatePrompts\(projectId/,
   "save-and-regenerate must not use legacy synchronous visual-plan or prompt endpoints"
 );
@@ -1118,6 +1138,16 @@ assert.doesNotMatch(
   source,
   /pg-insert-menu-title">结构/,
   "slash menu must keep structure diagrams out of the body editor"
+);
+assert.match(
+  source,
+  /result\.action === "merge_slides"[\s\S]*deleteSlide\(requestProjectId, slide\.id\)/,
+  "selected-page merge responses must delete concrete slide ids from the request snapshot"
+);
+assert.match(
+  source,
+  /result\.action === "merge_slides"[\s\S]*requestContext\.scope === "selected_slides"[\s\S]*allowedPageNums/,
+  "selected-page merge responses must stay bounded to the selected page scope"
 );
 
 console.log("project isolation tests passed");

@@ -19,7 +19,21 @@ from app.services.agent_next_action import CONTENT_ACTIONS, FINETUNE_ACTIONS, VI
 from app.services.artifact_versions import content_signature, style_asset_signature
 from app.services.image_analyzer import describe_context_image
 from app.services.style_proposal import enforce_user_style_requirements
-from app.services.content_plan import infer_page_count_from_topic
+from app.services.agent_action_system import (
+    CONTENT_MUTATION_PAYLOAD_KEYS,
+    content_action_catalog_prompt,
+    content_action_payload_complete,
+    no_change_for_action_validation,
+    validate_content_action_result,
+)
+from app.services.content_plan import (
+    infer_effective_content_intent_contract,
+    infer_page_count_from_topic,
+)
+from app.services.content_director import (
+    is_content_director_contract,
+    normalize_content_director_contract,
+)
 from app.services.source_intent import (
     infer_intent_contract,
     merge_intent_contract,
@@ -30,13 +44,6 @@ from app.services.source_intent import (
 router = APIRouter(prefix="/projects", tags=["chat"])
 
 
-CONTENT_MUTATION_PAYLOAD_KEYS = {
-    "regenerate_plan": "topic",
-    "update_slide_content": "updated_content",
-    "update_all_slides": "updated_slides",
-    "add_slide_before": "new_slide",
-    "add_slide_after": "new_slide",
-}
 CONTENT_MUTATION_ACTIONS = frozenset(CONTENT_MUTATION_PAYLOAD_KEYS)
 CONTENT_CONTRACT_REVIEW_ACTIONS = frozenset({
     "answer",
@@ -260,6 +267,36 @@ def _source_intent_context_text(project_context: dict) -> str:
     raw = project_context.get("intent_contract") if isinstance(project_context, dict) else None
     if not isinstance(raw, dict):
         return ""
+    if is_content_director_contract(raw):
+        contract = normalize_content_director_contract(raw)
+        delivery_intent = str(contract.get("delivery_intent") or "").strip()
+        if delivery_intent:
+            guidance = (
+                f"最终 PPT 应服务于：{delivery_intent} "
+                "处理上传材料时，以这个交付目标为准，保留关键事实、结构和用户明确要求保留的表达。"
+            )
+            if float(contract.get("confidence") or 0) < 0.5:
+                guidance += " 如果处理方式会明显改变产物，只问一个窄问题：更接近完整保留，还是可以提炼重组？"
+            return "【上传材料的处理方式】\n" + guidance
+        task_type = contract.get("task_type")
+        if task_type == "direct_replicate":
+            guidance = "用户希望尽量按原文和原页顺序整理；不要主动重组结构，标题正文只做必要清理。"
+        elif task_type == "polish_existing":
+            guidance = "用户希望保留主要事实和来源顺序，优化标题和正文表达。"
+        elif task_type in {"source_to_ppt", "teaching_deck"}:
+            if contract.get("coverage") in {"near_complete", "complete"} and contract.get("compression") == "low":
+                guidance = "用户希望充分使用上传材料，覆盖关键结构和论证，不要机械照搬原格式。"
+            else:
+                guidance = "用户希望基于上传材料组织成可讲的 PPT，保留关键事实并优化表达结构。"
+        elif task_type == "summary":
+            guidance = "用户希望提炼和压缩材料，突出关键判断，不需要逐页或逐段完整保留。"
+        elif task_type in {"merge_sources", "extract_only"}:
+            guidance = "用户允许按目标重组材料；必须保留关键事实，并说明内容来自哪些来源。"
+        else:
+            return ""
+        if float(contract.get("confidence") or 0) < 0.5:
+            guidance += " 如果处理方式会明显改变产物，只问一个窄问题：更接近完整保留，还是可以提炼重组？"
+        return "【上传材料的处理方式】\n" + guidance
     contract = normalize_intent_contract(raw)
     task_type = contract.get("task_type")
     if task_type == "replicate":
@@ -289,6 +326,17 @@ def _update_project_intent_from_message_if_needed(
         return {}
 
     incoming = infer_intent_contract(user_message, source_diagnostics=diagnostics)
+    if is_content_director_contract(current):
+        if not incoming.get("evidence") and float(incoming.get("confidence") or 0) < 0.7:
+            return current
+        merged = infer_effective_content_intent_contract(user_message, documents, incoming)
+        if merged != current:
+            project.intent_contract = merged
+            flag_modified(project, "intent_contract")
+            db.commit()
+            db.refresh(project)
+        return project.intent_contract if isinstance(project.intent_contract, dict) else {}
+
     if current and not incoming.get("evidence") and float(incoming.get("confidence") or 0) < 0.7:
         return current
 
@@ -378,20 +426,7 @@ def _infer_pending_content_plan_offer(history: list[dict], project_context: dict
 
 
 def _content_action_payload_complete(result: dict) -> bool:
-    action = result.get("action")
-    payload_key = CONTENT_MUTATION_PAYLOAD_KEYS.get(action)
-    if not payload_key:
-        return True
-    payload = result.get(payload_key)
-    if action == "update_all_slides":
-        if not isinstance(payload, list) or not payload:
-            return False
-        return any(isinstance(item, dict) and item.get("page_num") for item in payload)
-    if isinstance(payload, list):
-        return len(payload) > 0
-    if isinstance(payload, dict):
-        return bool(payload)
-    return bool(payload)
+    return content_action_payload_complete(result)
 
 
 def _content_result_needs_contract_review(result: dict, is_draft: bool) -> bool:
@@ -429,7 +464,7 @@ def _target_page_nums_from_context(page_context: dict | None) -> list[int]:
 
 
 def _normalize_updated_slides_payload(result: dict, page_context: dict | None = None) -> dict:
-    if not isinstance(result, dict) or result.get("action") != "update_all_slides":
+    if not isinstance(result, dict) or result.get("action") not in {"update_all_slides", "merge_slides"}:
         return result
     payload = result.get("updated_slides")
     if not isinstance(payload, list):
@@ -466,6 +501,16 @@ def _normalize_updated_slides_payload(result: dict, page_context: dict | None = 
         by_page[page_num] = patch
     cleaned = [by_page[page_num] for page_num in ordered_pages]
     normalized["updated_slides"] = cleaned
+    if normalized.get("action") == "merge_slides":
+        delete_page_nums: list[int] = []
+        for item in normalized.get("delete_page_nums") or []:
+            try:
+                page_num = int(item)
+            except (TypeError, ValueError):
+                continue
+            if page_num > 0 and page_num not in delete_page_nums:
+                delete_page_nums.append(page_num)
+        normalized["delete_page_nums"] = delete_page_nums
     return normalized
 
 
@@ -526,7 +571,6 @@ def _infer_content_edit_policy(
         text,
         flags=re.IGNORECASE,
     ))
-
     if local_scope and has_preservation_constraint and has_bounded_transform and not _is_replanning_request(user_message, project_context):
         required_action = "update_slide_content" if len(page_nums) <= 1 and (page_nums or (page_context or {}).get("mode") == "page") else "update_all_slides"
         return {
@@ -1090,7 +1134,8 @@ def _short_text(value, limit: int) -> str:
 
 
 def _build_content_contract_prompt() -> str:
-    return """你是 PPT GOD 的「内容指令编译器」。你的职责不是聊天，而是把用户的自然语言指令编译成对当前 PPT 内容的结构化操作。
+    action_catalog = content_action_catalog_prompt()
+    return ("""你是 PPT GOD 的「内容指令编译器」。你的职责不是聊天，而是把用户的自然语言指令编译成对当前 PPT 内容的结构化操作。
 
 硬性工作流合同：
 1. 只要用户的话可以被理解为要求、建议、反馈、抱怨或暗示要改变 PPT 的内容、页面、标题、正文、故事线、逻辑、结构、页数、顺序、表达方式，就必须返回一个可执行 mutation action。
@@ -1107,21 +1152,17 @@ def _build_content_contract_prompt() -> str:
 12. 当 page_context.scope="selected_slides" 或 target_page_nums 有多个页码时，必须返回 action="update_all_slides"，不得只返回 update_slide_content。
 13. target_area="notes" 表示修改演讲备注。update_all_slides 的每一项必须把 speaker_notes 放在顶层：{"page_num":N,"speaker_notes":"..."}；不得把 speaker_notes 放进 text_content。
 
-只输出合法 JSON 对象。允许的 action：
-- regenerate_plan
-- update_slide_content
-- update_all_slides
-- add_slide_before
-- add_slide_after
-- forward_to_visual
-- answer
+{action_catalog}
+
+只输出合法 JSON 对象。允许的 action 以内容动作目录为准。
 
 输出字段：
 - response: 给用户看的简短中文反馈
-- topic: regenerate_plan 必填
+- topic: regenerate_plan / generate_plan 必填
 - page_count: regenerate_plan 可选
-- updated_content / updated_slides / new_slide: 对应 action 必填
+- updated_content / updated_slides / delete_page_nums / new_slide: 对应 action 必填
 - no_change_reason: 仅 answer 必填"""
+    .replace("{action_catalog}", action_catalog))
 
 
 def _compile_content_instruction_with_llm(
@@ -1188,8 +1229,15 @@ def _enforce_content_action_contract(
 ) -> dict:
     result = _normalize_updated_slides_payload(result, page_context)
     edit_policy = _infer_content_edit_policy(user_message, page_context, project_context)
+    initial_action_validation = validate_content_action_result(
+        result,
+        user_message=user_message,
+        page_context=page_context,
+        project_context=project_context,
+    )
     if (
-        not _content_result_needs_contract_review(result, is_draft=False)
+        initial_action_validation.valid
+        and not _content_result_needs_contract_review(result, is_draft=False)
         and not _content_result_conflicts_with_page_context(result, user_message, page_context, project_context)
         and not _content_result_conflicts_with_edit_policy(result, edit_policy)
     ):
@@ -1236,8 +1284,16 @@ def _enforce_content_action_contract(
         compiled = None
 
     compiled = _normalize_updated_slides_payload(compiled, page_context) if isinstance(compiled, dict) else compiled
+    compiled_action_validation = validate_content_action_result(
+        compiled,
+        user_message=user_message,
+        page_context=page_context,
+        project_context=project_context,
+    ) if isinstance(compiled, dict) else None
     if (
         _content_contract_result_usable(compiled)
+        and compiled_action_validation
+        and compiled_action_validation.valid
         and not _content_result_conflicts_with_page_context(compiled, user_message, page_context, project_context)
         and not _content_result_conflicts_with_edit_policy(compiled, edit_policy)
     ):
@@ -1267,6 +1323,36 @@ def _enforce_content_action_contract(
                 compiled.get("action"),
             )
         return compiled
+
+    if (
+        compiled_action_validation
+        and not compiled_action_validation.valid
+        and compiled_action_validation.reason == "scope_conflict"
+        and edit_policy.get("kind") != "local_preservation_edit"
+    ):
+        page_update = _fallback_update_current_slide_from_attachments(
+            user_message=user_message,
+            page_context=page_context,
+            attachment_context=attachment_context,
+            response=result.get("response"),
+        )
+        if page_update:
+            return page_update
+        return no_change_for_action_validation(compiled_action_validation)
+    if (
+        not initial_action_validation.valid
+        and initial_action_validation.reason == "scope_conflict"
+        and edit_policy.get("kind") != "local_preservation_edit"
+    ):
+        page_update = _fallback_update_current_slide_from_attachments(
+            user_message=user_message,
+            page_context=page_context,
+            attachment_context=attachment_context,
+            response=result.get("response"),
+        )
+        if page_update:
+            return page_update
+        return no_change_for_action_validation(initial_action_validation)
 
     if result.get("action") in CONTENT_MUTATION_ACTIONS and not _content_action_payload_complete(result):
         page_update = _fallback_update_current_slide_from_attachments(
@@ -1368,11 +1454,13 @@ def _build_draft_prompt(has_documents: bool) -> str:
 
 {doc_hint}
 
-【场景推断规则】
-根据用户输入自动判断场景类型，不要问用户"你要什么类型"：
-- 年终总结/述职/业绩报告/公司介绍/讲义/培训 → reading（阅读/汇报型，侧重逻辑清晰、数据突出）
-- 产品发布/品牌路演/keynote/演讲 → presentation（演讲驱动型，侧重情绪节奏、钩子、高潮）
-- 客户提案/方案/商业计划书 → mixed（混合型）
+【交付意图理解规则】
+不要把用户需求硬拆成固定类型。你要像内容总监一样理解：
+- 这份 PPT 最终服务谁、在什么场合被使用、希望推动什么判断或行动。
+- 用户更在意完整保留、重点提炼、压缩汇报、深度讲授，还是重新组织表达。
+- 上传材料应该作为主线、证据、参考，还是只提取其中一部分。
+- 页数目标来自用户明确要求、材料容量，还是需要你根据交付目标给出合理建议。
+把这些判断浓缩成自然语言的 delivery_intent，后续生成会用它作为任务契约。
 
 【工作流 action 说明】
 - "diagnose"：首轮对话且信息极少时（如用户只说"帮我做个PPT"），先给出场景诊断和策略建议
@@ -1403,7 +1491,7 @@ def _build_draft_prompt(has_documents: bool) -> str:
 {{
   "action": "diagnose" | "collect_content" | "propose_plan" | "generate_plan" | "answer",
   "response": "给用户的友好中文回复，用内容总监的口吻，专业但有温度。不要出现'diagnose'、'propose_plan'等技术词汇。每次回复都必须包含下一步行动指引，不能停在反问。",
-  "scene_type": "reading" | "presentation" | "mixed" | null,
+  "delivery_intent": "一句自然语言，概括最终 PPT 服务的对象、场合、表达目标和素材使用方式。不要输出固定分类枚举。",
   "diagnosis": {{  // 仅在 action="diagnose" 时输出
     "input_type": "raw_document" | "vague_request" | "mature_outline" | "data_report",
     "suggested_strategy": "人话描述策略，如'建议先抛核心数据做钩子，再展开过程'",
@@ -1564,14 +1652,19 @@ def _build_visual_prompt(content_plan_summary: str, assets_summary: str = "", nu
 
 def _build_normal_prompt() -> str:
     """有 slides 后的内容执行阶段 prompt（内容总监）。"""
-    return """你是 PPT GOD 的内容总监。你有三重背景：TED演讲教练、麦肯锡咨询顾问、顶尖商业文案。用户已经进入了内容执行阶段，你的任务是根据用户指令执行内容操作或给出专业建议。**你不是问答机器人，你是流程推进者。每次回复都必须给用户明确的下一步指引，不能停在反问或让用户体验到"我不知道该做什么"。**
+    action_catalog = content_action_catalog_prompt()
+    return ("""你是 PPT GOD 的内容总监。你有三重背景：TED演讲教练、麦肯锡咨询顾问、顶尖商业文案。用户已经进入了内容执行阶段，你的任务是根据用户指令执行内容操作或给出专业建议。**你不是问答机器人，你是流程推进者。每次回复都必须给用户明确的下一步指引，不能停在反问或让用户体验到"我不知道该做什么"。**
 
-解析用户意图并返回 JSON：
-- "action": "regenerate_pages" | "retry_failed" | "update_style" | "update_slide_content" | "update_all_slides" | "regenerate_plan" | "add_slide_before" | "add_slide_after" | "forward_to_visual" | "answer"
+解析用户意图并返回 JSON，action 必须来自内容动作目录：
+{action_catalog}
+
+字段说明：
+- "action": string（必须来自内容动作目录）
 - "page_nums": int[]（regenerate_pages 时提取页码）
 - "style_id": string（update_style 时）
 - "updated_content": object（update_slide_content 时，返回该页完整的 content_json，必须包含 page_num、type、section_title、text_content、speaker_notes、visual_suggestion）
 - "updated_slides": object[]（update_all_slides 时，数组中每个元素只需包含 page_num 和 text_content）
+- "delete_page_nums": number[]（merge_slides 时必填，表示合并后要删除的页码）
 - "new_slide": object（add_slide_before / add_slide_after 时，返回新页的完整 content_json，必须包含 page_num、type、section_title、text_content、speaker_notes、visual_suggestion）
 - "topic": string（regenerate_plan 时必须输出，完整的主题描述用于重新生成内容规划）
 - "page_count": number（regenerate_plan 时可选，用户明确要求多少页就输出多少页，未提及则不输出）
@@ -1584,6 +1677,7 @@ def _build_normal_prompt() -> str:
 - 用户要求修改全部页面、全局调整、整体改写文字 → action="update_all_slides"
 - **用户反馈整体内容质量问题时（叙事/主线/脉络/结构/逻辑/节奏/论证不完整、不清楚、不连贯、像罗列素材、没有递进或缺少转折）→ action="regenerate_plan"，不要只口头答应；topic 中必须写明需要重构整体内容规划，并补足缺失的铺垫、冲突、转折、证据或结尾。**
 - **用户提到"按照 content plan"、"按照原文/文档"、"完全按照...来"、"按原来的大纲"等，意图是让现有页面内容对齐文档/大纲时 → action="update_all_slides"，不要只口头答应**
+- **用户明确选择了多页或给出页码范围，并要求把这些页合并、去重、精简成更少页时 → action="merge_slides"。只改这些页，updated_slides 返回合并后保留的页面，delete_page_nums 返回要删除的多余页，不得重做整套内容规划。**
 - **用户要求"重新生成内容规划"、"重新规划页面"、"按大纲重新来"、页数需要增减变化时 → action="regenerate_plan"，并在 topic 字段中输出完整的主题描述（用于重新生成内容规划）**
 - **【阶段优先规则·内容规划阶段】如果内容规划尚未被用户确认（上下文显示"内容规划已确认：否"），用户给出的任何与叙事结构、页面顺序、逻辑脉络、整体节奏、内容完整性、页数增减相关的反馈，必须优先视为对整套内容规划的调整，返回 action="regenerate_plan"（重构整套规划）或 "update_all_slides"（全局文字调整）。禁止把这些反馈理解为对单页内容的局部修改（update_slide_content），除非用户明确指定了具体页码和具体修改内容。**
 - **【局部保真编辑】如果用户明确指定局部范围（单页、选中页、页码范围、标题/正文/备注区域），并要求做有限变换（如提炼标题、突出重点、调整层级、优化表达、前置结论、强化某类信息），同时要求保留原有核心内容/事实/数据/案例/细节/正文，则必须返回 update_slide_content 或 update_all_slides。你只能把目标页的标题层级和必要正文结构调清楚；不得返回 regenerate_plan，不得减少页数，不得把多页内容压缩成摘要。**
@@ -1606,6 +1700,12 @@ def _build_normal_prompt() -> str:
   4. 如果本轮修改目标来自 page_context.target_area，则必须严格限定在该区域：title 只改 headline/subhead；body 只改 body；notes 只改 speaker_notes；whole 才能同时改标题、正文和备注
   5. 如果 page_context.scope="selected_slides"，updated_slides 只能包含 target_page_nums 中的页面，且不要混入没有 page_num 的说明对象；说明写在 response 字段
   6. **response 中必须告诉用户下一步该做什么**
+- merge_slides 时：
+  1. 只在 page_context.scope="selected_slides" 或用户明确给出页码范围时使用
+  2. updated_slides 返回合并后保留的页面，每项格式同 update_all_slides；delete_page_nums 返回被合并后要删除的页码
+  3. updated_slides 和 delete_page_nums 都只能包含目标页码，且不能重叠
+  4. 不要改变未选中的页面，不要返回 regenerate_plan
+  5. **response 中必须告诉用户下一步该做什么**
 - add_slide_before / add_slide_after 时：
   1. 必须在 new_slide 中返回新页完整的 content_json（包含所有字段）
   2. page_num 填用户指定的目标位置页码；如果用户没有明确指定，填当前上下文中的 page_num
@@ -1619,9 +1719,11 @@ def _build_normal_prompt() -> str:
 {"action": "regenerate_pages", "page_nums": [3, 4], "response": "好的，正在重新生成第3页和第4页。"}
 {"action": "update_slide_content", "updated_content": {"page_num":1,"type":"cover","section_title":"","text_content":{"headline":"新标题","subhead":"新副标题","body":""},"speaker_notes":"","visual_suggestion":""}, "response": "已更新封面标题和副标题。"}
 {"action": "update_all_slides", "updated_slides": [{"page_num":1,"text_content":{"headline":"...","subhead":"...","body":"markdown正文..."}},{"page_num":2,"speaker_notes":"演讲备注..."}], "response": "已根据原文调整所有页面。"}
+{"action": "merge_slides", "updated_slides": [{"page_num":3,"text_content":{"headline":"合并后的第一页","subhead":"","body":"markdown正文..."}},{"page_num":4,"text_content":{"headline":"合并后的第二页","subhead":"","body":"markdown正文..."}},{"page_num":5,"text_content":{"headline":"合并后的第三页","subhead":"","body":"markdown正文..."}}], "delete_page_nums": [6], "response": "已把选中页合并为3页，请检查内容顺序。"}
 {"action": "add_slide_after", "new_slide": {"page_num":3,"type":"content","section_title":"","text_content":{"headline":"新标题","subhead":"新副标题","body":""},"speaker_notes":"","visual_suggestion":""}, "response": "已在第3页后插入新页。"}
 
 - 必须只返回合法 JSON，不要 markdown 代码块，不要任何解释性文字。确保 JSON 可以被直接解析。"""
+    .replace("{action_catalog}", action_catalog))
 
 
 def _build_finetune_prompt(current_slide_info: str = "") -> str:

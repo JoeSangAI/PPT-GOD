@@ -34,8 +34,6 @@ _REPLICATE_STRONG_CUES = (
     r"原样",
     r"照搬",
     r"逐页还原",
-    r"按原文",
-    r"保留原文",
     r"内容(?:尽量)?不要动",
     r"内容(?:尽量)?不动",
     r"不改内容",
@@ -60,6 +58,12 @@ _SOURCE_PRESERVATION_CUES = (
     r"原文(?:内容)?(?:基本上?|尽量)?保持不变",
     r"原话(?:和原文)?(?:内容)?(?:基本上?|尽量)?不变",
     r"原文(?:内容)?(?:基本上?|尽量)?不变",
+    r"原文(?:内容)?(?:的)?字眼",
+    r"原文字眼",
+    r"(?:保留|保持).{0,12}(?:原文|原话|原句).{0,12}(?:结构|金句|主线|要点|内容)",
+    r"(?:保留|保持).{0,12}(?:原文|原话|原句).{0,12}(?:字眼|措辞|表达|说法)",
+    r"(?:尽量|不要|别).{0,12}改.{0,12}(?:原文|原话|原句|字眼|措辞|表达|内容)",
+    r"完整还原(?:原文|材料|讲稿|内容)?",
     r"文字(?:信息|内容)?(?:基本上?|尽量)?保持不变",
     r"内容(?:基本上?|尽量)?保持不变",
 )
@@ -244,6 +248,17 @@ def infer_intent_contract(
             "confidence": 0.8,
         })
         evidence.extend(extract_hits + restructure_hits)
+    elif has_source_preservation and has_target_count:
+        contract.update({
+            "task_type": "polish",
+            "rewrite_level": "light",
+            "page_order_policy": "preserve",
+            "page_count_policy": "target_count",
+            "source_fidelity": "faithful",
+            "visual_source_use": "page_reference",
+            "confidence": 0.86,
+        })
+        evidence.extend(source_preservation_hits + page_order_hits)
     elif restructure_hits or has_target_count:
         preserve_order = bool(page_order_hits) and not re.search(r"可以\s*重组|结构可以重组|can\s+reorder", text, flags=re.IGNORECASE)
         contract.update({

@@ -19,6 +19,7 @@ from app.services.artifact_versions import content_signature, dependency_signatu
 from app.tasks import compute_style_asset_signature, generate_style_proposals_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import apply_project_rollback, cancel_active_run, create_project_run, finish_run, get_active_run, reconcile_project_state, serialize_run, set_run_task
+from app.services.content_director import is_content_director_contract, normalize_content_director_contract
 from app.services.source_intent import normalize_intent_contract
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
 from app.celery_app import celery_app
@@ -43,6 +44,12 @@ def _active_run_for_project_action(project: Project | None, db: Session):
     from app.api.slides import _active_run_for_project_action as refresh_active_run
 
     return refresh_active_run(project, db)
+
+
+def _normalize_project_intent_contract_for_update(value: dict | None) -> dict:
+    if is_content_director_contract(value):
+        return normalize_content_director_contract(value)
+    return normalize_intent_contract(value)
 
 
 @router.post("", response_model=ProjectResponse)
@@ -118,7 +125,7 @@ def update_project(
         if payload.content_plan_confirmed and project.slides and project.status in {"draft", "planning"}:
             project.status = "visual_ready"
     if payload.intent_contract is not None:
-        project.intent_contract = normalize_intent_contract(payload.intent_contract)
+        project.intent_contract = _normalize_project_intent_contract_for_update(payload.intent_contract)
     db.commit()
     db.refresh(project)
     return project

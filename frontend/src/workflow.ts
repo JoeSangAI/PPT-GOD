@@ -10,6 +10,7 @@ export interface WorkflowInput {
   projectStatus?: string;
   slides?: WorkflowSlide[];
   activeRun?: WorkflowRun | null;
+  pendingRunKind?: string | null;
   contentPlanConfirmed?: boolean;
   showPrototypePreview?: boolean;
   hasSelectedStyle?: boolean;
@@ -401,7 +402,7 @@ export function planStaleSlideAction(items: StaleSlideActionInput[]): StaleSlide
 export function buildWorkflowState(input: WorkflowInput): WorkflowState {
   const slides = input.slides || [];
   const projectStatus = input.projectStatus || "draft";
-  const activeRun = isActiveRun(input.activeRun) ? input.activeRun! : null;
+  const activeRun = isActiveRun(input.activeRun) ? input.activeRun! : pendingRunForKind(input.pendingRunKind);
   const hasGeneratedImage = slides.some((s) => Boolean(s.image_path));
   const hasPrompt = slides.some((s) => Boolean(s.prompt_text));
   const hasFailedSlide = slides.some((s) => s.status === "failed");
@@ -458,6 +459,19 @@ export function buildGateContext(state: WorkflowState, revision = 0): GateContex
 
 export function isActiveRun(run?: WorkflowRun | null) {
   return Boolean(run && (run.status === "queued" || run.status === "running"));
+}
+
+function pendingRunForKind(kind?: string | null): WorkflowRun | null {
+  const normalizedKind = String(kind || "").trim();
+  if (!normalizedKind) return null;
+  return {
+    kind: normalizedKind,
+    status: "running",
+    message: WORKFLOW_RUN_LABELS[normalizedKind] || "任务正在处理中",
+    total_count: 0,
+    completed_count: 0,
+    failed_count: 0,
+  };
 }
 
 const RUN_COPY: Record<string, {

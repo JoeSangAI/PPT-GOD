@@ -6,7 +6,7 @@ from app.services.overlay_layers import (
     enabled_overlay_layers,
     overlay_reservation_instruction,
 )
-from app.services.section_text import sanitize_section_visual_numbering, should_render_section_title
+from app.services.section_text import sanitize_section_visual_numbering
 from app.services.style_pack import clean_image_prompt_style_text
 from app.services.visual_directives import (
     extract_visual_directives,
@@ -953,11 +953,6 @@ def generate_prompt_for_page(
     text_directives = []
     is_punchline_page = _is_punchline_page(page_intent)
     page_type = str((page_intent or {}).get("type") or "").strip().lower()
-    section_title = str((content_text or {}).get("section_title") or "").strip()
-    if page_type == "section" and should_render_section_title(section_title, content_text):
-        label = _escape(_strip_markdown(section_title))
-        if label:
-            text_directives.append(f'Chapter label: "{label}"')
     if content_text.get("headline"):
         h = _escape(_strip_markdown(content_text["headline"]))
         text_directives.append(f'Headline: "{h}"')
@@ -987,6 +982,12 @@ def generate_prompt_for_page(
             "Visible text rule: render the quoted strings in this section as required slide copy; "
             "do not render prompt labels, section headers, color codes, invented copy, lorem ipsum, or decorative microtext."
         )
+        if page_type == "section":
+            text_directives.append(
+                "Section metadata rule: section_title is structural metadata, not visible slide copy. "
+                "Do not render 第X章, Chapter X, module markers, standalone chapter numbers, badges, or ordinals "
+                "unless they appear inside the quoted Headline, Subhead, Body, or Diagram label text above."
+            )
     if visual_intents or diagram_labels:
         text_directives.append("Do not render visual intent phrases as text.")
         text_directives.append("Render diagram labels as visible labels inside the diagram.")
