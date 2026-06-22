@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import Project, Slide, SlideVersion
-from app.services.artifact_versions import with_stale_flags
+from app.services.artifact_versions import has_stale_flags, with_stale_flags
 from app.services.image_generation import (
     clear_reference_upload_cache,
     generate_slide_image,
@@ -39,7 +39,6 @@ from app.services.run_state import (
     mark_run_running,
     update_run_progress,
 )
-from app.services.section_text import should_render_section_title
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
@@ -547,19 +546,84 @@ def _seed_reference_limit(slide: Slide) -> int:
     return 1 if _uses_seed_base_edit_contract(slide) else 2
 
 
+def _split_compact_section_headline(title: str) -> tuple[str, str] | None:
+    value = str(title or "").strip()
+    if not value:
+        return None
+    for marker in ("正在", "行动清单", "如何", "怎么", "怎样"):
+        idx = value.find(marker)
+        if 1 < idx < len(value) - 1:
+            return value[:idx].strip(), value[idx:].strip()
+    compact = re.sub(r"\s+", "", value)
+    if (
+        len(compact) >= 8
+        and len(compact) % 2 == 0
+        and re.fullmatch(r"[\u4e00-\u9fffA-Za-z0-9]+", compact)
+    ):
+        midpoint = len(compact) // 2
+        return compact[:midpoint], compact[midpoint:]
+    return None
+
+
+def _section_seed_title_structure_instruction(headline: str, subhead: str) -> str:
+    title = str(headline or "").strip()
+    secondary = str(subhead or "").strip()
+    if not title:
+        return ""
+
+    question_break = None
+    for marker in ("？", "?"):
+        idx = title.find(marker)
+        if idx >= 0:
+            question_break = idx + len(marker)
+            break
+    if question_break:
+        kicker = title[:question_break].strip()
+        main = title[question_break:].strip()
+        if main:
+            return (
+                " Title hierarchy: preserve the seed slide's two-tier title block exactly: "
+                f"render 「{kicker}」 as the smaller white top line, then render 「{main}」 as "
+                "the larger champagne-gold main statement below it, wrapping only within the "
+                "same left title block used by the seed."
+            )
+
+    if secondary:
+        return (
+            " Title hierarchy: preserve the seed slide's two-tier title block exactly: "
+            f"render headline 「{title}」 as the smaller white top line and subhead 「{secondary}」 "
+            "as the larger champagne-gold main statement below it, wrapping only within the "
+            "same left title block used by the seed."
+        )
+
+    compact_split = _split_compact_section_headline(title)
+    if compact_split:
+        kicker, main = compact_split
+        return (
+            " Title hierarchy: preserve the seed slide's two-tier title block exactly: "
+            f"render 「{kicker}」 as the smaller white top line, then render 「{main}」 as "
+            "the larger champagne-gold main statement below it, wrapping only within the "
+            "same left title block used by the seed."
+        )
+
+    return (
+        " Title hierarchy: preserve the seed slide's left title block position, baseline, "
+        "divider line, font scale, and color hierarchy. Use the seed's white/gold text treatment; "
+        "when the headline needs two lines, keep the first line smaller white and the second line "
+        "larger champagne-gold inside the same title area."
+    )
+
+
 def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
     if seed_image_count <= 0 or not _uses_seed_base_edit_contract(slide):
         return ""
 
-    content = slide.content_json if isinstance(slide.content_json, dict) else {}
     text = _slide_text_content(slide)
-    section_title = str(content.get("section_title") or "").strip()
     headline = str(text.get("headline") or "").strip()
     subhead = str(text.get("subhead") or "").strip()
+    title_structure_instruction = _section_seed_title_structure_instruction(headline, subhead)
 
     targets = []
-    if should_render_section_title(section_title, text):
-        targets.append(f"chapter label 「{section_title}」")
     if headline:
         targets.append(f"headline 「{headline}」")
     if subhead:
@@ -569,11 +633,14 @@ def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
     return (
         "\n\nDIRECT SEED IMAGE EDIT CONTRACT: Use Reference Image 1 as the base slide image. "
         "Keep its background, texture, ornament placement, left-right composition, typography scale, "
-        "spacing, and alignment as unchanged as possible. Only update the visible chapter text to: "
-        f"{target_text}. Remove old seed chapter text, standalone chapter-number badges, and old module "
-        "markers/titles. Do not create any extra standalone chapter-number badge, module marker, module "
-        "title, or Arabic numeral unless it appears inside the quoted target text. This contract overrides "
-        "any earlier layout or composition wording that conflicts with the base image."
+        "spacing, alignment, title-block geometry, line breaks, and color hierarchy as unchanged as possible. "
+        "Only update the visible section headline/subhead text to: "
+        f"{target_text}. Remove old seed section text, standalone chapter-number badges, and old module "
+        "markers/titles. Do not render structural section metadata such as 第X章, Chapter X, module markers, "
+        "standalone chapter-number badges, module titles, or Arabic numerals unless they appear inside the "
+        "quoted target text. Ignore any earlier layout or composition wording that asks for numeric chapter "
+        f"transitions or standalone chapter markers.{title_structure_instruction} This contract overrides any earlier layout or composition "
+        "wording that conflicts with the base image."
     )
 
 
@@ -1795,7 +1862,10 @@ def run_generation_pipeline(
 
     # 先把目标页标记为 generating（只涉及本任务负责的页面）
     for slide in target_slides:
-        if not slide.prompt_text:
+        if has_stale_flags(slide.visual_json, "content", "visual"):
+            slide.status = "failed"
+            slide.error_msg = "页面内容或画面方案已更新，请先重新生成画面方案。"
+        elif not slide.prompt_text:
             slide.status = "failed"
             slide.error_msg = "缺少 prompt"
         else:
@@ -1978,7 +2048,7 @@ def run_generation_pipeline(
                     mark_unattempted_after_provider_cutoff(abort_generation_error)
                     break
 
-    slides_with_prompt = [s for s in target_slides if s.prompt_text]
+    slides_with_prompt = [s for s in target_slides if s.prompt_text and s.status != "failed"]
     if slides_with_prompt:
         # 两阶段生成：先生成同家族的种子页，再以种子图为版式锚点生成其它页。
         # 已经完成的页（finetune/重生成场景）直接进入 existing seeds 池，

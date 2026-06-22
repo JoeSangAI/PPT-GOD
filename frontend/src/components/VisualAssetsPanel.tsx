@@ -635,7 +635,7 @@ export default function VisualAssetsPanel({
                       section: "章节",
                       content: "内容",
                       data: "数据",
-                      quote: "强调",
+                      quote: "金句",
                       ending: "封底",
                     };
                     return (

@@ -66,7 +66,7 @@ export function StatusCard({ card, onAction }: StatusCardProps) {
             aria-valuemax={100}
             aria-valuenow={Math.round(card.progress.percent)}
           >
-            <i style={{ width: `${card.progress.percent}%` }} />
+            <i style={{ transform: `scaleX(${Math.max(0, Math.min(100, card.progress.percent)) / 100})` }} />
           </div>
         )}
       </div>

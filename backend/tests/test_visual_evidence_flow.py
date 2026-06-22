@@ -530,7 +530,7 @@ def test_prompt_text_contract_strips_unbalanced_markdown():
     assert 'Body: "**第四部分' not in prompt
 
 
-def test_section_prompt_requires_chapter_label_from_section_title():
+def test_section_prompt_uses_section_title_as_structure_not_visible_copy():
     prompts = prompt_engine.generate_prompts_for_all_pages(
         visual_plan=[{
             "page_num": 2,
@@ -553,8 +553,10 @@ def test_section_prompt_requires_chapter_label_from_section_title():
     )
 
     prompt = prompts[0]["prompt"]
-    assert 'Chapter label: "第一章"' in prompt
+    assert "Chapter label" not in prompt
+    assert "第一章" not in prompt
     assert 'Headline: "我们是谁？"' in prompt
+    assert "section_title is structural metadata" in prompt
 
 
 def test_section_prompt_does_not_duplicate_chapter_number_channels():
@@ -591,6 +593,38 @@ def test_section_prompt_does_not_duplicate_chapter_number_channels():
     assert "编号" not in prompt
     assert "「06」" not in prompt
     assert prompt.count("Part 6") == 1
+
+
+def test_section_prompt_strips_standalone_chapter_transition_layout_language():
+    prompts = prompt_engine.generate_prompts_for_all_pages(
+        visual_plan=[{
+            "page_num": 13,
+            "type": "section",
+            "layout": "section",
+            "visual_evidence": "章节转场：数字章节转场与章节名主导的仪式感画面",
+            "visual_description": (
+                "画面中心略偏上放置一个超大细体数字章节转场（01 / 03 类），"
+                "章节转场用香槟金，字距极宽；其下紧跟一行章节标题。"
+            ),
+        }],
+        content_plan=[{
+            "page_num": 13,
+            "type": "section",
+            "section_title": "第二章",
+            "text_content": {
+                "headline": "什么没变？人心仍然是终点",
+                "body": "",
+            },
+        }],
+        style_text_override="Style: 黑金极简\nPalette: #0A0A0A, #C9A961",
+    )
+
+    prompt = prompts[0]["prompt"]
+    assert 'Headline: "什么没变？人心仍然是终点"' in prompt
+    assert "第二章" not in prompt
+    assert "数字章节" not in prompt
+    assert "章节转场" not in prompt
+    assert "01 / 03" not in prompt
 
 
 def test_fallback_visual_plan_uses_concrete_visual_evidence():
@@ -791,6 +825,7 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_llm_drops_page(monkeyp
                     "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
                 }
             ],
+            style_override={"meta": {}, "body": "Style: 测试风格\nPalette: #111111, #FFFFFF\nVisual rhythm: 每页按文案生成画面证据"},
         )
 
 
@@ -823,6 +858,7 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missin
                     "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
                 }
             ],
+            style_override={"meta": {}, "body": "Style: 测试风格\nPalette: #111111, #FFFFFF\nVisual rhythm: 每页按文案生成画面证据"},
         )
 
 
@@ -880,6 +916,185 @@ def test_visual_plan_retries_empty_batch_as_single_pages(monkeypatch):
     assert plan[5]["visual_description"] == "第 6 页画面描述"
     assert any('"page_num": 6' in prompt and '"page_num": 10' in prompt for prompt in calls)
     assert any('"page_num": 6' in prompt and '"page_num": 10' not in prompt for prompt in calls)
+
+
+def test_visual_plan_drops_stale_numbered_visual_guidance_absent_from_visible_content(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    prompt = kwargs["messages"][-1]["content"]
+                    calls.append(prompt)
+                    payload = {
+                        "7": {
+                            "visual_evidence": "章节标题转场",
+                            "visual_summary": "墨黑底章节标题转场",
+                            "visual_description": "纯墨黑底，只保留章节标题与大段留白。",
+                            "visual_asset_ids": [],
+                            "visual_asset_usage": {},
+                        }
+                    }
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setenv("PPTGOD_VISUAL_PLAN_BATCH_WORKERS", "1")
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 7,
+                "type": "section",
+                "text_content": {
+                    "headline": "什么变了？决策不再只发生在人脑里",
+                    "subhead": "",
+                    "body": "",
+                },
+                "speaker_notes": '章节页先抛核心判断，让听众带着"被压缩过一遍"的悬念进入 1.1。',
+                "visual_suggestion": "章节大字 + 1.1 / 1.2 两个小标题并列。",
+                "visual_requirements": [
+                    {"directive": "并排显示 1.1 和 1.2 两个章节入口", "diagram_labels": ["1.1", "1.2"]}
+                ],
+            }
+        ],
+    )
+
+    assert calls
+    assert "1.1" not in calls[0]
+    assert "1.2" not in calls[0]
+    assert "两个小标题并列" not in calls[0]
+
+
+def test_visual_plan_sanitizes_section_numbering_returned_by_llm(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    payload = {
+                        "13": {
+                            "visual_evidence": "章节转场：数字章节转场与章节名主导的仪式感画面",
+                            "visual_summary": "第二章数字章节转场",
+                            "visual_description": (
+                                "画面中心略偏上放置一个超大细体数字章节转场（01 / 03 类），"
+                                "章节转场用香槟金；其下紧跟章节标题。"
+                            ),
+                            "visual_asset_ids": [],
+                            "visual_asset_usage": {},
+                        }
+                    }
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setenv("PPTGOD_VISUAL_PLAN_BATCH_WORKERS", "1")
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #C9A961",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 13,
+                "type": "section",
+                "section_title": "第二章",
+                "text_content": {
+                    "headline": "什么没变？人心仍然是终点",
+                    "subhead": "",
+                    "body": "",
+                },
+            }
+        ],
+    )
+
+    joined = " ".join(
+        str(plan[0].get(key) or "")
+        for key in ("visual_evidence", "visual_summary", "visual_description")
+    )
+    assert "第二章" not in joined
+    assert "数字章节" not in joined
+    assert "章节转场" not in joined
+    assert "01 / 03" not in joined
+
+
+def test_visual_plan_drops_stale_case_cards_absent_from_visible_content(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    prompt = kwargs["messages"][-1]["content"]
+                    calls.append(prompt)
+                    payload = {
+                        "9": {
+                            "visual_evidence": "私人买手式对话气泡",
+                            "visual_summary": "深色对话气泡展示用户委托 AI 筛选",
+                            "visual_description": "顶部用对话气泡承载提问场景，下方用两段信息层级对应正文。",
+                            "visual_asset_ids": [],
+                            "visual_asset_usage": {},
+                        }
+                    }
+                    return SimpleNamespace(
+                        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload, ensure_ascii=False)))]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setenv("PPTGOD_VISUAL_PLAN_BATCH_WORKERS", "1")
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 9,
+                "type": "content",
+                "text_content": {
+                    "headline": "消费者雇了一个“全知全能”的私人买手",
+                    "subhead": "",
+                    "body": (
+                        '- 过去搜索"防晒霜"：自己翻几百个商品、几千条评价\n'
+                        '- 现在直接说："我要去三亚冲浪，预算 200 内，敏感肌，帮我推荐三款防水防晒霜"'
+                    ),
+                },
+                "visual_suggestion": (
+                    '顶部"私人买手对话框"还原场景，下方三栏讲山姆/胖东来/Costco，'
+                    '底部一行大字"个人外脑"。'
+                ),
+            }
+        ],
+    )
+
+    assert calls
+    assert "山姆" not in calls[0]
+    assert "胖东来" not in calls[0]
+    assert "Costco" not in calls[0]
+    assert "个人外脑" not in calls[0]
 
 
 def test_visual_prompt_run_fails_when_any_page_prompt_generation_fails(monkeypatch):
@@ -1853,6 +2068,42 @@ def test_visual_plan_prompt_treats_toc_as_simple_navigation():
     assert "toc / 目录页：只有导航功能" in prompt
     assert "3-6 个短章节名" in prompt
     assert "不要做成花哨菜单" in prompt
+
+
+def test_visual_plan_prompt_treats_section_numbers_as_visible_only_when_user_wrote_them():
+    prompt = _build_batch_prompt(
+        pages_summary=[
+            {
+                "page_num": 8,
+                "type": "section",
+                "section_title": "第二章",
+                "text_content": {"headline": "什么没变？人心仍然是终点", "body": ""},
+            }
+        ],
+        style={"meta": {"theme": "黑金", "mood": "克制", "palette": ["#0A0A0A", "#C9A961"]}, "body": ""},
+    )
+
+    assert "只有当章号、章节编号或序号出现在 headline、subhead 或 body 的用户可见文案中" in prompt
+    assert "section_title 只作为结构元数据" in prompt
+
+
+def test_visual_plan_prompt_drops_section_number_from_existing_suggestion_when_absent_from_copy():
+    prompt = _build_batch_prompt(
+        pages_summary=[
+            {
+                "page_num": 8,
+                "type": "section",
+                "section_title": "第六章",
+                "text_content": {"headline": "行动清单", "body": ""},
+                "visual_suggestion": "左上角写第六章，下面放章节主标题和一条金色细线。",
+            }
+        ],
+        style={"meta": {"theme": "黑金", "mood": "克制", "palette": ["#0A0A0A", "#C9A961"]}, "body": ""},
+    )
+
+    assert "第六章" not in prompt
+    assert "左上角写" not in prompt
+    assert "章节主标题" in prompt
 
 
 def test_visual_plan_prompt_guards_cover_data_and_ending_roles():
@@ -3055,7 +3306,15 @@ def test_confirm_prototype_autofills_missing_prompts_before_full_generation(monk
     )
     db.commit()
 
-    monkeypatch.setattr(slides_api, "generate_prompt_for_page", lambda **_kwargs: "auto prompt")
+    def fake_generate_prompt_for_page(**kwargs):
+        content_text = kwargs.get("content_text") or {}
+        return (
+            "Visible Text:\n"
+            f"Headline: \"{content_text.get('headline', '')}\"\n"
+            "\n\nStyle: test"
+        )
+
+    monkeypatch.setattr(slides_api, "generate_prompt_for_page", fake_generate_prompt_for_page)
     monkeypatch.setattr(slides_api, "store_current_provider_credentials", lambda _redis: "cred")
     monkeypatch.setattr(slides_api.redis_client, "set", lambda *_args, **_kwargs: True)
     captured = {}
@@ -3073,8 +3332,10 @@ def test_confirm_prototype_autofills_missing_prompts_before_full_generation(monk
 
     assert result["page_nums"] == [2, 3]
     assert captured["page_nums"] == [2, 3]
-    assert refreshed[1].prompt_text == "auto prompt"
+    assert refreshed[1].prompt_text and "Headline: \"待生成\"" in refreshed[1].prompt_text
     assert refreshed[1].status == "prompt_ready"
+    assert refreshed[2].prompt_text and "Headline: \"已有 prompt\"" in refreshed[2].prompt_text
+    assert refreshed[2].status == "prompt_ready"
 
 
 def test_enqueue_generation_task_ignores_redis_tracking_failure(monkeypatch):
@@ -3173,6 +3434,181 @@ def test_content_edit_preserves_confirmed_workflow_and_existing_outputs():
     assert refreshed_slide.prompt_text == "old prompt"
     assert refreshed_slide.image_path == "/tmp/old.png"
     assert refreshed_slide.status == "completed"
+
+
+def test_content_edit_drops_unchanged_visual_guidance_when_text_changes():
+    db = make_session()
+    project = Project(
+        title="Content edit visual suggestion",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    old_visual_suggestion = "标题下方并排两个金色小序号「1.1」「1.2」，下方各放一个小标题。"
+    old_visual_requirements = [
+        {"directive": "并排显示 1.1 和 1.2 两个章节入口", "diagram_labels": ["1.1", "1.2"]}
+    ]
+    slide = Slide(
+        project_id=project.id,
+        page_num=7,
+        status="completed",
+        content_json={
+            "page_num": 7,
+            "type": "section",
+            "text_content": {
+                "headline": "什么变了？决策不再只发生在人脑里",
+                "body": "- 1.1 从人脑到系统\n- 1.2 从工具到代理",
+            },
+            "visual_suggestion": old_visual_suggestion,
+            "visual_requirements": old_visual_requirements,
+        },
+        visual_json={"visual_description": "old visual"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.commit()
+
+    slides_api.update_slide_content(
+        project.id,
+        slides_api.UpdateContentRequest(
+            page_num=7,
+            slide_id=slide.id,
+            content_json={
+                "text_content": {
+                    "headline": "什么变了？决策不再只发生在人脑里",
+                    "body": "",
+                },
+                "visual_suggestion": old_visual_suggestion,
+                "visual_requirements": old_visual_requirements,
+            },
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+
+    assert refreshed_slide.content_json["text_content"]["body"] == ""
+    assert refreshed_slide.content_json.get("visual_suggestion", "") == ""
+    assert refreshed_slide.content_json.get("visual_requirements", []) == []
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
+
+
+def test_content_save_drops_stale_case_visual_guidance_even_without_text_change():
+    db = make_session()
+    project = Project(
+        title="Content save stale visual suggestion",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    stale_visual_suggestion = (
+        '顶部"私人买手对话框"还原场景，下方三栏讲山姆/胖东来/Costco，'
+        '底部一行大字"个人外脑"。'
+    )
+    body_text = (
+        '- 过去搜索"防晒霜"：自己翻几百个商品、几千条评价\n'
+        '- 现在直接说："我要去三亚冲浪，预算 200 内，敏感肌，帮我推荐三款防水防晒霜"'
+    )
+    slide = Slide(
+        project_id=project.id,
+        page_num=9,
+        status="completed",
+        content_json={
+            "page_num": 9,
+            "type": "content",
+            "text_content": {
+                "headline": "消费者雇了一个“全知全能”的私人买手",
+                "body": body_text,
+            },
+            "visual_suggestion": stale_visual_suggestion,
+        },
+        visual_json={"visual_description": "old visual"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.commit()
+
+    slides_api.update_slide_content(
+        project.id,
+        slides_api.UpdateContentRequest(
+            page_num=9,
+            slide_id=slide.id,
+            content_json={
+                "text_content": {
+                    "headline": "消费者雇了一个“全知全能”的私人买手",
+                    "body": body_text,
+                },
+                "visual_suggestion": stale_visual_suggestion,
+            },
+        ),
+        db=db,
+    )
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+
+    assert refreshed_slide.content_json["text_content"]["body"] == body_text
+    assert refreshed_slide.content_json.get("visual_suggestion", "") == ""
+    assert artifact_stale(refreshed_slide.visual_json) == {"content": True}
+
+
+def test_visual_plan_regeneration_ignores_legacy_visual_suggestion(monkeypatch):
+    db = make_session()
+    project = Project(
+        title="Content-only visual regeneration",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=5,
+        status="completed",
+        content_json={
+            "page_num": 5,
+            "type": "content",
+            "text_content": {
+                "headline": "两张图看清这个时代",
+                "subhead": "时间线",
+                "body": "时代线——经典营销 → 移动互联网 → AI 时代",
+            },
+            "visual_suggestion": "左半页三段时间轴，右半页三方博弈图，下方用三条横线列张力。",
+        },
+        visual_json={"visual_description": "old visual"},
+        prompt_text="old prompt",
+        image_path="/tmp/old.png",
+    )
+    db.add(slide)
+    db.commit()
+
+    captured = {}
+
+    def fake_generate_visual_plan(**kwargs):
+        captured["content_plan"] = kwargs["content_plan"]
+        return [
+            {
+                "page_num": 5,
+                "type": "content",
+                "layout": "content",
+                "visual_description": "只做三段时间线。",
+            }
+        ]
+
+    monkeypatch.setattr(slides_api, "generate_visual_plan", fake_generate_visual_plan)
+
+    slides_api.create_visual_plan(project.id, slides_api.PageNumsRequest(), db=db)
+    refreshed_slide = db.query(Slide).filter(Slide.id == slide.id).first()
+
+    assert captured["content_plan"][0].get("visual_suggestion") == ""
+    assert captured["content_plan"][0].get("visual_requirements") == []
+    assert refreshed_slide.content_json.get("visual_suggestion") == ""
+    assert refreshed_slide.prompt_text is None
+    assert refreshed_slide.image_path is None
 
 
 def test_style_reference_upload_after_confirmation_stays_in_visual_stage(tmp_path, monkeypatch):

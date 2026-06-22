@@ -239,7 +239,7 @@ const TEMPLATE_CONFIRM_TYPES = [
   { key: "section", label: "章节" },
   { key: "content", label: "内容" },
   { key: "data", label: "数据" },
-  { key: "quote", label: "金句/强调" },
+  { key: "quote", label: "金句" },
   { key: "ending", label: "封底" },
 ] as const;
 
@@ -3017,6 +3017,9 @@ function App() {
       };
       const deferContentPlanPoll = (message: string) => {
         pollCompleted = true;
+        if (contentPlanRunId) {
+          locallyHandledRunIdsRef.current.delete(contentPlanRunId);
+        }
         cleanupContentPlanPoll();
         updateProjectChatMessages(projectId, "content", (prev) => [
           ...prev,
@@ -3032,7 +3035,7 @@ function App() {
         if (pollCompleted) return;
         try {
           if (Date.now() - startedAt > CONTENT_PLAN_TIMEOUT_MS) {
-            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，请稍后刷新页面查看结果，不要重复点击。");
+            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，完成后项目状态会自动更新，你可以稍后回到这个项目查看结果，不要重复点击。");
             return;
           }
           const workflow = await fetchWorkflowStatus(projectId);
@@ -3071,7 +3074,7 @@ function App() {
         if (pollCompleted) return;
         try {
           if (Date.now() - startedAt > CONTENT_PLAN_TIMEOUT_MS) {
-            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，请稍后刷新页面查看结果，不要重复点击。");
+            deferContentPlanPoll("这次内容较长，等待时间超过了页面自动跟踪范围。后台任务可能还在继续，完成后项目状态会自动更新，你可以稍后回到这个项目查看结果，不要重复点击。");
             return;
           }
           const currentSlides = await loadSlides(projectId);
@@ -4240,6 +4243,7 @@ function App() {
   };
 
 	  const handleRegenerateSlideFromEdits = async (slideId: string, changes: SlideEditChangeSet) => {
+	    void changes;
 	    if (!selectedProject) return;
 	    const projectId = selectedProject.id;
     if (operatingProjectId === projectId || hasActiveRun) {
@@ -4251,8 +4255,6 @@ function App() {
     }
 
 	    const pageNums = [slide.page_num];
-	    const needsVisualPlan = !changes.visualChanged && (changes.contentChanged || !slide.visual_json?.visual_description);
-	    const needsPrompt = needsVisualPlan || changes.visualChanged || !slide.prompt_text;
 	    const stageContext = buildCrossStageContext("visual");
 	    const loadingId = `single-regenerate-${slideId}-${Date.now()}`;
 	    const updateSinglePageRunMessage = (content: string, extra: Partial<ChatMessage> = {}) => {
@@ -4279,26 +4281,24 @@ function App() {
 	    let visualPromptRunId: string | null = null;
 	    let generationRunId: string | null = null;
 	    try {
-	      if (needsPrompt) {
-	        updateSinglePageRunMessage(`正在更新第 ${slide.page_num} 页画面方案...`);
-	        showToast(`正在更新第 ${slide.page_num} 页画面方案...`, "info");
-	        const visualPromptResult = await generateVisualPrompts(projectId, pageNums, stageContext);
-	        handleWorkflowRunStarted(projectId, visualPromptResult.run);
-	        visualPromptRunId = visualPromptResult?.run?.id ? String(visualPromptResult.run.id) : null;
-	        if (visualPromptRunId) {
-	          locallyHandledRunIdsRef.current.add(visualPromptRunId);
-	          updateSinglePageRunMessage(runProgressText(visualPromptResult.run), { runId: visualPromptRunId });
-	        }
-	        const visualPromptWorkflow = await pollUntilStatusNotGenerating(projectId);
-	        const visualPromptRun = visualPromptRunId && visualPromptWorkflow?.last_run?.id === visualPromptRunId
-	          ? visualPromptWorkflow.last_run
-	          : null;
-	        if (visualPromptRun && String(visualPromptRun.status || "") !== "succeeded") {
-	          throw new Error(userFacingGenerationError(visualPromptRun.error_msg || visualPromptRun.message || "画面方案生成失败"));
-	        }
-	        clearSlideStale(slideId, "content");
-	        clearSlideStale(slideId, "visual");
+	      updateSinglePageRunMessage(`正在更新第 ${slide.page_num} 页画面方案...`);
+	      showToast(`正在更新第 ${slide.page_num} 页画面方案...`, "info");
+	      const visualPromptResult = await generateVisualPrompts(projectId, pageNums, stageContext);
+	      handleWorkflowRunStarted(projectId, visualPromptResult.run);
+	      visualPromptRunId = visualPromptResult?.run?.id ? String(visualPromptResult.run.id) : null;
+	      if (visualPromptRunId) {
+	        locallyHandledRunIdsRef.current.add(visualPromptRunId);
+	        updateSinglePageRunMessage(runProgressText(visualPromptResult.run), { runId: visualPromptRunId });
 	      }
+	      const visualPromptWorkflow = await pollUntilStatusNotGenerating(projectId);
+	      const visualPromptRun = visualPromptRunId && visualPromptWorkflow?.last_run?.id === visualPromptRunId
+	        ? visualPromptWorkflow.last_run
+	        : null;
+	      if (visualPromptRun && String(visualPromptRun.status || "") !== "succeeded") {
+	        throw new Error(userFacingGenerationError(visualPromptRun.error_msg || visualPromptRun.message || "画面方案生成失败"));
+	      }
+	      clearSlideStale(slideId, "content");
+	      clearSlideStale(slideId, "visual");
 	      updateSinglePageRunMessage(`正在启动第 ${slide.page_num} 页图片生成...`);
 	      showToast(`正在重新生成第 ${slide.page_num} 页图片...`, "info");
 	      const result = await startGeneration(projectId, pageNums);
@@ -6986,6 +6986,90 @@ function App() {
         }
       }
 
+      // Agent 要求把选中页合并为更少页
+      if (result.action === "merge_slides" && result.updated_slides?.length > 0) {
+        if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
+        appendRequestMessage({ role: "agent", content: "正在合并选中页...", agentRole: "content" });
+        setOperatingProjectId(requestProjectId);
+        try {
+          const existingPageNums = new Set(requestSlidesSnapshot.map((s) => s.page_num));
+          const slideByPageNum = new Map(requestSlidesSnapshot.map((s) => [s.page_num, s]));
+          const allowedPageNums = requestContext.scope === "selected_slides" && requestContext.pageNums.length > 0
+            ? new Set(requestContext.pageNums)
+            : null;
+          const skipped: string[] = [];
+          const updatedPageNums: number[] = [];
+          const rawDeletePageNums = Array.isArray(result.delete_page_nums) ? result.delete_page_nums : [];
+          const deletePageNums: number[] = Array.from(
+            new Set<number>(
+              rawDeletePageNums
+                .map((item: any) => Number(item))
+                .filter((pageNum: number): pageNum is number => Number.isFinite(pageNum) && pageNum > 0)
+            )
+          ).sort((a, b) => b - a);
+
+          for (const slidePatch of result.updated_slides) {
+            const pageNum = Number(slidePatch.page_num);
+            if (!Number.isFinite(pageNum) || pageNum <= 0) continue;
+            if (allowedPageNums && !allowedPageNums.has(pageNum)) {
+              skipped.push(`第 ${pageNum} 页不在选中范围内`);
+              continue;
+            }
+            if (!existingPageNums.has(pageNum)) {
+              skipped.push(`第 ${pageNum} 页不存在`);
+              continue;
+            }
+            await updateSlideContent(requestProjectId, pageNum, slidePatch);
+            const changedSlide = slideByPageNum.get(pageNum);
+            if (changedSlide && isRequestVisible()) markSlideStale(changedSlide.id, "content");
+            updatedPageNums.push(pageNum);
+          }
+
+          const deletedPageNums: number[] = [];
+          for (const pageNum of deletePageNums) {
+            if (allowedPageNums && !allowedPageNums.has(pageNum)) {
+              skipped.push(`第 ${pageNum} 页不在选中范围内`);
+              continue;
+            }
+            if (updatedPageNums.includes(pageNum)) {
+              skipped.push(`第 ${pageNum} 页同时出现在保留页和删除页中`);
+              continue;
+            }
+            const slide = slideByPageNum.get(pageNum);
+            if (!slide) {
+              skipped.push(`第 ${pageNum} 页不存在`);
+              continue;
+            }
+            await deleteSlide(requestProjectId, slide.id);
+            deletedPageNums.push(pageNum);
+          }
+
+          await loadProjects();
+          await refreshRequestSlides();
+          if (isRequestVisible()) setDeckSelectedPages(new Set());
+          const affectedPageNums: number[] = Array.from(new Set<number>([...updatedPageNums, ...deletedPageNums])).sort((a, b) => a - b);
+          const receipt =
+            affectedPageNums.length > 0
+              ? buildChangeReceipt({
+                  status: "applied",
+                  subject: `已合并${formatPageNumsForReceipt(affectedPageNums)}内容`,
+                  change: summarizeContentChange(result.updated_slides?.[0], userMsg),
+                  skipped: skipped.join("；"),
+                  next: "相关画面方案需要重新检查；切到「视觉总监」更新画面后再生成图片。",
+                })
+              : buildChangeReceipt({
+                  status: "no_change",
+                  subject: "没有找到可合并的选中页，内容未变化",
+                  skipped: skipped.join("；"),
+                });
+          appendRequestMessage({ role: "agent", content: receipt, agentRole: "content" });
+        } catch (err: any) {
+          appendRequestMessage({ role: "agent", content: "合并页面失败：" + (err.message || "未知错误"), agentRole: "content" });
+        } finally {
+          setOperatingProjectId((current) => current === requestProjectId ? null : current);
+        }
+      }
+
       // Agent 要求全局修改多页文字内容
       if (result.action === "update_all_slides" && result.updated_slides?.length > 0) {
         if (isRequestVisible()) pushSlidesHistory(requestSlidesSnapshot);
@@ -7673,7 +7757,7 @@ function App() {
     agenda: "目录",
     content: "内容",
     hero: "金句",
-    quote: "引言",
+    quote: "金句",
     data: "数据",
     ending: "封底",
     section: "章节",
@@ -7814,6 +7898,7 @@ function App() {
     projectStatus: currentStatus,
     slides,
     activeRun,
+    pendingRunKind: contentPlanStartingProjectRef.current === selectedProject?.id ? "content_plan" : null,
     contentPlanConfirmed,
     showPrototypePreview,
     hasSelectedStyle: Boolean(selectedProject?.selected_style),
@@ -8082,8 +8167,8 @@ function App() {
       onClick={onClick}
       title={title}
     >
-      <div className="w-px h-full max-md:w-full max-md:h-px bg-gray-200 group-hover:bg-blue-300 transition-colors absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
-      <div className="opacity-0 group-hover:opacity-100 transition-all bg-white border border-gray-300 text-gray-500 hover:text-blue-600 hover:border-blue-400 hover:bg-blue-50 rounded-full w-6 h-6 flex items-center justify-center text-sm relative z-10 shadow-sm hover:shadow-md hover:scale-110">+</div>
+      <div className="pg-insert-gap-line absolute left-1/2 top-1/2 h-full w-px -translate-x-1/2 -translate-y-1/2 max-md:h-px max-md:w-full" />
+      <div className="pg-insert-gap-button relative z-10 flex h-6 w-6 items-center justify-center rounded-full text-sm">+</div>
     </div>
   );
 
@@ -8310,7 +8395,7 @@ function App() {
           aria-valuemax={100}
           aria-valuenow={Math.round(activeProgressDisclosure.percent)}
         >
-          <i style={{ width: `${activeProgressDisclosure.percent}%` }} />
+          <i style={{ transform: `scaleX(${Math.max(0, Math.min(100, activeProgressDisclosure.percent)) / 100})` }} />
         </div>
         {overviewDisplay.metrics.length > 0 && (
           <div className="pg-progress-metrics">
@@ -9969,7 +10054,7 @@ function App() {
                       }
                     });
                   }}
-                  className="text-slate-400 hover:text-red-500 text-sm px-1.5 py-0.5 rounded hover:bg-red-50 transition-colors"
+                  className="pg-chat-clear-button"
                   title="清空对话"
                 >
                   清空
@@ -10187,13 +10272,13 @@ function App() {
                 ) : (
                   <>
                     {msg.role === "agent" && msg.agentRole === "visual" && (
-                      <div className="pg-agent-label text-xs text-purple-600 mb-1 font-medium">视觉总监</div>
+                      <div className="pg-agent-label pg-agent-label--visual">视觉总监</div>
                     )}
                     {msg.role === "agent" && msg.agentRole === "content" && slides.length > 0 && currentStatus === "planning" && (
-                      <div className="pg-agent-label text-xs text-blue-600 mb-1 font-medium">内容总监</div>
+                      <div className="pg-agent-label pg-agent-label--content">内容总监</div>
                     )}
                     {msg.role === "agent" && msg.agentRole === "finetune" && (
-                      <div className="pg-agent-label text-xs text-amber-600 mb-1 font-medium">单页微调</div>
+                      <div className="pg-agent-label pg-agent-label--finetune">单页微调</div>
                     )}
                     <div
                       className={`pg-message p-3 rounded text-sm ${
@@ -10202,9 +10287,9 @@ function App() {
                           : msg.role === "system"
                           ? "pg-system-message bg-gray-50 text-gray-500 text-xs border border-gray-200"
                           : msg.agentRole === "visual"
-                          ? "bg-purple-50 text-gray-800 rounded-bl-none markdown-body border-l-2 border-purple-300"
+                          ? "pg-agent-message pg-agent-message--visual rounded-bl-none markdown-body"
                           : msg.agentRole === "finetune"
-                          ? "bg-amber-50 text-gray-800 rounded-bl-none markdown-body border-l-2 border-amber-400"
+                          ? "pg-agent-message pg-agent-message--finetune rounded-bl-none markdown-body"
                           : "bg-gray-100 text-gray-800 rounded-bl-none markdown-body"
                       }`}
                     >

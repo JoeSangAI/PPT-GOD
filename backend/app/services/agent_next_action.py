@@ -3,25 +3,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from app.services.agent_action_system import CONTENT_ACTION_NAMES
 from app.services.content_plan import resolve_requested_content_plan_page_count
 
 
-CONTENT_ACTIONS = frozenset({
-    "diagnose",
-    "collect_content",
-    "propose_plan",
-    "generate_plan",
-    "regenerate_pages",
-    "retry_failed",
-    "update_style",
-    "update_slide_content",
-    "update_all_slides",
-    "regenerate_plan",
-    "add_slide_before",
-    "add_slide_after",
-    "forward_to_visual",
-    "answer",
-})
+CONTENT_ACTIONS = CONTENT_ACTION_NAMES
 
 VISUAL_ACTIONS = frozenset({
     "collect_assets",
@@ -110,7 +96,7 @@ def _content_next_action(action: str | None, result: dict[str, Any], project_con
             "confirm": True,
         }
 
-    if action in {"update_slide_content", "update_all_slides", "add_slide_before", "add_slide_after"}:
+    if action in {"update_slide_content", "update_all_slides", "merge_slides", "add_slide_before", "add_slide_after"}:
         if project_context.get("content_plan_confirmed") or project_context.get("total_slides", 0) > 0:
             return {"type": "switch_to_visual", "label": "切换到视觉总监"}
 

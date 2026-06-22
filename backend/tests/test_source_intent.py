@@ -28,6 +28,18 @@ def test_replicate_cues_lock_verbatim_same_order():
     assert contract["confidence"] >= 0.8
 
 
+def test_course_target_count_with_original_quotes_is_not_direct_replicate():
+    contract = infer_intent_contract(
+        "做一篇大约在 1 小时左右的演讲课程内容，预计在 50 页左右。保留原文的结构、金句等",
+        source_diagnostics={"ppt_source_count": 0, "source_page_count": 0},
+    )
+
+    assert contract["task_type"] != "replicate"
+    assert contract["rewrite_level"] != "none"
+    assert contract["page_count_policy"] == "target_count"
+    assert contract["source_fidelity"] == "faithful"
+
+
 def test_finished_ppt_default_is_light_polish_not_replicate():
     contract = infer_intent_contract(
         "帮我把这个 PPT 做得更好",

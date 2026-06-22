@@ -1428,7 +1428,7 @@ body {
     var(--pg-bg);
   background-size: 56px 56px;
   color: var(--pg-ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
 }
 
@@ -2807,7 +2807,7 @@ body {
 .pg-auth {
   background: #ffffff;
   color: var(--pg-ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
 }
 
@@ -7294,10 +7294,12 @@ button.pg-project-export-link:disabled {
 .pg-progress-overview-bar i {
   display: block;
   height: 100%;
-  min-width: 8px;
+  width: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #2563eb, #14b8a6);
-  transition: width 240ms ease;
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 240ms ease;
 }
 
 .pg-progress-metrics {
@@ -8937,8 +8939,11 @@ button.pg-project-export-link:disabled {
 .pg-status-card-bar i {
   display: block;
   height: 100%;
+  width: 100%;
   background: currentColor;
-  transition: width 200ms ease;
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 200ms ease;
 }
 
 .pg-status-card-detail-link {
@@ -10398,5 +10403,129 @@ button.pg-project-export-link:disabled {
   .pg-app.is-single-slide-editing .pg-status-card {
     grid-column: 1 / -1;
     max-width: 100%;
+  }
+}
+
+/* UI polish pass: contrast-safe controls, role-neutral agent messages, transform-only progress motion. */
+.pg-insert-gap-line {
+  background: #d8dee8;
+  transition: background-color 150ms ease;
+}
+
+.pg-insert-gap:hover .pg-insert-gap-line {
+  background: #aab6c5;
+}
+
+.pg-insert-gap-button {
+  border: 1px solid rgba(41, 46, 50, 0.16);
+  background: rgba(255, 255, 255, 0.96);
+  color: #3f4956;
+  opacity: 0;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  transform: scale(0.92);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease,
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+
+.pg-insert-gap:hover .pg-insert-gap-button,
+.pg-insert-gap:focus-within .pg-insert-gap-button {
+  border-color: rgba(45, 119, 119, 0.34);
+  background: #ffffff;
+  color: #174b4b;
+  opacity: 1;
+  transform: scale(1);
+}
+
+.pg-chat-clear-button {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #667085;
+  padding: 2px 7px;
+  font-size: 13px;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+
+.pg-chat-clear-button:hover {
+  background: #fff1f0;
+  color: #a61b17;
+}
+
+.pg-agent-label {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  border: 1px solid rgba(41, 46, 50, 0.12);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #475467;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.4;
+}
+
+.pg-agent-label::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.72;
+}
+
+.pg-agent-label--visual {
+  color: #1f6767;
+}
+
+.pg-agent-label--content {
+  color: #175cd3;
+}
+
+.pg-agent-label--finetune {
+  color: #80551f;
+}
+
+.pg-oracle-panel .pg-agent-message {
+  border: 1px solid rgba(41, 46, 50, 0.12) !important;
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.92), rgba(248, 250, 250, 0.74)),
+    rgba(255, 255, 255, 0.72) !important;
+  color: var(--pg-ink) !important;
+}
+
+.pg-oracle-panel .pg-agent-message--visual {
+  border-color: rgba(45, 119, 119, 0.22) !important;
+}
+
+.pg-oracle-panel .pg-agent-message--finetune {
+  border-color: rgba(141, 106, 63, 0.24) !important;
+}
+
+.pg-auth-error {
+  border: 1px solid rgba(166, 27, 23, 0.22) !important;
+  border-radius: 10px !important;
+  background: #fff1f0 !important;
+  color: #8f1d18 !important;
+  padding: 10px 12px !important;
+  font-size: 12.5px !important;
+  line-height: 1.45 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pg-progress-overview-bar i,
+  .pg-status-card-bar i,
+  .pg-insert-gap-line,
+  .pg-insert-gap-button,
+  .pg-chat-clear-button {
+    transition: none !important;
   }
 }
