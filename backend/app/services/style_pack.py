@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 from app.services.visual_strategy import build_visual_strategy, visual_strategy_text
 
-DEFAULT_VISUAL_RHYTHM = "每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
+DEFAULT_VISUAL_RHYTHM = "按页面职责分配视觉强度：定调页可有一个明确记忆点；导航、论证、证据页优先阅读效率和信息秩序，内容页装饰低到中等。"
 
 
 def clean_image_prompt_style_text(value: object) -> str:

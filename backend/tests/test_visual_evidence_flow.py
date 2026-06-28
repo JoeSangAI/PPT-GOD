@@ -2070,6 +2070,45 @@ def test_visual_plan_prompt_treats_toc_as_simple_navigation():
     assert "不要做成花哨菜单" in prompt
 
 
+def test_visual_plan_prompt_includes_page_role_visual_budget():
+    prompt = _build_batch_prompt(
+        pages_summary=[
+            {
+                "page_num": 4,
+                "type": "content",
+                "headline": "关键判断",
+                "body_preview": "观点一、观点二、观点三",
+            }
+        ],
+        style={"meta": {"theme": "商务", "mood": "克制", "palette": ["#111111", "#D4AF37"]}, "body": ""},
+    )
+
+    assert "按页面职责分配视觉强度" in prompt
+    assert "导航页（toc）、论证页" in prompt
+    assert "证据页（data / table / case / map / 截图 / 产品）" in prompt
+    assert "一页只保留一个视觉重点" in prompt
+    assert "避免海报化构图" in prompt
+
+
+def test_visual_plan_prompt_includes_content_page_decoration_budget():
+    prompt = _build_batch_prompt(
+        pages_summary=[
+            {
+                "page_num": 8,
+                "type": "case",
+                "headline": "案例拆解",
+                "body_preview": "起点、做法、结果、风险",
+            }
+        ],
+        style={"meta": {"theme": "商务", "mood": "克制", "palette": ["#111111", "#D4AF37"]}, "body": ""},
+    )
+
+    assert "强调色只用于标题、编号、关键数字和少量分隔线" in prompt
+    assert "不要把每个信息块都做成图标卡" in prompt
+    assert "描边卡" in prompt
+    assert "强装饰容器" in prompt
+
+
 def test_visual_plan_prompt_treats_section_numbers_as_visible_only_when_user_wrote_them():
     prompt = _build_batch_prompt(
         pages_summary=[

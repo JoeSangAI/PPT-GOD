@@ -101,7 +101,7 @@ def _compact_style_pack(style_text: str, max_lines: int = 6, max_chars: int = 76
             "Palette: 由主题和场景自然选择\n"
             "Mood: 贴合当前页面内容气质\n"
             "Typography: 由风格气质决定字体搭配\n"
-            "Visual rhythm: 每页由文案决定画面证据"
+            "Visual rhythm: 按页面职责分配视觉强度；定调页可有一个记忆点，导航、论证、证据页优先信息秩序"
         )
     lines = [line.strip() for line in style_text.splitlines() if line.strip()]
     priority_by_key: dict[str, str] = {}
@@ -937,7 +937,7 @@ def generate_prompt_for_page(
             "Palette: 由主题和场景自然选择\n"
             "Mood: 贴合当前页面内容气质\n"
             "Typography: 由风格气质决定字体搭配\n"
-            "Visual rhythm: 每页由文案决定画面证据"
+            "Visual rhythm: 按页面职责分配视觉强度；定调页可有一个记忆点，导航、论证、证据页优先信息秩序"
         )
 
     reference_descriptions = _reference_descriptions_for_prompt(page_intent, content_text or {}, reference_images)

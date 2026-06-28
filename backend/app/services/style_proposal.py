@@ -17,7 +17,7 @@ from app.services.visual_strategy import build_visual_strategy
 logger = logging.getLogger(__name__)
 
 STYLE_PROPOSAL_POLICY_VERSION = "2026-05-15-style-source-priority-v1"
-DEFAULT_CONTENT_STYLE_HINT = "每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
+DEFAULT_CONTENT_STYLE_HINT = "按页面职责分配视觉强度：定调页可有一个明确记忆点；导航、论证、证据页优先阅读效率和信息秩序，内容页装饰低到中等。"
 
 
 def _parse_llm_json(raw: str, *, expected_type: type, context: str):
@@ -472,21 +472,21 @@ def _decision_archetypes(summary: Dict) -> List[Dict]:
             "best_for": f"想让观众第一眼记住{topic}的气质、场景和品牌/主题识别。",
             "tradeoff": "强视觉页更有存在感，正文页需要控制装饰密度。",
             "visual_focus": "用更明确的主色、场景化画面和统一装饰语言建立整套 PPT 的第一印象。",
-            "content_style_hint": "用明确主色、场景化画面和统一装饰语言建立整套 PPT 的第一印象；正文页控制装饰密度。",
+            "content_style_hint": "定调页用明确主色和一个场景记忆点建立第一印象；正文、数据和表格页只保留低到中等装饰。",
         },
         {
             "decision_label": information_label,
             "best_for": "页数、文字或数据较多，希望阅读效率、可信感和汇报稳定性优先。",
             "tradeoff": "画面冲击力更克制，但更适合长时间讲解和逐页阅读。",
             "visual_focus": "浅底、清晰层级、图表/卡片秩序和少量强调色，降低理解成本。",
-            "content_style_hint": "内容页优先浅底或低干扰基底、清晰层级、图表/卡片秩序和少量强调色，降低理解成本。",
+            "content_style_hint": "导航、论证和证据页优先浅底或低干扰基底、清晰层级、图表/卡片秩序和少量强调色。",
         },
         {
             "decision_label": "表达冲击",
             "best_for": "希望提案更有态度，适合路演、发布、竞标或需要快速抓住注意力的场景。",
             "tradeoff": "视觉个性更强，需要接受更高对比和更鲜明的版式节奏。",
             "visual_focus": "高对比色块、大标题、强节奏分区和更鲜明的视觉符号。",
-            "content_style_hint": "使用高对比色块、大标题、强节奏分区和鲜明视觉符号；内容页仍保持阅读层级。",
+            "content_style_hint": "定调页可使用高对比色块和鲜明视觉符号；内容页只保留一个视觉重点，避免海报化构图。",
         },
     ]
 
@@ -826,6 +826,7 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
             "页面类型适配规则：先保持整套深色视觉基底，再按页面功能调节强弱。"
             f"封面、章节页、转场页、金句页可放大使用品牌主色 {primary} 和强调色 {accent}，承担品牌定调和情绪冲击；"
             "内容页、数据页、表格页仍使用同一深色系语言，通过高对比暗色卡片、局部浅色内容区、清晰字号层级和留白保证阅读效率。"
+            "除定调页外，一页只保留一个视觉重点，避免海报化构图、大面积纹理、强光效和复杂背景。"
             "除非用户明确要求或出现极端表格/长文页，不要把正文页自动切成浅色或另一套视觉语言。"
         )
     if base_tone == "light":
@@ -839,6 +840,7 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
         return (
             f"页面类型适配规则：整套页面以 {light_base} 一类浅底和留白保证阅读效率，强视觉页也保持明亮基底。"
             f"用 {brand} 做标题、页眉、编号和品牌装饰，用 {accent_light} 做少量装饰线和重点信息；"
+            "导航、论证和证据页只保留一个视觉重点，避免海报化构图、大面积纹理、强光效和复杂背景；"
             "深色只用于文字、细线或局部强调，不能在封面、章节或正文页随机回到深色整页背景。"
         )
     if palette and _needs_page_type_modulation(primary):
@@ -846,6 +848,7 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
             "页面类型适配规则：参考图只用于定调，不要求所有页面按同一强度复刻。"
             f"封面、章节页、转场页、金句页可放大使用品牌主色 {primary} 和强调色 {accent}，承担品牌定调和情绪冲击；"
             "内容页、数据页、表格页、长文分析页必须先沿用同一套色彩和材质语言，再用卡片、留白、局部内容区和字号层级解决阅读效率。"
+            "除定调页外，一页只保留一个视觉重点，避免海报化构图、大面积纹理、强光效和复杂背景。"
             "如果需要浅底，必须按同类信息页成组出现，并保留相同品牌色、装饰语言和 Logo 对比处理。"
         )
 
@@ -853,6 +856,7 @@ def _page_type_adaptation_rules(palette: List[Dict], visual_strategy: Dict | Non
         "页面类型适配规则：参考图提供风格基因，不是每页画面模板。"
         "封面/章节页可以更强烈地使用主色，内容/数据/表格页必须优先保证阅读效率，"
         "但同类正文页应使用同一种信息页处理，不要逐页随机切换明暗语言。"
+        "除定调页外，一页只保留一个视觉重点，避免海报化构图、大面积纹理、强光效和复杂背景。"
     )
 
 
@@ -1146,6 +1150,7 @@ def generate_style_proposals(content_plan: List[Dict], assets: Optional[Dict] = 
 
 【content_style_hint 写作要求——给生图，不给用户看】
 - 这是后续每页生图 Prompt 的全局风格约束，只写画面如何生成：色彩节奏、材质、装饰强度、页面类型适配、配图证据选择原则。
+- 必须按页面职责分配视觉强度：定调页允许一个记忆点；导航、论证、证据页优先信息秩序，装饰低到中等。
 - 不要写"选它如果"、"更看重"、"推荐此方案"、"原因是"、"非常适合"、"需要接受的取舍"等决策说明。
 - 不要复述客户收益、讲者专业感、方案说服力或选择理由；这些只属于 description、best_for、tradeoff。
 """
@@ -1309,6 +1314,7 @@ def _generate_asset_based_proposal(
 
 【content_style_hint 写作要求——给生图，不给用户看】
 - 只写可执行的画面生成约束：主色关系、背景/内容页节奏、材质纹理、装饰强度、参考图复用边界、配图对象由每页文案决定。
+- 必须按页面职责分配视觉强度：定调页允许一个记忆点；导航、论证、证据页优先信息秩序，装饰低到中等。
 - 不要写"推荐此方案"、"原因是"、"非常适合"、"需要接受的取舍"、"客户会感受到"等解释性语言。
 - 不要复述用户上传了什么素材或为什么选择这套素材；只把素材转成最终画面的风格约束。"""
 
