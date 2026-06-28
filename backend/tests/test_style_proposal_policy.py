@@ -963,7 +963,8 @@ def test_selected_style_pack_ignores_decision_fields_without_image_facing_hint()
 
     style_pack = style_pack_from_selected_style(selected_style)
 
-    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "Visual rhythm: 按页面职责分配视觉强度" in style_pack
+    assert "导航、论证、证据页优先阅读效率和信息秩序" in style_pack
     assert "选它如果" not in style_pack
     assert "更看重" not in style_pack
     assert "需要接受的取舍" not in style_pack
@@ -988,7 +989,8 @@ def test_selected_style_pack_does_not_use_description_as_visual_rhythm_source():
 
     style_pack = style_pack_from_selected_style(selected_style)
 
-    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "Visual rhythm: 按页面职责分配视觉强度" in style_pack
+    assert "内容页装饰低到中等" in style_pack
     assert "推荐此方案的原因" not in style_pack
     assert "专业前瞻感" not in style_pack
 
@@ -1021,7 +1023,8 @@ def test_selected_style_pack_does_not_use_style_library_choice_rationale_as_rhyt
 
     style_pack = style_pack_from_selected_style(selected_style)
 
-    assert "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度" in style_pack
+    assert "Visual rhythm: 按页面职责分配视觉强度" in style_pack
+    assert "内容页装饰低到中等" in style_pack
     assert "我从风格库中选择" not in style_pack
     assert "原本的设计定位" not in style_pack
     assert "非常适合这份 PPT" not in style_pack

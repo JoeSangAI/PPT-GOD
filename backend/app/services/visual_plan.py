@@ -876,6 +876,9 @@ def _build_batch_prompt(
     page_type_style_rules = """
 【页面类型适配规则 — 必须遵守】
 参考图/风格方案只提供“风格基因”，不是每页画面模板。具体每页画什么，必须由该页文案内容决定。
+- 总则：按页面职责分配视觉强度。定调页（cover / section / hero / quote / ending）可以有一个明确视觉记忆点；导航页（toc）、论证页（content / 对比 / 框架）和证据页（data / table / case / map / 截图 / 产品）优先阅读效率和信息秩序。
+- 除定调页外，一页只保留一个视觉重点，避免海报化构图、大面积装饰纹理、强光效、复杂背景和多个视觉中心。
+- 内容、数据、案例、目录页的强调色只用于标题、编号、关键数字和少量分隔线；不要把每个信息块都做成图标卡、描边卡或强装饰容器。
 - cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
 - cover / 封面：只负责定调和命名，不承载正文论证；标题、副标题和主视觉必须形成单一焦点，避免信息堆叠。
 - toc / 目录页：只有导航功能，不承担内容论证。画面必须像清爽的路线图：3-6 个短章节名、明确编号、足够留白、少装饰；不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
@@ -1102,7 +1105,7 @@ def _fallback_visual_plan(
         "Mood: 贴合内容气质\n"
         "Typography: 由风格气质决定字体搭配\n"
         "Page type adaptation: 封面/章节页可强化情绪，内容/数据页优先可读\n"
-        "Visual rhythm: 每页由文案决定画面证据，风格只统一色彩、材质和装饰强度"
+        "Visual rhythm: 按页面职责分配视觉强度；定调页可有一个记忆点，导航、论证、证据页优先信息秩序"
     )
     visual_strategy = _visual_strategy_from_style_text(style_pack_snapshot)
     for page in content_plan:
