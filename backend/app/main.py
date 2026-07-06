@@ -17,7 +17,7 @@ from app.core.tester_auth import (
     set_current_request_is_local,
     set_current_tester_id,
 )
-from app.api import auth, projects, slides, chat, documents
+from app.api import agent, auth, projects, slides, chat, documents
 from app.models.base import SessionLocal, engine
 from app.models import models
 
@@ -169,6 +169,7 @@ async def mvp_context_and_project_guard(request: Request, call_next):
         reset_provider_credentials(provider_token)
 
 app.include_router(auth.router)
+app.include_router(agent.router)
 app.include_router(projects.router)
 app.include_router(slides.router)
 app.include_router(chat.router)

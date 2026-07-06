@@ -94,11 +94,10 @@ def test_reference_texture_and_typography_survive_to_compact_prompt():
         style_text_override=style_text,
     )
 
-    assert "Typography:" in prompt
-    assert "clean sans-serif hierarchy" in prompt
-    assert "strong headline weight" in prompt
-    assert "Inter Display" not in prompt
-    assert "Inter Regular" not in prompt
+    assert "Typography contract:" in prompt
+    assert "Inter Display" in prompt
+    assert "Inter Regular" in prompt
+    assert "generation guidance only" in prompt
     assert "font family names" in prompt
     assert "Texture/material:" in prompt
     assert "soft blur glow" in prompt

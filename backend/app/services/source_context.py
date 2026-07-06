@@ -2,10 +2,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.config import settings
 from app.services.source_pack import FRONT_MATTER_ROLE_TERMS, estimate_tokens, front_matter_role_for_text
 
 
-DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET = 120_000
+DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET = max(120_000, int(settings.CONTENT_PLAN_SOURCE_CONTEXT_TOKEN_BUDGET or 500_000))
 SOURCE_PAGE_FIGURE_LIMIT = 120
 OTHER_FIGURE_LIMIT = 120
 

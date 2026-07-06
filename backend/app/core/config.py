@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     MINIMAX_LLM_MODEL: str = "MiniMax-M3"
     COMET_API_KEY: str = ""
     COMET_API_BASE: str = "https://api.cometapi.com/v1"
-    COMET_IMAGE_MODEL: str = "gpt-image-2-all"
+    COMET_IMAGE_MODEL: str = "gpt-image-2"
     IMAGE_API_TIMEOUT_SECONDS: float = 125.0
     IMAGE_GEN_MODE: str = "real"  # real | mock | cached
     IMAGE_GEN_CACHE_DIR: str = ""
@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     CELERY_WORKER_STARTUP_TIMEOUT_SECONDS: int = 8
     RUN_HEARTBEAT_TIMEOUT_SECONDS: int = 300
     CONTENT_PLAN_HEARTBEAT_TIMEOUT_SECONDS: int = 1800
+    CONTENT_PLAN_SOURCE_CONTEXT_TOKEN_BUDGET: int = 500_000
+    CONTENT_PLAN_PAGE_MAP_DOCUMENT_CHAR_LIMIT: int = 180_000
+    CONTENT_PLAN_PAGE_MAP_SOURCE_DRAFT_CHAR_LIMIT: int = 90_000
     CELERY_TASK_SOFT_TIME_LIMIT: int = 1800
     CELERY_TASK_TIME_LIMIT: int = 2100
     PPTX_ASSEMBLY_LOCK_TTL_SECONDS: int = 300

@@ -46,6 +46,12 @@ def _active_run_for_project_action(project: Project | None, db: Session):
     return refresh_active_run(project, db)
 
 
+def _autoname_project_from_existing_slides(project: Project) -> bool:
+    from app.api.slides import _autoname_project_from_slides
+
+    return _autoname_project_from_slides(project, list(project.slides or []))
+
+
 def _normalize_project_intent_contract_for_update(value: dict | None) -> dict:
     if is_content_director_contract(value):
         return normalize_content_director_contract(value)
@@ -81,7 +87,8 @@ def list_projects(tester_id: str = Depends(require_tester_id), db: Session = Dep
     for project in projects:
         before = project.status
         reconcile_project_state(project, list(project.slides or []), get_active_run(db, project.id))
-        changed = _clear_stale_style_proposal(project) or changed or project.status != before or bool(db.dirty)
+        title_changed = _autoname_project_from_existing_slides(project)
+        changed = title_changed or _clear_stale_style_proposal(project) or changed or project.status != before or bool(db.dirty)
     if changed:
         db.commit()
     return projects
@@ -94,11 +101,12 @@ def get_project(project_id: str, tester_id: str = Depends(tester_id_from_header)
     before = project.status
     reconcile_project_state(project, list(project.slides or []), get_active_run(db, project_id))
     style_proposal_changed = _clear_stale_style_proposal(project)
+    title_changed = _autoname_project_from_existing_slides(project)
     # 用户已进入项目详情，清除未读通知
     if project.has_unread_notification:
         project.has_unread_notification = False
         project.unread_notification_message = None
-    if project.status != before or style_proposal_changed or not project.has_unread_notification or db.dirty:
+    if project.status != before or style_proposal_changed or title_changed or not project.has_unread_notification or db.dirty:
         db.commit()
         db.refresh(project)
     return project

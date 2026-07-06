@@ -6,7 +6,7 @@ The selected visual style bar currently shows the chosen style name, palette chi
 
 This does not solve the user's real question after a style is selected: "What will this visual direction actually do to my deck?" The expanded state still reads like a metadata dump. It does not make the difference between cover, section, content, and data pages visible.
 
-The product copy principle from `DEVELOPMENT_MEMORY.md` applies here: every visible detail should help the user make a concrete decision. If the information does not help the user decide whether to trust, adjust, or regenerate the direction, it should be removed or pushed into a deeper detail view.
+The product copy principle from `AGENTS.md` applies here: every visible detail should help the user make a concrete decision. If the information does not help the user decide whether to trust, adjust, or regenerate the direction, it should be removed or pushed into a deeper detail view.
 
 ## Problem
 

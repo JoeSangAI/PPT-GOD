@@ -172,6 +172,43 @@ def test_prompt_engine_injects_exact_overlay_reservation_once():
     assert "Background treatment: keep the following zones completely free" not in prompt
 
 
+def test_prompt_engine_keeps_overlay_base_prompt_free_of_paste_placeholder_language():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 6,
+            "type": "content",
+            "layout": "creative-proof",
+            "visual_evidence": "三时段分众投放的创意样张拼贴：早/中/晚场景下的阿福健康提醒",
+            "visual_description": (
+                "画面下半部预留为三联卡片清洁区，三张原图精确粘贴位；"
+                "left-card 放午间样张, center-card 放夜间样张, right-card 放早晨样张。"
+            ),
+            "overlay_layers": [
+                {"asset_id": "asset-lunch", "enabled": True, "preset": "left-card", "mode": "exact_cutout"},
+                {"asset_id": "asset-night", "enabled": True, "preset": "center-card", "mode": "exact_cutout"},
+                {"asset_id": "asset-morning", "enabled": True, "preset": "right-card", "mode": "exact_cutout"},
+            ],
+        },
+        content_text={
+            "headline": "创意样张：把公众号事件声量，转成电梯里的即时提醒",
+        },
+        reference_images=[],
+        style_text_override="Style: 3D卡通角色IP萌系\nPalette: purple, white",
+    )
+
+    assert prompt.count("Exact Overlay Reservation:") == 1
+    pre_overlay = prompt.split("Exact Overlay Reservation:", 1)[0]
+    assert "base background" in pre_overlay.lower()
+    assert "upper 14%" in pre_overlay.lower()
+    assert "compact header scale" in pre_overlay.lower()
+    assert "三联卡片" not in pre_overlay
+    assert "创意样张拼贴" not in pre_overlay
+    assert "原图精确粘贴位" not in pre_overlay
+    assert "left-card" not in pre_overlay
+    assert "center-card" not in pre_overlay
+    assert "right-card" not in pre_overlay
+
+
 def test_prompt_engine_omits_overlay_reservation_without_layers():
     prompt = generate_prompt_for_page(
         page_intent={
@@ -384,6 +421,7 @@ def test_prompt_engine_binds_multi_item_body_to_matching_visual_subjects():
     assert 'Linked caption body: "特罗卡德罗 Trocadéro：最经典的正面视角，适合拍完整铁塔。"' in prompt
     assert 'Info block body: "特罗卡德罗 Trocadéro：最经典的正面视角，适合拍完整铁塔。"' not in prompt
     assert "Image-text binding:" in prompt
+    assert "numbered markers" not in prompt
     assert "Match these caption anchors to corresponding photos/subjects: 特罗卡德罗 Trocadéro、战神广场 Champ de Mars、比尔阿克姆桥 Pont de Bir-Hakeim、Le Jules Verne" in prompt
 
 
@@ -433,6 +471,59 @@ def test_prompt_engine_uses_explicit_image_slots_as_compact_source_of_truth():
     assert "A: 特罗卡德罗 Trocadéro 正面铁塔远景; role=primary; position=upper-center large landscape; shape=landscape postcard; linked text=body_1, 特罗卡德罗 Trocadéro" in prompt
     assert "B: Le Jules Verne 塔内餐厅窗边餐桌; role=support; position=right-side tall card; shape=vertical rounded photo; linked text=body_4, Le Jules Verne" in prompt
     assert "Use Slot map as the source of truth for image placement and caption association." in prompt
+
+
+def test_prompt_engine_numbers_multiple_reference_images_to_reduce_single_ref_bias():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 3,
+            "type": "content",
+            "layout": "collage",
+            "visual_evidence": "Use all selected museum photos as a three-card comparison.",
+            "visual_asset_usage": {
+                "asset-a": "left card",
+                "asset-b": "center card",
+                "asset-c": "right card",
+            },
+        },
+        content_text={
+            "headline": "三张参考图共同构成页面证据",
+            "body": [
+                "左图：城市街景",
+                "中图：产品近景",
+                "右图：用户场景",
+            ],
+        },
+        reference_images=[
+            {
+                "role": "visual_asset",
+                "id": "asset-a",
+                "asset_name": "城市街景",
+                "asset_kind": "other",
+                "label": "Reference Image A",
+            },
+            {
+                "role": "visual_asset",
+                "id": "asset-b",
+                "asset_name": "产品近景",
+                "asset_kind": "other",
+                "label": "Reference Image B",
+            },
+            {
+                "role": "visual_asset",
+                "id": "asset-c",
+                "asset_name": "用户场景",
+                "asset_kind": "other",
+                "label": "Reference Image C",
+            },
+        ],
+    )
+
+    assert "Reference image 1 (城市街景):" in prompt
+    assert "Reference image 2 (产品近景):" in prompt
+    assert "Reference image 3 (用户场景):" in prompt
+    assert "Use every numbered reference image" in prompt
+    assert "Do not ignore later references" in prompt
 
 
 def test_prompt_engine_keeps_info_block_for_single_visual_subject():
@@ -486,6 +577,64 @@ def test_prompt_engine_does_not_bind_unlabeled_overview_points():
     assert 'Info block body: "巴黎以塞纳河为城市主轴，许多重要地标都分布在两岸。"' in prompt
     assert "Linked caption body:" not in prompt
     assert "Image-text binding:" not in prompt
+
+
+def test_prompt_engine_does_not_number_independent_narrative_paragraphs():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 3,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "围绕「先把基础名词讲清楚」的正文段落与关键词清单",
+            "visual_summary": "正文段落主导，关键词轻量收束",
+            "visual_description": (
+                "以本页已有标题、副标题和正文段落为主体，采用清晰的纵向阅读层级；"
+                "如果正文里列出多个名词、工具或关键词，只把它们作为原文关键词处理，"
+                "不要为这些词补写解释、示例或额外小字。"
+            ),
+        },
+        content_text={
+            "headline": "先把基础名词讲清楚",
+            "subhead": "不被高大上的 Agent 叙事带偏",
+            "body": (
+                "现在短视频上有很多人在讲各种各样的 Agent，也在讲各种各样听起来很高大上的名词。\n\n"
+                "这些内容不一定错，但如果基础概念还没有建立，很容易把人带偏：还没搞清楚 LLM、Token、Prompt、Context，就已经开始追 Hermes，Harness，Loop。\n\n"
+                "所以这门课的目的很简单：把这些基础名词列出来，用普通人能理解的方式讲清楚，先建立一套不容易被带偏的底层认知。\n\n"
+                "今天会讲到：LLM、Token、GPT、注意力机制、Prompt、Context、Chatbot、Agent、Agentic AI、多模态。"
+            ),
+        },
+        reference_images=[],
+        style_text_override="Style: 冷银科技编辑\nVisual rhythm: 内容页以分栏、对比、流程箭头、卡片矩阵为主。",
+    )
+
+    assert 'Body: "现在短视频上有很多人在讲各种各样的 Agent' in prompt
+    assert "Linked caption body:" not in prompt
+    assert "Image-text binding:" not in prompt
+    assert "numbered markers" not in prompt
+    assert "standalone numeric badges" in prompt
+
+
+def test_prompt_engine_renders_quote_body_on_quote_page():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 6,
+            "type": "quote",
+            "layout": "hero",
+            "visual_evidence": "名人名言引用页，Steve Jobs 肖像作为背景的一部分",
+            "visual_description": "大号引文排版，右下角作者署名，背景使用低对比度人物肖像。",
+        },
+        content_text={
+            "headline": "Stay hungry, stay foolish.",
+            "subhead": "—— Steve Jobs",
+            "body": "你的时间有限，不要浪费在重复别人的生活上。不要被教条困住。",
+        },
+        reference_images=[],
+        style_text_override="Style: 冷银科技编辑",
+    )
+
+    assert 'Quote: "你的时间有限，不要浪费在重复别人的生活上。不要被教条困住。"' in prompt
+    assert "Quote punchline treatment" in prompt
+    assert "Punchline slide treatment: render only one dominant short line" not in prompt
 
 
 def test_prompt_engine_assigns_body_to_info_block_for_text_content_clause():
@@ -583,6 +732,55 @@ def test_final_prompt_omits_selected_style_choice_rationale():
     assert "更看重" not in prompt
     assert "需要接受的取舍" not in prompt
     assert "第一眼记住" not in prompt
+
+
+def test_final_prompt_keeps_project_typography_contract_compact():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 1,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "术语卡片矩阵",
+            "visual_description": "冷白基底，深石墨标题，冷蓝编号。",
+        },
+        content_text={"headline": "基础名词", "body": ["LLM", "Token"]},
+        reference_images=[],
+        style_text_override=(
+            "Style: 冷银科技编辑\n"
+            "Palette: #3B6BFF, #1F2227, #F4F5F7\n"
+            "Typography: 中文使用思源黑体（Source Han Sans）/ 苹方 PingFang SC 体系的无衬线字体；"
+            "英文使用 SF Pro / Inter；代码与数据使用 JetBrains Mono / IBM Plex Mono 作为辅助\n"
+            "Visual rhythm: 冷白基底，深石墨标题，冷蓝高亮。"
+        ),
+    )
+
+    assert "Typography contract:" in prompt
+    assert "Source Han Sans" in prompt
+    assert "PingFang SC" in prompt
+    assert "SF Pro / Inter" in prompt
+    assert "JetBrains Mono / IBM Plex Mono" in prompt
+    assert "generation guidance only" in prompt
+    assert "never render these font family names as visible slide text" in prompt
+    assert "serif-flavored headline option" not in prompt
+
+
+def test_final_prompt_does_not_treat_chinese_sans_serif_as_serif():
+    prompt = generate_prompt_for_page(
+        page_intent={
+            "page_num": 2,
+            "type": "content",
+            "layout": "content",
+            "visual_evidence": "信息卡片",
+            "visual_description": "浅底信息卡片，标题加粗。",
+        },
+        content_text={"headline": "无衬线测试"},
+        reference_images=[],
+        style_text_override="Style: 简洁科技\nTypography: 无衬线黑体，标题加粗\nVisual rhythm: 信息卡片。",
+    )
+
+    assert "Typography contract:" in prompt
+    assert "无衬线黑体，标题加粗" in prompt
+    assert "serif-flavored headline option" not in prompt
 
 
 def test_prompt_engine_strips_visual_plan_field_instructions_from_page_intent():

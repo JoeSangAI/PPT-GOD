@@ -3,14 +3,14 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import json_repair
 
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model, get_raw_provider_credentials, provider_credentials_context
 from app.services.logo_policy import logo_policy_for_page
-from app.services.overlay_layers import apply_llm_overlay_layout, normalize_overlay_layers
+from app.services.overlay_layers import apply_llm_overlay_layout, build_overlay_asset_context_map, normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
 from app.services.section_text import sanitize_section_visual_numbering
 from app.services.style_pack import derive_style_pack_from_content
@@ -60,7 +60,7 @@ LOGO_RESERVATION_TERMS = (
     "左上角", "右下角", "左下角", "叠加", "overlay", "title-block",
 )
 BRAND_MARK_DRAWING_TERMS = ("品牌抽象", "展翅", "翅膀", "翼形", "飞翼")
-WATERMARK_TERMS = ("虎课", "虎课网", "watermark", "水印", "stock")
+WATERMARK_TERMS = ("watermark", "水印", "stock")
 SECTION_DECIMAL_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,3}[.．]\d{1,3})(?!\d)")
 STRUCTURAL_SECTION_LABEL_RE = re.compile(
     r"(?:第\s*(?:0?\d{1,3}|[零〇一二两三四五六七八九十百千万]+)\s*(?:章|章节|部分|篇|节|部)|"
@@ -85,6 +85,28 @@ GENERIC_VISUAL_LABEL_TERMS = (
     "节点", "线条", "细线", "卡片", "图标", "区块", "画面", "视觉",
     "步骤名", "章节标题", "核心追问短句", "无衬线", "英文字", "中文字",
     "英文", "中文", "字体", "字号", "对话气泡",
+)
+SEMANTIC_MICROCOPY_VISUAL_TERMS = (
+    "定义块", "定义区", "短定义", "极简定义", "解释区", "解释小字",
+    "用途说明", "适用场景", "适用场景小字", "补充小字", "说明小字",
+    "解释性小字", "一句用途", "一句解释", "一句说明", "一行说明",
+    "两行说明", "示例说明", "价值说明", "词条", "glossary",
+    "definition card", "definition block", "use-case caption",
+)
+SEMANTIC_MICROCOPY_SOURCE_CUES = (
+    "什么是", "是什么", "定义", "含义", "英文全称", "中文叫", "指的是",
+    "叫做", "本质上就是", "可以理解为", "意味着", "g 是", "p 是",
+    "t 是", "用途", "适用场景", "作用是", "价值在于", "示例", "例如",
+    "generative", "pre-trained", "pretrained", "transformer",
+)
+GLOSSARY_LAYOUT_VISUAL_TERMS = (
+    "术语卡", "名词卡", "概念卡", "术语矩阵", "名词矩阵", "关键词矩阵",
+    "关键词平铺", "名词地图", "基础名词地图", "glossary layout",
+    "term card", "term matrix", "keyword matrix",
+)
+NARRATIVE_KEYWORD_LIST_CUES = (
+    "今天会讲到", "会讲到", "这门课", "本课", "课程目的", "目的很简单",
+    "先把", "基础名词", "底层认知", "容易被带偏", "不被", "讲清楚",
 )
 
 
@@ -247,6 +269,24 @@ def _is_punchline_page_type(page_type: str) -> bool:
     return str(page_type or "").strip().lower() in {"hero", "quote"}
 
 
+def _is_attributed_quote_page(page: Dict) -> bool:
+    text = page.get("text_content", {}) if isinstance(page.get("text_content"), dict) else {}
+    blob = "\n".join(
+        str(value or "")
+        for value in [
+            page.get("type"),
+            page.get("visual_suggestion"),
+            page.get("section_title"),
+            text.get("headline"),
+            text.get("subhead"),
+            text.get("body"),
+        ]
+    )
+    if any(marker.lower() in blob.lower() for marker in ("名人名言", "引用页", "quote page", "quotation page", "肖像")):
+        return True
+    return False
+
+
 def _infer_seed_family(page_type: str) -> str:
     """推断页面所属"家族"，用于版式一致性锚定。
 
@@ -381,6 +421,8 @@ def _fallback_visual_evidence(page: Dict) -> str:
     headline = text.get("headline", "") or page.get("section_title", "")
 
     if _is_punchline_page_type(page_type):
+        if _is_attributed_quote_page(page):
+            return f"名人名言引用页：围绕「{headline}」的引文排版、作者署名与人物肖像背景"
         return f"围绕「{headline}」的金句排版、可选署名/上下文与象征性背景"
     if page_type == "section":
         return f"围绕「{headline}」的章节主标题和转场氛围"
@@ -392,6 +434,12 @@ def _fallback_visual_evidence(page: Dict) -> str:
 def _fallback_visual_description(page: Dict, visual_evidence: str) -> str:
     page_type = str(page.get("type") or "").strip().lower()
     if _is_punchline_page_type(page_type):
+        if _is_attributed_quote_page(page):
+            return (
+                f"以「{visual_evidence}」作为名人名言页主视觉，保留引文与作者署名的高可读排版；"
+                "如果有明确人物，将人物肖像作为背景的一部分，低对比度融入画面，不做独立人物卡；"
+                "版面使用大量留白和低干扰背景，并严格沿用全局风格的配色、字体气质和材质语言。"
+            )
         return (
             f"以「{visual_evidence}」作为金句页主视觉，只保留核心短句和必要的轻量辅助信息；"
             "版面使用大量留白和低干扰背景，可用纹理、光效、象征物、人物或场景承托，"
@@ -407,6 +455,109 @@ def _fallback_visual_description(page: Dict, visual_evidence: str) -> str:
         f"以「{visual_evidence}」作为本页画面证据，"
         "根据页面信息密度安排文字区和配图区，使用全局风格色彩与材质做克制统一的包装。"
     )
+
+
+def _contains_any_compact(text: str, terms: tuple[str, ...]) -> bool:
+    lowered = str(text or "").lower()
+    compact = re.sub(r"\s+", "", lowered)
+    for term in terms:
+        term_lower = str(term or "").lower()
+        if not term_lower:
+            continue
+        if term_lower in lowered or re.sub(r"\s+", "", term_lower) in compact:
+            return True
+    return False
+
+
+def _visual_plan_requests_semantic_microcopy(*values: str) -> bool:
+    text = "\n".join(str(value or "") for value in values)
+    if _contains_any_compact(text, SEMANTIC_MICROCOPY_VISUAL_TERMS):
+        return True
+    return bool(
+        re.search(
+            r"(?:每[张个项一]|每一[张个项])[^。；;\n]{0,48}"
+            r"(?:包含|配有|承载|下方|旁边|补充|加入)[^。；;\n]{0,48}"
+            r"(?:一句|一行|两行|短|小字)[^。；;\n]{0,24}"
+            r"(?:说明|解释|定义|用途|描述|文案)",
+            text,
+        )
+    )
+
+
+def _text_has_sourced_semantic_microcopy(text: str) -> bool:
+    segments = [segment.strip() for segment in re.split(r"[\n。；;]", str(text or "")) if segment.strip()]
+    explanatory_pairs = 0
+    for segment in segments:
+        if "：" not in segment and ":" not in segment:
+            continue
+        head, tail = re.split(r"[：:]", segment, maxsplit=1)
+        head = head.strip()
+        tail = tail.strip()
+        if not (2 <= len(head) <= 36 and len(tail) >= 8):
+            continue
+        looks_like_bare_list = len(re.findall(r"[、/,/|]", tail)) >= 2 and not _contains_any_compact(
+            tail,
+            SEMANTIC_MICROCOPY_SOURCE_CUES,
+        )
+        if not looks_like_bare_list:
+            explanatory_pairs += 1
+    return explanatory_pairs >= 2
+
+
+def _page_allows_semantic_microcopy(page: Dict) -> bool:
+    visible_text = _page_visible_copy_text(page)
+    guidance_text = "\n".join([
+        _flatten_guidance_text(page.get("visual_suggestion")),
+        _flatten_guidance_text(page.get("visual_requirements")),
+    ])
+    if _visual_plan_requests_semantic_microcopy(guidance_text):
+        return True
+    combined = f"{visible_text}\n{guidance_text}"
+    if _contains_any_compact(combined, SEMANTIC_MICROCOPY_SOURCE_CUES):
+        return True
+    return _text_has_sourced_semantic_microcopy(visible_text)
+
+
+def _visual_plan_requests_glossary_layout(*values: str) -> bool:
+    return _contains_any_compact("\n".join(str(value or "") for value in values), GLOSSARY_LAYOUT_VISUAL_TERMS)
+
+
+def _page_is_narrative_keyword_intro(page: Dict) -> bool:
+    text = page.get("text_content", {}) or {}
+    body = text.get("body", "")
+    if isinstance(body, list):
+        body_lines = [str(item).strip() for item in body if str(item).strip()]
+    else:
+        body_lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    visible_text = _page_visible_copy_text(page)
+    return len(body_lines) >= 3 and _contains_any_compact(visible_text, NARRATIVE_KEYWORD_LIST_CUES)
+
+
+def _copy_faithful_content_visual_intent(page: Dict) -> Dict[str, str]:
+    text = page.get("text_content", {}) or {}
+    headline = str(text.get("headline") or page.get("section_title") or "本页观点").strip()
+    body = text.get("body", "")
+    if isinstance(body, list):
+        body_lines = [str(item).strip() for item in body if str(item).strip()]
+    else:
+        body_lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    if body_lines:
+        evidence = f"围绕「{headline}」的正文段落与关键词清单"
+        summary = "正文段落主导，关键词轻量收束"
+        description = (
+            "以本页已有标题、副标题和正文段落为主体，采用清晰的纵向阅读层级；"
+            "如果正文里列出多个名词、工具或关键词，只把它们作为原文关键词处理，"
+            "不要为这些词补写解释、示例或额外小字。画面用留白、细线和低干扰科技纹理组织阅读节奏。"
+        )
+    else:
+        evidence = _fallback_visual_evidence(page)
+        summary = evidence
+        description = _fallback_visual_description(page, evidence)
+    return {
+        "visual_evidence": evidence,
+        "visual_summary": summary,
+        "visual_description": description,
+    }
 
 
 def _page_search_text(page: Dict) -> str:
@@ -639,9 +790,18 @@ def _excluded_visual_asset_ids(page: Dict, valid_asset_ids: set[str]) -> list[st
     return result
 
 
-def _manual_overlay_layers(page: Dict, valid_asset_ids: set[str]) -> list[dict]:
+def _manual_overlay_layers(
+    page: Dict,
+    valid_asset_ids: set[str],
+    asset_context_by_id: dict[str, dict[str, Any]] | None = None,
+) -> list[dict]:
     raw = page.get("overlay_layers") or []
-    return normalize_overlay_layers(raw, valid_asset_ids=valid_asset_ids, strict_assets=True)
+    return normalize_overlay_layers(
+        raw,
+        valid_asset_ids=valid_asset_ids,
+        strict_assets=True,
+        asset_context_by_id=asset_context_by_id,
+    )
 
 
 def _safe_parse_json(raw: str, batch_num: int) -> Optional[Dict]:
@@ -865,11 +1025,10 @@ def _build_batch_prompt(
 3. 这些页面的画面主体是"背景"，不是"截图内容"。截图由后端程序粘贴，AI 只负责生成干净的背景。
 4. 预留区域必须保持完全干净：无文字、无图表、无主体物、无密集纹理，只生成柔和的背景色调。
 5. 如果一页有多个精确粘贴素材，请在 overlay_layout 中为每张素材分配互补的位置，确保它们不重叠。
-   - 选择原则：根据页面类型、标题位置、文字密度决定
-   - 章节页/封面：大标题通常在左或中，截图可以放在右侧 (right-card) 或底部 (bottom-band)
-   - 内容页：文字较多的页面，截图可以放在右侧 (right-card) 或左下角 (left-card)
-   - 多张截图时：主图放大在右侧 (right-card)，辅助图缩小放在右下角 (bottom-right-small) 或底部 (bottom-band)
-   - 避免所有截图挤在同一个位置
+   - 多张素材没有明确主次时，全部设为 layout_role=peer，后端会使用等尺寸 gallery 布局。
+   - 如果素材名称或用户说明明确包含优化前/优化后、before/after、步骤1/2/3、流程阶段，请在 reason 中说明这个关系。
+   - 只有用户明确说主图、主视觉、核心图、大图、重点图时，才把该素材设为 primary，其他设为 secondary。
+   - 不要为了显得丰富而强行制造主次；避免所有截图挤在同一个位置。
 
 """
 
@@ -881,11 +1040,11 @@ def _build_batch_prompt(
 - 内容、数据、案例、目录页的强调色只用于标题、编号、关键数字和少量分隔线；不要把每个信息块都做成图标卡、描边卡或强装饰容器。
 - cover / section / ending：可以更强烈使用品牌主色、深色、高饱和色或装饰元素，承担品牌定调和仪式感。
 - cover / 封面：只负责定调和命名，不承载正文论证；标题、副标题和主视觉必须形成单一焦点，避免信息堆叠。
-- toc / 目录页：只有导航功能，不承担内容论证。画面必须像清爽的路线图：3-6 个短章节名、明确编号、足够留白、少装饰；不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
+- toc / 目录页：只有导航功能，不承担内容论证；篇幅紧凑时可以不出现。画面根据内容选择清单、分栏、矩阵或简洁路径：3-6 个短章节名、明确编号、足够留白、少装饰；不要固定成单一路径构图，也不要做成花哨菜单、图标墙、复杂信息图或封面式海报。
 - section / 章节页：只负责章节切换、段落节奏和仪式感。画面应突出章节主标题或一句转场判断；不要渲染独立章号、章节编号、三点列表、数据图或复杂商业证据。只有当章号、章节编号或序号出现在 headline、subhead 或 body 的用户可见文案中，才允许把它作为可见文字；section_title 只作为结构元数据，不等于可见章节编码。
 - data / 数据页：只有当页面正文给出真实数字、标签或表格时才画图；必须围绕这些数据做大数字、简单图表或高可读表格，不要编造数值、趋势或坐标轴。
 - ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
-- hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。只围绕一句短句、一个短语或一个词做强记忆点；它可以是引用，也可以是口号、结论、转场判断、数据洞察或用户原话。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
+- hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。普通金句只围绕一句短句、一个短语或一个词做强记忆点；名人名言/引用页可以承载略长引文，但必须保留引用感和作者署名。若有明确名人作者，优先考虑把人物肖像作为背景的一部分，低对比度融入画面，不做独立人物卡。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
 - content / data / table / 对比分析页：优先保证阅读效率，但必须在整套明暗/基底策略内处理。信息越密集，越应通过卡片、内容区、网格、字号层级和留白降噪；不要机械切换到另一套浅底风格。
 - 多对象内容页：当正文列出多个地点、作品、产品、步骤或人物，且画面包含多张图/多个对象时，visual_description 必须说明图文如何一一贴近对应：可用编号、短标签、旁注、轻连线或穿插式照片卡片。版面应让图片和文字跨越中线形成互动，不要只写孤立的左文右图或单独信息块。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
@@ -950,13 +1109,13 @@ def _build_batch_prompt(
 
 【质量标准】
 1. visual_evidence 必须具体。优先选择白皮书、直播间、达人矩阵、终端货架、企业楼宇、地图、增长曲线、VS 对比、产品/工艺场景等能证明观点的对象。
-   - toc / 目录页例外：visual_evidence 应写成「章节路线图 / 导航结构」，不要编造商业证据或场景图。
+   - toc / 目录页例外：visual_evidence 应写成「章节导航 / 目录结构」，不要编造商业证据或场景图。
    - section / 章节页例外：visual_evidence 应写成「章节主标题 / 转场氛围」，不要写独立章号、章节编号、正文证据或信息图；只有当章号、章节编号或序号出现在 headline、subhead 或 body 的用户可见文案中，才允许把它作为画面文字。
    - data / 数据页例外：visual_evidence 应写成「正文给出的具体数字/图表对象」，不要写没有数据支撑的抽象增长曲线。
    - ending / 封底例外：visual_evidence 应写成「收束画面 / CTA / 联系方式区域」，不要引入新的证明素材。
-   - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠。
+   - 但 hero / quote / 金句页例外：visual_evidence 应写成「金句排版 + 轻量上下文/背景/象征物」这类 punchline treatment，不能写成普通信息图、三点列表或商业证据堆叠；如果是名人名言/引用页，visual_evidence 应明确「引文排版 + 作者署名 + 人物肖像背景」。
 2. 禁止输出“现代商务风格画面”“与主题相关的视觉元素”“品牌调性背景”等空泛句。
-3. visual_summary 必须极简，只说「画面是什么」（有参考图时可点出「基于用户参考路线图」等）。
+3. visual_summary 必须极简，只说「画面是什么」（有参考图时可点出「基于用户参考结构图」等）。
 4. visual_description 必须先服务 visual_evidence，再体现风格系统。不要堆叠每页重复的纹样、光效、材质细节。
 5. 必须体现风格系统的配色和调性（无参考图页尤其重要），但只描述整体色调强弱，不写过多具体装饰元素。
 6. 如果 existing_visual_suggestion 有内容，以它为基础扩展；如果为空，根据内容自行设计。
@@ -967,16 +1126,25 @@ def _build_batch_prompt(
 8. ⚠️ 每页的 visual_description 只能描述该页自己的画面。严禁引用其他页面的参考图或视觉元素。
 9. 如果本页选择了产品/物料/人物视觉资产，visual_evidence、visual_description 和 visual_asset_usage 不要描述该资产的名称、外观或身份细节；只写 uploaded product/person/material image 以及位置、大小、与背景关系。资产身份由上传图决定。
 10. 如果页面数据里有 excluded_visual_asset_ids，说明用户已经从这一页手动移除了这些素材；本页不得再选择、描述或暗示使用这些素材。
+11. 内容保真：visual_evidence、visual_summary、visual_description 只决定“怎么呈现”，不能新增正文没有的语义内容。若正文只提供关键词、名词、工具名或导航标签，允许把原词作为标签/导航处理，但不得补写定义、用途、适用场景、示例、结论或其他说明性小字；只有正文或 visual_requirements 已明确提供这些说明时，才可以设计相应解释区。
 
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
 {{"1": {{"visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {logo_policy_example}}}, "2": {{...}}, ...}}
 
 对于包含 overlay_layers 的页面，请在对应页面的对象中增加 overlay_layout 字段：
-"overlay_layout": [{{"asset_id": "素材ID", "preset": "right-card", "reason": "简要理由"}}]
+"overlay_layout": [{{"asset_id": "素材ID", "layout_role": "peer|primary|secondary", "preset": "可选preset", "reason": "简要理由"}}]
 
-可选 preset：top-right-small, bottom-right-small, left-card, right-card, center-card, bottom-band
-如果一页有多张 overlay，必须为每张分配不同的 preset，确保不重叠。
+层级判断：
+- 多张素材没有明确主次时，全部设为 peer，后端会自动使用等尺寸 gallery 布局。
+- 用户明确说主图、主视觉、核心图、大图、重点图时，设为 primary；其他相关图设为 secondary。
+- 不要为了显得丰富而强行制造主次；只有用户意图或素材关系明确时才使用 primary/secondary。
+
+可选 preset：top-right-small, bottom-right-small, left-card, right-card, center-card, bottom-band,
+gallery-2-left, gallery-2-right, gallery-3-left, gallery-3-center, gallery-3-right,
+gallery-4-left, gallery-4-mid-left, gallery-4-mid-right, gallery-4-right,
+primary-left, secondary-right, secondary-right-top, secondary-right-bottom
+如果一页有多张 overlay，必须确保它们不重叠；同级组优先等尺寸、同一基线。
 
 为当前批次的每一页都生成，不要遗漏。"""
     return prompt
@@ -1345,6 +1513,7 @@ def _do_generate_visual_plan(
             for asset in (global_visual_assets or [])
             if asset.get("id")
         }
+        asset_context_by_id = build_overlay_asset_context_map(global_visual_assets or [])
         manual_asset_ids = _manual_visual_asset_ids(page, valid_asset_ids)
         manual_asset_usage = _manual_visual_asset_usage(page, manual_asset_ids)
         manual_asset_route_modes = _manual_visual_asset_route_modes(page, valid_asset_ids, manual_asset_ids)
@@ -1354,7 +1523,7 @@ def _do_generate_visual_plan(
             if asset_id not in set(manual_asset_ids)
         ]
         excluded_asset_id_set = set(excluded_asset_ids)
-        overlay_layers = _manual_overlay_layers(page, valid_asset_ids)
+        overlay_layers = _manual_overlay_layers(page, valid_asset_ids, asset_context_by_id)
         # 应用 LLM 建议的 overlay 布局（如果 LLM 返回了 overlay_layout）
         if isinstance(desc_data, dict) and desc_data.get("overlay_layout"):
             overlay_layers = apply_llm_overlay_layout(overlay_layers, desc_data.get("overlay_layout"))
@@ -1426,10 +1595,19 @@ def _do_generate_visual_plan(
             }
 
         if not visual_evidence:
-            raise VisualPlanGenerationError(f"Visual plan page {page_num} missing visual_evidence")
+            visual_evidence = _fallback_visual_evidence(page)
+            visual_summary = visual_summary or visual_evidence
+            logger.warning(
+                "VisualPlan: page %s missing visual_evidence from LLM; using page-grounded fallback",
+                page_num,
+            )
 
         if not visual_desc:
-            raise VisualPlanGenerationError(f"Visual plan page {page_num} missing visual_description")
+            visual_desc = _fallback_visual_description(page, visual_evidence)
+            logger.warning(
+                "VisualPlan: page %s missing visual_description from LLM; using page-grounded fallback",
+                page_num,
+            )
 
         hint = (page.get("reference_user_hint") or "").strip()
         if hint:
@@ -1474,6 +1652,32 @@ def _do_generate_visual_plan(
                 visual_evidence = _fallback_visual_evidence(page)
             if not visual_desc:
                 visual_desc = _fallback_visual_description(page, visual_evidence)
+
+        if (
+            _visual_plan_requests_semantic_microcopy(visual_evidence, visual_summary, visual_desc)
+            and not _page_allows_semantic_microcopy(page)
+        ):
+            logger.warning(
+                "VisualPlan: page %s returned unsupported semantic microcopy intent; replacing with copy-faithful content layout",
+                page_num,
+            )
+            faithful_intent = _copy_faithful_content_visual_intent(page)
+            visual_evidence = faithful_intent["visual_evidence"]
+            visual_summary = faithful_intent["visual_summary"]
+            visual_desc = faithful_intent["visual_description"]
+
+        if (
+            _visual_plan_requests_glossary_layout(visual_evidence, visual_summary, visual_desc)
+            and _page_is_narrative_keyword_intro(page)
+        ):
+            logger.warning(
+                "VisualPlan: page %s turned a narrative keyword-intro page into glossary layout; replacing with copy-faithful content layout",
+                page_num,
+            )
+            faithful_intent = _copy_faithful_content_visual_intent(page)
+            visual_evidence = faithful_intent["visual_evidence"]
+            visual_summary = faithful_intent["visual_summary"]
+            visual_desc = faithful_intent["visual_description"]
 
         if str(page_type or "").strip().lower() == "section":
             visual_evidence = sanitize_section_visual_numbering(visual_evidence)

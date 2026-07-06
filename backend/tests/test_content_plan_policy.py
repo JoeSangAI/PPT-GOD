@@ -17,6 +17,7 @@ from app.services.content_plan import (
     _document_preservation_policy,
     _enforce_requested_page_range,
     _extend_outline_to_target_count,
+    _fallback_deck_blueprint,
     _generate_deck_blueprint,
     _generate_outline_from_blueprint_in_chunks,
     _is_general_transform_request,
@@ -127,11 +128,66 @@ def test_per_page_feedback_is_not_treated_as_one_page_request():
     assert resolve_requested_content_plan_page_count(topic, 60) == 60
 
 
-def test_content_plan_page_types_keep_quote_as_legacy_hero_alias():
-    assert "quote" not in content_plan_module.CANONICAL_CONTENT_PLAN_TYPES
-    assert content_plan_module._canonical_content_plan_type("quote") == "hero"
+def test_content_plan_page_types_keep_quote_separate_from_hero():
+    assert "quote" in content_plan_module.CANONICAL_CONTENT_PLAN_TYPES
+    assert content_plan_module._canonical_content_plan_type("quote") == "quote"
+    assert content_plan_module._canonical_content_plan_type("quotation") == "quote"
     assert content_plan_module._canonical_content_plan_type("金句") == "hero"
-    assert "cover、toc、section、content、data、hero、quote、ending" not in inspect.getsource(content_plan_module)
+    assert "禁止使用 outline、section_cover、framework、case、quiz、transition、quote" not in inspect.getsource(content_plan_module)
+
+
+def test_content_markdown_normalization_reclassifies_body_rich_hero_before_punchline_cleanup():
+    outline = [
+        {
+            "page_num": 10,
+            "type": "hero",
+            "section_title": "GPT",
+            "text_content": {
+                "headline": "GPT 里的 P：Pre-trained，预训练",
+                "subhead": "先理解模型能力从哪里来",
+                "body": (
+                    "预训练意味着，模型在正式给用户使用之前，已经在大量数据上完成了训练。\n\n"
+                    "它不是每一次聊天都从零开始学习，也不是你说几句话，就把底层模型重新训练了一遍。\n\n"
+                    "很多时候大家觉得模型“降智”，先不要急着归因到底层模型变了。\n\n"
+                    "更稳妥的讲法是：预训练模型的基础能力，大体来自训练阶段。"
+                ),
+            },
+            "speaker_notes": "解释预训练。",
+            "visual_suggestion": "金句排版 + 细线时间轴",
+            "source_refs": [],
+        }
+    ]
+
+    normalized = content_plan_module._normalize_content_markdown(outline)
+
+    assert normalized[0]["type"] == "content"
+    assert "预训练意味着" in normalized[0]["text_content"]["body"]
+    assert "它不是每一次聊天都从零开始学习" in normalized[0]["text_content"]["body"]
+    assert "原金句页正文素材" not in normalized[0]["speaker_notes"]
+
+
+def test_content_markdown_normalization_keeps_quote_type_with_visible_body():
+    outline = [
+        {
+            "page_num": 4,
+            "type": "quote",
+            "section_title": "引用",
+            "text_content": {
+                "headline": "Stay hungry, stay foolish.",
+                "subhead": "—— Steve Jobs",
+                "body": "你的时间有限，不要浪费在重复别人的生活上。不要被教条困住。",
+            },
+            "speaker_notes": "这是一页名人名言。",
+            "visual_suggestion": "名人名言引用页，使用乔布斯肖像作为背景的一部分。",
+            "source_refs": [],
+        }
+    ]
+
+    normalized = content_plan_module._normalize_content_markdown(outline)
+
+    assert normalized[0]["type"] == "quote"
+    assert "你的时间有限" in normalized[0]["text_content"]["body"]
+    assert "原金句页正文素材" not in normalized[0]["speaker_notes"]
 
 
 def test_colloquial_chinese_page_range_survives_numbered_brief_items():
@@ -1805,6 +1861,94 @@ P3｜section｜哲学地基｜第一层：为什么必须回到本体论？
     assert section["section_title"] == "哲学地基"
 
 
+def test_page_map_normalization_repairs_course_map_content_page_to_toc():
+    page_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "实体企业 AI 出海方法论",
+            "bullets": [],
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "课程地图",
+            "headline": "课程地图:20 页讲清楚一套打法",
+            "bullets": [
+                "模块一:认知重构",
+                "模块二:战略选择",
+                "模块三:战术打法",
+                "模块四:案例拆解",
+                "90 天落地地图",
+            ],
+            "speaker_notes": "先让听众看到整套课程结构。",
+            "visual_suggestion": "目录路线图。",
+        },
+        {
+            "page_num": 3,
+            "type": "section",
+            "section_title": "认知重构",
+            "headline": "模块一 · 认知重构",
+            "bullets": [],
+        },
+        {
+            "page_num": 4,
+            "type": "content",
+            "section_title": "认知重构",
+            "headline": "重新理解出海",
+            "bullets": ["出海不是渠道，而是全球化经营。"],
+        },
+    ]
+
+    outline = content_plan_from_page_map(page_map)
+
+    assert outline[1]["type"] == "toc"
+    assert "模块一:认知重构" in outline[1]["text_content"]["body"]
+
+
+def test_page_map_normalization_keeps_roadmap_content_page_as_content():
+    page_map = [
+        {
+            "page_num": 1,
+            "type": "cover",
+            "section_title": "封面",
+            "headline": "实体企业 AI 出海方法论",
+            "bullets": [],
+        },
+        {
+            "page_num": 2,
+            "type": "content",
+            "section_title": "落地计划",
+            "headline": "90 天落地地图:从想出海到跑通最小闭环",
+            "bullets": [
+                "Day 1-30 认知期:锁定目标市场",
+                "Day 31-60 试跑期:独立站 MVP 上线",
+                "Day 61-90 闭环期:跑通首单",
+                "三个关键产出:市场判断书、最小可行品牌、可复制飞轮",
+            ],
+        },
+        {
+            "page_num": 3,
+            "type": "content",
+            "section_title": "落地计划",
+            "headline": "预算与组织安排",
+            "bullets": ["预算、人力和节奏需要提前对齐。"],
+        },
+        {
+            "page_num": 4,
+            "type": "ending",
+            "section_title": "结尾",
+            "headline": "行动收束",
+            "bullets": [],
+        },
+    ]
+
+    outline = content_plan_from_page_map(page_map)
+
+    assert outline[1]["type"] == "content"
+
+
 def test_page_map_parser_carries_figure_refs_into_content_plan():
     markdown = """P1｜cover｜封面｜向硅谷学创新第一章
 备注：开场。
@@ -2065,6 +2209,34 @@ FIGURE figure_id="fig-1" source_document="book.pdf" source_type="pdf" source_pag
     assert_no_internal_source_markers(draft)
 
 
+def test_document_driven_short_deck_draft_omits_toc_when_page_budget_is_tight():
+    documents = """# 向硅谷学创新
+
+## 绪论
+大企业为什么会失去创新能力。
+
+## 第一章
+微软在 2014 年被卡住，需要重新发现企业存在的原因。
+
+## 第二章
+组织愿景需要与个人北极星保持一致。
+"""
+
+    draft = build_document_driven_long_deck_draft(
+        topic="做成 6 页分享 PPT",
+        documents=documents,
+        target_count=6,
+        min_pages=6,
+        max_pages=6,
+    )
+
+    assert len(draft) == 6
+    assert [page["page_num"] for page in draft] == [1, 2, 3, 4, 5, 6]
+    assert all(str(page.get("type")) not in {"agenda", "toc"} for page in draft)
+    assert "目录" not in str(draft[1].get("text_content", {}).get("headline") or "")
+    assert "地图" not in json.dumps(draft[:2], ensure_ascii=False)
+
+
 def test_source_context_draft_uses_real_agenda_ending_and_pdf_figures():
     documents = """--- SOURCE filename="book.pdf" kind="pdf" ---
 --- PAGE 17 ---
@@ -2100,7 +2272,9 @@ FIGURE figure_id="book.pdf:p47:x1:1" source_document="book.pdf" source_type="pdf
     )
 
     toc_body = draft[1]["text_content"]["body"]
-    assert draft[1]["text_content"]["headline"] == "内容地图"
+    assert draft[1]["type"] == "toc"
+    assert draft[1]["text_content"]["headline"] == "目录"
+    assert "地图" not in draft[1]["visual_suggestion"]
     assert "绪论" in toc_body
     assert "第1章" in toc_body
     assert "续 2" not in toc_body
@@ -2124,6 +2298,31 @@ FIGURE figure_id="book.pdf:p47:x1:1" source_document="book.pdf" source_type="pdf
         for ref in (page.get("figure_refs") or [])
     }
     assert {"book.pdf:p20:x1:1", "book.pdf:p47:x1:1"} <= outline_figure_ids
+
+
+def test_fallback_blueprint_does_not_force_course_map_for_directory_page():
+    documents = """# 课程脉络
+
+## 模块一：认知重构
+理解 AI 出海的决策变化。
+
+## 模块二：战略选择
+锁定市场和品牌定位。
+
+## 模块三：落地执行
+建立节奏、案例和行动清单。
+"""
+
+    blueprint = _fallback_deck_blueprint(
+        target_count=12,
+        min_pages=10,
+        max_pages=12,
+        documents=documents,
+    )
+
+    assert "P2：目录" in blueprint
+    assert "课程地图" not in blueprint
+    assert "路线图" not in blueprint
 
 
 def test_source_draft_condenses_full_source_instead_of_truncating_tail():
@@ -3366,7 +3565,7 @@ P3｜ending｜总结｜下一步
     class FakeCompletions:
         def create(self, **kwargs):
             prompt = kwargs["messages"][1]["content"]
-            assert "逐页内容地图" in prompt
+            assert "逐页内容规划" in prompt
             assert "不要输出 JSON" in prompt
             assert "不要把同一个来源主题拆成" in prompt
             assert "不能出现连续两页同标题" in prompt
@@ -3420,7 +3619,7 @@ def test_generate_content_plan_trims_page_map_to_strict_requested_count(monkeypa
     class FakeCompletions:
         def create(self, **kwargs):
             prompt = kwargs["messages"][1]["content"]
-            assert "逐页内容地图" in prompt
+            assert "逐页内容规划" in prompt
             return FakeResponse()
 
     class FakeChat:
@@ -4344,7 +4543,7 @@ def test_partial_page_map_does_not_save_skeleton_placeholders(monkeypatch):
     class FakeCompletions:
         def create(self, **kwargs):
             prompt = kwargs["messages"][1]["content"]
-            if "逐页内容地图" in prompt:
+            if "逐页内容规划" in prompt:
                 return FakeResponse(partial_map)
             assert "只续写第 7 页到第 16 页" in prompt
             return FakeResponse(json.dumps(extension_pages, ensure_ascii=False))
@@ -4403,6 +4602,11 @@ def test_page_map_generation_scales_output_budget_for_long_decks(monkeypatch):
     )
 
     assert captured_kwargs["max_tokens"] >= 30000
+
+
+def test_page_map_input_limits_are_long_context_aligned():
+    assert content_plan_module.PAGE_MAP_DOCUMENT_LIMIT >= 180_000
+    assert content_plan_module.PAGE_MAP_SOURCE_DRAFT_LIMIT >= 90_000
 
 
 def test_source_draft_page_map_does_not_create_skeleton_without_documents():
