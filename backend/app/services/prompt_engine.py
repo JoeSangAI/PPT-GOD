@@ -20,7 +20,7 @@ BRAND_MARK_DRAWING_TERMS = (
     "logo", "wordmark", "lockup", "标识", "徽标", "角标", "小logo", "小 Logo",
     "品牌标识", "品牌角标", "品牌抽象", "展翅", "翅膀", "翼形", "飞翼",
 )
-WATERMARK_TERMS = ("虎课", "虎课网", "watermark", "水印", "stock", "template watermark")
+WATERMARK_TERMS = ("watermark", "水印", "stock", "template watermark")
 
 
 def _strip_markdown(text: str) -> str:
@@ -71,17 +71,55 @@ def _strip_markdown(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+_TYPEFACE_CONTRACT_MARKERS = (
+    "字体", "字体系", "黑体", "宋体", "楷体", "等宽", "衬线", "无衬线",
+    "font", "typeface", "serif", "sans", "mono", "inter", "source han",
+    "pingfang", "sf pro", "jetbrains", "ibm plex", "helvetica", "arial",
+    "roboto", "san francisco",
+)
+
+
+def _clean_typography_payload(line: str) -> str:
+    raw = str(line or "").strip()
+    if raw.lower().startswith("typography:"):
+        raw = raw.split(":", 1)[1].strip()
+    payload = clean_image_prompt_style_text(raw)
+    payload = _remove_microcopy_clauses(_remove_negative_clauses(payload))
+    payload = re.sub(r"\s+", " ", payload).strip(" ，,。；;")
+    if len(payload) > 320:
+        payload = payload[:320].rstrip(" ，,。；;") + "..."
+    return payload
+
+
+def _mentions_typeface_contract(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _TYPEFACE_CONTRACT_MARKERS)
+
+
 def _image_typography_line(line: str) -> str:
-    """Reduce typography metadata to visual intent so font names are not drawn."""
-    raw = str(line or "")
+    """Keep a compact deck-wide type contract without asking the model to draw font names."""
+    payload = _clean_typography_payload(line)
+    if payload and _mentions_typeface_contract(payload):
+        return (
+            "Typography contract: generation guidance only; use "
+            f"{payload}; never render these font family names as visible slide text."
+        )
+
+    raw = payload or str(line or "")
     lowered = raw.lower()
     cues: list[str] = []
-    if any(token in raw for token in ("衬线", "宋体", "明朝")) or "serif" in lowered:
-        cues.append("serif-flavored headline option")
-    if (
+    mentions_sans = (
         any(token in raw for token in ("无衬线", "黑体", "思源黑体", "苹方"))
         or any(token in lowered for token in ("sans", "inter", "source han", "helvetica", "arial", "roboto", "san francisco"))
-    ):
+    )
+    mentions_serif = (
+        any(token in raw for token in ("宋体", "明朝"))
+        or ("衬线" in raw and "无衬线" not in raw)
+        or ("serif" in lowered and "sans-serif" not in lowered and "sans serif" not in lowered)
+    )
+    if mentions_serif:
+        cues.append("serif-flavored headline option")
+    if mentions_sans:
         cues.append("clean sans-serif hierarchy")
     if any(token in raw for token in ("粗", "大字", "标题")) or any(token in lowered for token in ("bold", "heavy", "semibold", "headline")):
         cues.append("strong headline weight")
@@ -90,7 +128,11 @@ def _image_typography_line(line: str) -> str:
     if not cues:
         cues.append("clear presentation hierarchy")
     unique_cues = list(dict.fromkeys(cues))[:3]
-    return "Typography: " + ", ".join(unique_cues) + "; do not render or spell out font family names."
+    return (
+        "Typography contract: generation guidance only; "
+        + ", ".join(unique_cues)
+        + "; never render typography guidance as visible slide text."
+    )
 
 
 def _compact_style_pack(style_text: str, max_lines: int = 6, max_chars: int = 760) -> str:
@@ -105,11 +147,10 @@ def _compact_style_pack(style_text: str, max_lines: int = 6, max_chars: int = 76
         )
     lines = [line.strip() for line in style_text.splitlines() if line.strip()]
     priority_by_key: dict[str, str] = {}
-    # Keep the semantic contract before cosmetic details. Visual rhythm is where
-    # topic-specific subject anchors usually live, so it must survive compaction.
+    # Keep the project type contract and visual rhythm ahead of cosmetic details.
     keywords = (
-        "Style:", "Palette:", "Mood:", "Visual rhythm:",
-        "Texture/material:", "Typography:",
+        "Style:", "Palette:", "Mood:", "Typography:",
+        "Visual rhythm:", "Texture/material:",
     )
     for line in lines:
         for keyword in keywords:
@@ -221,11 +262,11 @@ _INFO_BLOCK_DECORATIVE_MARKERS = (
 )
 
 _MULTI_VISUAL_SUBJECT_MARKERS = (
-    "多张", "多个", "多图", "三图", "拼贴", "辅图", "小图", "小尺寸",
-    "照片组合", "照片卡片", "环绕", "叠放", "错位", "分栏", "对比",
-    "集合", "三宝", "作品", "馆藏", "机位", "餐厅", "橱窗", "门面",
+    "多张", "多图", "三图", "拼贴", "辅图", "小图", "小尺寸",
+    "照片组合", "照片卡片", "环绕", "叠放", "错位",
+    "三宝", "作品", "馆藏", "机位", "餐厅", "橱窗", "门面",
     "主图与辅图", "1-2张", "0-2张", "2张", "3张",
-    "collage", "multiple", "comparison", "grid", "cards",
+    "collage",
 )
 
 
@@ -387,7 +428,7 @@ def _composition_binding_instruction(page_intent: Dict, content_text: Optional[D
     label_clause = f" Match these caption anchors to corresponding photos/subjects: {label_text}." if label_text else ""
     return (
         "Image-text binding: use an interleaved composition. Place each Linked caption body near its matching photo "
-        "or visual subject, using small numbered markers, caption chips, or short connector lines consistently across "
+        "or visual subject, using caption chips or short connector lines consistently across "
         "text and images. Let photo cards and captions cross the center line so the middle of the slide feels active "
         "and balanced, not split into a detached text side and detached image side."
         + label_clause
@@ -558,6 +599,26 @@ def _is_punchline_page(page_intent: Dict) -> bool:
     return page_type in {"hero", "quote"} or layout == "hero"
 
 
+def _is_attributed_quote_punchline(page_intent: Dict, content_text: Dict) -> bool:
+    text_blob = "\n".join(
+        str(value or "")
+        for value in [
+            (page_intent or {}).get("visual_evidence"),
+            (page_intent or {}).get("visual_description"),
+            (page_intent or {}).get("visual_summary"),
+            content_text.get("headline") if isinstance(content_text, dict) else "",
+            content_text.get("subhead") if isinstance(content_text, dict) else "",
+            content_text.get("body") if isinstance(content_text, dict) else "",
+        ]
+    )
+    page_type = str((page_intent or {}).get("type") or "").strip().lower()
+    if page_type == "quote":
+        return True
+    if any(marker.lower() in text_blob.lower() for marker in ("名人名言", "引用页", "quote page", "quotation page", "肖像")):
+        return True
+    return False
+
+
 def _has_product_ref(reference_images: Optional[List[Dict]]) -> bool:
     return any(_is_product_ref(ref) for ref in reference_images or [])
 
@@ -677,6 +738,50 @@ def _compact_layout_intent(
     if visual_desc:
         return f"Layout: {layout}. {visual_desc}"
     return f"Layout: {layout}. Arrange text and visual evidence with clear hierarchy and strong readability."
+
+
+def _overlay_base_visual_evidence() -> str:
+    return (
+        "Base background mode: generate a clean uninterrupted slide background and the required visible slide text only. "
+        "Leave reserved media zones as plain continuation of the background for later inserted assets."
+    )
+
+
+def _overlay_base_layout_intent(page_intent: Dict, overlay_layers: Optional[List[Dict]] = None) -> str:
+    layout = page_intent.get("layout") or page_intent.get("type", "content")
+    reservation_presets = {
+        "left-card",
+        "right-card",
+        "center-card",
+        "gallery-2-left",
+        "gallery-2-right",
+        "gallery-3-left",
+        "gallery-3-center",
+        "gallery-3-right",
+        "gallery-4-left",
+        "gallery-4-mid-left",
+        "gallery-4-mid-right",
+        "gallery-4-right",
+        "primary-left",
+        "secondary-right",
+        "secondary-right-top",
+        "secondary-right-bottom",
+    }
+    side_or_center_slots = [
+        layer for layer in (overlay_layers or [])
+        if str(layer.get("preset") or "") in reservation_presets
+    ]
+    header_rule = ""
+    if len(side_or_center_slots) >= 2 or any(str(layer.get("preset") or "") == "center-card" for layer in side_or_center_slots):
+        header_rule = (
+            " Use compact header scale; keep all visible text fully inside the upper 14% of the slide "
+            "when center or side media zones are reserved."
+        )
+    return (
+        f"Layout: {layout}. Keep later media areas visually invisible: no visible container, frame, border, shadow, "
+        "or decorative mark. Place all required visible text in safe areas outside those zones."
+        + header_rule
+    )
 
 
 def _compact_reference_text(text: str, max_chars: int = 260) -> str:
@@ -808,6 +913,19 @@ def _brand_mark_safety_instruction(page_intent: Dict) -> str:
     return ""
 
 
+def _reference_prompt_prefix(ref: Dict, index: int) -> str:
+    label = str(ref.get("label") or "").strip()
+    generic_label = bool(re.fullmatch(r"Reference Image \d+", label, flags=re.IGNORECASE))
+    description_label = _reference_context_text(str(ref.get("description") or ""), 64)
+    label = ref.get("asset_name") or ("" if generic_label else label) or description_label or ref.get("role") or ""
+    compact_label = _compact_reference_text(label, 64) if label else ""
+    return f"Reference image {index}" + (f" ({compact_label})" if compact_label else "")
+
+
+def _reference_prompt_line(prefix: str, text: str) -> str:
+    return f"{prefix}: {text}" if prefix else text
+
+
 def _reference_descriptions_for_prompt(
     page_intent: Dict,
     content_text: Dict,
@@ -823,30 +941,42 @@ def _reference_descriptions_for_prompt(
         )
 
     if reference_images:
-        for img in sorted(reference_images, key=_reference_priority):
+        numbered_reference_count = 0
+
+        def add_numbered_ref(prefix: str, text: str) -> None:
+            nonlocal numbered_reference_count
+            reference_descriptions.append(_reference_prompt_line(prefix, text))
+            numbered_reference_count += 1
+
+        for ref_index, img in enumerate(sorted(reference_images, key=_reference_priority), start=1):
+            prefix = _reference_prompt_prefix(img, ref_index)
             role = img.get("role", "style_ref")
             desc = img.get("description", "")
             process_mode = img.get("process_mode", "")
             if role == "style_ref":
-                reference_descriptions.append(
-                    "Style reference: borrow only mood, palette, and composition rhythm."
+                add_numbered_ref(
+                    prefix,
+                    "Style reference: borrow only mood, palette, and composition rhythm.",
                 )
             elif role == "logo":
-                reference_descriptions.append(
-                    "Uploaded identity asset: use only when explicitly requested as a scene object."
+                add_numbered_ref(
+                    prefix,
+                    "Uploaded identity asset: use only when explicitly requested as a scene object.",
                 )
             elif role == "content_ref":
                 detail = _reference_context_text(desc, 180) if desc else ""
-                reference_descriptions.append(
+                add_numbered_ref(
+                    prefix,
                     "Page reference: use this uploaded image as the page visual source."
-                    + (f" Context: {detail}" if detail else "")
+                    + (f" Context: {detail}" if detail else ""),
                 )
             elif role == "chart_ref":
                 detail = _reference_context_text(desc, 180) if desc else ""
-                reference_descriptions.append(
+                add_numbered_ref(
+                    prefix,
                     "Chart/data reference: follow this uploaded chart for the chart area. "
                     "Preserve its core structure, node labels, arrows, and table relationships."
-                    + (f" Context: {detail}" if detail else "")
+                    + (f" Context: {detail}" if detail else ""),
                 )
             elif role == "visual_asset":
                 asset_name = img.get("asset_name") or "visual asset"
@@ -875,29 +1005,38 @@ def _reference_descriptions_for_prompt(
                     if placement:
                         placement_text = _compact_reference_text(placement, 100).rstrip(".")
                         rule += f" Placement/use: {placement_text}."
-                reference_descriptions.append(rule)
+                add_numbered_ref(prefix, rule)
             elif role == "seed_ref":
-                reference_descriptions.append(
+                add_numbered_ref(
+                    prefix,
                     "Seed page: copy layout DNA only (grid, hierarchy, palette rhythm). "
-                    "Do not copy seed text, body imagery, product shots, or logo unless this page has its own uploaded logo."
+                    "Do not copy seed text, body imagery, product shots, or logo unless this page has its own uploaded logo.",
                 )
             elif role == "template":
                 strength = str(img.get("application_strength") or "standard").lower()
                 if strength == "strong":
-                    reference_descriptions.append(
+                    add_numbered_ref(
+                        prefix,
                         "Template page: stay very close to the template's layout, color palette, typography rhythm, and visual mood. "
-                        "Replace old content with this slide's own text; do not copy old images or logos."
+                        "Replace old content with this slide's own text; do not copy old images or logos.",
                     )
                 elif strength == "standard":
-                    reference_descriptions.append(
+                    add_numbered_ref(
+                        prefix,
                         "Template page: borrow page layout plus color palette and typography feel. "
-                        "Use this slide's own subject and evidence; do not copy old text, old images, or old logos."
+                        "Use this slide's own subject and evidence; do not copy old text, old images, or old logos.",
                     )
                 else:  # light
-                    reference_descriptions.append(
+                    add_numbered_ref(
+                        prefix,
                         "Template page: borrow layout only: text zones, image zones, card/grid placement, and hierarchy. "
-                        "Do not borrow template colors, old text, old images, or old logos."
+                        "Do not borrow template colors, old text, old images, or old logos.",
                     )
+        if numbered_reference_count > 1:
+            reference_descriptions.append(
+                "Use every numbered reference image according to its role, slot, or placement note. "
+                "Do not ignore later references just because the first reference is visually dominant."
+            )
     return [line.strip() for line in reference_descriptions if line and line.strip()]
 
 
@@ -941,7 +1080,10 @@ def generate_prompt_for_page(
         )
 
     reference_descriptions = _reference_descriptions_for_prompt(page_intent, content_text or {}, reference_images)
+    overlay_layers = enabled_overlay_layers(page_intent)
     body_label = _body_directive_label(page_intent, style_text, content_text)
+    if overlay_layers and body_label == "Linked caption body":
+        body_label = "Body"
 
     # 强制追加文字渲染指令（确保文字一定出现在图片上）
     # 外层用单引号包裹用户文本，避免与用户文本中的双引号冲突
@@ -952,6 +1094,7 @@ def generate_prompt_for_page(
 
     text_directives = []
     is_punchline_page = _is_punchline_page(page_intent)
+    is_quote_punchline = is_punchline_page and _is_attributed_quote_punchline(page_intent, content_text)
     page_type = str((page_intent or {}).get("type") or "").strip().lower()
     if content_text.get("headline"):
         h = _escape(_strip_markdown(content_text["headline"]))
@@ -960,18 +1103,19 @@ def generate_prompt_for_page(
         s = _escape(_strip_markdown(content_text["subhead"]))
         text_directives.append(f'Subhead: "{s}"')
     body = content_text.get("body")
-    if body and (not is_punchline_page or body_label != "Body"):
+    if body and (not is_punchline_page or is_quote_punchline or body_label != "Body"):
+        visible_body_label = "Quote" if is_quote_punchline and body_label == "Body" else body_label
         if isinstance(body, str):
             lines = [line.strip() for line in body.splitlines() if line.strip()]
             for item in lines:
                 cleaned = _escape(_strip_markdown(item))
                 if cleaned:
-                    text_directives.append(f'{body_label}: "{cleaned}"')
+                    text_directives.append(f'{visible_body_label}: "{cleaned}"')
         else:
             for item in body:
                 cleaned = _escape(_strip_markdown(item))
                 if cleaned:
-                    text_directives.append(f'{body_label}: "{cleaned}"')
+                    text_directives.append(f'{visible_body_label}: "{cleaned}"')
     for label in diagram_labels[:16]:
         cleaned = _escape(_strip_markdown(label))
         if cleaned:
@@ -980,7 +1124,8 @@ def generate_prompt_for_page(
     if text_directives:
         text_directives.append(
             "Visible text rule: render the quoted strings in this section as required slide copy; "
-            "do not render prompt labels, section headers, color codes, invented copy, lorem ipsum, or decorative microtext."
+            "do not render prompt labels, section headers, color codes, invented copy, lorem ipsum, or decorative microtext; "
+            "treat standalone numeric badges like 01/02/03/04 as visible text and render them only when quoted copy or Slot map IDs include them."
         )
         if page_type == "section":
             text_directives.append(
@@ -993,26 +1138,31 @@ def generate_prompt_for_page(
         text_directives.append("Render diagram labels as visible labels inside the diagram.")
         text_directives.append("Render visible body text only as readable slide copy.")
     visual_intent_section = ""
-    if visual_intents:
+    if visual_intents and not overlay_layers:
         visual_intent_section = "\n\nVisual Intent:\n" + "\n".join(
             f"- {_compact_reference_text(intent, 140)}" for intent in visual_intents[:6]
         )
 
     punchline_treatment = ""
     if is_punchline_page:
-        punchline_treatment = (
-            "Punchline slide treatment: render only one dominant short line/phrase/word plus minimal context if useful; "
-            "do not add bullets, explanatory body copy, charts, dense panels, or unrelated typography. "
-            "Use the same project typeface feel, palette, material texture, and decoration language, only with stronger scale and negative space."
-        )
+        if is_quote_punchline:
+            punchline_treatment = (
+                "Quote punchline treatment: render the quotation as dominant readable quote copy, with the author/source as minimal attribution; "
+                "the quote may wrap into several calm lines, but do not turn it into bullets, panels, charts, or explanatory body sections. "
+                "If a recognizable author portrait is part of the page intent, use it as a low-distraction background element rather than a separate content card. "
+                "Use the same project typeface feel, palette, material texture, and decoration language, only with stronger scale and negative space."
+            )
+        else:
+            punchline_treatment = (
+                "Punchline slide treatment: render only one dominant short line/phrase/word plus minimal context if useful; "
+                "do not add bullets, explanatory body copy, charts, dense panels, or unrelated typography. "
+                "Use the same project typeface feel, palette, material texture, and decoration language, only with stronger scale and negative space."
+            )
 
     protected_block = _protected_assets_block(reference_images)
     protected_section = f"{protected_block}\n\n" if protected_block else ""
     brand_mark_safety = _brand_mark_safety_instruction(page_intent)
-    artifact_safety = (
-        "Watermarks and stray marks: no third-party watermarks, stock/template labels, "
-        "tutorial-site stamps, 虎课网, or unauthorized extra text."
-    )
+    artifact_safety = "Render only the quoted slide copy and intentional confirmed assets."
 
     # Keep the first-pass prompt compact: visible copy, style, page intent, and
     # short reference roles. Uploaded images carry asset identity; long product
@@ -1030,23 +1180,28 @@ def generate_prompt_for_page(
         else ""
     )
     style_block = _compact_style_pack(style_text)
-    overlay_layers = enabled_overlay_layers(page_intent)
-    visual_evidence = _compact_visual_evidence_with_style(
-        page_intent,
-        reference_images,
-        style_text,
-        content_text,
-        body_label=body_label,
-    )
-    layout_intent = _compact_layout_intent(
-        page_intent,
-        reference_images,
-        style_text,
-        content_text,
-        body_label=body_label,
-    )
-    slot_map = _image_slot_map_instruction(page_intent)
-    composition_binding = _composition_binding_instruction(page_intent, content_text, body_label)
+    if overlay_layers:
+        visual_evidence = _overlay_base_visual_evidence()
+        layout_intent = _overlay_base_layout_intent(page_intent, overlay_layers)
+        slot_map = ""
+        composition_binding = ""
+    else:
+        visual_evidence = _compact_visual_evidence_with_style(
+            page_intent,
+            reference_images,
+            style_text,
+            content_text,
+            body_label=body_label,
+        )
+        layout_intent = _compact_layout_intent(
+            page_intent,
+            reference_images,
+            style_text,
+            content_text,
+            body_label=body_label,
+        )
+        slot_map = _image_slot_map_instruction(page_intent)
+        composition_binding = _composition_binding_instruction(page_intent, content_text, body_label)
     composition_parts = []
     if slot_map:
         composition_parts.append("Slot map:\n" + slot_map)

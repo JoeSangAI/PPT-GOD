@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List
 
+from app.core.config import settings
 from app.core.llm_client import get_llm_client
 from app.core.provider_credentials import get_minimax_llm_model
 from app.services.content_director import (
@@ -81,8 +82,8 @@ PAGE_MAP_MODEL_TIMEOUT_SECONDS = 150.0
 PAGE_MAP_BASE_MAX_TOKENS = 16_000
 PAGE_MAP_MAX_TOKENS_CAP = 64_000
 PAGE_MAP_TOKENS_PER_PAGE = 650
-PAGE_MAP_DOCUMENT_LIMIT = 30000
-PAGE_MAP_SOURCE_DRAFT_LIMIT = 18000
+PAGE_MAP_DOCUMENT_LIMIT = max(30_000, int(settings.CONTENT_PLAN_PAGE_MAP_DOCUMENT_CHAR_LIMIT or 180_000))
+PAGE_MAP_SOURCE_DRAFT_LIMIT = max(18_000, int(settings.CONTENT_PLAN_PAGE_MAP_SOURCE_DRAFT_CHAR_LIMIT or 90_000))
 PAGE_MAP_USEFUL_RATIO = 0.75
 AUTO_DOCUMENT_PAGE_MIN_CHARS = 5000
 AUTO_DOCUMENT_PAGE_MIN = 12
@@ -96,7 +97,7 @@ CONTENT_PLAN_STRATEGY_REUSE_EXPORTED = "reuse_exported_plan"
 CONTENT_PLAN_STRATEGY_REUSE_PAGINATED = "reuse_paginated_markdown"
 CONTENT_PLAN_STRATEGY_LONG_DECK = "long_structured_deck"
 CONTENT_PLAN_STRATEGY_PAGE_MAP = "page_map"
-CANONICAL_CONTENT_PLAN_TYPES = {"cover", "toc", "section", "content", "data", "hero", "ending"}
+CANONICAL_CONTENT_PLAN_TYPES = {"cover", "toc", "section", "content", "data", "hero", "quote", "ending"}
 CONTENT_BODY_REQUIRED_TYPES = {"content", "data"}
 CONTENT_PLAN_TYPE_ALIASES = {
     "agenda": "toc",
@@ -129,10 +130,14 @@ CONTENT_PLAN_TYPE_ALIASES = {
     "正文": "content",
     "内容": "content",
     "金句": "hero",
-    "quote": "hero",
-    "quotation": "hero",
-    "quote_slide": "hero",
-    "quoteslide": "hero",
+    "quote": "quote",
+    "quotation": "quote",
+    "quote_slide": "quote",
+    "quoteslide": "quote",
+    "引用": "quote",
+    "引用页": "quote",
+    "名人名言": "quote",
+    "名人名言页": "quote",
     "punchline": "hero",
     "golden_sentence": "hero",
     "goldensentence": "hero",
@@ -3525,12 +3530,36 @@ def _paginated_markdown_page_type(label: str, page_num: int) -> str:
         return "section"
     if "数据" in text:
         return "data"
+    if any(marker in text for marker in ("引用", "名人名言")):
+        return "quote"
     if any(marker in text for marker in ("金句", "使命")):
         return "hero"
     return "content"
 
 
-def _auto_reclassify_page_type(content_json: dict, current_type: str) -> str | None:
+_QUOTE_PAGE_TYPE_MARKERS = {"quote", "quotation", "quote_slide", "quoteslide"}
+_QUOTE_TEXT_MARKERS = ("名人名言", "引用页", "quote page", "quotation page", "肖像")
+
+
+def _is_attributed_quote_page(content_json: dict, *, original_type: str | None = None) -> bool:
+    raw_type = re.sub(r"\s+", "", str(original_type or "")).strip().lower()
+    if raw_type in _QUOTE_PAGE_TYPE_MARKERS or "引用" in raw_type or "名人名言" in raw_type:
+        return True
+
+    text_content = content_json.get("text_content") if isinstance(content_json.get("text_content"), dict) else {}
+    headline = str(text_content.get("headline") or "")
+    subhead = str(text_content.get("subhead") or "")
+    body = str(text_content.get("body") or "")
+    supporting_text = "\n".join(
+        str(content_json.get(key) or "")
+        for key in ("visual_suggestion", "speaker_notes", "section_title")
+    )
+    if any(marker.lower() in supporting_text.lower() for marker in _QUOTE_TEXT_MARKERS):
+        return True
+    return False
+
+
+def _auto_reclassify_page_type(content_json: dict, current_type: str, original_type: str | None = None) -> str | None:
     """根据内容特征判断是否应切换类型。只处理 content/data/hero 之间，其他类型不变。
 
     返回新类型（如需切换），或 None（保持当前）。
@@ -3548,6 +3577,10 @@ def _auto_reclassify_page_type(content_json: dict, current_type: str) -> str | N
     has_table = bool(re.search(r"(?m)^\|.*\|.*\|$", body))
     bullet_lines = sum(1 for l in lines if l.startswith(("- ", "* ", "1. ", "2. ", "3. ", "4. ", "5. ")))
     total_chars = len(body)
+    headline_compact = re.sub(r"\s+", "", str(text_content.get("headline") or ""))
+    body_compact = ""
+    if len(lines) == 1:
+        body_compact = re.sub(r"\s+", "", _strip_leading_list_marker(lines[0]))
 
     # 数字/百分比/金额密度
     digit_chars = len(re.findall(r"[0-9]", body))
@@ -3565,7 +3598,16 @@ def _auto_reclassify_page_type(content_json: dict, current_type: str) -> str | N
     should_be_data = has_table or data_density > 0.40 or data_indicators >= 3
     should_be_hero = (
         not has_table and bullet_lines == 0 and total_chars < 80 and len(lines) <= 2
+    ) or (
+        current_type == "hero"
+        and not has_table
+        and bullet_lines == 1
+        and len(lines) == 1
+        and total_chars < 80
+        and bool(headline_compact)
+        and body_compact == headline_compact
     )
+    should_be_quote_hero = current_type == "hero" and _is_attributed_quote_page(content_json, original_type=original_type)
 
     if current_type == "content":
         if should_be_data:
@@ -3578,7 +3620,7 @@ def _auto_reclassify_page_type(content_json: dict, current_type: str) -> str | N
     elif current_type == "hero":
         if should_be_data:
             return "data"
-        if not should_be_hero:
+        if not should_be_hero and not should_be_quote_hero:
             return "content"
 
     return None
@@ -3928,6 +3970,46 @@ def _expand_page_specs(specs: list[dict], required_count: int) -> list[dict]:
     return expanded[:required_count]
 
 
+def _split_source_specs_by_visible_points(specs: list[dict]) -> list[dict]:
+    split_specs: list[dict] = []
+    for spec in specs:
+        points: list[str] = []
+        seen: set[str] = set()
+        for raw in spec.get("lines") or []:
+            for point in _source_visible_bullet_candidates(str(raw or ""), max_chars=96):
+                key = re.sub(r"\s+", "", point)
+                if not key or key in seen or len(key) < 6:
+                    continue
+                seen.add(key)
+                points.append(point)
+        if len(points) <= 1:
+            split_specs.append(dict(spec))
+            continue
+        for idx, point in enumerate(points):
+            support_points = [point]
+            if idx + 1 < len(points):
+                support_points.append(points[idx + 1])
+            elif idx > 0:
+                support_points.append(points[idx - 1])
+            split_specs.append({
+                **spec,
+                "headline": _source_visible_headline(point) or point,
+                "lines": support_points,
+                "source_chunk_index": idx,
+            })
+    return split_specs
+
+
+def _is_compact_single_source_spec(specs: list[dict]) -> bool:
+    if len(specs) != 1:
+        return False
+    lines = [str(line or "").strip() for line in (specs[0].get("lines") or []) if str(line or "").strip()]
+    if not lines or len(lines) > 3:
+        return False
+    total_chars = sum(len(re.sub(r"\s+", "", line)) for line in lines)
+    return total_chars <= 360
+
+
 def _dedupe_ordered_text(values: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -3989,6 +4071,12 @@ def _fit_source_specs_to_count(specs: list[dict], required_count: int) -> list[d
     if len(specs) == required_count:
         return [dict(spec) for spec in specs]
     if len(specs) < required_count:
+        if _is_compact_single_source_spec(specs):
+            split_specs = _split_source_specs_by_visible_points(specs)
+            if len(split_specs) > len(specs):
+                if len(split_specs) >= required_count:
+                    return _fit_source_specs_to_count(split_specs, required_count)
+                return _expand_page_specs(split_specs, required_count)
         return _expand_page_specs(specs, required_count)
 
     fitted: list[dict] = []
@@ -4356,6 +4444,25 @@ def _agenda_lines_from_specs(specs: list[dict], *, limit: int = 8) -> list[str]:
     return lines
 
 
+def _should_include_toc_page(*, target_count: int, agenda_lines: list[str]) -> bool:
+    if int(target_count or 0) <= 6:
+        return False
+    distinct_lines = {
+        re.sub(r"\s+", "", str(line or ""))
+        for line in agenda_lines
+        if str(line or "").strip()
+    }
+    return len(distinct_lines) >= 2
+
+
+def _source_body_spec_count(*, target_count: int, include_toc: bool) -> int:
+    target_count = max(1, int(target_count or 1))
+    if target_count <= 1:
+        return 0
+    non_body_pages = 3 if include_toc else 2
+    return max(1, target_count - non_body_pages)
+
+
 def build_document_driven_long_deck_draft(
     *,
     topic: str,
@@ -4383,7 +4490,11 @@ def build_document_driven_long_deck_draft(
     if context_specs:
         title = _source_context_primary_title(documents, topic)
         top_sections = _agenda_lines_from_specs(context_specs)
-        specs = _fit_source_specs_to_count(context_specs, max(0, target_count - 2))
+        include_toc = _should_include_toc_page(target_count=target_count, agenda_lines=top_sections)
+        specs = _fit_source_specs_to_count(
+            context_specs,
+            _source_body_spec_count(target_count=target_count, include_toc=include_toc),
+        )
         ending_spec = context_specs[-1] if context_specs else None
     else:
         root_title = ""
@@ -4398,7 +4509,11 @@ def build_document_driven_long_deck_draft(
             if int(unit.get("level") or 9) <= 2 and str(unit.get("title") or "").strip() != title
         ][:8]
         source_units = [unit for unit in units_for_draft if str(unit.get("title") or "").strip() != title]
-        specs = _fit_source_specs_to_count(_unit_page_specs(source_units or units_for_draft), max(0, target_count - 2))
+        include_toc = _should_include_toc_page(target_count=target_count, agenda_lines=top_sections)
+        specs = _fit_source_specs_to_count(
+            _unit_page_specs(source_units or units_for_draft),
+            _source_body_spec_count(target_count=target_count, include_toc=include_toc),
+        )
         ending_spec = None
 
     pages: list[dict] = [
@@ -4419,26 +4534,30 @@ def build_document_driven_long_deck_draft(
     ]
 
     agenda_lines = top_sections or [str(spec.get("headline") or "") for spec in specs[:6]]
-    pages.append({
-        "page_num": 2,
-        "type": "agenda",
-        "section_title": "内容总览",
-        "text_content": {
-            "headline": "内容地图",
-            "subhead": "",
-            "body": "\n".join(f"- {line}" for line in agenda_lines if line),
-        },
-        "speaker_notes": "先把整份内容的主线和页面路径讲清楚，帮助听众理解后续展开顺序。",
-        "visual_suggestion": "内容地图式页面，用清晰的分段路径或目录结构呈现。",
-        "source_refs": agenda_lines,
-        "generation_status": "source_draft",
-    })
+    content_start_page = 2
+    if include_toc:
+        pages.append({
+            "page_num": 2,
+            "type": "toc",
+            "section_title": "目录",
+            "text_content": {
+                "headline": "目录",
+                "subhead": "",
+                "body": "\n".join(f"- {line}" for line in agenda_lines if line),
+            },
+            "speaker_notes": "先把整份内容的主线和展开顺序讲清楚，帮助听众理解后续结构。",
+            "visual_suggestion": "目录页，用清晰短标题呈现章节顺序；可采用列表、分栏、矩阵或简洁路径。",
+            "source_refs": agenda_lines,
+            "generation_status": "source_draft",
+        })
+        content_start_page = 3
 
-    for page_num in range(3, target_count + 1):
+    for page_num in range(content_start_page, target_count + 1):
+        spec_index = page_num - content_start_page
         spec = (
             ending_spec
             if page_num == target_count and ending_spec
-            else specs[page_num - 3] if page_num - 3 < len(specs) else specs[-1]
+            else specs[spec_index] if spec_index < len(specs) else specs[-1]
         )
         lines = [line for line in (spec.get("lines") or []) if line]
         if not lines:
@@ -4455,11 +4574,16 @@ def build_document_driven_long_deck_draft(
             headline = _source_visible_headline(raw_headline) or raw_headline
             page_type = (
                 "section"
-                if _source_spec_should_be_section(spec, headline) or page_num in {3, 12, 23, 34, 45, 56, 67}
+                if _source_spec_should_be_section(spec, headline) or page_num in {content_start_page, 12, 23, 34, 45, 56, 67}
                 else "content"
             )
             section_title = _normalize_section_title(str(spec.get("section_title") or "内容规划").strip())
             screen_lines = _source_visible_body_lines(body_lines, headline=headline, max_lines=3 if page_type == "section" else 4)
+            if len(screen_lines) < 2:
+                headline_key = re.sub(r"\s+", "", headline)
+                body_keys = {re.sub(r"\s+", "", line) for line in screen_lines}
+                if headline_key and headline_key not in body_keys:
+                    screen_lines = [headline, *screen_lines]
             if page_type == "content" and len(screen_lines) < 2:
                 page_type = "hero"
         body = "\n".join(f"- {line}" for line in screen_lines)
@@ -4673,6 +4797,70 @@ def _page_map_bullet_limit(status: str) -> int:
     return 5
 
 
+_TOC_PAGE_TITLE_RE = re.compile(
+    r"(目录|议程|大纲|内容地图|课程地图|课程总览|内容总览|课程全景|整体结构|全局结构|本次.*展开|怎么展开|agenda|contents|outline)",
+    flags=re.IGNORECASE,
+)
+_TOC_PAGE_ITEM_RE = re.compile(
+    r"(^|\s)(模块|章节|章|节|部分|part|chapter|module)\s*[一二三四五六七八九十\d]*|"
+    r"(^|\s)P\s*\d+|"
+    r"^[一二三四五六七八九十\d]{1,3}[、.)．]",
+    flags=re.IGNORECASE,
+)
+
+
+def _body_lines_for_type_inference(value) -> list[str]:
+    if isinstance(value, list):
+        candidates = [str(item or "") for item in value]
+    else:
+        candidates = str(value or "").splitlines()
+    lines: list[str] = []
+    for item in candidates:
+        line = _strip_leading_list_marker(str(item or "")).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _should_reclassify_content_page_as_toc(
+    *,
+    page_type: str,
+    section_title: str,
+    headline: str,
+    body_lines: list[str],
+) -> bool:
+    if str(page_type or "").strip().lower() != "content":
+        return False
+    title_text = f"{section_title} {headline}".strip()
+    if not _TOC_PAGE_TITLE_RE.search(title_text):
+        return False
+    if len(body_lines) < 3:
+        return False
+    structured_items = sum(1 for line in body_lines if _TOC_PAGE_ITEM_RE.search(line))
+    return structured_items >= 2 or len(body_lines) >= 4
+
+
+def _should_reclassify_source_page_map_as_hero(
+    *,
+    page_type: str,
+    generation_status: str,
+    headline: str,
+    subhead: str,
+    bullets: list[str],
+) -> bool:
+    if page_type != "content" or generation_status != "page_map_source":
+        return False
+    if subhead.strip() or len(bullets) != 1:
+        return False
+    bullet = _clean_visible_page_map_text(_strip_leading_list_marker(str(bullets[0] or "")))
+    headline_text = _clean_visible_page_map_text(str(headline or ""))
+    compact_bullet = re.sub(r"\s+", "", bullet)
+    compact_headline = re.sub(r"\s+", "", headline_text)
+    if not compact_bullet or len(compact_bullet) > 40:
+        return False
+    return bool(compact_headline and compact_headline == compact_bullet)
+
+
 def _normalize_page_map(page_map: list[dict]) -> list[dict]:
     normalized: list[dict] = []
     for page in sorted([p for p in page_map if isinstance(p, dict)], key=lambda item: int(item.get("page_num") or 10**6)):
@@ -4691,6 +4879,21 @@ def _normalize_page_map(page_map: list[dict]) -> list[dict]:
         subhead = _clean_visible_page_map_text(str(page.get("subhead") or ""))
         speaker_notes = _clean_visible_page_map_text(str(page.get("speaker_notes") or ""))
         visual_suggestion = _clean_visible_page_map_text(str(page.get("visual_suggestion") or ""))
+        if _should_reclassify_content_page_as_toc(
+            page_type=page_type,
+            section_title=section_title,
+            headline=headline,
+            body_lines=bullets,
+        ):
+            page_type = "toc"
+        elif _should_reclassify_source_page_map_as_hero(
+            page_type=page_type,
+            generation_status=generation_status,
+            headline=headline,
+            subhead=subhead,
+            bullets=bullets,
+        ):
+            page_type = "hero"
         normalized.append({
             "page_num": page_num,
             "type": page_type,
@@ -5487,7 +5690,7 @@ def _generate_model_page_map(
 - 自动识别并过滤版式模板占位符，只保留真实信息。
 - 保持原PPT的信息密度，不要因为"每页只说一件事"而删减原文内容。"""
 
-    prompt = f"""你是一位顶尖的 PPT 内容架构师。请先生成整份 PPT 的"逐页内容地图"，不要输出 JSON。
+    prompt = f"""你是一位顶尖的 PPT 内容架构师。请先生成整份 PPT 的"逐页内容规划"，不要输出 JSON。
 
 【用户主题和约束】
 {topic}
@@ -5516,10 +5719,10 @@ def _generate_model_page_map(
 {mode_instruction}
 
 【输出要求】
-1. 一次性给出全局逐页内容地图，必须覆盖整份 PPT 的开场、主线、转场、案例和结尾。
+1. 一次性给出全局逐页内容规划，必须覆盖整份 PPT 的开场、主线、转场、案例和结尾。
 2. 标题和 bullet 必须尽量来自用户材料或 Brief，不能为了凑页数发明不相干内容。
 3. 如果提供了"必须覆盖的原文结构清单"，必须逐项覆盖；可以优化标题表达，但不能漏掉任何章节、编号小节、结语或行动清单。
-4. 如果提供了"系统预生成的正文底稿"，你必须以它为基础优化标题、顺序和取舍；content/agenda/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
+4. 如果提供了"系统预生成的正文底稿"，你必须以它为基础优化标题、顺序和取舍；content/toc/data 页不能删除底稿 bullet，合并页面时也要把被合并页面的关键事实写进新 bullet。
 5. 不要把同一个来源主题拆成"简短版"和"展开版"两页；如果两页标题、bullet 或来源线索接近，必须合并为一页，只保留更完整的一版。
 6. 相邻页面必须有明确的新信息、新问题或新叙事功能；不能出现连续两页同标题、同 bullet、同来源框架。
 7. 页间要有连续叙事：上一页为什么引出下一页要想清楚。
@@ -5527,7 +5730,8 @@ def _generate_model_page_map(
 9. 用户材料中的 Markdown 分隔线（如 ---、***、___）只代表结构，不能作为标题、bullet 或正文输出。
 10. 如果用户上传材料来自 PPT 解析，其中可能残留版式模板占位文字（如"单击此处添加标题""标题/主文案""第一行："等）或布局结构标注。你必须自动识别并过滤这些非内容元素，只保留真实信息。
 11. 如果用户材料里出现 AVAILABLE_FIGURES / FIGURE 行，你要自主判断哪些原图适合哪一页；适合时在该页写"配图：source_document 第source_page_num页 figure_id=\"完整FIGURE_ID\" 使用理由"。figure_id 必须原样复制 FIGURE 行里的值；不要写 figure_id、figureid、图片ID 等占位符；不适合就不要硬配图。
-12. 输出格式必须固定为；下面是格式说明，不要复制"标题"、"bullet"、"演讲者备注"等占位词，必须替换成用户材料中的真实内容。备注要先写出这一页需要讲什么，再补一句必要的转场：
+12. 目录页是可选页；篇幅紧凑或叙事更连贯时可以不放。使用目录页时 type 用 toc，标题可以直接写“目录”，不要套固定命名或固定路径构图。
+13. 输出格式必须固定为；下面是格式说明，不要复制"标题"、"bullet"、"演讲者备注"等占位词，必须替换成用户材料中的真实内容。备注要先写出这一页需要讲什么，再补一句必要的转场：
 P1｜cover｜封面｜用用户材料写出的封面标题
 - 用用户材料写出的具体要点
 - 用用户材料写出的具体要点
@@ -5553,7 +5757,7 @@ P2｜content｜章节｜用用户材料写出的页面标题
         stream = client.chat.completions.create(
             model=get_minimax_llm_model(),
             messages=[
-                {"role": "system", "content": "你是世界一流的 PPT 总架构师。先做完整逐页内容地图，不输出 JSON。"},
+                {"role": "system", "content": "你是世界一流的 PPT 总架构师。先做完整逐页内容规划，不输出 JSON。"},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.45,
@@ -5663,7 +5867,23 @@ def generate_content_page_map(
         logger.info("ContentPlan: using deterministic source page map for direct replicate, pages=%s", len(source_draft))
         return _normalize_page_map(source_draft)
 
-    source_page_map_markdown = render_page_map_markdown(source_draft)
+    raw_source_page_map_markdown = render_page_map_markdown(source_draft)
+    if on_progress:
+        on_progress({
+            "stage": "diagnostic",
+            "diagnostic_event": "content_plan_page_map_input",
+            "documents_chars": len(documents or ""),
+            "page_map_document_limit_chars": PAGE_MAP_DOCUMENT_LIMIT,
+            "page_map_document_will_truncate": len(documents or "") > PAGE_MAP_DOCUMENT_LIMIT,
+            "source_draft_page_count": len(source_draft or []),
+            "source_draft_chars": len(raw_source_page_map_markdown),
+            "source_draft_limit_chars": PAGE_MAP_SOURCE_DRAFT_LIMIT,
+            "source_draft_will_truncate": len(raw_source_page_map_markdown) > PAGE_MAP_SOURCE_DRAFT_LIMIT,
+            "target_page_count": target_count,
+            "min_pages": min_pages,
+            "max_pages": max_pages,
+        })
+    source_page_map_markdown = raw_source_page_map_markdown
     if len(source_page_map_markdown) > PAGE_MAP_SOURCE_DRAFT_LIMIT:
         source_page_map_markdown = _document_excerpt_for_extension(
             source_page_map_markdown,
@@ -5947,8 +6167,8 @@ def _fallback_deck_blueprint(target_count: int, min_pages: int, max_pages: int, 
         f"- P1：封面。定主题、受众和表达语境，正文留空。",
     ]
     source_sections = _source_deck_sections(documents)
-    if source_sections and target_count >= 4:
-        lines.append("- P2：目录。按上传材料的核心章节生成课程地图，必须显示全局结构。")
+    if source_sections and _should_include_toc_page(target_count=target_count, agenda_lines=source_sections):
+        lines.append("- P2：目录。按上传材料的核心章节显示全局结构，标题可以简洁写成“目录”。")
         for start, end, title in _distribute_source_sections(target_count=target_count, sections=source_sections):
             lines.append(f"- P{start}-P{end}：{title}。严格围绕上传材料这一章节展开，拆成原文判断、方法框架、案例和关键段落。")
         lines.append("\n必须覆盖上传材料中的每个章节，不能只讲前半部分；后续分段生成时不得跳过后面的模块。")
@@ -6210,7 +6430,7 @@ def _generate_outline_from_blueprint_in_chunks(
 - 如果上方给出了逐页原文章节，section_title 必须与对应页码一致；不能提前跳到后续章节，也不能重复上一章节。
 - 不能重复已生成页面；要接上已有页面摘要的叙事。
 - 每页必须包含 type、section_title、text_content、speaker_notes、visual_suggestion、source_refs。
-- type 只能使用 cover、toc、section、content、data、hero、ending；目录页用 toc，章节页用 section，普通论述/案例/自检/框架页用 content，含真实数字/表格/对比指标的页面用 data，金句/关键判断页用 hero；禁止使用 outline、section_cover、framework、case、quiz、transition、quote 等新类型。
+- type 只能使用 cover、toc、section、content、data、hero、quote、ending；目录页用 toc，章节页用 section，普通论述/案例/自检/框架页用 content，含真实数字/表格/对比指标的页面用 data，hero 只用于无正文或极短正文的一句话金句/关键判断页，quote 用于名人名言/引用页；其他多段/长段正文必须用 content；禁止使用 outline、section_cover、framework、case、quiz、transition 等新类型。
 - text_content.headline、subhead、body 中禁止出现 Markdown 标题符号（#、##、###）；正文列表必须逐条换行，不要把多个目录项、项目符号或编号压成同一行。
 - text_content.body 是页面卡片/PPT 上可见的正文区域；speaker_notes 只是讲师备注，不会显示在页面正文里。
 - content/data 页的 text_content.body 必须写得言之有物 —— 给听众具体的案例/数据/反例/类比，不是抽象概括；不要把丰富段落压成一行标题，也不要把多句压缩成一句。
@@ -6377,7 +6597,7 @@ def generate_long_deck_outline_chunk(
 - 如果上方给出了逐页原文章节，section_title 必须与对应页码一致；不能提前跳到后续章节，也不能重复上一章节。
 - 不能重复已生成页面；要接上已有页面摘要的叙事。
 - 每页必须包含 type、section_title、text_content、speaker_notes、visual_suggestion、source_refs。
-- type 只能使用 cover、toc、section、content、data、hero、ending；目录页用 toc，章节页用 section，普通论述/案例/自检/框架页用 content，含真实数字/表格/对比指标的页面用 data，金句/关键判断页用 hero；禁止使用 outline、section_cover、framework、case、quiz、transition、quote 等新类型。
+- type 只能使用 cover、toc、section、content、data、hero、quote、ending；目录页用 toc，章节页用 section，普通论述/案例/自检/框架页用 content，含真实数字/表格/对比指标的页面用 data，hero 只用于无正文或极短正文的一句话金句/关键判断页，quote 用于名人名言/引用页；其他多段/长段正文必须用 content；禁止使用 outline、section_cover、framework、case、quiz、transition 等新类型。
 - text_content.headline、subhead、body 中禁止出现 Markdown 标题符号（#、##、###）；正文列表必须逐条换行，不要把多个目录项、项目符号或编号压成同一行。
 - text_content.body 是页面卡片/PPT 上可见的正文区域；speaker_notes 只是讲师备注，不会显示在页面正文里。
 - content/data 页的 text_content.body 必须写得言之有物 —— 给听众具体的案例/数据/反例/类比，不是抽象概括；不要把丰富段落压成一行标题，也不要把多句压缩成一句。
@@ -6989,7 +7209,8 @@ def _normalize_content_markdown(outline: List[Dict], *, topic: str = "") -> List
     for page in outline:
         if not isinstance(page, dict):
             continue
-        page["type"] = _canonical_content_plan_type(str(page.get("type") or "content"))
+        original_type = str(page.get("type") or "content")
+        page["type"] = _canonical_content_plan_type(original_type)
         text_content = page.get("text_content")
         if isinstance(text_content, dict):
             for key in ("headline", "subhead", "body"):
@@ -7020,11 +7241,23 @@ def _normalize_content_markdown(outline: List[Dict], *, topic: str = "") -> List
                 "subhead": "",
                 "body": _normalize_body_markdown(body),
             }
+        text_content = page.get("text_content") if isinstance(page.get("text_content"), dict) else {}
+        if _should_reclassify_content_page_as_toc(
+            page_type=str(page.get("type") or ""),
+            section_title=str(page.get("section_title") or ""),
+            headline=str(text_content.get("headline") or ""),
+            body_lines=_body_lines_for_type_inference(text_content.get("body")),
+        ):
+            page["type"] = "toc"
+        elif str(page.get("type") or "").strip().lower() == "hero":
+            reclassified_type = _auto_reclassify_page_type(page, "hero", original_type=original_type)
+            if reclassified_type:
+                page["type"] = reclassified_type
         notes = page.get("speaker_notes")
         if isinstance(notes, str):
             page["speaker_notes"] = _strip_source_context_markers(normalize_markdown_content(notes))
         page["source_refs"] = _clean_page_map_source_ref_values(page.get("source_refs"))
-        _normalize_punchline_page_content(page)
+        _normalize_punchline_page_content(page, original_type=original_type)
         separated = separate_visual_directives_from_page(page)
         if separated is not page:
             page.clear()
@@ -7045,7 +7278,7 @@ def _first_text_line(value) -> str:
     return ""
 
 
-def _normalize_punchline_page_content(page: Dict) -> None:
+def _normalize_punchline_page_content(page: Dict, *, original_type: str | None = None) -> None:
     """Keep hero/quote slides as punchline slides, not lightweight content slides."""
     page_type = str(page.get("type") or "").strip().lower()
     if page_type not in {"hero", "quote"}:
@@ -7064,6 +7297,22 @@ def _normalize_punchline_page_content(page: Dict) -> None:
         headline = body_line
 
     body_text = "\n".join(str(x) for x in body) if isinstance(body, list) else str(body or "")
+    if _is_attributed_quote_page(page, original_type=original_type):
+        text_content["headline"] = headline
+        text_content["subhead"] = subhead
+        if isinstance(body, list):
+            text_content["body"] = "\n".join(str(x).strip() for x in body if str(x).strip())
+        else:
+            text_content["body"] = normalize_markdown_emphasis(body_text.strip()) if body_text.strip() else ""
+        suggestion = str(page.get("visual_suggestion") or "").strip()
+        if not suggestion or any(term in suggestion for term in ("内容页", "信息图", "列表", "要点")):
+            page["visual_suggestion"] = (
+                "名人名言/引用金句页：保留引文正文与作者署名；"
+                "如有明确人物，可将人物肖像作为背景的一部分，低对比度融入版面，"
+                "同时沿用整套 PPT 的配色、字体气质和材质语言。"
+            )
+        return
+
     if body_text.strip():
         notes = str(page.get("speaker_notes") or "").strip()
         preserved = f"原金句页正文素材：{normalize_markdown_emphasis(body_text.strip())}"

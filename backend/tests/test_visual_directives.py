@@ -75,6 +75,15 @@ def test_visual_directive_extraction_keeps_negated_matrix_reference_visible():
     assert result["cleaned_markdown"] == "这不是要做成矩阵，而是在解释矩阵组织的弊端。"
 
 
+def test_visual_directive_extraction_keeps_tool_use_workflow_copy_visible():
+    body = "Agentic AI 则把 Agent 放进真实工作环境，让它开始读写文件、调用工具、串联更长的办公流程。"
+
+    result = extract_visual_directives(body)
+
+    assert result["suggestions"] == []
+    assert result["cleaned_markdown"] == body
+
+
 def test_prompt_does_not_invite_rendering_prompt_metadata_as_slide_text():
     prompt = prompt_engine.generate_prompt_for_page(
         page_intent={
@@ -96,8 +105,12 @@ def test_prompt_does_not_invite_rendering_prompt_metadata_as_slide_text():
     assert 'Headline: "疯火轮 AI"' in prompt
     assert "All listed text must appear" not in prompt
     assert "16:9" not in prompt
-    assert "Source Han Sans" not in prompt
-    assert "Inter Bold" not in prompt
+    visible_text_section = prompt.split("Rules:", 1)[0]
+    assert "Source Han Sans" not in visible_text_section
+    assert "Inter Bold" not in visible_text_section
+    assert "Typography contract:" in prompt
+    assert "Source Han Sans" in prompt
+    assert "Inter Bold" in prompt
     assert "font family names" in prompt
 
 

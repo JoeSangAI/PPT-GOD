@@ -221,7 +221,7 @@ function ProviderSetup({
                   className="pg-auth-input"
                   value={value.deerImageModel}
                   onChange={(e) => update("deerImageModel", e.target.value)}
-                  placeholder="gpt-image-2-all"
+                  placeholder="gpt-image-2"
                 />
               </label>
             </div>

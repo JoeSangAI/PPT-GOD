@@ -15,6 +15,7 @@ from app.api import projects as projects_api
 from app.api import documents as documents_api
 from app.api import slides as slides_api
 from app.services import generation_pipeline
+from app.services import visual_plan
 from app.schemas.project import ProjectUpdate
 from app.api.slides import _resolve_generation_page_nums
 from app.models.base import Base
@@ -727,7 +728,7 @@ def test_fallback_visual_plan_does_not_leak_old_product_domain_for_debate_pages(
         assert stale_term not in description
 
 
-def test_punchline_page_content_is_normalized_to_one_line():
+def test_hero_with_explanatory_body_is_reclassified_to_content():
     outline = _normalize_content_markdown([
         {
             "page_num": 3,
@@ -743,12 +744,11 @@ def test_punchline_page_content_is_normalized_to_one_line():
     ])
 
     page = outline[0]
+    assert page["type"] == "content"
     assert page["text_content"]["headline"] == "管理就是把复杂留给自己"
     assert page["text_content"]["subhead"] == ""
-    assert page["text_content"]["body"] == ""
-    assert "原金句页正文素材" in page["speaker_notes"]
-    assert "金句页" in page["visual_suggestion"]
-    assert "整套 PPT" in page["visual_suggestion"]
+    assert page["text_content"]["body"] == "- 第一条解释\n- 第二条解释"
+    assert "原金句页正文素材" not in page["speaker_notes"]
 
 
 def test_single_ppt_outline_gets_source_refs_when_polishing():
@@ -793,6 +793,30 @@ def test_fallback_visual_plan_treats_hero_as_punchline_slide():
     assert plan[0]["logo_policy"]["show_logo"] is False
 
 
+def test_fallback_visual_plan_uses_portrait_background_for_attributed_quote():
+    plan = _fallback_visual_plan(
+        [
+            {
+                "page_num": 6,
+                "type": "quote",
+                "text_content": {
+                    "headline": "Stay hungry, stay foolish.",
+                    "subhead": "—— Steve Jobs",
+                    "body": "你的时间有限，不要浪费在重复别人的生活上。不要被教条困住。",
+                },
+                "visual_suggestion": "名人名言引用页",
+            }
+        ],
+        [],
+    )
+
+    assert plan[0]["layout"] == "hero"
+    assert plan[0]["seed_family"] == "hero"
+    assert "名人名言" in plan[0]["visual_evidence"]
+    assert "肖像" in plan[0]["visual_evidence"]
+    assert "肖像" in plan[0]["visual_description"]
+
+
 def test_visual_plan_json_repair_handles_multiline_llm_strings():
     raw = '{"6": {"visual_evidence": "终端货架", "visual_description": "第一行\n第二行", "visual_asset_ids": [], "visual_asset_usage": {}}}'
 
@@ -829,7 +853,7 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_llm_drops_page(monkeyp
         )
 
 
-def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missing(monkeypatch):
+def test_visual_plan_fills_page_grounded_evidence_when_llm_omits_required_field(monkeypatch):
     class FakeClient:
         class chat:
             class completions:
@@ -849,17 +873,19 @@ def test_visual_plan_raises_instead_of_auto_fallback_when_required_fields_missin
         lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
     )
 
-    with pytest.raises(VisualPlanGenerationError, match="missing visual_evidence"):
-        _do_generate_visual_plan(
-            content_plan=[
-                {
-                    "page_num": 1,
-                    "type": "content",
-                    "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
-                }
-            ],
-            style_override={"meta": {}, "body": "Style: 测试风格\nPalette: #111111, #FFFFFF\nVisual rhythm: 每页按文案生成画面证据"},
-        )
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 1,
+                "type": "content",
+                "text_content": {"headline": "当前页", "body": "本页必须得到完整视觉方案"},
+            }
+        ],
+        style_override={"meta": {}, "body": "Style: 测试风格\nPalette: #111111, #FFFFFF\nVisual rhythm: 每页按文案生成画面证据"},
+    )
+
+    assert plan[0]["visual_evidence"] == "支撑「当前页」这一页观点的核心场景、物件或结构图"
+    assert plan[0]["visual_description"] == "只有描述，没有画面证据"
 
 
 def test_visual_plan_retries_empty_batch_as_single_pages(monkeypatch):
@@ -1214,6 +1240,47 @@ def test_old_visual_prompt_task_cleanup_keeps_newer_registry_task(monkeypatch):
     asyncio.run(run_old_cleanup_with_new_task_registered())
 
 
+def test_visual_prompt_task_replacement_does_not_deadlock_when_old_task_cleans_registry():
+    project_id = "replace-deadlock-project"
+    slides_api._running_tasks.pop(project_id, None)
+
+    async def scenario():
+        cleanup_finished = asyncio.Event()
+        release_new_task = asyncio.Event()
+
+        async def old_task_body():
+            try:
+                await asyncio.sleep(60)
+            finally:
+                async with slides_api._running_tasks_lock:
+                    cleanup_finished.set()
+
+        async def new_task_body():
+            await release_new_task.wait()
+
+        old_task = asyncio.create_task(old_task_body())
+        await asyncio.sleep(0)
+        async with slides_api._running_tasks_lock:
+            slides_api._running_tasks[project_id] = old_task
+
+        new_task = await asyncio.wait_for(
+            slides_api._replace_running_project_task(project_id, new_task_body()),
+            timeout=0.5,
+        )
+        assert slides_api._running_tasks.get(project_id) is new_task
+        await asyncio.wait_for(cleanup_finished.wait(), timeout=0.5)
+        assert slides_api._running_tasks.get(project_id) is new_task
+
+        release_new_task.set()
+        await asyncio.wait_for(new_task, timeout=0.5)
+        slides_api._running_tasks.pop(project_id, None)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        slides_api._running_tasks.pop(project_id, None)
+
+
 def test_pipeline_does_not_retry_slide_after_inner_image_retries_are_exhausted(monkeypatch, tmp_path):
     db = make_session()
     project = Project(title="No duplicate image retry", status="prompt_ready", content_plan_confirmed=True)
@@ -1369,6 +1436,37 @@ def test_pptx_assembler_adds_exact_overlay_layer(tmp_path):
     prs = Presentation(str(output_path))
     # Background image + card rectangle + exact overlay image.
     assert len(prs.slides[0].shapes) >= 3
+
+
+def test_pptx_assembler_keeps_exact_cutout_below_title_safe_area_without_text_regions(tmp_path):
+    bg_path = tmp_path / "slide.png"
+    asset_path = tmp_path / "asset.png"
+    output_path = tmp_path / "out.pptx"
+    Image.new("RGB", (1792, 1024), "white").save(bg_path)
+    Image.new("RGB", (320, 420), "red").save(asset_path)
+
+    assemble_pptx(
+        slide_images=[{
+            "page_num": 1,
+            "image_path": str(bg_path),
+            "visual_json": {
+                "overlay_layers": [{
+                    "id": "ov",
+                    "asset_id": "asset-1",
+                    "enabled": True,
+                    "preset": "right-card",
+                    "mode": "exact_cutout",
+                    "valign": "center",
+                }]
+            },
+        }],
+        output_path=str(output_path),
+        overlay_assets={"asset-1": {"file_path": str(asset_path)}},
+    )
+
+    prs = Presentation(str(output_path))
+    overlay_shape = prs.slides[0].shapes[1]
+    assert overlay_shape.top >= int(prs.slide_height * 0.24)
 
 
 def test_logo_overlay_layout_avoids_dense_ending_content(tmp_path):
@@ -2262,13 +2360,21 @@ def test_prompt_strips_generated_logo_and_watermark_instructions():
         ),
     )
 
-    assert "Watermarks and stray marks:" in prompt
+    assert "Render only the quoted slide copy and intentional confirmed assets." in prompt
+    assert "Watermarks and stray marks:" not in prompt
+    assert "虎课网" not in prompt
     assert "Brand marks:" not in prompt
     assert "logo" not in prompt.lower()
     assert "LOGO" not in prompt
     assert "右上角小Logo" not in prompt
     assert "品牌抽象展翅造型" not in prompt
     assert "金黑配色" not in prompt
+
+
+def test_prompt_hygiene_terms_do_not_encode_case_specific_bad_samples():
+    combined_terms = (*prompt_engine.WATERMARK_TERMS, *visual_plan.WATERMARK_TERMS)
+
+    assert all("虎课" not in term for term in combined_terms)
 
 
 def test_project_logo_policy_is_disabled_when_no_confirmed_logo():
@@ -3232,6 +3338,249 @@ def test_visual_plan_forces_logo_policy_off_when_project_has_no_logo(monkeypatch
     assert plan[0]["logo_policy"]["placement"] == "top-right"
     assert plan[0]["logo_policy"]["use_as_scene_asset"] is False
     assert "品牌标识" not in plan[0]["visual_description"]
+
+
+def test_visual_plan_replaces_unsupported_definition_cards_for_keyword_intro(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"3": {'
+                                        '"visual_evidence": "术语卡片矩阵：LLM / Token / Prompt / Context 四个名词标签与极简定义块", '
+                                        '"visual_summary": "四宫格术语卡，阅读优先", '
+                                        '"visual_description": "主体为 2×2 术语卡矩阵，每张卡片包含名词标签与一至两行短定义留白区。", '
+                                        '"visual_asset_ids": [], '
+                                        '"visual_asset_usage": {}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 3,
+                "type": "content",
+                "text_content": {
+                    "headline": "先把基础名词讲清楚",
+                    "subhead": "不被高大上的 Agent 叙事带偏",
+                    "body": (
+                        "现在短视频上有很多人在讲各种各样的 Agent，也在讲各种各样听起来很高大上的名词。\n\n"
+                        "这些内容不一定错，但如果基础概念还没有建立，很容易把人带偏：还没搞清楚 LLM、Token、Prompt、Context，就已经开始追 Hermes，Harness，Loop。\n\n"
+                        "所以这门课的目的很简单：把这些基础名词列出来，用普通人能理解的方式讲清楚，先建立一套不容易被带偏的底层认知。\n\n"
+                        "今天会讲到：LLM、Token、GPT、注意力机制、Prompt、Context、Chatbot、Agent、Agentic AI、多模态。"
+                    ),
+                },
+            }
+        ],
+        has_project_logo=False,
+    )
+
+    joined = "\n".join(
+        str(plan[0].get(key, ""))
+        for key in ("visual_evidence", "visual_summary", "visual_description")
+    )
+    assert "术语卡" not in joined
+    assert "定义块" not in joined
+    assert "短定义" not in joined
+    assert "正文段落" in plan[0]["visual_description"]
+    assert "关键词" in plan[0]["visual_evidence"]
+
+
+def test_visual_plan_replaces_glossary_layout_when_keyword_list_is_only_part_of_narrative(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"3": {'
+                                        '"visual_evidence": "基础名词术语卡片矩阵：LLM / Token / Prompt / Context 等关键词平铺", '
+                                        '"visual_summary": "冷白底术语卡片矩阵，建立基础名词地图", '
+                                        '"visual_description": "主体为基础名词卡片矩阵，只展示关键词标签，不补写定义。", '
+                                        '"visual_asset_ids": [], '
+                                        '"visual_asset_usage": {}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 3,
+                "type": "content",
+                "text_content": {
+                    "headline": "先把基础名词讲清楚",
+                    "subhead": "不被高大上的 Agent 叙事带偏",
+                    "body": (
+                        "现在短视频上有很多人在讲各种各样的 Agent，也在讲各种各样听起来很高大上的名词。\n\n"
+                        "这些内容不一定错，但如果基础概念还没有建立，很容易把人带偏：还没搞清楚 LLM、Token、Prompt、Context，就已经开始追 Hermes，Harness，Loop。\n\n"
+                        "所以这门课的目的很简单：把这些基础名词列出来，用普通人能理解的方式讲清楚，先建立一套不容易被带偏的底层认知。\n\n"
+                        "今天会讲到：LLM、Token、GPT、注意力机制、Prompt、Context、Chatbot、Agent、Agentic AI、多模态。"
+                    ),
+                },
+            }
+        ],
+        has_project_logo=False,
+    )
+
+    joined = "\n".join(
+        str(plan[0].get(key, ""))
+        for key in ("visual_evidence", "visual_summary", "visual_description")
+    )
+    assert "术语卡" not in joined
+    assert "名词地图" not in joined
+    assert "正文段落" in plan[0]["visual_description"]
+
+
+def test_visual_plan_replaces_unsourced_explainer_microcopy_for_keyword_list(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"27": {'
+                                        '"visual_evidence": "工具能力卡片矩阵：Web Search / Web Fetch / OCR / 文件读取", '
+                                        '"visual_summary": "四宫格工具卡，补充用途说明", '
+                                        '"visual_description": "主体为四张工具卡片，每张卡包含工具名称、一个图标和一句用途说明，补充适用场景小字。", '
+                                        '"visual_asset_ids": [], '
+                                        '"visual_asset_usage": {}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 27,
+                "type": "content",
+                "text_content": {
+                    "headline": "Tool Use：Agent 开始有手脚",
+                    "subhead": "工具让 Chatbot 从回答问题走向完成任务",
+                    "body": "常见工具包括：Web Search、Web Fetch、OCR、文件读取、图像生成。",
+                },
+            }
+        ],
+        has_project_logo=False,
+    )
+
+    joined = "\n".join(
+        str(plan[0].get(key, ""))
+        for key in ("visual_evidence", "visual_summary", "visual_description")
+    )
+    assert "用途说明" not in joined
+    assert "适用场景小字" not in joined
+    assert "正文段落" in plan[0]["visual_description"]
+
+
+def test_visual_plan_keeps_definition_cards_when_page_explicitly_defines_term(monkeypatch):
+    class FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**_kwargs):
+                    return SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    content=(
+                                        '{"5": {'
+                                        '"visual_evidence": "LLM 术语卡与 Large Language Model 解释区", '
+                                        '"visual_summary": "LLM 概念卡片", '
+                                        '"visual_description": "主体为 LLM 术语卡，承接英文全称和中文含义的解释区域。", '
+                                        '"visual_asset_ids": [], '
+                                        '"visual_asset_usage": {}'
+                                        '}}'
+                                    )
+                                )
+                            )
+                        ]
+                    )
+
+    import app.services.visual_plan as visual_plan_module
+
+    monkeypatch.setattr(visual_plan_module, "get_llm_client", lambda: FakeClient())
+    monkeypatch.setattr(visual_plan_module, "_load_style", lambda _style_id: {"meta": {}, "body": ""})
+    monkeypatch.setattr(
+        visual_plan_module,
+        "derive_style_pack_from_content",
+        lambda _content_plan: "Style: test\nPalette: #111111, #FFFFFF",
+    )
+
+    plan = _do_generate_visual_plan(
+        content_plan=[
+            {
+                "page_num": 5,
+                "type": "content",
+                "text_content": {
+                    "headline": "LLM 是什么",
+                    "subhead": "Large Language Model，大语言模型",
+                    "body": "LLM 的英文全称是 Large Language Model，中文叫大语言模型。",
+                },
+            }
+        ],
+        has_project_logo=False,
+    )
+
+    joined = "\n".join(
+        str(plan[0].get(key, ""))
+        for key in ("visual_evidence", "visual_summary", "visual_description")
+    )
+    assert "术语卡" in joined
+    assert "Large Language Model" in joined
 
 
 def test_visual_plan_locks_manual_pins_and_route_modes_when_llm_selects_other_asset(monkeypatch):
@@ -5342,6 +5691,47 @@ def test_overlay_layers_endpoint_and_visual_merge(tmp_path):
 
     merged = slides_api._merge_manual_pins_into_visual_json({"visual_asset_ids": []}, slide.visual_json)
     assert merged["overlay_layers"][0]["asset_id"] == asset.id
+
+
+def test_overlay_layers_endpoint_uses_asset_context_for_comparison_layout(tmp_path):
+    db = make_session()
+    project = Project(title="Overlay comparison", status="completed")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="completed", prompt_text="old", visual_json={})
+    db.add(slide)
+    assets = []
+    for name, note in [("优化后首页截图", "after"), ("优化前首页截图", "before")]:
+        path = tmp_path / f"{note}.png"
+        Image.new("RGB", (120, 180), "white").save(path)
+        asset = ReferenceImage(
+            project_id=project.id,
+            role="visual_asset",
+            file_path=str(path),
+            process_mode="blend",
+            asset_name=name,
+            asset_kind="material",
+            usage_note=note,
+            asset_analysis={"subject": name},
+        )
+        db.add(asset)
+        assets.append(asset)
+    db.commit()
+
+    result = slides_api.update_slide_overlay_layers(
+        project.id,
+        slide.id,
+        slides_api.OverlayLayersRequest(layers=[
+            slides_api.OverlayLayerRequest(asset_id=assets[0].id, mode="exact_cutout"),
+            slides_api.OverlayLayerRequest(asset_id=assets[1].id, mode="exact_cutout"),
+        ]),
+        db=db,
+    )
+
+    by_asset = {layer["asset_id"]: layer for layer in result["overlay_layers"]}
+    assert by_asset[assets[1].id]["layout_group"] == "comparison"
+    assert by_asset[assets[1].id]["preset"] == "gallery-2-left"
+    assert by_asset[assets[0].id]["preset"] == "gallery-2-right"
 
 
 def test_overlay_layers_accept_page_reference_assets(tmp_path):

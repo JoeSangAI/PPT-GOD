@@ -52,6 +52,8 @@ const appSource = readFileSync(join(import.meta.dirname, "App.tsx"), "utf8");
 assert.doesNotMatch(appSource, /quote:\s*"引言"/, "legacy quote pages should not be labelled as 引言");
 assert.match(appSource, /quote:\s*"金句"/, "legacy quote pages should be shown as 金句");
 assert.match(appSource, /\{ key: "data", label: "数据" \}/, "data page type must remain selectable");
+assert.match(appSource, /\{ key: "toc", label: "目录" \}/, "directory page type must use the canonical toc key");
+assert.doesNotMatch(appSource, /\{ key: "agenda", label: "目录" \}/, "directory page type selector must not save the legacy agenda key");
 
 function context(input) {
   return buildGateContext(buildWorkflowState(input), input.revision ?? 0);

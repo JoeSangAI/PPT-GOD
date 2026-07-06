@@ -2,7 +2,7 @@
 Timeout configuration guardrails.
 
 These values were tuned through multiple debugging rounds for CometAPI's
-gpt-image-2-all. If you need to change them, run a full image generation
+gpt-image-2. If you need to change them, run a full image generation
 end-to-end test first and update this file.
 """
 
@@ -14,7 +14,7 @@ class TestTimeoutConfig:
     def test_image_api_timeout_not_too_short(self):
         """IMAGE_API_TIMEOUT_SECONDS must be >= 300s.
 
-        CometAPI gpt-image-2-all can take 30-120s normally and 2-3x
+        CometAPI gpt-image-2 can take 30-120s normally and 2-3x
         longer during peak hours. Values below 300s caused paid but
         failed generations (2026-05-16 incident).
         """
@@ -38,9 +38,9 @@ class TestTimeoutConfig:
         )
 
     def test_comet_image_model_is_gpt_image_2(self):
-        """COMET_IMAGE_MODEL must be gpt-image-2-all."""
+        """COMET_IMAGE_MODEL must be gpt-image-2."""
         model = (settings.COMET_IMAGE_MODEL or "").strip()
-        assert model == "gpt-image-2-all", (
-            f"COMET_IMAGE_MODEL={model} must be 'gpt-image-2-all'. "
-            "Other models were removed from the codebase."
+        assert model == "gpt-image-2", (
+            f"COMET_IMAGE_MODEL={model} must be 'gpt-image-2'. "
+            "The upstream image model name must not include the all suffix."
         )

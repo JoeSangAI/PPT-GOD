@@ -1,11 +1,11 @@
 from pathlib import Path
 
 
-def test_development_memory_records_product_architecture_taste():
-    memory = Path(__file__).resolve().parents[2] / "DEVELOPMENT_MEMORY.md"
+def test_memory_records_compression_into_project_agents():
+    memory = Path(__file__).resolve().parents[2] / "MEMORY.md"
     text = memory.read_text(encoding="utf-8")
 
-    assert "Product Architecture Taste" in text
-    assert "Prefer one elegant underlying principle" in text
-    assert "Be skeptical of fallback" in text
-    assert "The highest bar is not" in text
+    assert "Compressed the previous long project memory into `AGENTS.md`" in text
+    assert "Product architecture taste was promoted to `AGENTS.md`" in text
+    assert "Source-level prevention, fallback quality, and case-driven robustness" in text
+    assert "Image generation architecture constraints were promoted to `AGENTS.md`" in text

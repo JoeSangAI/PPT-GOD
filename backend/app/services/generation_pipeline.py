@@ -27,6 +27,7 @@ from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_ove
 from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.logo_policy import is_logo_confirmed, logo_policy_for_page, should_show_logo, should_use_logo_as_scene_asset
 from app.services.overlay_layers import enabled_overlay_layers, exact_overlay_asset_ids
+from app.services.pipeline_diagnostics import append_pipeline_diagnostic_log
 from app.services.pptx_assembler import assemble_pptx
 from app.services.run_state import (
     cleanup_generation_progress,
@@ -647,6 +648,9 @@ def _seed_base_edit_instruction(slide: Slide, seed_image_count: int) -> str:
 def _load_reference_images(
     slide: Slide,
     seed_image_paths: Optional[List[str]] = None,
+    *,
+    audit_project_id: str | None = None,
+    audit_run_id: str | None = None,
 ) -> List[Dict]:
     """
     加载一页真正需要作为 image input 上传给生图模型的参考图：
@@ -1028,6 +1032,24 @@ def _load_reference_images(
         f"Slide {slide.page_num}: 共加载 {kept_image_refs} 张图片参考"
         f"（种子: {'有' if seed_loaded else '无'}）"
     )
+    if audit_project_id or audit_run_id:
+        append_pipeline_diagnostic_log(
+            audit_project_id,
+            audit_run_id,
+            "reference_inputs_resolved",
+            kind="image-reference",
+            slide_id=getattr(slide, "id", None),
+            page_num=getattr(slide, "page_num", None),
+            overlay_asset_ids=sorted(overlay_asset_ids),
+            loaded_page_reference_count=loaded_count,
+            loaded_image_reference_count=kept_image_refs,
+            skipped_overlay_count=skipped_overlay,
+            skipped_finetune_count=skipped_finetune,
+            skipped_duplicate_count=skipped_duplicate,
+            skipped_missing_count=skipped_missing,
+            max_reference_inputs=MAX_REFERENCE_INPUTS,
+            references=_reference_audit(limited_refs),
+        )
     return limited_refs
 
 
@@ -2116,7 +2138,15 @@ def run_generation_pipeline(
 
         # Stage 1：生成种子页（不带种子参考图，因为它们本身就是种子）
         if seed_pages:
-            ref_data_by_slide = {s.id: _load_reference_images(s, seed_image_paths=None) for s in seed_pages}
+            ref_data_by_slide = {
+                s.id: _load_reference_images(
+                    s,
+                    seed_image_paths=None,
+                    audit_project_id=project_id,
+                    audit_run_id=run_id,
+                )
+                for s in seed_pages
+            }
             def add_seed_result(result: Dict) -> None:
                 slide = result["slide"]
                 seed_key = _slide_seed_key(slide)
@@ -2134,7 +2164,12 @@ def run_generation_pipeline(
                 # finetune 页面不使用种子参考（底图优先）
                 if _is_finetune_slide(s):
                     seed_paths = []
-                ref_data_by_slide[s.id] = _load_reference_images(s, seed_image_paths=seed_paths)
+                ref_data_by_slide[s.id] = _load_reference_images(
+                    s,
+                    seed_image_paths=seed_paths,
+                    audit_project_id=project_id,
+                    audit_run_id=run_id,
+                )
             run_slide_group(non_seed_pages, ref_data_by_slide)
 
     # 组装 PPTX 时，收集所有已完成页面的图片（包括之前任务生成的），
