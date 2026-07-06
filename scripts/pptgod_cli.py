@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 
@@ -24,12 +25,29 @@ sys.path.insert(0, str(BACKEND_DIR))
 from app.services.content_plan_markdown import validate_content_plan_markdown  # noqa: E402
 
 
+class DownloadHttpError(RuntimeError):
+    def __init__(self, status: int, body: str):
+        self.status = int(status)
+        self.body = body
+        super().__init__(f"HTTP {self.status}: {body[:240]}")
+
+
 def _read_markdown(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
 def _print_json(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _decode_json_body(body: str, *, url: str) -> dict:
+    if not body.strip():
+        return {}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        preview = body.strip().replace("\n", " ")[:240]
+        raise RuntimeError(f"接口返回非 JSON 响应，请确认本地后端已重启并加载最新代码：{url}；响应片段：{preview}") from exc
 
 
 def _validation_payload(markdown: str) -> dict:
@@ -140,7 +158,7 @@ def _post_json(url: str, payload: dict, *, tester_id: str | None = None) -> tupl
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read().decode("utf-8")
-            return int(response.status), json.loads(body) if body else {}
+            return int(response.status), _decode_json_body(body, url=url)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8")
         try:
@@ -148,6 +166,40 @@ def _post_json(url: str, payload: dict, *, tester_id: str | None = None) -> tupl
         except json.JSONDecodeError:
             payload = {"detail": body}
         return int(exc.code), payload
+
+
+def _get_json(url: str, *, tester_id: str | None = None) -> tuple[int, dict]:
+    headers = {}
+    if tester_id:
+        headers["x-pptgod-tester-id"] = tester_id
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            return int(response.status), _decode_json_body(body, url=url)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            payload = {"detail": body}
+        return int(exc.code), payload
+
+
+def _download_url_to_file(url: str, output_path: Path, *, tester_id: str | None = None) -> dict:
+    headers = {}
+    if tester_id:
+        headers["x-pptgod-tester-id"] = tester_id
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            data = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise DownloadHttpError(exc.code, body) from exc
+    output_path.write_bytes(data)
+    return {"output_path": str(output_path.resolve()), "bytes": len(data)}
 
 
 def _tester_login(backend_url: str, tester_name: str) -> str:
@@ -158,6 +210,38 @@ def _tester_login(backend_url: str, tester_name: str) -> str:
     if not (200 <= status < 300) or not response.get("tester_id"):
         raise RuntimeError(f"测试账号登录失败：{response}")
     return str(response["tester_id"])
+
+
+def _agent_get(
+    backend_url: str,
+    path: str,
+    *,
+    tester_id: str,
+    params: dict[str, str] | None = None,
+) -> tuple[int, dict]:
+    query = f"?{urllib.parse.urlencode(params or {})}" if params else ""
+    return _get_json(backend_url.rstrip("/") + path + query, tester_id=tester_id)
+
+
+def _agent_post(
+    backend_url: str,
+    path: str,
+    payload: dict,
+    *,
+    tester_id: str,
+) -> tuple[int, dict]:
+    return _post_json(backend_url.rstrip("/") + path, payload, tester_id=tester_id)
+
+
+def _prepare_agent_request(args, *, start_frontend: bool = False) -> tuple[str, str, str]:
+    backend_url = args.backend_url.rstrip("/")
+    frontend_url = args.frontend_url.rstrip("/")
+    if not args.no_start:
+        _start_backend(backend_url)
+        if start_frontend:
+            _start_frontend(frontend_url)
+    tester_id = _tester_login(backend_url, args.tester_name)
+    return backend_url, frontend_url, tester_id
 
 
 def import_content_plan_command(args) -> int:
@@ -195,6 +279,231 @@ def import_content_plan_command(args) -> int:
     return 0
 
 
+def status_command(args) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/status",
+        tester_id=tester_id,
+        params={"frontend_base_url": frontend_url},
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    _print_json(response)
+    return 0
+
+
+def open_project_command(args) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args, start_frontend=not args.print_only)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/status",
+        tester_id=tester_id,
+        params={"frontend_base_url": frontend_url},
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+
+    ui_urls = response.get("ui_urls") if isinstance(response.get("ui_urls"), dict) else {}
+    ui_url = ui_urls.get(args.stage) or response.get("ui_url")
+    if args.stage == "review":
+        ui_url = ui_urls.get("project") or ui_url
+    if not ui_url:
+        _print_json({"ok": False, "error": "项目状态响应缺少 ui_url", "response": response})
+        return 1
+
+    if not args.print_only:
+        webbrowser.open(str(ui_url))
+    response["opened"] = not args.print_only
+    response["selected_stage"] = args.stage
+    response["selected_ui_url"] = ui_url
+    _print_json(response)
+    return 0
+
+
+def export_content_plan_command(args) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/content-plan/export",
+        tester_id=tester_id,
+        params={"frontend_base_url": frontend_url},
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+
+    markdown = str(response.get("markdown") or "")
+    output_path = Path(args.output).expanduser() if args.output else None
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(markdown, encoding="utf-8")
+        response["output_path"] = str(output_path.resolve())
+        if not args.include_markdown:
+            response.pop("markdown", None)
+
+    _print_json(response)
+    return 0
+
+
+def _post_agent_action(args, path: str, payload: dict) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    request_payload = {"frontend_base_url": frontend_url, **payload}
+    status, response = _agent_post(backend_url, path, request_payload, tester_id=tester_id)
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    _print_json(response)
+    return 0
+
+
+def confirm_content_plan_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    return _post_agent_action(args, f"/agent/projects/{project_path}/content-plan/confirm", {})
+
+
+def start_visual_proposals_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    payload = {"force": bool(args.force)}
+    if args.user_description:
+        payload["user_description"] = args.user_description
+    return _post_agent_action(args, f"/agent/projects/{project_path}/visual-proposals/start", payload)
+
+
+def get_visual_proposals_command(args) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/visual-proposals",
+        tester_id=tester_id,
+        params={"frontend_base_url": frontend_url},
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    _print_json(response)
+    return 0
+
+
+def _read_json_file(path: str) -> dict:
+    return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+
+
+def confirm_visual_proposal_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    payload: dict = {}
+    if args.index is not None:
+        payload["proposal_index"] = int(args.index)
+    if args.style_json:
+        payload["selected_style"] = _read_json_file(args.style_json)
+    return _post_agent_action(args, f"/agent/projects/{project_path}/visual-proposals/confirm", payload)
+
+
+def _parse_page_nums(value: str | None) -> list[int] | None:
+    if not value:
+        return None
+    nums: list[int] = []
+    for part in value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        nums.append(int(item))
+    return nums or None
+
+
+def generate_visual_prompts_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    payload: dict = {}
+    page_nums = _parse_page_nums(args.page_nums)
+    if page_nums:
+        payload["page_nums"] = page_nums
+    if args.stage_context:
+        payload["stage_context"] = args.stage_context
+    return _post_agent_action(args, f"/agent/projects/{project_path}/visual-prompts/start", payload)
+
+
+def generate_slides_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    payload: dict = {"prototype": bool(args.prototype)}
+    page_nums = _parse_page_nums(args.page_nums)
+    if page_nums:
+        payload["page_nums"] = page_nums
+    return _post_agent_action(args, f"/agent/projects/{project_path}/slides/generate", payload)
+
+
+def get_generation_status_command(args) -> int:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/generation-status",
+        tester_id=tester_id,
+        params={"frontend_base_url": frontend_url},
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    _print_json(response)
+    return 0
+
+
+def retry_failed_slides_command(args) -> int:
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    return _post_agent_action(args, f"/agent/projects/{project_path}/slides/retry-failed", {})
+
+
+def _export_ppt_contract(args) -> tuple[int, dict, str]:
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _agent_get(
+        backend_url,
+        f"/agent/projects/{project_path}/pptx/export",
+        tester_id=tester_id,
+        params={
+            "frontend_base_url": frontend_url,
+            "api_base_url": backend_url,
+            "prototype": "true" if args.prototype else "false",
+        },
+    )
+    return status, response, tester_id
+
+
+def export_ppt_command(args) -> int:
+    status, response, _tester_id = _export_ppt_contract(args)
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    _print_json(response)
+    return 0
+
+
+def download_ppt_command(args) -> int:
+    status, response, tester_id = _export_ppt_contract(args)
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    download_url = str(response.get("download_url") or "")
+    if not download_url:
+        _print_json({"ok": False, "error": "导出响应缺少 download_url", "response": response})
+        return 1
+    filename = str(response.get("filename") or ("prototype.pptx" if args.prototype else "presentation.pptx"))
+    output_path = Path(args.output or filename).expanduser()
+    try:
+        download_info = _download_url_to_file(download_url, output_path, tester_id=tester_id)
+    except DownloadHttpError as exc:
+        _print_json({"ok": False, "status": exc.status, "response": {"detail": exc.body}, "download_url": download_url})
+        return 1
+    response.update(download_info)
+    _print_json(response)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PPT God local Agent CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -212,6 +521,125 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
     import_parser.add_argument("--frontend-url", default="http://localhost:5173")
     import_parser.set_defaults(func=import_content_plan_command)
+
+    status_parser = subparsers.add_parser("status", help="Read a PPT God project status for Agent handoff")
+    status_parser.add_argument("project_id", help="PPT God project id")
+    status_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    status_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    status_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    status_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    status_parser.set_defaults(func=status_command)
+
+    open_parser = subparsers.add_parser("open", help="Open a PPT God project UI after verifying project access")
+    open_parser.add_argument("project_id", help="PPT God project id")
+    open_parser.add_argument("--stage", choices=["project", "content", "visual", "review"], default="project")
+    open_parser.add_argument("--print-only", action="store_true", help="Print the resolved URL without opening a browser")
+    open_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    open_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend/frontend services")
+    open_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    open_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    open_parser.set_defaults(func=open_project_command)
+
+    export_parser = subparsers.add_parser("export-content-plan", help="Export a project content plan as strict Agent Markdown")
+    export_parser.add_argument("project_id", help="PPT God project id")
+    export_parser.add_argument("--output", default=None, help="Optional path to write the exported Markdown")
+    export_parser.add_argument("--include-markdown", action="store_true", help="Keep markdown in JSON output even when --output is set")
+    export_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    export_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    export_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    export_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    export_parser.set_defaults(func=export_content_plan_command)
+
+    confirm_content_parser = subparsers.add_parser("confirm-content-plan", help="Confirm imported/generated content plan and move to visual stage")
+    confirm_content_parser.add_argument("project_id", help="PPT God project id")
+    confirm_content_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    confirm_content_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    confirm_content_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    confirm_content_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    confirm_content_parser.set_defaults(func=confirm_content_plan_command)
+
+    start_visual_parser = subparsers.add_parser("start-visual-proposals", help="Start or reuse PPT God visual proposal generation")
+    start_visual_parser.add_argument("project_id", help="PPT God project id")
+    start_visual_parser.add_argument("--force", action="store_true", help="Regenerate proposals even when cached proposals exist")
+    start_visual_parser.add_argument("--user-description", default="", help="Optional visual direction requirements")
+    start_visual_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    start_visual_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    start_visual_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    start_visual_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    start_visual_parser.set_defaults(func=start_visual_proposals_command)
+
+    get_visual_parser = subparsers.add_parser("get-visual-proposals", help="Read cached or running visual proposals")
+    get_visual_parser.add_argument("project_id", help="PPT God project id")
+    get_visual_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    get_visual_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    get_visual_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    get_visual_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    get_visual_parser.set_defaults(func=get_visual_proposals_command)
+
+    confirm_visual_parser = subparsers.add_parser("confirm-visual-proposal", help="Confirm one visual proposal by index or a supplied style JSON")
+    confirm_visual_parser.add_argument("project_id", help="PPT God project id")
+    confirm_visual_parser.add_argument("--index", type=int, default=None, help="One-based proposal index to confirm")
+    confirm_visual_parser.add_argument("--style-json", default=None, help="Path to a selected_style JSON object")
+    confirm_visual_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    confirm_visual_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    confirm_visual_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    confirm_visual_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    confirm_visual_parser.set_defaults(func=confirm_visual_proposal_command)
+
+    visual_prompts_parser = subparsers.add_parser("generate-visual-prompts", help="Start visual-plan and image-prompt generation")
+    visual_prompts_parser.add_argument("project_id", help="PPT God project id")
+    visual_prompts_parser.add_argument("--page-nums", default=None, help="Optional comma-separated page numbers, such as 1,3,5")
+    visual_prompts_parser.add_argument("--stage-context", default="", help="Optional generation requirements for this run")
+    visual_prompts_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    visual_prompts_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    visual_prompts_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    visual_prompts_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    visual_prompts_parser.set_defaults(func=generate_visual_prompts_command)
+
+    generate_slides_parser = subparsers.add_parser("generate-slides", help="Start PPT slide image generation")
+    generate_slides_parser.add_argument("project_id", help="PPT God project id")
+    generate_slides_parser.add_argument("--page-nums", default=None, help="Optional comma-separated page numbers, such as 1,3,5")
+    generate_slides_parser.add_argument("--prototype", action="store_true", help="Generate a prototype subset instead of a full batch")
+    generate_slides_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    generate_slides_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    generate_slides_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    generate_slides_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    generate_slides_parser.set_defaults(func=generate_slides_command)
+
+    generation_status_parser = subparsers.add_parser("get-generation-status", help="Read generation workflow status")
+    generation_status_parser.add_argument("project_id", help="PPT God project id")
+    generation_status_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    generation_status_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    generation_status_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    generation_status_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    generation_status_parser.set_defaults(func=get_generation_status_command)
+
+    retry_failed_parser = subparsers.add_parser("retry-failed-slides", help="Retry failed slide image generations")
+    retry_failed_parser.add_argument("project_id", help="PPT God project id")
+    retry_failed_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    retry_failed_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    retry_failed_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    retry_failed_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    retry_failed_parser.set_defaults(func=retry_failed_slides_command)
+
+    export_ppt_parser = subparsers.add_parser("export-ppt", help="Return the PPTX download contract for a project")
+    export_ppt_parser.add_argument("project_id", help="PPT God project id")
+    export_ppt_parser.add_argument("--prototype", action="store_true", help="Export prototype PPTX")
+    export_ppt_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    export_ppt_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    export_ppt_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    export_ppt_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    export_ppt_parser.set_defaults(func=export_ppt_command)
+
+    download_ppt_parser = subparsers.add_parser("download-ppt", help="Download a generated PPTX file")
+    download_ppt_parser.add_argument("project_id", help="PPT God project id")
+    download_ppt_parser.add_argument("--output", default=None, help="Output .pptx path. Defaults to the project filename.")
+    download_ppt_parser.add_argument("--prototype", action="store_true", help="Download prototype PPTX")
+    download_ppt_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
+    download_ppt_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    download_ppt_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    download_ppt_parser.add_argument("--frontend-url", default="http://localhost:5173")
+    download_ppt_parser.set_defaults(func=download_ppt_command)
     return parser
 
 

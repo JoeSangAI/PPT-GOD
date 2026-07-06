@@ -9534,7 +9534,7 @@ function App() {
                                 { key: "data", label: "数据" },
                                 { key: "section", label: "章节" },
                                 { key: "hero", label: "金句" },
-                                { key: "agenda", label: "目录" },
+                                { key: "toc", label: "目录" },
                               ].map((opt) => (
                                 <button
                                   key={opt.key}

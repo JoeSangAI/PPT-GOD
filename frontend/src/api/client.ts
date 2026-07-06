@@ -44,7 +44,7 @@ export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
   minimaxLlmModel: "MiniMax-M3",
   deerApiKey: "",
   deerApiBase: "https://api.deerapi.com/v1",
-  deerImageModel: "gpt-image-2-all",
+  deerImageModel: "gpt-image-2",
 };
 
 function clearLegacyStoredAuth() {
@@ -94,7 +94,7 @@ export function getProviderSettings(): ProviderSettings {
     if (next.deerApiBase.includes("api.deepapi.com")) {
       next.deerApiBase = DEFAULT_PROVIDER_SETTINGS.deerApiBase;
     }
-    if (next.deerImageModel === "GPT-Image-V4") {
+    if (next.deerImageModel === "GPT-Image-V4" || next.deerImageModel === "gpt-image-2-all") {
       next.deerImageModel = DEFAULT_PROVIDER_SETTINGS.deerImageModel;
     }
     if (next.minimaxLlmModel === "MiniMax-M2.7") {

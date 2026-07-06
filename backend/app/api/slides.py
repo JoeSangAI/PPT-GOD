@@ -42,6 +42,29 @@ _running_tasks: dict = {}
 _running_tasks_lock = asyncio.Lock()
 
 
+def _consume_background_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        logger.warning("Background task finished with unhandled error: %s", exc)
+
+
+async def _replace_running_project_task(project_id: str, task_coro) -> asyncio.Task:
+    old_task = None
+    async with _running_tasks_lock:
+        existing_task = _running_tasks.get(project_id)
+        if existing_task and not existing_task.done():
+            existing_task.cancel()
+            old_task = existing_task
+        task = asyncio.create_task(task_coro)
+        _running_tasks[project_id] = task
+    if old_task is not None:
+        old_task.add_done_callback(_consume_background_task_result)
+    return task
+
+
 def _resolve_file_path(file_path: str) -> str:
     """安全解析文件路径，兼容从不同工作目录启动的情况。"""
     if not file_path:
@@ -59,6 +82,10 @@ def _resolve_file_path(file_path: str) -> str:
 
 
 from app.core.config import settings
+from app.services.content_plan_diagnostics import (
+    build_content_outline_quality_diagnostic,
+    build_content_source_diagnostic,
+)
 from app.services.content_plan import (
     PAGE_MAP_DOCUMENT_LIMIT,
     generate_content_plan,
@@ -68,6 +95,7 @@ from app.services.content_plan import (
     resolve_content_plan_page_target,
     resolve_requested_content_plan_page_count,
     _auto_reclassify_page_type,
+    _canonical_content_plan_type,
 )
 from app.services.source_context import (
     DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET,
@@ -92,6 +120,7 @@ from app.services.logo_policy import (
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.overlay_layers import (
+    build_overlay_asset_context_map,
     exact_overlay_asset_ids,
     merge_overlay_layers_into_visual_json,
     normalize_overlay_layers,
@@ -126,7 +155,17 @@ from app.services.visual_block_renderer import (
 )
 from app.services.visual_directives import extract_visual_directives
 from app.services.image_analyzer import analyze_reference_image, analyze_visual_asset, describe_context_image
-from app.services.artifact_versions import artifact_meta, dependency_signature, has_stale_flags, with_artifact_meta, with_stale_flags
+from app.services.artifact_versions import (
+    artifact_meta,
+    artifact_stale,
+    content_signature,
+    dependency_signature,
+    digest,
+    has_stale_flags,
+    strip_artifact_meta,
+    with_artifact_meta,
+    with_stale_flags,
+)
 from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
 from app.services.run_state import (
@@ -151,6 +190,7 @@ from app.services.run_state import (
     generation_progress,
 )
 from app.services.project_quality_report import build_project_quality_report
+from app.services.pipeline_diagnostics import append_pipeline_diagnostic_log
 from app.celery_app import celery_app
 from celery.result import AsyncResult
 
@@ -352,6 +392,30 @@ def _derive_project_title(topic: str, outline: list[dict]) -> str | None:
         if len(title) >= 2 and title not in UNTITLED_PROJECT_TITLES:
             return title
     return None
+
+
+def _autoname_project_from_outline(project: Project | None, outline: list[dict], topic: str | None = None) -> bool:
+    if not _should_autoname_project(project):
+        return False
+    derived_title = _derive_project_title(topic or (project.title if project else ""), outline)
+    if not derived_title:
+        return False
+    project.title = derived_title
+    return True
+
+
+def _autoname_project_from_slides(project: Project | None, slides: list[Slide], topic: str | None = None) -> bool:
+    if not _should_autoname_project(project):
+        return False
+    outline: list[dict] = []
+    for slide in sorted(slides or [], key=lambda item: int(item.page_num or 0)):
+        if not isinstance(slide.content_json, dict):
+            continue
+        item = copy.deepcopy(slide.content_json)
+        item.setdefault("page_num", slide.page_num)
+        item.setdefault("type", slide.type or item.get("type", "content"))
+        outline.append(item)
+    return _autoname_project_from_outline(project, outline, topic=topic)
 
 
 def _style_text_from_selected_style(selected_style: dict | str | None) -> str | None:
@@ -913,7 +977,13 @@ def _sync_exact_page_reference_overlay_layers(slide: Slide, refs: list[Reference
     page_refs = sorted(refs or list(slide.reference_images or []), key=_reference_image_sort_key)
     exact_refs = [ref for ref in page_refs if _page_reference_exact_overlay_ref(ref)]
     visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
-    existing_layers = normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+    asset_context_by_id = build_overlay_asset_context_map(page_refs)
+    existing_layers = normalize_overlay_layers(
+        visual.get("overlay_layers"),
+        valid_asset_ids=None,
+        strict_assets=False,
+        asset_context_by_id=asset_context_by_id,
+    )
     by_asset_id = {str(layer.get("asset_id")): layer for layer in existing_layers if layer.get("asset_id")}
     used_presets = {str(layer.get("preset")) for layer in existing_layers if layer.get("preset")}
     changed = False
@@ -936,7 +1006,12 @@ def _sync_exact_page_reference_overlay_layers(slide: Slide, refs: list[Reference
         })
         changed = True
 
-    normalized = normalize_overlay_layers(existing_layers, valid_asset_ids=None, strict_assets=False)
+    normalized = normalize_overlay_layers(
+        existing_layers,
+        valid_asset_ids=None,
+        strict_assets=False,
+        asset_context_by_id=asset_context_by_id,
+    )
     if changed or ("overlay_layers" in visual and visual.get("overlay_layers") != normalized):
         visual["overlay_layers"] = normalized
         slide.visual_json = visual
@@ -1172,10 +1247,12 @@ def _with_prompt_asset_policies(page_intent: dict | None, project: Project, slid
         return intent
     valid_overlay_ids = _valid_overlay_asset_ids_for_slide(project, slide)
     if isinstance(intent.get("overlay_layers"), list):
+        overlay_context_assets = list(getattr(project, "reference_images", []) or []) + list(getattr(slide, "reference_images", []) or [])
         intent["overlay_layers"] = normalize_overlay_layers(
             intent.get("overlay_layers"),
             valid_asset_ids=valid_overlay_ids,
             strict_assets=True,
+            asset_context_by_id=build_overlay_asset_context_map(overlay_context_assets),
         )
     intent["available_overlay_asset_ids"] = sorted(valid_overlay_ids)
     return intent
@@ -1630,16 +1707,134 @@ def _slide_generation_guidance_matches_current_content(slide: Slide) -> bool:
     )
 
 
+def _prompt_dependencies_for_slide(
+    project: Project,
+    slides: list[Slide],
+    slide: Slide,
+    base_deps: dict[str, str] | None = None,
+) -> dict[str, str]:
+    deps = dict(base_deps or dependency_signature(project, slides))
+    deps["content"] = content_signature([slide])
+    deps["content_scope"] = "slide"
+    return deps
+
+
+def _slide_prompt_content_dependency_matches_current_content(
+    slide: Slide,
+    prompt_deps: dict[str, str],
+    current_deps: dict[str, str],
+) -> bool:
+    prompt_content = prompt_deps.get("content")
+    if not prompt_content:
+        return True
+    current_slide_content = content_signature([slide])
+    if prompt_content in {current_slide_content, current_deps.get("content")}:
+        return True
+    # Legacy prompt metadata used a deck-level content signature. If another page
+    # changed after this prompt was written, the old deck hash cannot be compared
+    # to this page directly; fall back to the actual prompt/content contract.
+    return (
+        _slide_generation_guidance_matches_current_content(slide)
+        and _slide_prompt_text_matches_current_generation_context(slide)
+    )
+
+
 def _slide_prompt_dependencies_match_generation_sources(slide: Slide, current_deps: dict[str, str]) -> bool:
     visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
     meta = artifact_meta(visual)
     prompt_deps = meta.get("prompt_dependencies") if isinstance(meta.get("prompt_dependencies"), dict) else None
     if not prompt_deps:
         return True
-    for key in ("content", "selected_style", "style_assets", "visual_assets"):
+    if not _slide_prompt_content_dependency_matches_current_content(slide, prompt_deps, current_deps):
+        return False
+    for key in ("selected_style", "style_assets", "visual_assets"):
         if prompt_deps.get(key) != current_deps.get(key):
             return False
     return True
+
+
+_PROMPT_VISUAL_SIGNATURE_KEYS = (
+    "page_num",
+    "type",
+    "layout",
+    "visual_summary",
+    "visual_evidence",
+    "visual_description",
+    "design_notes",
+    "visual_asset_ids",
+    "visual_asset_usage",
+    "asset_route_modes",
+    "overlay_layers",
+    "logo_policy",
+    "image_slots",
+)
+
+
+def _prompt_visual_plan_signature(visual_json: dict | None) -> str:
+    visual = strip_artifact_meta(visual_json if isinstance(visual_json, dict) else {})
+    payload = {
+        key: visual.get(key)
+        for key in _PROMPT_VISUAL_SIGNATURE_KEYS
+        if key in visual
+    }
+    if isinstance(payload.get("overlay_layers"), list):
+        payload["overlay_layers"] = normalize_overlay_layers(
+            payload.get("overlay_layers"),
+            valid_asset_ids=None,
+            strict_assets=False,
+        )
+    return digest(payload)
+
+
+def _prompt_writeback_visual_kind(visual_json: dict | None) -> str:
+    kind = str(artifact_meta(visual_json).get("kind") or "")
+    if kind == "manual_visual_edit":
+        return kind
+    return "visual_plan"
+
+
+def _legacy_exact_overlay_prompt_looks_current(slide: Slide) -> bool:
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    layers = normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+    if not layers:
+        return False
+    if not all(str(layer.get("mode") or "").startswith("exact_") for layer in layers):
+        return False
+    prompt = str(slide.prompt_text or "")
+    if "Exact Overlay Reservation" in prompt or "CRITICAL LAYOUT INSTRUCTION" in prompt:
+        return True
+    has_page_reference = "Page reference:" in prompt or "页面素材" in prompt or "本页素材" in prompt
+    has_reserved_slot = any(term in prompt for term in ("卡位", "预留", "留出", "reserved", "reserve", "slot"))
+    return has_page_reference and has_reserved_slot
+
+
+def _slide_prompt_visual_plan_matches_current(slide: Slide) -> bool:
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    meta = artifact_meta(visual)
+    prompt_visual_signature = meta.get("prompt_visual_signature")
+    if isinstance(prompt_visual_signature, str) and prompt_visual_signature:
+        return prompt_visual_signature == _prompt_visual_plan_signature(visual)
+    return _legacy_exact_overlay_prompt_looks_current(slide)
+
+
+def _repair_recoverable_generation_stale_flags(project: Project, slides: list[Slide], target_slides: list[Slide]) -> None:
+    current_deps = dependency_signature(project, slides)
+    for slide in target_slides:
+        stale = artifact_stale(slide.visual_json)
+        if not stale.get("visual") or stale.get("content"):
+            continue
+        if not slide.prompt_text or not str(slide.prompt_text).strip():
+            continue
+        if not _slide_generation_guidance_matches_current_content(slide):
+            continue
+        if not _slide_prompt_dependencies_match_generation_sources(slide, current_deps):
+            continue
+        if not _slide_prompt_text_matches_current_generation_context(slide):
+            continue
+        if not _slide_prompt_visual_plan_matches_current(slide):
+            continue
+        slide.visual_json = with_stale_flags(slide.visual_json, visual=False)
+        flag_modified(slide, "visual_json")
 
 
 def _slide_prompt_text_matches_current_generation_context(slide: Slide) -> bool:
@@ -1647,6 +1842,8 @@ def _slide_prompt_text_matches_current_generation_context(slide: Slide) -> bool:
 
 
 def _raise_if_generation_inputs_not_current(project: Project, slides: list[Slide], target_slides: list[Slide]) -> None:
+    _repair_recoverable_generation_stale_flags(project, slides, target_slides)
+
     stale_plan_pages = [
         s.page_num
         for s in target_slides
@@ -1691,6 +1888,20 @@ def _raise_if_generation_inputs_not_current(project: Project, slides: list[Slide
             status_code=400,
             detail=f"第 {', '.join(map(str, prompt_stale_pages))} 页的生图 Prompt 不是基于最新内容，请先更新画面方案。"
         )
+
+
+def _refresh_prompts_for_synced_exact_overlays(
+    project: Project,
+    target_slides: list[Slide],
+    synced_page_nums: list[int],
+    db: Session,
+) -> None:
+    if not synced_page_nums:
+        return
+    synced = {int(page_num) for page_num in synced_page_nums}
+    for slide in target_slides:
+        if int(slide.page_num or 0) in synced:
+            _regenerate_slide_prompt(slide, project, db)
 
 
 def _invalidate_content_dependent_outputs(project: Project):
@@ -2007,7 +2218,14 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
     }
 
     visual = copy.deepcopy(slide.visual_json) if isinstance(slide.visual_json, dict) else {}
-    overlay_layers = normalize_overlay_layers(visual.get("overlay_layers"), valid_asset_ids=None, strict_assets=False)
+    overlay_asset_context_by_id = build_overlay_asset_context_map(existing_refs)
+    overlay_layers = normalize_overlay_layers(
+        visual.get("overlay_layers"),
+        valid_asset_ids=None,
+        strict_assets=False,
+        asset_context_by_id=overlay_asset_context_by_id,
+    )
+    synced_refs = list(existing_refs)
 
     for ref in existing_refs:
         block_id = str((ref.asset_analysis or {}).get("content_block_id") or "")
@@ -2037,6 +2255,7 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
             )
             db.add(ref)
             db.flush()
+            synced_refs.append(ref)
         else:
             ref.file_path = file_path
             ref.process_mode = route_mode
@@ -2046,6 +2265,8 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
                 **(ref.asset_analysis if isinstance(ref.asset_analysis, dict) else {}),
                 **payload,
             }
+            if ref not in synced_refs:
+                synced_refs.append(ref)
         block["rendered_asset_id"] = ref.id
 
         overlay_layers = [layer for layer in overlay_layers if str(layer.get("asset_id")) != str(ref.id)]
@@ -2054,13 +2275,19 @@ def _sync_content_block_assets(db: Session, project: Project, slide: Slide, cont
                 "id": f"ov_{ref.id}",
                 "asset_id": ref.id,
                 "enabled": True,
-                "preset": "center-card",
                 "fit": "contain",
                 "mode": "exact_card",
+                "preset": "center-card",
                 "usage_note": f"{ref.asset_name or '画面素材'}：原样保留",
             })
 
-    visual["overlay_layers"] = normalize_overlay_layers(overlay_layers, valid_asset_ids=None, strict_assets=False)
+    overlay_asset_context_by_id = build_overlay_asset_context_map(synced_refs)
+    visual["overlay_layers"] = normalize_overlay_layers(
+        overlay_layers,
+        valid_asset_ids=None,
+        strict_assets=False,
+        asset_context_by_id=overlay_asset_context_by_id,
+    )
     slide.visual_json = visual
     content["content_blocks"] = blocks
     return content
@@ -2725,9 +2952,11 @@ class OverlayLayerRequest(BaseModel):
     id: Optional[str] = None
     asset_id: str
     enabled: bool = True
-    preset: str = "right-card"
+    preset: Optional[str] = None
     fit: str = "contain"
     mode: str = "exact_card"
+    layout_role: Optional[str] = None
+    layout_group: Optional[str] = None
     usage_note: Optional[str] = None
     z_index: Optional[int] = None
 
@@ -2807,6 +3036,7 @@ def _generate_content_plan_bg(
     logger = logging.getLogger(__name__)
     from app.models.base import SessionLocal
     db = SessionLocal()
+    source_context = None
     try:
         logger.info(f"[ContentPlan BG] Starting for project={project_id}, topic={topic[:30]}...")
         mark_run_running(db, run_id, stage="document_parse", message="正在读取上传材料...")
@@ -2935,11 +3165,25 @@ def _generate_content_plan_bg(
                 db.commit()
                 logger.info(f"[ContentPlan BG] Inferred page_count={page_count} from single uploaded PPT")
 
-        target_page_count, _, _ = resolve_content_plan_page_target(
+        target_page_count, min_pages, _ = resolve_content_plan_page_target(
             intent_topic,
             page_count,
             documents,
             intent_contract=intent_contract,
+        )
+        append_pipeline_diagnostic_log(
+            project_id,
+            run_id,
+            "content_plan_source_context",
+            kind="content-plan",
+            **build_content_source_diagnostic(
+                topic=intent_topic,
+                documents=documents,
+                source_context=source_context,
+                source_draft_markdown="",
+                target_page_count=target_page_count,
+                requested_page_count=page_count,
+            ),
         )
         update_run_progress(db, run_id, total_count=target_page_count)
         db.commit()
@@ -2949,6 +3193,17 @@ def _generate_content_plan_bg(
         _update_progress(project_id, {"stage": "content_plan", "message": "开始生成 Content Plan...", "current_page": 0, "total_pages": target_page_count}, run_id)
 
         def report_progress(data: dict):
+            if isinstance(data, dict) and data.get("diagnostic_event"):
+                diagnostic_event = str(data.get("diagnostic_event") or "content_plan_diagnostic")
+                payload = {k: v for k, v in data.items() if k != "diagnostic_event"}
+                append_pipeline_diagnostic_log(
+                    project_id,
+                    run_id,
+                    diagnostic_event,
+                    kind="content-plan",
+                    **payload,
+                )
+                return
             _update_progress(project_id, data, run_id)
 
         outline = generate_content_plan(
@@ -2962,6 +3217,17 @@ def _generate_content_plan_bg(
         if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "model_return"):
             return
         logger.info(f"[ContentPlan BG] Generated {len(outline)} pages")
+        append_pipeline_diagnostic_log(
+            project_id,
+            run_id,
+            "content_plan_outline_quality",
+            kind="content-plan",
+            **build_content_outline_quality_diagnostic(
+                outline,
+                target_page_count=target_page_count,
+                min_pages=min_pages,
+            ),
+        )
         update_run_progress(
             db,
             run_id,
@@ -3020,10 +3286,7 @@ def _generate_content_plan_bg(
             project.content_plan_confirmed = False
             project.style_proposal = None
             project.selected_style = None
-            if _should_autoname_project(project):
-                derived_title = _derive_project_title(topic, outline)
-                if derived_title:
-                    project.title = derived_title
+            _autoname_project_from_outline(project, outline, topic=topic)
         if not _content_plan_run_is_active_for_writeback(db, run_id, logger, project_id, "before_final_commit"):
             db.rollback()
             return
@@ -3120,7 +3383,9 @@ def list_slides(project_id: str, db: Session = Depends(get_db)):
         .order_by(Slide.page_num)
         .all()
     )
-    if _repair_project_logo_policies(project, slides):
+    changed = _repair_project_logo_policies(project, slides)
+    changed = _autoname_project_from_slides(project, slides) or changed
+    if changed:
         db.commit()
     # 手动加载所有参考图，避免 joinedload 在 SQLAlchemy 2.0 下的兼容问题
     slide_ids = [s.id for s in slides]
@@ -3403,9 +3668,10 @@ def create_prompts(
             visual_intent = visual_intent_by_page.get(slide.page_num, slide.visual_json)
             slide.visual_json = with_artifact_meta(
                 visual_intent,
-                kind="visual_plan",
+                kind=_prompt_writeback_visual_kind(visual_intent),
                 dependencies=artifact_deps,
-                prompt_dependencies=artifact_deps,
+                prompt_dependencies=_prompt_dependencies_for_slide(project, slides, slide, artifact_deps),
+                prompt_visual_signature=_prompt_visual_plan_signature(visual_intent),
             )
             slide.image_path = None
             slide.error_msg = None
@@ -3478,21 +3744,14 @@ async def create_visual_and_prompts(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
-    # 启动后台任务，独立于 HTTP 连接运行
-    async with _running_tasks_lock:
-        existing_task = _running_tasks.get(project_id)
-        if existing_task and not existing_task.done():
-            existing_task.cancel()
-            try:
-                await existing_task
-            except asyncio.CancelledError:
-                pass
-
-        task_credentials = get_raw_provider_credentials()
-        task = asyncio.create_task(
-            _do_generate_visual_and_prompts(project_id, target_page_nums, run.id, task_credentials, (body.stage_context or "").strip()[:4000])
-        )
-        _running_tasks[project_id] = task
+    # 启动后台任务，独立于 HTTP 连接运行。
+    # 旧任务取消后的清理也会获取 _running_tasks_lock；这里不能在锁内 await 旧任务，
+    # 否则旧任务 finally 会等待这把锁，当前请求也会等待旧任务，形成死锁。
+    task_credentials = get_raw_provider_credentials()
+    await _replace_running_project_task(
+        project_id,
+        _do_generate_visual_and_prompts(project_id, target_page_nums, run.id, task_credentials, (body.stage_context or "").strip()[:4000]),
+    )
 
     return {"status": "started", "message": "视觉方案和生图 Prompt 生成已启动，请稍候。", "run": serialize_run(run)}
 
@@ -3723,7 +3982,8 @@ async def _do_generate_visual_and_prompts(
                     slide.visual_json,
                     kind="visual_plan",
                     dependencies=artifact_deps,
-                    prompt_dependencies=artifact_deps,
+                    prompt_dependencies=_prompt_dependencies_for_slide(project, slides, slide, artifact_deps),
+                    prompt_visual_signature=_prompt_visual_plan_signature(slide.visual_json),
                 )
                 slide.image_path = None
                 slide.error_msg = None
@@ -3893,11 +4153,7 @@ def start_generation(
     target_slides = [s for s in slides if s.page_num in page_nums] if page_nums else slides
     synced_exact_pages = _sync_exact_page_reference_overlays_for_generation(db, target_slides)
     if synced_exact_pages:
-        db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
-        )
+        _refresh_prompts_for_synced_exact_overlays(project, target_slides, synced_exact_pages, db)
     _raise_if_generation_inputs_not_current(project, slides, target_slides)
     missing_prompt_pages = [
         s.page_num
@@ -4037,7 +4293,8 @@ def confirm_prototype(
                 refreshed_slide.visual_json,
                 kind="visual_plan",
                 dependencies=refreshed_deps,
-                prompt_dependencies=refreshed_deps,
+                prompt_dependencies=_prompt_dependencies_for_slide(project, refreshed_slides, refreshed_slide, refreshed_deps),
+                prompt_visual_signature=_prompt_visual_plan_signature(refreshed_slide.visual_json),
             )
             flag_modified(refreshed_slide, "visual_json")
         slides = refreshed_slides
@@ -4092,6 +4349,11 @@ def stop_generation(
     active_run = get_active_run(db, project_id)
     if not active_run:
         return {"message": "No generation in progress", "status": project.status}
+
+    task = _running_tasks.get(project_id)
+    if task and not task.done():
+        task.cancel()
+        task.add_done_callback(_consume_background_task_result)
 
     # 重置所有 generating 状态的 slide
     slides = (
@@ -5110,7 +5372,12 @@ def update_slide_overlay_layers(
         )
         raise HTTPException(status_code=400, detail=f"Invalid overlay asset ids: {', '.join(missing[:5])}")
 
-    normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
+    normalized_layers = normalize_overlay_layers(
+        raw_layers,
+        valid_asset_ids=valid_ids,
+        strict_assets=True,
+        asset_context_by_id=build_overlay_asset_context_map(valid_assets),
+    )
     overlay_asset_ids = {str(layer.get("asset_id")) for layer in normalized_layers if layer.get("asset_id")}
     for asset in valid_assets:
         if str(asset.id) in overlay_asset_ids:
@@ -5160,11 +5427,7 @@ def retry_failed_slides(
 
     synced_exact_pages = _sync_exact_page_reference_overlays_for_generation(db, failed_slides)
     if synced_exact_pages:
-        db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail=f"第 {', '.join(map(str, synced_exact_pages))} 页有原样保留素材，请先重新生成画面描述以预留位置。"
-        )
+        _refresh_prompts_for_synced_exact_overlays(project, failed_slides, synced_exact_pages, db)
 
     project_slides = (
         db.query(Slide)
@@ -5290,9 +5553,10 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
     artifact_deps = dependency_signature(project, project_slides)
     slide.visual_json = with_artifact_meta(
         slide.visual_json,
-        kind="visual_plan",
+        kind=_prompt_writeback_visual_kind(slide.visual_json),
         dependencies=artifact_deps,
-        prompt_dependencies=artifact_deps,
+        prompt_dependencies=_prompt_dependencies_for_slide(project, project_slides, slide, artifact_deps),
+        prompt_visual_signature=_prompt_visual_plan_signature(slide.visual_json),
     )
     slide.image_path = None
     slide.error_msg = None
@@ -5736,6 +6000,13 @@ def update_slide_content(
     directive_extraction = extract_visual_directives(str(text_content.get("body") or ""))
     slide.content_json = existing
     _mark_slide_artifacts_stale(slide, content=True)
+    project_slides = (
+        db.query(Slide)
+        .filter(Slide.project_id == project_id)
+        .order_by(Slide.page_num)
+        .all()
+    )
+    _autoname_project_from_slides(project, project_slides)
     db.commit()
 
     # 自动重分类：若未锁定，根据内容特征判断是否需要切换类型
@@ -5837,7 +6108,12 @@ def update_slide_visual(
             )
             raise HTTPException(status_code=400, detail=f"Invalid overlay asset ids: {', '.join(missing[:5])}")
 
-        normalized_layers = normalize_overlay_layers(raw_layers, valid_asset_ids=valid_ids, strict_assets=True)
+        normalized_layers = normalize_overlay_layers(
+            raw_layers,
+            valid_asset_ids=valid_ids,
+            strict_assets=True,
+            asset_context_by_id=build_overlay_asset_context_map(valid_assets),
+        )
         overlay_asset_ids = {str(layer.get("asset_id")) for layer in normalized_layers if layer.get("asset_id")}
         for asset in valid_assets:
             if str(asset.id) in overlay_asset_ids:
@@ -5888,7 +6164,10 @@ def update_slide_type(
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
 
-    slide.type = body.type
+    normalized_type = _canonical_content_plan_type(body.type)
+    slide.type = normalized_type
+    content_json = {**slide.content_json, "type": normalized_type} if isinstance(slide.content_json, dict) else {"type": normalized_type}
+    slide.content_json = content_json
     slide.type_locked = True
     _mark_slide_artifacts_stale(slide, content=True)
     db.commit()
@@ -5998,6 +6277,7 @@ def create_slide(
     db.flush()
     new_slide.content_json = _sync_content_block_assets(db, project, new_slide, new_content)
     _invalidate_content_dependent_outputs(project)
+    _autoname_project_from_slides(project, [*slides, new_slide])
     db.commit()
     db.refresh(new_slide)
 

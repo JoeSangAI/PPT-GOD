@@ -54,6 +54,15 @@ class ContentPlanImportReceipt:
     ui_url: str
 
 
+@dataclass
+class ContentPlanExportReceipt:
+    project_id: str
+    title: str
+    slides_count: int
+    filename: str
+    markdown: str
+
+
 class ContentPlanMarkdownError(ValueError):
     def __init__(self, errors: list[str], warnings: list[str] | None = None):
         self.errors = errors
@@ -198,8 +207,72 @@ def _clean_project_title(value: str | None, fallback: str = "未命名项目") -
     return title[:100] or fallback
 
 
-def _ui_url(project_id: str, frontend_base_url: str = "http://localhost:5173") -> str:
-    return f"{frontend_base_url.rstrip('/')}/projects/{project_id}?stage=content"
+def project_ui_url(project_id: str, frontend_base_url: str = "http://localhost:5173", *, stage: str | None = None) -> str:
+    url = f"{frontend_base_url.rstrip('/')}/projects/{project_id}"
+    return f"{url}?stage={stage}" if stage else url
+
+
+def _content_review_ui_url(project_id: str, frontend_base_url: str = "http://localhost:5173") -> str:
+    return project_ui_url(project_id, frontend_base_url, stage="content")
+
+
+def _markdown_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(str(item.get("content") or "").strip())
+            else:
+                parts.append(str(item).strip())
+        return "\n\n".join(part for part in parts if part)
+    return str(value).strip()
+
+
+def _markdown_section(label: str, value: Any) -> str:
+    return f"### {label}\n\n{_markdown_value(value)}\n"
+
+
+def safe_content_plan_filename(title: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "-", str(title or "").strip()).strip(" .")
+    return (name[:80] or "内容规划") + ".md"
+
+
+def build_strict_content_plan_markdown(project: Project, slides: list[Slide]) -> str:
+    lines: list[str] = [f"# {_markdown_value(project.title) or '未命名项目'}", ""]
+    for slide in sorted(slides, key=lambda item: int(item.page_num or 0)):
+        content = slide.content_json if isinstance(slide.content_json, dict) else {}
+        text_content = content.get("text_content") if isinstance(content.get("text_content"), dict) else {}
+        page_num = int(slide.page_num or content.get("page_num") or 0)
+        page_type = str(content.get("type") or slide.type or "content").strip() or "content"
+
+        lines.extend(
+            [
+                f"## P{page_num}",
+                _markdown_section("类型", page_type),
+                _markdown_section("标题", text_content.get("headline")),
+                _markdown_section("副标题", text_content.get("subhead")),
+                _markdown_section("正文", text_content.get("body")),
+                _markdown_section("备注", content.get("speaker_notes")),
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def export_content_plan_markdown(project: Project, slides: list[Slide]) -> ContentPlanExportReceipt:
+    ordered_slides = sorted(slides, key=lambda item: int(item.page_num or 0))
+    markdown = build_strict_content_plan_markdown(project, ordered_slides)
+    return ContentPlanExportReceipt(
+        project_id=project.id,
+        title=project.title,
+        slides_count=len(ordered_slides),
+        filename=safe_content_plan_filename(f"{project.title}-内容规划"),
+        markdown=markdown,
+    )
 
 
 def import_content_plan_markdown(
@@ -246,5 +319,5 @@ def import_content_plan_markdown(
         title=project.title,
         slides_count=len(parsed.slides),
         warnings=parsed.warnings,
-        ui_url=_ui_url(project.id, frontend_base_url),
+        ui_url=_content_review_ui_url(project.id, frontend_base_url),
     )

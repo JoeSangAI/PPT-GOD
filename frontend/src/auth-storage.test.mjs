@@ -92,7 +92,7 @@ const legacyAuth = JSON.stringify({
   const { DEFAULT_PROVIDER_SETTINGS } = loadClient({ localStorage, sessionStorage });
 
   assert.equal(DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel, "MiniMax-M3");
-  assert.equal(DEFAULT_PROVIDER_SETTINGS.deerImageModel, "gpt-image-2-all");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.deerImageModel, "gpt-image-2");
 }
 
 {
@@ -108,5 +108,5 @@ const legacyAuth = JSON.stringify({
   const provider = getProviderSettings();
 
   assert.equal(provider.minimaxLlmModel, "MiniMax-M3");
-  assert.equal(provider.deerImageModel, "gpt-image-2-all");
+  assert.equal(provider.deerImageModel, "gpt-image-2");
 }
