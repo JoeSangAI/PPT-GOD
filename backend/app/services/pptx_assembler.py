@@ -11,7 +11,7 @@ from pptx.util import Inches
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_symbol_image
 from app.services.logo_overlay_layout import logo_geometry_from_resolved_box, resolve_logo_overlay_box, resolve_logo_render_policy
 from app.services.logo_policy import LOGO_HEIGHT_RATIOS, LOGO_WIDTH_RATIOS, logo_policy_for_page, normalize_logo_placement, should_show_logo
-from app.services.overlay_layers import contained_picture_box, enabled_overlay_layers, overlay_box
+from app.services.overlay_layers import contained_picture_box, enabled_overlay_layers, header_safe_overlay_box, overlay_box
 from app.services.text_region_detector import compute_safe_overlay_box
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,8 @@ def assemble_pptx(
                     resolved_asset_path,
                 )
                 continue
-            left, top, width, height = overlay_box(prs, str(layer.get("preset") or "right-card"))
+            preset = str(layer.get("preset") or "right-card")
+            left, top, width, height = overlay_box(prs, preset)
             # 文字避让：exact_cutout 模式下，如果已预计算文字区域，则调整位置
             if layer.get("mode") == "exact_cutout":
                 text_regions = slide_data.get("text_regions")
@@ -161,6 +162,16 @@ def assemble_pptx(
                         text_regions,
                         float(prs.slide_width),
                         float(prs.slide_height),
+                    )
+                else:
+                    left, top, width, height = header_safe_overlay_box(
+                        left,
+                        top,
+                        width,
+                        height,
+                        float(prs.slide_width),
+                        float(prs.slide_height),
+                        preset,
                     )
             if layer.get("mode") == "exact_card":
                 card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)

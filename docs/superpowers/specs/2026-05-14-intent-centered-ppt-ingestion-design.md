@@ -6,7 +6,7 @@ Users often upload PPT files that are not editable decks. A common case is a dec
 
 This creates the wrong product behavior: the system understands that screenshots can become reference images, but it misses the deeper job of recovering the original written intent before deciding how to make a new PPT.
 
-The product principle from `DEVELOPMENT_MEMORY.md` applies here: PPT God should understand the user's intent and turn it into the PPT artifact, not only process files.
+The product principle from `AGENTS.md` applies here: PPT God should understand the user's intent and turn it into the PPT artifact, not only process files.
 
 ## Problem
 

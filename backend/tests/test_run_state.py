@@ -8,8 +8,8 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
 from app.models.base import Base
-from app.models.models import Project, ProjectRun, Slide
-from app.services.artifact_versions import artifact_stale, dependency_signature, with_artifact_meta
+from app.models.models import Project, ProjectRun, ReferenceImage, Slide
+from app.services.artifact_versions import artifact_stale, dependency_signature, with_artifact_meta, with_stale_flags
 from app.services.run_state import (
     apply_project_rollback,
     create_project_run,
@@ -473,6 +473,38 @@ def test_cancelled_prototype_with_preserved_old_image_returns_to_prompt_ready():
     assert slide.status == "prompt_ready"
 
 
+def test_update_slide_type_canonicalizes_toc_alias_and_syncs_content_json():
+    db = make_session()
+    project = Project(title="Manual type", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=2,
+        type="content",
+        content_json={
+            "page_num": 2,
+            "type": "content",
+            "section_title": "内容地图",
+            "text_content": {"headline": "课程地图", "body": "- 模块一\n- 模块二\n- 模块三"},
+        },
+    )
+    db.add(slide)
+    db.flush()
+
+    result = slides_api.update_slide_type(
+        project.id,
+        slides_api.UpdateTypeRequest(page_num=2, slide_id=slide.id, type="agenda"),
+        db=db,
+    )
+    db.refresh(slide)
+
+    assert result["type"] == "toc"
+    assert slide.type == "toc"
+    assert slide.content_json["type"] == "toc"
+    assert slide.type_locked is True
+
+
 def test_rollback_to_prompt_requires_selected_style():
     db = make_session()
     project = Project(title="Prompt rollback without style", status="completed", content_plan_confirmed=True)
@@ -641,6 +673,309 @@ def test_start_generation_blocks_pages_with_unapplied_plan_changes():
         assert "未应用的内容或画面修改" in exc.detail
     else:
         raise AssertionError("expected stale page to block direct generation")
+
+
+def test_generation_preflight_allows_legacy_prompt_when_only_another_slide_changed():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Legacy deck dependency",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    first = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        content_json={
+            "page_num": 1,
+            "type": "content",
+            "text_content": {"headline": "第一页标题", "body": "第一页正文"},
+        },
+        visual_json={"page_num": 1, "visual_description": "第一页画面"},
+        prompt_text=(
+            "Visible Text:\n"
+            "Headline: \"第一页标题\"\n"
+            "Body: \"第一页正文\"\n\n"
+            "Layout:\n"
+            "第一页画面"
+        ),
+    )
+    second = Slide(
+        project_id=project.id,
+        page_num=2,
+        status="prompt_ready",
+        content_json={
+            "page_num": 2,
+            "type": "content",
+            "text_content": {"headline": "第二页旧标题", "body": "第二页正文"},
+        },
+        visual_json={"page_num": 2, "visual_description": "第二页画面"},
+        prompt_text=(
+            "Visible Text:\n"
+            "Headline: \"第二页旧标题\"\n"
+            "Body: \"第二页正文\"\n\n"
+            "Layout:\n"
+            "第二页画面"
+        ),
+    )
+    db.add_all([first, second])
+    db.flush()
+    legacy_deck_deps = dependency_signature(project, [first, second])
+    first.visual_json = with_artifact_meta(
+        first.visual_json,
+        kind="visual_plan",
+        dependencies=legacy_deck_deps,
+        prompt_dependencies=legacy_deck_deps,
+        prompt_visual_signature=slides_api._prompt_visual_plan_signature(first.visual_json),
+    )
+    second.visual_json = with_artifact_meta(
+        second.visual_json,
+        kind="visual_plan",
+        dependencies=legacy_deck_deps,
+        prompt_dependencies=legacy_deck_deps,
+        prompt_visual_signature=slides_api._prompt_visual_plan_signature(second.visual_json),
+    )
+    db.flush()
+
+    second.content_json = {
+        "page_num": 2,
+        "type": "content",
+        "text_content": {"headline": "第二页新标题", "body": "第二页正文"},
+    }
+    db.flush()
+    slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+    first = slides[0]
+
+    slides_api._raise_if_generation_inputs_not_current(project, slides, [first])
+
+
+def test_start_generation_refreshes_prompt_when_exact_overlay_syncs(monkeypatch, tmp_path):
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Exact overlay generation",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=6,
+        status="prompt_ready",
+        content_json={
+            "page_num": 6,
+            "type": "content",
+            "text_content": {
+                "headline": "创意样张",
+                "body": "把公众号事件声量转成电梯里的即时提醒",
+            },
+        },
+        visual_json={"page_num": 6, "visual_description": "三张电梯提醒海报并排展示"},
+        prompt_text=(
+            "Visible Text:\n"
+            "Headline: \"创意样张\"\n"
+            "Body: \"把公众号事件声量转成电梯里的即时提醒\"\n\n"
+            "Layout:\n"
+            "旧 Prompt 没有为原样保留素材预留位置。"
+        ),
+    )
+    db.add(slide)
+    db.flush()
+    image_path = tmp_path / "page-ref.png"
+    Image.new("RGB", (160, 90), "white").save(image_path)
+    page_ref = ReferenceImage(
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(image_path),
+        process_mode="original",
+        asset_name="原样保留素材",
+    )
+    db.add(page_ref)
+    db.commit()
+
+    refreshed_prompts = []
+
+    def fake_generate_prompt_for_page(**kwargs):
+        page_intent = kwargs["page_intent"]
+        refreshed_prompts.append(page_intent)
+        assert page_intent["overlay_layers"][0]["asset_id"] == page_ref.id
+        return (
+            "Visible Text:\n"
+            "Headline: \"创意样张\"\n"
+            "Body: \"把公众号事件声量转成电梯里的即时提醒\"\n\n"
+            "Exact Overlay Reservation:\n"
+            "Reserve a clean slot for the original page asset."
+        )
+
+    class FakeTask:
+        id = "task-1"
+
+    monkeypatch.setattr(slides_api, "generate_prompt_for_page", fake_generate_prompt_for_page)
+    monkeypatch.setattr(slides_api, "ensure_generation_worker_ready", lambda: True)
+    monkeypatch.setattr(slides_api, "_enqueue_generation_task", lambda *args, **kwargs: FakeTask())
+
+    result = slides_api.start_generation(
+        project.id,
+        body=slides_api.PageNumsRequest(page_nums=[6], prototype=True),
+        db=db,
+    )
+
+    refreshed = db.query(Slide).filter(Slide.id == slide.id).one()
+    assert result["message"] == "Generation started"
+    assert refreshed_prompts
+    assert refreshed.visual_json["overlay_layers"][0]["asset_id"] == page_ref.id
+    assert artifact_stale(refreshed.visual_json) == {}
+    assert "Exact Overlay Reservation" in refreshed.prompt_text
+
+
+def test_generation_preflight_repairs_residual_visual_stale_when_inputs_match(tmp_path):
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Residual visual stale",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+
+    image_path = tmp_path / "page-ref.png"
+    Image.new("RGB", (160, 90), "white").save(image_path)
+    slide = Slide(
+        project_id=project.id,
+        page_num=6,
+        status="prompt_ready",
+        content_json={
+            "page_num": 6,
+            "type": "content",
+            "text_content": {
+                "headline": "创意样张",
+                "body": "把公众号事件声量转成电梯里的即时提醒",
+            },
+        },
+        visual_json={
+            "page_num": 6,
+            "visual_description": "新画面，预留本页素材卡位",
+            "overlay_layers": [
+                {
+                    "id": "ov_ref",
+                    "asset_id": "ref-6",
+                    "enabled": True,
+                    "preset": "right-card",
+                    "fit": "contain",
+                    "mode": "exact_cutout",
+                    "valign": "bottom",
+                    "usage_note": "本页素材：原图保留",
+                    "z_index": 0,
+                }
+            ],
+        },
+        prompt_text=(
+            "Visible Text:\n"
+            "Headline: \"创意样张\"\n"
+            "Body: \"把公众号事件声量转成电梯里的即时提醒\"\n\n"
+            "References:\n"
+            "- Page reference: use this uploaded image as the page visual source. Context: page-ref.png\n\n"
+            "Layout:\n"
+            "预留本页素材卡位。"
+        ),
+    )
+    ref = ReferenceImage(
+        id="ref-6",
+        project_id=project.id,
+        slide_id=slide.id,
+        role="content_ref",
+        file_path=str(image_path),
+        process_mode="original",
+        asset_name="本页素材",
+    )
+    db.add_all([slide, ref])
+    db.flush()
+    project_slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+    deps = dependency_signature(project, project_slides)
+    slide.visual_json = with_artifact_meta(
+        slide.visual_json,
+        kind="visual_plan",
+        dependencies=deps,
+        prompt_dependencies=deps,
+    )
+    slide.visual_json = with_stale_flags(slide.visual_json, visual=True)
+    db.commit()
+
+    refreshed = db.query(Slide).filter(Slide.id == slide.id).one()
+    assert artifact_stale(refreshed.visual_json) == {"visual": True}
+
+    slides_api._raise_if_generation_inputs_not_current(project, [refreshed], [refreshed])
+
+    assert artifact_stale(refreshed.visual_json) == {}
+
+
+def test_generation_preflight_keeps_visual_stale_when_visual_signature_changed():
+    from app.api import slides as slides_api
+
+    db = make_session()
+    project = Project(
+        title="Changed visual stays stale",
+        status="prompt_ready",
+        content_plan_confirmed=True,
+        selected_style={"name": "Brand"},
+    )
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        status="prompt_ready",
+        content_json={
+            "page_num": 1,
+            "type": "content",
+            "text_content": {"headline": "当前标题"},
+        },
+        visual_json={
+            "page_num": 1,
+            "visual_description": "旧画面",
+        },
+        prompt_text=(
+            "Visible Text:\n"
+            "Headline: \"当前标题\"\n\n"
+            "Layout:\n"
+            "旧画面"
+        ),
+    )
+    db.add(slide)
+    db.flush()
+    deps = dependency_signature(project, [slide])
+    old_signature = slides_api._prompt_visual_plan_signature(slide.visual_json)
+    slide.visual_json = with_artifact_meta(
+        slide.visual_json,
+        kind="visual_plan",
+        dependencies=deps,
+        prompt_dependencies=deps,
+        prompt_visual_signature=old_signature,
+    )
+    slide.visual_json["visual_description"] = "新的手工画面描述"
+    slide.visual_json = with_stale_flags(slide.visual_json, visual=True)
+    db.commit()
+
+    refreshed = db.query(Slide).filter(Slide.id == slide.id).one()
+    try:
+        slides_api._raise_if_generation_inputs_not_current(project, [refreshed], [refreshed])
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert "未应用的内容或画面修改" in exc.detail
+    else:
+        raise AssertionError("expected changed visual signature to keep blocking generation")
 
 
 def test_start_generation_blocks_visual_guidance_with_old_visible_labels():

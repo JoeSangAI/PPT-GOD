@@ -2,6 +2,7 @@ import pytest
 
 from app.services.content_plan_markdown import (
     ContentPlanMarkdownError,
+    export_content_plan_markdown,
     import_content_plan_markdown,
     parse_content_plan_markdown,
     validate_content_plan_markdown,
@@ -118,6 +119,23 @@ def test_import_content_plan_markdown_creates_project_and_pending_slides():
     assert slides[0].status == "pending"
     assert slides[0].content_json["text_content"]["headline"] == "AI 时代消费者决策路径"
     assert slides[1].content_json["speaker_notes"].startswith("这一页解释")
+
+
+def test_export_content_plan_markdown_round_trips_to_strict_agent_format():
+    db = make_session()
+    receipt = import_content_plan_markdown(db, VALID_MARKDOWN, title=None, tester_id=None)
+    project = db.query(Project).filter(Project.id == receipt.project_id).first()
+    slides = db.query(Slide).filter(Slide.project_id == receipt.project_id).order_by(Slide.page_num).all()
+
+    export = export_content_plan_markdown(project, slides)
+    validation = validate_content_plan_markdown(export.markdown)
+
+    assert export.slides_count == 2
+    assert export.filename.endswith(".md")
+    assert "## P1 ·" not in export.markdown
+    assert "### 类型\n\ncover" in export.markdown
+    assert validation.ok is True
+    assert validation.slides[1]["text_content"]["headline"] == "消费者不再只是在搜索框里决策"
 
 
 def test_import_rejects_invalid_markdown_without_partial_project():

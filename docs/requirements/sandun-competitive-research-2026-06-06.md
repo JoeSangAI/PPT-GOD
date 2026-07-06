@@ -267,7 +267,7 @@ PPT God 当前已经具备：
 - 用户可直接继续，也可补充。
 
 为什么适合 PPT God：
-- 与 DEVELOPMENT_MEMORY 的 “task contract” 原则一致。
+- 与 AGENTS.md 的 “task contract” 原则一致。
 - 可以降低后续“页数不对、内容跑偏”的概率。
 
 ### P1: 每页证据与素材计划面板

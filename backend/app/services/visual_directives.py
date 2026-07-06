@@ -202,10 +202,21 @@ def _directive_match(text: str) -> re.Match[str] | None:
     for pattern in _DIRECTIVE_PATTERNS:
         match = pattern.search(text)
         if match:
+            if _starts_inside_plain_verb(text, match):
+                continue
             if _has_negated_directive_context(text, match):
                 continue
             return match
     return None
+
+
+def _starts_inside_plain_verb(text: str, match: re.Match[str]) -> bool:
+    if match.start() <= 0:
+        return False
+    matched = match.group(0)
+    if matched.startswith("用") and text[match.start() - 1] == "调":
+        return True
+    return False
 
 
 def _has_negated_directive_context(text: str, match: re.Match[str]) -> bool:

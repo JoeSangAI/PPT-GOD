@@ -1,3 +1,13 @@
-# Claude Notes
+# CLAUDE.md
 
-Shared project memory lives in [DEVELOPMENT_MEMORY.md](./DEVELOPMENT_MEMORY.md). Read it before changing product copy or user-facing workflow text.
+This file is a thin adapter for Claude Code inside PPT God.
+
+Primary project rules live in:
+
+@./AGENTS.md
+
+Primary global rules live in:
+
+@/Users/Joe_1/.codex/AGENTS.md
+
+Follow those rules first. Do not maintain an independent Claude-only rule system for this project.

@@ -10,7 +10,7 @@
 - `backend/app/services/content_plan.py` currently treats a single uploaded PPT with no transform keywords as direct 1:1 replicate through `build_direct_ppt_replicate_outline()`.
 - `backend/app/api/slides.py` calls `load_project_documents()` and `generate_content_plan()` from `_generate_content_plan_bg()`.
 - `backend/app/api/chat.py` builds a `project_context` dict for Agent prompts but has no durable source-treatment contract.
-- `DEVELOPMENT_MEMORY.md` says user-facing copy should focus on jobs-to-be-done, not internal terms such as pipeline or process modes.
+- `AGENTS.md` says user-facing copy should focus on jobs-to-be-done, not internal terms such as pipeline or process modes.
 
 ## Desired Behavior
 
@@ -784,7 +784,7 @@ Expected final state:
 Before finalizing implementation:
 
 - Inspect `git diff --stat`.
-- Inspect all modified user-facing strings against `DEVELOPMENT_MEMORY.md`.
+- Inspect all modified user-facing strings against `AGENTS.md`.
 - Confirm no unrelated dirty files were reverted.
 - Confirm no temporary verification files are staged.
 - Summarize:

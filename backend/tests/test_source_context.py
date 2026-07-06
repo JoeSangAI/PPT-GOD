@@ -1,4 +1,5 @@
 from app.services.source_context import (
+    DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET,
     SourceScopeRequired,
     build_brief_source_pack,
     build_source_context,
@@ -70,6 +71,10 @@ def test_brief_source_pack_wraps_short_prompt_as_source():
     assert pack["document"]["kind"] == "brief"
     assert pack["pages"][0]["text"] == "帮我做一份品牌策略 PPT"
     assert pack["stats"]["estimated_tokens"] > 0
+
+
+def test_source_context_default_budget_uses_long_context_capacity():
+    assert DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET >= 500_000
 
 
 def test_source_context_uses_requested_first_chapter_only():

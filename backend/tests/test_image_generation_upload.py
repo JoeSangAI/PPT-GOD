@@ -48,7 +48,7 @@ def test_edit_api_uploads_region_mask_as_mask_file(monkeypatch):
     result_b64 = image_generation.base64.b64encode(result_buf.getvalue()).decode("ascii")
     captured = {}
 
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
     monkeypatch.setattr(
         image_generation,
         "get_provider_credentials",
@@ -102,7 +102,7 @@ def test_default_api_backoff_uses_four_attempts(monkeypatch):
     calls = []
     sleeps = []
 
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
     monkeypatch.setattr(image_generation.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     def fake_generate(_prompt, size="1792x1024", idempotency_key=None):
@@ -155,7 +155,7 @@ def test_aspect_ratio_gate_retries_once_with_fresh_idempotency_key(monkeypatch):
 
     monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_TOLERANCE", 0.04)
     monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_MAX_RETRIES", 1)
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
 
     def fake_generate(_prompt, size="1792x1024", idempotency_key=None):
         calls.append((size, idempotency_key))
@@ -181,7 +181,7 @@ def test_aspect_ratio_gate_fails_after_one_retry(monkeypatch):
 
     monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_TOLERANCE", 0.04)
     monkeypatch.setattr(image_generation.settings, "IMAGE_ASPECT_RATIO_MAX_RETRIES", 1)
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
 
     def fake_generate(*_args, **_kwargs):
         nonlocal calls
@@ -286,7 +286,7 @@ def test_gateway_cutoff_stops_after_configured_attempts(monkeypatch):
     attempts = 0
 
     monkeypatch.setattr(image_generation.settings, "IMAGE_GATEWAY_CUTOFF_MAX_ATTEMPTS", 2)
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
     monkeypatch.setattr(image_generation.time, "sleep", lambda _seconds: None)
 
     def fake_generate(*_args, **_kwargs):
@@ -450,7 +450,7 @@ def test_edit_read_timeout_retries_with_same_idempotency_key(monkeypatch):
     sleeps = []
     reference = Image.new("RGB", (32, 18), "white")
 
-    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2-all")
+    monkeypatch.setattr(image_generation, "get_comet_image_model", lambda: "gpt-image-2")
     monkeypatch.setattr(image_generation.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     def fake_edit(_prompt, _reference_images, size="1792x1024", idempotency_key=None, project_id=None):
