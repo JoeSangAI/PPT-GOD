@@ -19,6 +19,7 @@ import TableCell from "@tiptap/extension-table-cell";
 import TableHeader from "@tiptap/extension-table-header";
 import { SLIDE_TYPE_COLORS, SLIDE_TYPE_LABELS, SLIDE_TYPE_OPTIONS } from "./slideTypes";
 import PptGodLogo from "./components/PptGodLogo";
+import { overlayPlacementStyle } from "./overlayPlacement";
 
 // 修复 marked 无法解析 **text标点**后接字符 的粗体（CommonMark 规范限制）
 const fixMarkedBoldHtml = (html: string): string => {
@@ -1404,15 +1405,6 @@ function logoOverlaySrc(item: any) {
   return item?.overlay_url || item?.url || "";
 }
 
-const OVERLAY_PRESET_BOXES: Record<string, { left: string; top: string; width: string; height: string }> = {
-  "top-right-small": { left: "72%", top: "8%", width: "20%", height: "18%" },
-  "bottom-right-small": { left: "72%", top: "72%", width: "20%", height: "18%" },
-  "left-card": { left: "6.5%", top: "18%", width: "36%", height: "58%" },
-  "right-card": { left: "59.5%", top: "18%", width: "34%", height: "58%" },
-  "center-card": { left: "28%", top: "20%", width: "44%", height: "56%" },
-  "bottom-band": { left: "12%", top: "68%", width: "76%", height: "22%" },
-};
-
 function enabledOverlayLayers(slide: any) {
   const layers = slide?.visual_json?.overlay_layers;
   return Array.isArray(layers) ? layers.filter((layer: any) => layer && layer.enabled !== false) : [];
@@ -1467,7 +1459,7 @@ function SlideImageWithOverlays({
       {overlays.map((layer: any, index: number) => {
         const asset = assetById.get(String(layer.asset_id));
         if (!asset?.url) return null;
-        const box = OVERLAY_PRESET_BOXES[layer.preset] || OVERLAY_PRESET_BOXES["right-card"];
+        const box = overlayPlacementStyle(layer);
         return (
           <div
             key={layer.id || `${layer.asset_id}-${index}`}

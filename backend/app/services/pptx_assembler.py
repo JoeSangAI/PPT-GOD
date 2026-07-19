@@ -17,6 +17,70 @@ from app.services.text_region_detector import compute_safe_overlay_box
 logger = logging.getLogger(__name__)
 
 
+def _normalized_region(
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    slide_width: float,
+    slide_height: float,
+) -> Dict:
+    return {
+        "x": float(left) / slide_width,
+        "y": float(top) / slide_height,
+        "width": float(width) / slide_width,
+        "height": float(height) / slide_height,
+    }
+
+
+def _resolved_placement_box(
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    slide_width: float,
+    slide_height: float,
+    **metadata,
+) -> Dict:
+    return {
+        "left": float(left) / slide_width,
+        "top": float(top) / slide_height,
+        "width": float(width) / slide_width,
+        "height": float(height) / slide_height,
+        **metadata,
+    }
+
+
+def _persist_overlay_placement(
+    visual_json: Dict,
+    layer: Dict,
+    resolved_box: Dict,
+) -> None:
+    """Keep preview and exported PPT on the exact same collision-safe geometry."""
+    raw_layers = visual_json.get("overlay_layers")
+    if not isinstance(raw_layers, list):
+        return
+    layer_id = str(layer.get("id") or "")
+    asset_id = str(layer.get("asset_id") or "")
+    updated_layers = []
+    matched = False
+    for raw in raw_layers:
+        if not isinstance(raw, dict):
+            updated_layers.append(raw)
+            continue
+        raw_id = str(raw.get("id") or "")
+        raw_asset_id = str(raw.get("asset_id") or "")
+        is_match = not matched and (
+            (layer_id and raw_id == layer_id)
+            or (not layer_id and asset_id and raw_asset_id == asset_id)
+        )
+        if is_match:
+            raw = {**raw, "resolved_overlay_box": resolved_box}
+            matched = True
+        updated_layers.append(raw)
+    visual_json["overlay_layers"] = updated_layers
+
+
 def _resolve_file_path(file_path: str) -> str:
     """安全解析文件路径，兼容从不同工作目录启动的情况。"""
     if not file_path:
@@ -128,7 +192,14 @@ def assemble_pptx(
                 height=prs.slide_height,
             )
 
-        overlay_layers = enabled_overlay_layers(slide_data.get("visual_json") or {})
+        visual_json = slide_data.get("visual_json") or {}
+        text_regions = list(
+            slide_data.get("text_regions")
+            or visual_json.get("detected_text_regions")
+            or []
+        )
+        placed_overlay_regions: List[Dict] = []
+        overlay_layers = enabled_overlay_layers(visual_json)
         if overlay_layers:
             logger.info(
                 "Assembler: page %s has %s overlay layers, overlay_assets keys=%s",
@@ -153,26 +224,30 @@ def assemble_pptx(
                 continue
             preset = str(layer.get("preset") or "right-card")
             left, top, width, height = overlay_box(prs, preset)
-            # 文字避让：exact_cutout 模式下，如果已预计算文字区域，则调整位置
-            if layer.get("mode") == "exact_cutout":
-                text_regions = slide_data.get("text_regions")
-                if text_regions:
-                    left, top, width, height = compute_safe_overlay_box(
-                        left, top, width, height,
-                        text_regions,
-                        float(prs.slide_width),
-                        float(prs.slide_height),
-                    )
-                else:
-                    left, top, width, height = header_safe_overlay_box(
-                        left,
-                        top,
-                        width,
-                        height,
-                        float(prs.slide_width),
-                        float(prs.slide_height),
-                        preset,
-                    )
+            # 所有精确后贴模式都必须避让文字与前一个后贴元素。没有检测结果时，
+            # 至少执行标题安全区兜底；绝不再让 exact_card 绕过碰撞检查。
+            avoid_regions = [*text_regions, *placed_overlay_regions]
+            if avoid_regions:
+                left, top, width, height = compute_safe_overlay_box(
+                    left,
+                    top,
+                    width,
+                    height,
+                    avoid_regions,
+                    float(prs.slide_width),
+                    float(prs.slide_height),
+                    min_scale=0.55,
+                )
+            else:
+                left, top, width, height = header_safe_overlay_box(
+                    left,
+                    top,
+                    width,
+                    height,
+                    float(prs.slide_width),
+                    float(prs.slide_height),
+                    preset,
+                )
             if layer.get("mode") == "exact_card":
                 card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)
                 card.fill.solid()
@@ -186,7 +261,8 @@ def assemble_pptx(
                     top + inset,
                     max(1, width - inset * 2),
                     max(1, height - inset * 2),
-                    valign=str(layer.get("valign") or "bottom"),
+                    # 截图/图表放进白卡片时应视觉居中；底部落地只适合透明产品抠图。
+                    valign="center",
                 )
             else:
                 pic_left, pic_top, pic_width, pic_height = contained_picture_box(
@@ -204,6 +280,30 @@ def assemble_pptx(
                 width=pic_width,
                 height=pic_height,
             )
+            placed_overlay_regions.append(_normalized_region(
+                left,
+                top,
+                width,
+                height,
+                float(prs.slide_width),
+                float(prs.slide_height),
+            ))
+            _persist_overlay_placement(
+                visual_json,
+                layer,
+                _resolved_placement_box(
+                    left,
+                    top,
+                    width,
+                    height,
+                    float(prs.slide_width),
+                    float(prs.slide_height),
+                    source_preset=preset,
+                    source_mode=str(layer.get("mode") or "exact_card"),
+                    strategy="collision-safe",
+                ),
+            )
+            slide_data["visual_json"] = visual_json
 
         if (
             logo_config
@@ -237,6 +337,47 @@ def assemble_pptx(
                 slide_image_path=img_path,
                 resolved_box=render_policy.get("resolved_overlay_box") or raw_policy.get("resolved_overlay_box"),
             )
+            avoid_regions = [*text_regions, *placed_overlay_regions]
+            if avoid_regions:
+                left, top, width, height = compute_safe_overlay_box(
+                    left,
+                    top,
+                    width,
+                    height,
+                    avoid_regions,
+                    float(prs.slide_width),
+                    float(prs.slide_height),
+                    # Logo 不能靠缩到不可读来“解决”碰撞；优先保留尺寸并换到安全角落。
+                    min_scale=0.82,
+                    # 文字检测框存在少量误差，Logo 旁需额外保留约 4% 画布的安全呼吸区。
+                    clearance=0.04,
+                    candidate_layout="corners",
+                )
+            final_logo_box = _resolved_placement_box(
+                left,
+                top,
+                width,
+                height,
+                float(prs.slide_width),
+                float(prs.slide_height),
+                source_placement=(
+                    render_policy.get("placement")
+                    or policy.get("placement")
+                    or logo_config.get("anchor")
+                    or "top-right"
+                ),
+                source_scale=render_policy.get("scale") or policy.get("scale") or "small",
+                strategy="collision-safe",
+            )
+            visual_json = slide_data.get("visual_json") or {}
+            final_logo_policy = {
+                **raw_policy,
+                **policy,
+                **{key: value for key, value in render_policy.items() if value is not None},
+                "resolved_overlay_box": final_logo_box,
+            }
+            visual_json["logo_policy"] = final_logo_policy
+            slide_data["visual_json"] = visual_json
             slide.shapes.add_picture(
                 logo_path_to_render,
                 left=left,

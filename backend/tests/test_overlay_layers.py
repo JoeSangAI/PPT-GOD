@@ -26,6 +26,51 @@ def test_normalize_overlay_layers_accepts_string_asset_ids():
     assert result[0]["fit"] == "contain"
 
 
+def test_normalize_overlay_layers_preserves_matching_resolved_placement():
+    result = normalize_overlay_layers(
+        [{
+            "asset_id": "asset-1",
+            "mode": "exact_card",
+            "preset": "primary-left",
+            "resolved_overlay_box": {
+                "left": 0.03,
+                "top": 0.19,
+                "width": 0.38,
+                "height": 0.52,
+                "source_preset": "primary-left",
+                "source_mode": "exact_card",
+            },
+        }],
+        valid_asset_ids=None,
+        strict_assets=False,
+    )
+
+    assert result[0]["resolved_overlay_box"]["left"] == 0.03
+    assert result[0]["resolved_overlay_box"]["source_preset"] == "primary-left"
+
+
+def test_normalize_overlay_layers_drops_stale_resolved_placement():
+    result = normalize_overlay_layers(
+        [{
+            "asset_id": "asset-1",
+            "mode": "exact_card",
+            "preset": "right-card",
+            "resolved_overlay_box": {
+                "left": 0.03,
+                "top": 0.19,
+                "width": 0.38,
+                "height": 0.52,
+                "source_preset": "primary-left",
+                "source_mode": "exact_card",
+            },
+        }],
+        valid_asset_ids=None,
+        strict_assets=False,
+    )
+
+    assert "resolved_overlay_box" not in result[0]
+
+
 def test_normalize_overlay_layers_keeps_single_default_slot():
     result = normalize_overlay_layers(
         [{"asset_id": "asset-1", "mode": "exact_cutout"}],

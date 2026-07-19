@@ -31,6 +31,7 @@ from app.services.logo_overlay_layout import resolve_logo_overlay_box, resolve_l
 from app.services.logo_policy import logo_policy_for_page
 from app.services.project_quality_report import build_project_quality_report
 from app.services.pptx_assembler import assemble_pptx
+from app.services.text_region_detector import _overlaps
 from app.services import prompt_engine
 from app.utils.text_cleaning import normalize_markdown_emphasis
 from app.services.visual_plan import (
@@ -1436,6 +1437,56 @@ def test_pptx_assembler_adds_exact_overlay_layer(tmp_path):
     prs = Presentation(str(output_path))
     # Background image + card rectangle + exact overlay image.
     assert len(prs.slides[0].shapes) >= 3
+    card = prs.slides[0].shapes[1]
+    picture = prs.slides[0].shapes[2]
+    assert (picture.top + picture.height / 2) == pytest.approx(
+        card.top + card.height / 2,
+        abs=Inches(0.02),
+    )
+
+
+def test_pptx_assembler_moves_exact_card_away_from_detected_text(tmp_path):
+    bg_path = tmp_path / "slide.png"
+    asset_path = tmp_path / "asset.png"
+    output_path = tmp_path / "out.pptx"
+    Image.new("RGB", (1792, 1024), "black").save(bg_path)
+    Image.new("RGB", (640, 360), "red").save(asset_path)
+    text_regions = [{"x": 0.47, "y": 0.08, "width": 0.48, "height": 0.82}]
+
+    slide_data = {
+            "page_num": 1,
+            "image_path": str(bg_path),
+            "text_regions": text_regions,
+            "visual_json": {
+                "overlay_layers": [{
+                    "id": "ov",
+                    "asset_id": "asset-1",
+                    "enabled": True,
+                    "preset": "primary-left",
+                    "mode": "exact_card",
+                }]
+            },
+        }
+    assemble_pptx(
+        slide_images=[slide_data],
+        output_path=str(output_path),
+        overlay_assets={"asset-1": {"file_path": str(asset_path)}},
+    )
+
+    prs = Presentation(str(output_path))
+    card = prs.slides[0].shapes[1]
+    resolved = {
+        "x": card.left / prs.slide_width,
+        "y": card.top / prs.slide_height,
+        "width": card.width / prs.slide_width,
+        "height": card.height / prs.slide_height,
+    }
+    assert _overlaps(resolved, text_regions) is False
+    assert resolved["width"] < 0.46
+    persisted = slide_data["visual_json"]["overlay_layers"][0]["resolved_overlay_box"]
+    assert persisted["left"] == pytest.approx(resolved["x"], abs=0.001)
+    assert persisted["top"] == pytest.approx(resolved["y"], abs=0.001)
+    assert persisted["source_preset"] == "primary-left"
 
 
 def test_pptx_assembler_keeps_exact_cutout_below_title_safe_area_without_text_regions(tmp_path):
@@ -1653,6 +1704,143 @@ def test_pptx_assembler_uses_resolved_logo_overlay_box(tmp_path):
     assert logo_shape.left == int(prs.slide_width * 0.12)
     assert logo_shape.top == int(prs.slide_height * 0.08)
     assert logo_shape.width == int(prs.slide_width * 0.18)
+
+
+def test_pptx_assembler_moves_logo_away_from_detected_title(tmp_path):
+    bg_path = tmp_path / "slide.png"
+    logo_path = tmp_path / "logo.png"
+    output_path = tmp_path / "out.pptx"
+    Image.new("RGB", (1792, 1024), "black").save(bg_path)
+    Image.new("RGBA", (300, 120), (255, 255, 255, 255)).save(logo_path)
+    title_region = [{"x": 0.06, "y": 0.04, "width": 0.89, "height": 0.10}]
+
+    slide_data = {
+            "page_num": 1,
+            "type": "content",
+            "image_path": str(bg_path),
+            "text_regions": title_region,
+            "visual_json": {
+                "logo_policy": {
+                    "show_logo": True,
+                    "placement": "top-right",
+                    "scale": "small",
+                    "resolved_overlay_box": {
+                        "left": 0.89,
+                        "top": 0.03,
+                        "width": 0.07,
+                        "height": 0.08,
+                        "strategy": "smart:test",
+                    },
+                }
+            },
+        }
+    assemble_pptx(
+        slide_images=[slide_data],
+        output_path=str(output_path),
+        logo_config={"file_path": str(logo_path), "anchor": "top-right"},
+    )
+
+    prs = Presentation(str(output_path))
+    logo = prs.slides[0].shapes[1]
+    resolved = {
+        "x": logo.left / prs.slide_width,
+        "y": logo.top / prs.slide_height,
+        "width": logo.width / prs.slide_width,
+        "height": logo.height / prs.slide_height,
+    }
+    assert _overlaps(resolved, title_region, clearance=0.04) is False
+    assert resolved["y"] > 0.14
+    persisted = slide_data["visual_json"]["logo_policy"]["resolved_overlay_box"]
+    assert persisted["left"] == pytest.approx(resolved["x"], abs=0.001)
+    assert persisted["top"] == pytest.approx(resolved["y"], abs=0.001)
+    assert persisted["strategy"] == "collision-safe"
+    assert persisted["source_placement"] == "top-right"
+    assert persisted["source_scale"] == "small"
+
+
+def test_logo_only_page_is_included_in_placement_safety_detection():
+    slide_data = {
+        "page_num": 3,
+        "type": "content",
+        "visual_json": {"logo_policy": {"show_logo": True}},
+    }
+
+    assert generation_pipeline._slide_needs_placement_safety(
+        slide_data,
+        logo_available=True,
+    ) is True
+    assert generation_pipeline._slide_needs_placement_safety(
+        slide_data,
+        logo_available=False,
+    ) is False
+
+
+def test_project_logo_policy_preserves_matching_collision_safe_box(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGBA", (180, 80), (255, 255, 255, 255)).save(logo_path)
+    project = SimpleNamespace(reference_images=[SimpleNamespace(
+        role="logo",
+        slide_id=None,
+        file_path=str(logo_path),
+        asset_analysis={},
+        logo_anchor="top-right",
+    )])
+    resolved_box = {
+        "left": 0.94,
+        "top": 0.89,
+        "width": 0.04,
+        "height": 0.08,
+        "source_placement": "top-right",
+        "source_scale": "small",
+        "strategy": "collision-safe",
+    }
+
+    result = slides_api._with_project_logo_policy({
+        "type": "content",
+        "logo_policy": {
+            "show_logo": True,
+            "placement": "top-right",
+            "scale": "small",
+            "render_variant": "full",
+            "resolved_overlay_box": resolved_box,
+        },
+    }, project)
+
+    assert result["logo_policy"]["resolved_overlay_box"] == resolved_box
+
+
+def test_project_logo_policy_drops_resolved_box_after_anchor_change(tmp_path):
+    logo_path = tmp_path / "logo.png"
+    Image.new("RGBA", (180, 80), (255, 255, 255, 255)).save(logo_path)
+    project = SimpleNamespace(reference_images=[SimpleNamespace(
+        role="logo",
+        slide_id=None,
+        file_path=str(logo_path),
+        asset_analysis={},
+        logo_anchor="bottom-left",
+    )])
+
+    result = slides_api._with_project_logo_policy({
+        "type": "content",
+        "logo_policy": {
+            "show_logo": True,
+            "placement": "top-right",
+            "scale": "small",
+            "render_variant": "full",
+            "resolved_overlay_box": {
+                "left": 0.94,
+                "top": 0.89,
+                "width": 0.04,
+                "height": 0.08,
+                "source_placement": "top-right",
+                "source_scale": "small",
+                "strategy": "collision-safe",
+            },
+        },
+    }, project)
+
+    assert result["logo_policy"]["placement"] == "bottom-left"
+    assert "resolved_overlay_box" not in result["logo_policy"]
 
 
 def test_pptx_assembler_uses_clean_logo_without_rectangular_backplate(tmp_path):

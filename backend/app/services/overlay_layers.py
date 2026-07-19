@@ -470,7 +470,7 @@ def normalize_overlay_layers(
         valign = str(raw.get("valign") or DEFAULT_OVERLAY_VALIGN).strip()
         if valign not in OVERLAY_VALIGNS:
             valign = DEFAULT_OVERLAY_VALIGN
-        normalized.append({
+        normalized_layer = {
             "id": layer_id,
             "asset_id": asset_id,
             "enabled": enabled,
@@ -482,7 +482,37 @@ def normalize_overlay_layers(
             "layout_group": layout_group,
             "usage_note": str(raw.get("usage_note") or "").strip(),
             "z_index": index,
-        })
+        }
+        resolved_box = raw.get("resolved_overlay_box")
+        if isinstance(resolved_box, Mapping):
+            try:
+                left = float(resolved_box.get("left"))
+                top = float(resolved_box.get("top"))
+                box_width = float(resolved_box.get("width"))
+                box_height = float(resolved_box.get("height"))
+            except (TypeError, ValueError):
+                resolved_box = None
+            if (
+                resolved_box is not None
+                and 0 <= left < 1
+                and 0 <= top < 1
+                and box_width > 0
+                and box_height > 0
+                and left + box_width <= 1.001
+                and top + box_height <= 1.001
+                and str(resolved_box.get("source_preset") or preset) == preset
+                and str(resolved_box.get("source_mode") or mode) == mode
+            ):
+                normalized_layer["resolved_overlay_box"] = {
+                    "left": left,
+                    "top": top,
+                    "width": box_width,
+                    "height": box_height,
+                    "source_preset": preset,
+                    "source_mode": mode,
+                    "strategy": str(resolved_box.get("strategy") or "collision-safe"),
+                }
+        normalized.append(normalized_layer)
     return normalized
 
 
