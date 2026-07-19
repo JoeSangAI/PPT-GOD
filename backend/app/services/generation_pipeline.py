@@ -84,6 +84,14 @@ def _pipeline_image_worker_count() -> int:
         return 1
 
 
+def _slide_needs_placement_safety(slide_data: Dict, *, logo_available: bool) -> bool:
+    """精准粘贴或 Logo 会在生成图之后落版的页面，都必须检测文字区域。"""
+    return bool(
+        enabled_overlay_layers(slide_data.get("visual_json"))
+        or (logo_available and should_show_logo(slide_data))
+    )
+
+
 def _result_has_gateway_timeout(result: Dict) -> bool:
     events = result.get("image_generation_events") or []
     if any((event or {}).get("status") == "gateway_timeout" for event in events):
@@ -2258,8 +2266,8 @@ def run_generation_pipeline(
                 )
                 logo_path_for_overlay = prepare_logo_lockup_image([_resolve_file_path(ref.file_path) for ref in logo_refs]) if logo_refs else None
                 logo_symbol_path_for_overlay = prepare_logo_symbol_image(_resolve_file_path(logo_refs[0].file_path)) if len(logo_refs) == 1 else None
+                slides_by_page = {s.page_num: s for s in slides}
                 if logo_path_for_overlay and logo_config:
-                    slides_by_page = {s.page_num: s for s in slides}
                     for slide_data in all_completed_images:
                         if not should_show_logo(slide_data):
                             continue
@@ -2307,16 +2315,19 @@ def run_generation_pipeline(
                         list(overlay_assets.keys()),
                     )
 
-                # 并发检测文字区域（exact_cutout 避让用）
-                slides_with_overlay = [
+                # 所有后贴元素共享同一套文字避让：精准粘贴和 Logo 页面都要检测。
+                slides_needing_placement_safety = [
                     sd for sd in all_completed_images
-                    if enabled_overlay_layers(sd.get("visual_json"))
+                    if _slide_needs_placement_safety(
+                        sd,
+                        logo_available=bool(logo_path_for_overlay),
+                    )
                 ]
-                if slides_with_overlay:
+                if slides_needing_placement_safety:
                     from app.services.text_region_detector import detect_text_regions
                     logger.info(
                         "Pipeline: 开始并发检测 %s 页的文字区域",
-                        len(slides_with_overlay),
+                        len(slides_needing_placement_safety),
                     )
 
                     def _detect_for_slide(sd):
@@ -2337,16 +2348,25 @@ def run_generation_pipeline(
                     with ThreadPoolExecutor(max_workers=3) as executor:
                         futures = [
                             executor.submit(_detect_for_slide, sd)
-                            for sd in slides_with_overlay
+                            for sd in slides_needing_placement_safety
                         ]
                         for future in as_completed(futures):
                             page_num, regions = future.result()
                             if regions is not None:
-                                slide_data_map[page_num]["text_regions"] = regions
+                                slide_data = slide_data_map[page_num]
+                                slide_data["text_regions"] = regions
+                                visual = dict(slide_data.get("visual_json") or {})
+                                visual["detected_text_regions"] = regions
+                                slide_data["visual_json"] = visual
+                                slide_model = slides_by_page.get(page_num)
+                                if slide_model:
+                                    slide_model.visual_json = visual
+                                    flag_modified(slide_model, "visual_json")
                                 logger.info(
                                     "Pipeline: page %s 检测到 %s 个文字区域",
                                     page_num, len(regions),
                                 )
+                    db.commit()
 
                 assemble_pptx(
                     slide_images=all_completed_images,
@@ -2354,6 +2374,14 @@ def run_generation_pipeline(
                     logo_config=logo_config,
                     overlay_assets=overlay_assets,
                 )
+                # 组装器已经算出碰撞安全的最终坐标。把它写回页面数据，确保网页预览
+                # 与导出的 PPT 使用同一结果，而不是继续显示旧的预设位置。
+                for slide_data in all_completed_images:
+                    slide_model = slides_by_page.get(slide_data.get("page_num"))
+                    if slide_model:
+                        slide_model.visual_json = slide_data.get("visual_json") or {}
+                        flag_modified(slide_model, "visual_json")
+                db.commit()
                 logger.info(f"Pipeline: PPTX 组装完成 {pptx_path}")
             except Exception as e:
                 logger.error(f"Pipeline: PPTX 组装失败: {e}")

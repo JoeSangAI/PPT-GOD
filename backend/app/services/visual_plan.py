@@ -1019,17 +1019,21 @@ def _build_batch_prompt(
 
 """
 
-    # 检查是否有 exact_cutout overlay 的页面
-    has_exact_cutout = False
+    # 检查所有需要原样后贴的页面（白卡片与透明贴图都必须预留干净区域）
+    has_exact_overlay = False
     overlay_pages: list[dict] = []
     for p in pages_summary:
         layers = p.get("overlay_layers") or []
         exact_layers = [
             layer for layer in layers
-            if isinstance(layer, dict) and layer.get("mode") == "exact_cutout" and layer.get("enabled", True)
+            if (
+                isinstance(layer, dict)
+                and layer.get("mode") in {"exact_card", "exact_cutout"}
+                and layer.get("enabled", True)
+            )
         ]
         if exact_layers:
-            has_exact_cutout = True
+            has_exact_overlay = True
             overlay_pages.append({
                 "page_num": p.get("page_num"),
                 "presets": [layer.get("preset", "right-card") for layer in exact_layers],
@@ -1044,7 +1048,7 @@ def _build_batch_prompt(
             })
 
     overlay_instruction = ""
-    if has_exact_cutout:
+    if has_exact_overlay:
         overlay_pages_desc = "\n".join(
             f"  - 第 {op['page_num']} 页: "
             + "; ".join(
@@ -1054,7 +1058,7 @@ def _build_batch_prompt(
             for op in overlay_pages
         )
         overlay_instruction = f"""
-【精确粘贴（exact_cutout）页面处理规则 — 必须遵守】
+【精准粘贴页面处理规则 — 必须遵守】
 以下页面包含精确粘贴素材（用户上传的截图将原样放置在指定位置，不是由 AI 绘制）：
 {overlay_pages_desc}
 

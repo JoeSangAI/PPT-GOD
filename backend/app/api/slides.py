@@ -1198,6 +1198,7 @@ def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dic
     logo_ref = _project_logo_ref(project)
     intent = copy.deepcopy(page_intent)
     policy = intent.get("logo_policy") if isinstance(intent.get("logo_policy"), dict) else {}
+    existing_resolved_box = policy.get("resolved_overlay_box")
     if not logo_ref:
         policy = dict(policy)
         policy["show_logo"] = False
@@ -1211,11 +1212,17 @@ def _with_project_logo_policy(page_intent: dict | None, project: Project) -> dic
     if page_type == "ending":
         policy["placement"] = logo_anchor_from_ref(logo_ref)
         policy["scale"] = "small"
-        policy.pop("resolved_overlay_box", None)
     elif page_type != "cover":
         policy["placement"] = logo_anchor_from_ref(logo_ref)
-        policy.pop("resolved_overlay_box", None)
     normalized_policy = logo_policy_for_page({**intent, "logo_policy": policy})
+    if isinstance(existing_resolved_box, dict):
+        source_placement = str(existing_resolved_box.get("source_placement") or "")
+        source_scale = str(existing_resolved_box.get("source_scale") or "")
+        if (
+            source_placement == str(normalized_policy.get("placement") or "")
+            and source_scale == str(normalized_policy.get("scale") or "")
+        ):
+            normalized_policy["resolved_overlay_box"] = existing_resolved_box
     if "use_as_scene_asset" in policy:
         normalized_policy["use_as_scene_asset"] = bool(policy.get("use_as_scene_asset"))
     intent["logo_policy"] = normalized_policy

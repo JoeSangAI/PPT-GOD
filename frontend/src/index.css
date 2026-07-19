@@ -3079,12 +3079,19 @@ body {
 }
 
 .pg-slide-grid > .pg-slide-card {
-  min-width: min(100%, 326px) !important;
+  min-width: min(100%, 200px) !important;
   flex-grow: 0 !important;
   flex-shrink: 0 !important;
-  flex-basis: clamp(326px, calc((100% - 42px) / 3), 448px) !important;
-  height: 328px;
-  padding: 14px;
+  /* Four 12px insert gaps surround three cards in each row. */
+  flex-basis: clamp(200px, calc((100% - 48px) / 3), 448px) !important;
+  height: 260px;
+  padding: 12px;
+}
+
+@media (min-width: 769px) {
+  .pg-insert-gap {
+    height: 260px;
+  }
 }
 
 .pg-slide-card {
