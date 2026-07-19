@@ -8,7 +8,7 @@
 
 </div>
 
-![PPT God：整套一致、逐页可控、品牌准确的 PPT 工作流](./docs/readme-assets/hero-showcase.jpg?v=4808084)
+![PPT God：整套一致、逐页可控、品牌准确的 PPT 工作流](./docs/readme-assets/hero-showcase.jpg?v=20260719-native)
 
 <p align="center"><sub>首屏中的 Apple Vision Pro 为公开资料 Demo；产品界面经过脱敏，展示内容均可公开。</sub></p>
 
@@ -55,7 +55,7 @@ PPT God 不把“风格”锁死在一个模板里。同一份品牌企划，可
 
 在批量生成前，先确认每页标题、正文、页面类型、参考素材和视觉方向；需要修改时，可以选中单页、多页或整套 PPT 继续调整。
 
-![PPT God 页面级内容与画面控制](./docs/readme-assets/page-control.jpg)
+![PPT God 页面级内容与画面控制](./docs/readme-assets/page-control.jpg?v=20260719-native)
 
 ## 真实案例不只是作品，也是产品的训练场
 
