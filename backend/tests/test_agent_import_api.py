@@ -34,6 +34,18 @@ cover
 """
 
 
+def test_agent_capabilities_exposes_stable_contract_and_semantic_types():
+    response = agent_api.get_agent_capabilities()
+
+    assert response["ok"] is True
+    assert response["contract_version"] == "1"
+    assert response["slide_types"] == [
+        "cover", "toc", "section", "content", "data", "hero", "quote", "ending"
+    ]
+    assert response["async_contract"]["start_returns_run"] is True
+    assert "update_preview" in response["operations"]["content_plan"]
+
+
 def make_session():
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
@@ -106,6 +118,9 @@ def test_agent_project_status_returns_handoff_state():
     assert response["slides_summary"]["total"] == 1
     assert response["slides_summary"]["by_status"] == {"pending": 1}
     assert response["slides"][0]["headline"] == "外部 Agent 导入测试"
+    assert response["slides"][0]["body"].startswith("这一页用于验证")
+    assert response["slides"][0]["body_storage_consistent"] is True
+    assert response["slides"][0]["content_blocks_count"] == 1
     assert response["next_action"]["stage"] == "content"
 
 
@@ -133,6 +148,56 @@ def test_agent_export_content_plan_returns_strict_markdown():
     assert response["filename"].endswith(".md")
     assert "### 类型\n\ncover" in response["markdown"]
     assert validation.ok is True
+
+
+def test_agent_update_content_plan_previews_then_applies_without_advancing_stage():
+    db = make_session()
+    updated_markdown = VALID_MARKDOWN.replace(
+        "这一页用于验证 Codex 直接提交内容规划后，PPT God 能进入内容确认阶段。",
+        "这一页已经由外部 Agent 更新，但项目阶段与确认状态必须保持不变。",
+    )
+    token = set_current_request_is_local(True)
+    try:
+        imported = agent_api.import_content_plan(
+            agent_api.ImportContentPlanRequest(markdown=VALID_MARKDOWN),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+        project = db.query(Project).filter(Project.id == imported["project_id"]).first()
+        project.status = "completed"
+        project.content_plan_confirmed = True
+        db.commit()
+
+        preview = agent_api.update_agent_content_plan(
+            imported["project_id"],
+            agent_api.UpdateContentPlanRequest(markdown=updated_markdown),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+        applied = agent_api.update_agent_content_plan(
+            imported["project_id"],
+            agent_api.UpdateContentPlanRequest(
+                markdown=updated_markdown,
+                apply=True,
+                expected_preview_token=preview["preview_token"],
+            ),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+    finally:
+        reset_current_request_is_local(token)
+
+    slide = db.query(Slide).filter(Slide.project_id == imported["project_id"]).first()
+    db.refresh(project)
+    assert preview["applied"] is False
+    assert preview["summary"]["changed"] == 1
+    assert applied["applied"] is True
+    assert applied["readback"]["ok"] is True
+    assert applied["readback"]["slides"][0]["body_storage_consistent"] is True
+    assert applied["project_state_unchanged"] is True
+    assert project.status == "completed"
+    assert project.content_plan_confirmed is True
+    assert "项目阶段与确认状态必须保持不变" in slide.content_json["text_content"]["body"]
 
 
 def test_agent_confirm_content_plan_advances_project_to_visual_ready():
@@ -422,6 +487,62 @@ def test_agent_retry_failed_slides_reuses_existing_retry_contract(monkeypatch):
     assert response["ok"] is True
     assert response["message"] == "Retry started"
     assert captured["project_id"] == imported["project_id"]
+
+
+def test_agent_confirm_prototype_reuses_existing_contract(monkeypatch):
+    db = make_session()
+    token = set_current_request_is_local(True)
+    try:
+        imported = agent_api.import_content_plan(
+            agent_api.ImportContentPlanRequest(markdown=VALID_MARKDOWN),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+        monkeypatch.setattr(
+            agent_api.slides_api,
+            "confirm_prototype",
+            lambda project_id, db: {"message": "Full generation started", "run": {"id": "run-full"}},
+        )
+
+        response = agent_api.confirm_agent_prototype(
+            imported["project_id"],
+            agent_api.AgentActionRequest(frontend_base_url="http://localhost:5173"),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+    finally:
+        reset_current_request_is_local(token)
+
+    assert response["ok"] is True
+    assert response["run"]["id"] == "run-full"
+
+
+def test_agent_stop_generation_reuses_existing_contract(monkeypatch):
+    db = make_session()
+    token = set_current_request_is_local(True)
+    try:
+        imported = agent_api.import_content_plan(
+            agent_api.ImportContentPlanRequest(markdown=VALID_MARKDOWN),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+        monkeypatch.setattr(
+            agent_api.slides_api,
+            "stop_generation",
+            lambda project_id, db: {"message": "Generation stopped", "status": "prompt_ready"},
+        )
+
+        response = agent_api.stop_agent_generation(
+            imported["project_id"],
+            agent_api.AgentActionRequest(frontend_base_url="http://localhost:5173"),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+    finally:
+        reset_current_request_is_local(token)
+
+    assert response["ok"] is True
+    assert response["message"] == "Generation stopped"
 
 
 def test_agent_export_ppt_returns_download_contract(monkeypatch):

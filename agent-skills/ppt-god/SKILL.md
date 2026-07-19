@@ -38,16 +38,40 @@ python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py validate-c
 python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py import-content-plan <plan.md> --title "<title>" --open
 ```
 
-6. Save the returned `project_id`. Use it for later operations.
-7. Use the Web UI at visual or review-heavy stages instead of forcing every choice through chat.
+6. For an existing project, do not import a duplicate. Preview an in-place update first:
+
+```bash
+python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py update-content-plan <project_id> <plan.md>
+```
+
+Review `changed`, `added`, `deleted`, `unchanged`, and deletion warnings. Only after
+the diff is correct, apply it with `--apply`; add `--open` when Web review is useful.
+This command must not confirm content, change the workflow stage, or start generation.
+After apply, require `readback.ok: true`; this verifies the rich-text editor's
+`content_blocks` body and the Markdown body mirror agree. The integrated local UI
+defaults to `http://localhost:8000`; port 5173 is only for Vite development.
+
+7. Save the returned `project_id`. Use it for later operations.
+8. Use the Web UI at visual or review-heavy stages instead of forcing every choice through chat.
+
+Do not edit internal fields such as `seed_family` or `visual_language_group` to make
+a slide look different. They are consistency metadata, not public creative controls.
+Use the visual-planning, page revision, local selection, version, and rollback
+workflows so the requested change remains scoped and recoverable.
 
 ## CLI Operations
 
 Common commands:
 
+- `doctor`
+- `capabilities`
+- `whoami`
+- `list-projects`
 - `status <project_id>`
 - `open <project_id> --stage content|visual|review`
 - `export-content-plan <project_id> --output <path>`
+- `update-content-plan <project_id> <plan.md>` (dry-run by default)
+- `update-content-plan <project_id> <plan.md> --apply --open`
 - `confirm-content-plan <project_id>`
 - `start-visual-proposals <project_id> --user-description "..."`
 - `get-visual-proposals <project_id>`
@@ -55,7 +79,10 @@ Common commands:
 - `generate-visual-prompts <project_id> --page-nums "1,2"`
 - `generate-slides <project_id> --page-nums "1,2" --prototype`
 - `get-generation-status <project_id>`
+- `wait <project_id> --run-id <run_id>`
 - `retry-failed-slides <project_id>`
+- `confirm-prototype <project_id>`
+- `stop-generation <project_id>`
 - `export-ppt <project_id>`
 - `download-ppt <project_id> --output <path>`
 
@@ -64,6 +91,13 @@ Run `python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py <comm
 ## Content Contract
 
 When bypassing PPT God's internal content Agent, the output must still satisfy PPT God's strict content-plan Markdown format. The format is strict, but the field content can be rich. Validate before import; if validation fails, fix the Markdown and validate again.
+
+The public `### 类型` contract contains exactly eight semantic roles:
+`cover`, `toc`, `section`, `content`, `data`, `hero`, `quote`, and `ending`.
+Do not encode visual composition in this field. Values such as `content_split`,
+`content_top`, `content_hero`, or `content_dense` are invalid; describe the desired
+composition in the content or visual-planning stage instead. The canonical format
+and role definitions live in `docs/agent/content-planning-playbook.md`.
 
 Use PPT God's methodology, examples, and validation rules as guidance, not as a hard ceiling on user intent. If the user's high-context direction is clear and the final fields remain valid, prefer the user's intent.
 

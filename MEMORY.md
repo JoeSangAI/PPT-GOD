@@ -7,6 +7,10 @@ Use `AGENTS.md` for current project rules. Use this file only during retrospecti
 ## Active Notes
 
 - 2026-07-03: Agent-driven products should not default to pure language control. Agent is strongest at high-context intent understanding and orchestration; GUI is strongest at high-frequency, broad-scope, multimodal alignment and precise confirmation. PPT God should support full Agent control, but expose contextual UI checkpoints when content, visual direction, page layout, assets, or generation quality need user alignment.
+- 2026-07-19: Visual planning must preserve rich page context. Truncating a list to its first few items can silently remove the evidence the visual planner is expected to represent. Speaker notes are useful non-visible context for scenes and cases, but must stay separate from exact on-slide copy.
+- 2026-07-19: Visual form should follow semantic relationship. A process, cycle, hierarchy, or containment diagram is not a harmless layout choice; it asserts a relationship. The planner should make the primary relationship explicit and carry anti-misreading constraints into generation.
+- 2026-07-19: Revision quality depends on an explicit change budget: preserve approved elements when the user asks to fix one problem, and widen the redesign only when requested. Existing local edit, history, and rollback cover much of the protection; do not create another versioning system before validating the interaction need.
+- 2026-07-19: Distinguish product failures from Agent orchestration failures. Manually overriding visual-language or seed-family metadata can create style drift that should not be “fixed” by adding a global visual prohibition.
 
 ## Processed
 

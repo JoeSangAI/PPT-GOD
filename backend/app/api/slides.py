@@ -95,8 +95,8 @@ from app.services.content_plan import (
     resolve_content_plan_page_target,
     resolve_requested_content_plan_page_count,
     _auto_reclassify_page_type,
-    _canonical_content_plan_type,
 )
+from app.services.slide_types import UnsupportedSlideTypeError, normalize_slide_type
 from app.services.source_context import (
     DEFAULT_SOURCE_CONTEXT_TOKEN_BUDGET,
     SourceScopeRequired,
@@ -118,6 +118,7 @@ from app.services.logo_policy import (
     should_use_logo_as_scene_asset,
 )
 from app.services.logo_assets import prepare_logo_lockup_image, prepare_logo_overlay_image, prepare_logo_symbol_image
+from app.services.content_plan_markdown import effective_content_body_markdown
 from app.services.logo_overlay_layout import resolve_logo_render_policy
 from app.services.overlay_layers import (
     build_overlay_asset_context_map,
@@ -2340,7 +2341,7 @@ def _build_content_plan_markdown(project: Project, slides: list[Slide]) -> str:
         section_title = _plain_markdown_value(content.get("section_title"))
         headline = _plain_markdown_value(text_content.get("headline"))
         subhead = _plain_markdown_value(text_content.get("subhead"))
-        body = _plain_markdown_value(text_content.get("body"))
+        body = effective_content_body_markdown(content)
         speaker_notes = _plain_markdown_value(content.get("speaker_notes"))
 
         lines.extend([
@@ -5506,6 +5507,7 @@ def _regenerate_slide_prompt(slide: Slide, project: Project, db: Session, user_f
         "page_num": slide.page_num,
         "type": visual_json.get("type") or content_json.get("type", "content"),
         "layout": visual_json.get("layout"),
+        "semantic_relation": visual_json.get("semantic_relation", "none"),
         "visual_summary": visual_json.get("visual_summary", ""),
         "visual_evidence": visual_json.get("visual_evidence", ""),
         "visual_description": visual_json.get("visual_description", ""),
@@ -6164,7 +6166,10 @@ def update_slide_type(
     if not slide:
         raise HTTPException(status_code=404, detail="Slide not found")
 
-    normalized_type = _canonical_content_plan_type(body.type)
+    try:
+        normalized_type = normalize_slide_type(body.type)
+    except UnsupportedSlideTypeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     slide.type = normalized_type
     content_json = {**slide.content_json, "type": normalized_type} if isinstance(slide.content_json, dict) else {"type": normalized_type}
     slide.content_json = content_json

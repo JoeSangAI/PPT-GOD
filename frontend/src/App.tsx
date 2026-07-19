@@ -17,6 +17,7 @@ import { Table } from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
 import TableCell from "@tiptap/extension-table-cell";
 import TableHeader from "@tiptap/extension-table-header";
+import { SLIDE_TYPE_COLORS, SLIDE_TYPE_LABELS, SLIDE_TYPE_OPTIONS } from "./slideTypes";
 import PptGodLogo from "./components/PptGodLogo";
 
 // 修复 marked 无法解析 **text标点**后接字符 的粗体（CommonMark 规范限制）
@@ -7751,29 +7752,8 @@ function App() {
     await uploadAgentAttachmentFiles(Array.from(files));
   };
 
-  const typeLabel: Record<string, string> = {
-    cover: "封面",
-    toc: "目录",
-    agenda: "目录",
-    content: "内容",
-    hero: "金句",
-    quote: "金句",
-    data: "数据",
-    ending: "封底",
-    section: "章节",
-  };
-
-  const typeColor: Record<string, string> = {
-    cover: "bg-purple-100 text-purple-700",
-    toc: "bg-blue-100 text-blue-700",
-    agenda: "bg-blue-100 text-blue-700",
-    content: "bg-gray-100 text-gray-700",
-    hero: "bg-yellow-100 text-yellow-700",
-    quote: "bg-yellow-100 text-yellow-700",
-    data: "bg-green-100 text-green-700",
-    ending: "bg-gray-100 text-gray-700",
-    section: "bg-pink-100 text-pink-700",
-  };
+  const typeLabel: Record<string, string> = SLIDE_TYPE_LABELS;
+  const typeColor: Record<string, string> = SLIDE_TYPE_COLORS;
   const projectLogo = referenceImages.find(isConfirmedLogoRef);
   const projectVisualAssetById = useMemo(() => {
     const map = new Map<string, any>();
@@ -9529,13 +9509,7 @@ function App() {
                           </button>
                           {activeTypeMenuSlideId === slide.id && (
                             <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-slate-200 rounded-lg shadow-lg p-1.5 min-w-[120px]">
-                              {[
-                                { key: "content", label: "正文" },
-                                { key: "data", label: "数据" },
-                                { key: "section", label: "章节" },
-                                { key: "hero", label: "金句" },
-                                { key: "toc", label: "目录" },
-                              ].map((opt) => (
+                              {SLIDE_TYPE_OPTIONS.map((opt) => (
                                 <button
                                   key={opt.key}
                                   type="button"

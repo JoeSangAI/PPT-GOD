@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 
+import pytest
+
 from fastapi import HTTPException
 from PIL import Image
 from pptx import Presentation
@@ -473,7 +475,7 @@ def test_cancelled_prototype_with_preserved_old_image_returns_to_prompt_ready():
     assert slide.status == "prompt_ready"
 
 
-def test_update_slide_type_canonicalizes_toc_alias_and_syncs_content_json():
+def test_update_slide_type_accepts_canonical_toc_and_syncs_content_json():
     db = make_session()
     project = Project(title="Manual type", status="planning")
     db.add(project)
@@ -494,7 +496,7 @@ def test_update_slide_type_canonicalizes_toc_alias_and_syncs_content_json():
 
     result = slides_api.update_slide_type(
         project.id,
-        slides_api.UpdateTypeRequest(page_num=2, slide_id=slide.id, type="agenda"),
+        slides_api.UpdateTypeRequest(page_num=2, slide_id=slide.id, type="toc"),
         db=db,
     )
     db.refresh(slide)
@@ -503,6 +505,29 @@ def test_update_slide_type_canonicalizes_toc_alias_and_syncs_content_json():
     assert slide.type == "toc"
     assert slide.content_json["type"] == "toc"
     assert slide.type_locked is True
+
+
+def test_update_slide_type_rejects_legacy_or_unknown_values():
+    db = make_session()
+    project = Project(title="Strict manual type", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, type="content", content_json={"type": "content"})
+    db.add(slide)
+    db.flush()
+
+    for invalid_type in ("agenda", "content_split", "content_magic"):
+        with pytest.raises(HTTPException) as exc_info:
+            slides_api.update_slide_type(
+                project.id,
+                slides_api.UpdateTypeRequest(page_num=1, slide_id=slide.id, type=invalid_type),
+                db=db,
+            )
+        assert exc_info.value.status_code == 400
+
+    db.refresh(slide)
+    assert slide.type == "content"
+    assert slide.content_json["type"] == "content"
 
 
 def test_rollback_to_prompt_requires_selected_style():
