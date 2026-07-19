@@ -10,7 +10,7 @@
 
 </div>
 
-![PPT God：封面、数据与场景页面保持跨页一致](./docs/readme-assets/hero-showcase.jpg?v=20260719-single-message)
+![PPT God：封面、数据与场景页面保持跨页一致](./docs/readme-assets/hero-consistency.jpg)
 
 <p align="center"><sub>首屏中的 Apple Vision Pro 为公开资料 Demo；产品界面经过脱敏，展示内容均可公开。</sub></p>
 
@@ -24,11 +24,11 @@
 
 ### 风格选择：同一份内容，也可以先看两种方向
 
-![绵棠手礼：同一份内容的两种风格方向](./docs/readme-assets/brand-style-case.jpg?v=20260719-single-message)
+![绵棠手礼：同一份内容的两种风格方向](./docs/readme-assets/style-choice-comparison.jpg)
 
 ### 内容规划：长材料先变成结构，再进入页面
 
-![古希腊神话：长材料经过内容规划变成四篇章结构](./docs/readme-assets/course-structure-case.jpg?v=20260719-single-message)
+![古希腊神话：长材料经过内容规划变成四篇章结构](./docs/readme-assets/content-planning-structure.jpg)
 
 ## 你真正买到的，是四种确定性
 
