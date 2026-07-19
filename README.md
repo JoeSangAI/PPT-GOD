@@ -8,7 +8,7 @@
 
 </div>
 
-![PPT God：整套一致、逐页可控、品牌准确的 PPT 工作流](./docs/readme-assets/hero-showcase.jpg)
+![PPT God：整套一致、逐页可控、品牌准确的 PPT 工作流](./docs/readme-assets/hero-showcase.jpg?v=4808084)
 
 <p align="center"><sub>首屏中的 Apple Vision Pro 为公开资料 Demo；产品界面经过脱敏，展示内容均可公开。</sub></p>
 
@@ -56,6 +56,12 @@ PPT God 不把“风格”锁死在一个模板里。同一份品牌企划，可
 在批量生成前，先确认每页标题、正文、页面类型、参考素材和视觉方向；需要修改时，可以选中单页、多页或整套 PPT 继续调整。
 
 ![PPT God 页面级内容与画面控制](./docs/readme-assets/page-control.jpg)
+
+## 真实案例不只是作品，也是产品的训练场
+
+PPT God 采用案例驱动的自迭代体系：每一次真实交付中的反馈，都会先脱敏为回归案例，再沉淀成可复用的能力与质量检查，让后续项目默认受益。
+
+**真实反馈 → 脱敏回归 → 能力升级 → 下一次默认更稳**
 
 ## 不只做品牌发布，也能吃下课程与长内容
 
