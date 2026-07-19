@@ -26,9 +26,9 @@
 
 ![绵棠手礼：同一份内容的两种风格方向](./docs/readme-assets/style-choice-comparison.jpg)
 
-### 内容规划：长材料先变成结构，再进入页面
+### 课程课件：长内容先建结构，再形成节奏
 
-![古希腊神话：长材料经过内容规划变成四篇章结构](./docs/readme-assets/content-planning-structure.jpg)
+![古希腊神话：长内容形成有章节结构与讲述节奏的成套课件](./docs/readme-assets/course-deck-grid-showcase.jpg)
 
 ## 你真正买到的，是四种确定性
 
