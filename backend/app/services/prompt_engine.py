@@ -7,6 +7,7 @@ from app.services.overlay_layers import (
     overlay_reservation_instruction,
 )
 from app.services.section_text import sanitize_section_visual_numbering
+from app.services.semantic_relations import semantic_relation_prompt_rule
 from app.services.style_pack import clean_image_prompt_style_text
 from app.services.visual_directives import (
     extract_visual_directives,
@@ -1215,6 +1216,10 @@ def generate_prompt_for_page(
         valid_asset_ids=_valid_overlay_asset_ids(page_intent),
     )
     overlay_section = f"\n\nExact Overlay Reservation:\n{overlay_reservation}" if overlay_reservation else ""
+    semantic_relation_section = (
+        "\n\nSemantic Structure:\n"
+        + semantic_relation_prompt_rule((page_intent or {}).get("semantic_relation"))
+    )
     final_prompt = (
         user_feedback_section
         + text_section
@@ -1231,6 +1236,7 @@ def generate_prompt_for_page(
         + str(visual_evidence)
         + "\n\nLayout:\n"
         + str(layout_intent)
+        + semantic_relation_section
         + composition_section
         + (f"\n{punchline_treatment}" if punchline_treatment else "")
         + overlay_section

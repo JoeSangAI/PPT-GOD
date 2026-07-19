@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api import slides as slides_api
 from app.models.base import Base
 from app.models.models import Project, ReferenceImage, Slide
+from app.services.content_plan_markdown import content_body_storage_state
 
 
 def make_session():
@@ -98,3 +99,42 @@ def test_exact_visual_block_creates_overlay_layer(tmp_path, monkeypatch):
     assert len(layers) == 1
     assert layers[0]["asset_id"] == ref.id
     assert layers[0]["preset"] == "center-card"
+
+
+def test_content_update_replaces_stale_editor_blocks_when_markdown_body_is_updated():
+    db = make_session()
+    project = Project(title="editor body sync", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(
+        project_id=project.id,
+        page_num=1,
+        type="content",
+        content_json={
+            "text_content": {"headline": "正文同步", "subhead": "", "body": "旧正文"},
+            "content_blocks": [{"id": "body", "kind": "markdown", "markdown": "旧正文"}],
+        },
+        visual_json={},
+    )
+    db.add(slide)
+    db.commit()
+
+    slides_api.update_slide_content(
+        project.id,
+        slides_api.UpdateContentRequest(
+            page_num=1,
+            slide_id=slide.id,
+            content_json={
+                "text_content": {"headline": "正文同步", "subhead": "", "body": "用户手动编辑后的新版正文"},
+                "speaker_notes": "同步备注",
+            },
+        ),
+        db,
+    )
+
+    db.refresh(slide)
+    state = content_body_storage_state(slide.content_json)
+    assert state["effective_body"] == "用户手动编辑后的新版正文"
+    assert state["text_body"] == "用户手动编辑后的新版正文"
+    assert state["blocks_body"] == "用户手动编辑后的新版正文"
+    assert state["consistent"] is True

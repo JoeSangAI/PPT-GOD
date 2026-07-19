@@ -12,12 +12,21 @@ from app.core.provider_credentials import get_minimax_llm_model, get_raw_provide
 from app.services.logo_policy import logo_policy_for_page
 from app.services.overlay_layers import apply_llm_overlay_layout, build_overlay_asset_context_map, normalize_overlay_layers
 from app.services.prompt_engine import _sanitize_product_reference_text
+from app.services.semantic_relations import (
+    SEMANTIC_RELATIONS,
+    is_supported_semantic_relation_label,
+    normalize_semantic_relation,
+)
 from app.services.section_text import sanitize_section_visual_numbering
+from app.services.slide_types import normalize_slide_type
 from app.services.style_pack import derive_style_pack_from_content
 from app.services.visual_strategy import visual_language_group
 from app.utils.text_cleaning import clean_llm_output
 
 logger = logging.getLogger(__name__)
+
+VISUAL_PLAN_VISIBLE_BODY_MAX_CHARS = 3000
+VISUAL_PLAN_SPEAKER_NOTES_MAX_CHARS = 1800
 
 ASSET_RECALL_SUMMARY_KEYS = {
     "name",
@@ -155,6 +164,32 @@ def _flatten_guidance_text(value) -> str:
     if isinstance(value, dict):
         return "\n".join(_flatten_guidance_text(item) for item in value.values())
     return str(value)
+
+
+def _visual_plan_context_text(value: object, *, max_chars: int) -> tuple[str, bool]:
+    """Flatten structured planning context without silently dropping later items."""
+    text = _flatten_guidance_text(value)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text or max_chars <= 0:
+        return "", False
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars].rstrip() + "\n[context truncated]", True
+
+
+def _sanitize_section_notes_context(value: str, *, visible_text: str) -> str:
+    """Keep section notes useful without reintroducing hidden chapter labels."""
+    text = str(value or "")
+
+    def drop_unsupported(match: re.Match) -> str:
+        token = match.group(0)
+        return token if _token_supported_by_visible_copy(token, visible_text) else ""
+
+    text = STRUCTURAL_SECTION_LABEL_RE.sub(drop_unsupported, text)
+    text = SECTION_DECIMAL_TOKEN_RE.sub(drop_unsupported, text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _clean_sensitive_label_candidate(value: str, *, allow_short: bool = False) -> str:
@@ -400,18 +435,22 @@ def _assign_layout(page_type: str, body_count: int = 0, headline: str = "", subh
     cover → cover | ending → ending | section → section | toc → toc
     data → data | hero → hero | content → content
     """
-    page_type = str(page_type or "content").strip().lower()
+    page_type = normalize_slide_type(
+        page_type,
+        allow_legacy_stored_aliases=True,
+        default="content",
+    )
     mapping = {
         "cover": "cover",
         "toc": "toc",
-        "agenda": "toc",
         "section": "section",
         "hero": "hero",
         "quote": "hero",
+        "content": "content",
         "data": "data",
         "ending": "ending",
     }
-    return mapping.get(page_type, "content")
+    return mapping[page_type]
 
 
 def _fallback_visual_evidence(page: Dict) -> str:
@@ -1045,7 +1084,7 @@ def _build_batch_prompt(
 - data / 数据页：只有当页面正文给出真实数字、标签或表格时才画图；必须围绕这些数据做大数字、简单图表或高可读表格，不要编造数值、趋势或坐标轴。
 - ending / 封底：只做收束、感谢、CTA 或联系方式；呼应封面但更安静，不引入新商业证据或复杂画面。
 - hero / quote / 金句页：这是独立的 punchline treatment，不是内容页。普通金句只围绕一句短句、一个短语或一个词做强记忆点；名人名言/引用页可以承载略长引文，但必须保留引用感和作者署名。若有明确名人作者，优先考虑把人物肖像作为背景的一部分，低对比度融入画面，不做独立人物卡。视觉形式不固定，但必须沿用全局配色、字体气质、材质和装饰语言，不要突然改成另一套字体或海报风格。
-- content / data / table / 对比分析页：优先保证阅读效率，但必须在整套明暗/基底策略内处理。信息越密集，越应通过卡片、内容区、网格、字号层级和留白降噪；不要机械切换到另一套浅底风格。
+- content / data / table / 对比分析页：优先保证阅读效率，但必须在整套明暗/基底策略内处理。信息越密集，越应先用字号层级、留白、对齐、必要的分组或图表降噪；只有内容本身存在明确分组、比较或独立单元时才使用卡片/内容区，不要把卡片和图标当成默认装饰，也不要机械切换到另一套浅底风格。
 - 多对象内容页：当正文列出多个地点、作品、产品、步骤或人物，且画面包含多张图/多个对象时，visual_description 必须说明图文如何一一贴近对应：可用编号、短标签、旁注、轻连线或穿插式照片卡片。版面应让图片和文字跨越中线形成互动，不要只写孤立的左文右图或单独信息块。
 - 地图 / 图表 / 结构页：由文案决定地图、图表、流程或业务场景，不要机械复刻参考图里的封面构图。
 - 如果参考图本身是强视觉封面、海报、广告KV或单页主视觉，必须先抽象为色彩/材质/装饰/构图原则，再按页面类型调节强度，不能把单页主视觉机械扩散到全 deck。
@@ -1084,7 +1123,7 @@ def _build_batch_prompt(
 
 【整套明暗/基底策略 — 必须先遵守，再设计单页】
 {visual_strategy_text}
-除非这套策略明确允许浅底例外，否则内容页不得因为信息量较大就自动切换成米白、浅灰等另一套视觉语言；应优先在当前基底内用卡片、局部内容区、字号层级和留白解决可读性。
+除非这套策略明确允许浅底例外，否则内容页不得因为信息量较大就自动切换成米白、浅灰等另一套视觉语言；应优先在当前基底内用字号层级、留白、对齐、必要的分组或图表解决可读性。卡片只在语义需要分组时使用。
 
 【大纲（{len(sanitized_pages)} 页）】
 {json.dumps(sanitized_pages, ensure_ascii=False, indent=2)}
@@ -1093,16 +1132,21 @@ def _build_batch_prompt(
 {overlay_instruction}
 {visual_asset_instruction}
 {page_type_style_rules}
+【可见正文与讲稿上下文】
+- body_context 是本页完整的可见正文上下文。视觉方案必须覆盖其中所有关键对象和要点，不能只处理前几项。
+- speaker_notes_context 是不可见的演讲者讲稿，只用于理解案例、人物、场景和叙事意图。可以据此选择画面证据，但绝对不能把讲稿原句或讲稿中的补充文字当成页面可见文案。
+- 如果 context_truncated=true，说明该字段因调用安全上限被截断；不得声称已经覆盖被截断的部分。
 【Logo 管道规则】
 {logo_pipeline_rule}
 
 【任务】
-为每一页生成五个字段：
-0. visual_evidence：这一页最应该出现的“画面证据/配图对象”（20-45字）。它必须是可被看见的场景、物件、图表、对比结构或商业证据，不能只写风格。
-1. visual_summary：一句话画面意向（20-30字；有参考图时 20-35 字），用于全局预览页快速理解。如"全屏深色背景，中央 DNA 双螺旋光纹"
-2. visual_description：围绕 visual_evidence 写可执行画面方案，只描述画面证据、构图、主次、色调与文字/配图区关系。**不含**任何必须在页面上逐字渲染的正文（正文由单独约束）。
-3. visual_asset_ids：本页需要使用的全局视觉资产 id 数组；无关页面输出 []，最多 3 个
-4. visual_asset_usage：对象，key 为 asset_id，value 为一句中文说明，只说明该资产在本页的用途、位置和叙事作用；无资产输出 {{}}
+为每一页生成六个字段：
+0. semantic_relation：先判断本页信息关系，只能从 {json.dumps(list(SEMANTIC_RELATIONS), ensure_ascii=False)} 中选择。none=没有明确关系；sequence=顺序；parallel=并列；comparison=对比；causality=因果；hierarchy=层级/包含；convergence=多因素汇聚到一个结果；cycle=真实循环。不要为了方便画图而把并列内容改成步骤、把独立变量改成循环或包含。
+1. visual_evidence：这一页最应该出现的“画面证据/配图对象”（20-45字）。它必须是可被看见的场景、物件、图表、对比结构或商业证据，不能只写风格。
+2. visual_summary：一句话画面意向（20-30字；有参考图时 20-35 字），用于全局预览页快速理解。如"全屏深色背景，中央 DNA 双螺旋光纹"
+3. visual_description：围绕 visual_evidence 写可执行画面方案，只描述画面证据、构图、主次、色调与文字/配图区关系。构图必须遵守 semantic_relation。**不含**任何必须在页面上逐字渲染的正文（正文由单独约束）。
+4. visual_asset_ids：本页需要使用的全局视觉资产 id 数组；无关页面输出 []，最多 3 个
+5. visual_asset_usage：对象，key 为 asset_id，value 为一句中文说明，只说明该资产在本页的用途、位置和叙事作用；无资产输出 {{}}
 {logo_policy_rule}
    - 无参考图：约 80–120 字，说明画面证据、布局主次、文字区与配图区如何分工、整体色调强度。
    - 含参考图：见上文规则。
@@ -1130,7 +1174,7 @@ def _build_batch_prompt(
 
 【输出格式】
 严格输出 JSON 对象，key 为 page_num（字符串），value 为对象：
-{{"1": {{"visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {logo_policy_example}}}, "2": {{...}}, ...}}
+{{"1": {{"semantic_relation": "parallel", "visual_evidence": "画面证据...", "visual_summary": "一句话意向...", "visual_description": "详细描述...", "visual_asset_ids": [], "visual_asset_usage": {{}}, "logo_policy": {logo_policy_example}}}, "2": {{...}}, ...}}
 
 对于包含 overlay_layers 的页面，请在对应页面的对象中增加 overlay_layout 字段：
 "overlay_layout": [{{"asset_id": "素材ID", "layout_role": "peer|primary|secondary", "preset": "可选preset", "reason": "简要理由"}}]
@@ -1291,6 +1335,7 @@ def _fallback_visual_plan(
             "page_num": page.get("page_num", 0),
             "type": page_type,
             "layout": _assign_layout(page_type, body_count, headline, text_content.get("subhead", "")),
+            "semantic_relation": normalize_semantic_relation(page.get("semantic_relation")),
             "visual_evidence": visual_evidence,
             "visual_summary": visual_evidence,
             "visual_description": _fallback_visual_description(page, visual_evidence),
@@ -1354,6 +1399,19 @@ def _do_generate_visual_plan(
     for page in content_plan:
         text = page.get("text_content", {})
         page_num = page.get("page_num", 0)
+        body_context, body_context_truncated = _visual_plan_context_text(
+            text.get("body"),
+            max_chars=VISUAL_PLAN_VISIBLE_BODY_MAX_CHARS,
+        )
+        speaker_notes_context, speaker_notes_context_truncated = _visual_plan_context_text(
+            page.get("speaker_notes"),
+            max_chars=VISUAL_PLAN_SPEAKER_NOTES_MAX_CHARS,
+        )
+        if str(page.get("type") or "").strip().lower() == "section":
+            speaker_notes_context = _sanitize_section_notes_context(
+                speaker_notes_context,
+                visible_text=_page_visible_copy_text(page),
+            )
         recalled_assets = _recall_visual_assets_for_page(page, global_visual_assets)
         recalled_assets_by_page[int(page_num or 0)] = recalled_assets
         summary = {
@@ -1361,7 +1419,12 @@ def _do_generate_visual_plan(
             "type": page.get("type", "content"),
             "headline": text.get("headline", ""),
             "subhead": text.get("subhead", ""),
-            "body_preview": text.get("body", [])[:3] if isinstance(text.get("body"), list) else (text.get("body", "")[:120] if isinstance(text.get("body"), str) else ""),
+            "body_context": body_context,
+            "speaker_notes_context": speaker_notes_context,
+            "context_truncated": {
+                "body": body_context_truncated,
+                "speaker_notes": speaker_notes_context_truncated,
+            },
             "existing_visual_suggestion": _current_visual_suggestion(page),
             "visual_requirements": _current_visual_requirements(page),
             "reference_context": page.get("reference_context", ""),
@@ -1493,6 +1556,14 @@ def _do_generate_visual_plan(
 
         desc_data = descriptions.get(page_num, {})
         if isinstance(desc_data, dict):
+            raw_semantic_relation = desc_data.get("semantic_relation")
+            semantic_relation = normalize_semantic_relation(raw_semantic_relation)
+            if raw_semantic_relation and not is_supported_semantic_relation_label(raw_semantic_relation):
+                logger.warning(
+                    "VisualPlan: page %s returned unsupported semantic_relation=%r; using none",
+                    page_num,
+                    raw_semantic_relation,
+                )
             visual_evidence = desc_data.get("visual_evidence", "")
             visual_summary = desc_data.get("visual_summary", "")
             visual_desc = desc_data.get("visual_description", "")
@@ -1501,6 +1572,7 @@ def _do_generate_visual_plan(
             llm_logo_policy = desc_data.get("logo_policy") if isinstance(desc_data.get("logo_policy"), dict) else None
         else:
             # 兼容旧格式：直接是字符串
+            semantic_relation = "none"
             visual_evidence = ""
             visual_summary = ""
             visual_desc = str(desc_data) if desc_data else ""
@@ -1688,6 +1760,7 @@ def _do_generate_visual_plan(
         intent = {
             "page_num": page.get("page_num", 0),
             "type": page_type,
+            "semantic_relation": semantic_relation,
             "layout": _assign_layout(
                 page_type,
                 body_count,

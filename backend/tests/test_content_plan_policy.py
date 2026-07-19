@@ -133,6 +133,28 @@ def test_content_plan_page_types_keep_quote_separate_from_hero():
     assert content_plan_module._canonical_content_plan_type("quote") == "quote"
     assert content_plan_module._canonical_content_plan_type("quotation") == "quote"
     assert content_plan_module._canonical_content_plan_type("金句") == "hero"
+
+
+def test_short_content_does_not_auto_upgrade_to_hero():
+    page = {
+        "text_content": {
+            "headline": "品牌还剩下什么？",
+            "body": "选择本身还属于谁？",
+        }
+    }
+
+    assert content_plan_module._auto_reclassify_page_type(page, "content") is None
+
+
+def test_body_rich_hero_still_falls_back_to_content():
+    page = {
+        "text_content": {
+            "headline": "品牌还剩下什么？",
+            "body": "第一段解释品牌的作用。\n第二段展开信任成本。\n第三段补充持续交付与责任。" * 4,
+        }
+    }
+
+    assert content_plan_module._auto_reclassify_page_type(page, "hero") == "content"
     assert "禁止使用 outline、section_cover、framework、case、quiz、transition、quote" not in inspect.getsource(content_plan_module)
 
 

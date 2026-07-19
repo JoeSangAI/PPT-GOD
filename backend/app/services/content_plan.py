@@ -24,6 +24,7 @@ from app.services.source_intent import (
     normalize_intent_contract as normalize_legacy_intent_contract,
     source_diagnostics_from_documents,
 )
+from app.services.slide_types import CANONICAL_SLIDE_TYPE_SET
 from app.services.visual_directives import separate_visual_directives_from_page
 from app.utils.text_cleaning import (
     is_markdown_thematic_break_line,
@@ -97,7 +98,7 @@ CONTENT_PLAN_STRATEGY_REUSE_EXPORTED = "reuse_exported_plan"
 CONTENT_PLAN_STRATEGY_REUSE_PAGINATED = "reuse_paginated_markdown"
 CONTENT_PLAN_STRATEGY_LONG_DECK = "long_structured_deck"
 CONTENT_PLAN_STRATEGY_PAGE_MAP = "page_map"
-CANONICAL_CONTENT_PLAN_TYPES = {"cover", "toc", "section", "content", "data", "hero", "quote", "ending"}
+CANONICAL_CONTENT_PLAN_TYPES = set(CANONICAL_SLIDE_TYPE_SET)
 CONTENT_BODY_REQUIRED_TYPES = {"content", "data"}
 CONTENT_PLAN_TYPE_ALIASES = {
     "agenda": "toc",
@@ -3612,8 +3613,11 @@ def _auto_reclassify_page_type(content_json: dict, current_type: str, original_t
     if current_type == "content":
         if should_be_data:
             return "data"
-        if should_be_hero:
-            return "hero"
+        # A short body is not enough to prove punchline intent. Keep an
+        # explicitly chosen content role unless the user/model selects hero.
+        # Auto-upgrading short content to hero makes semantic type behave like
+        # a hidden layout guess and can unexpectedly change visual intensity.
+        return None
     elif current_type == "data":
         if not should_be_data:
             return "content"

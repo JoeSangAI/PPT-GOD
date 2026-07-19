@@ -40,6 +40,7 @@ from app.services.run_state import (
     mark_run_running,
     update_run_progress,
 )
+from app.services.slide_types import normalize_slide_type
 from app.utils.reference_image import default_visual_asset_process_mode
 
 logger = logging.getLogger(__name__)
@@ -1055,19 +1056,22 @@ def _load_reference_images(
 
 def _map_slide_type_to_template_key(slide_type: str) -> str:
     """将 slide 类型映射到模板类别。"""
-    slide_type = str(slide_type or "content").lower()
+    slide_type = normalize_slide_type(
+        slide_type,
+        allow_legacy_stored_aliases=True,
+        default="content",
+    )
     mapping = {
         "cover": "cover",
         "toc": "toc",
         "section": "section",
+        "content": "content",
         "hero": "quote",
         "quote": "quote",
         "data": "data",
-        "chart": "data",
-        "table": "data",
         "ending": "ending",
     }
-    return mapping.get(slide_type, "content")
+    return mapping[slide_type]
 
 
 def _slide_family(slide: Slide) -> Optional[str]:
@@ -1077,7 +1081,11 @@ def _slide_family(slide: Slide) -> Optional[str]:
         if family:
             return str(family)
     # 老数据 fallback：按 slide.type 推断（MECE：cover/ending 已拆分）
-    slide_type = (slide.type or "content").lower()
+    slide_type = normalize_slide_type(
+        slide.type,
+        allow_legacy_stored_aliases=True,
+        default="content",
+    )
     if slide_type == "cover":
         return "cover"
     if slide_type == "ending":

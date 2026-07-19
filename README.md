@@ -189,3 +189,38 @@ PPT God 不是只给你一组灵感图。最终目标是一份可以下载、检
 - **产品可信度**：截图、界面、实物和关键卖点不能被编造。
 
 PPT God 想做的，就是让 AI 从“帮你想一想”走向“帮你做出一份真正能用的 PPT”。
+
+---
+
+## 🤖 Agent CLI：更新已有项目的内容规划
+
+外部 Agent 可以用严格 Markdown 新建项目，也可以在原项目内同步内容。已有项目默认只预览差异，不会直接写入：
+
+先检查本地服务、Agent 合同、当前账号和项目连接：
+
+```bash
+python scripts/pptgod_cli.py doctor
+python scripts/pptgod_cli.py capabilities
+python scripts/pptgod_cli.py whoami
+python scripts/pptgod_cli.py list-projects
+```
+
+```bash
+python scripts/pptgod_cli.py update-content-plan <project_id> path/to/plan.md
+```
+
+确认 `changed`、`added`、`deleted`、`unchanged` 和删除风险后，再明确应用：
+
+```bash
+python scripts/pptgod_cli.py update-content-plan <project_id> path/to/plan.md --apply --open
+```
+
+同步会尽量保留已匹配页面的稳定 ID、素材绑定、画面方案、Prompt、图片和历史版本。它不会自动确认内容、切换项目阶段或启动视觉生成。完整格式和工作流见 [`docs/agent/content-planning-playbook.md`](docs/agent/content-planning-playbook.md)。
+
+正文同步会同时更新富文本编辑器使用的 `content_blocks` 与 Markdown 正文镜像，并在提交前读回验证；应用成功时响应中的 `readback.ok` 必须为 `true`。本地整合版默认打开 `http://localhost:8000`，5173 端口仅用于前端开发模式。
+
+启动视觉方案、画面 Prompt 或图片生成后，可以让 CLI 等待持久化 run 到达终态，避免 Agent 自己写轮询脚本：
+
+```bash
+python scripts/pptgod_cli.py wait <project_id> --run-id <run_id>
+```

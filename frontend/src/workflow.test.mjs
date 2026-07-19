@@ -46,14 +46,20 @@ const {
   summarizeVisualChange,
   summarizeInsertedSlide,
 } = loadTsModule("changeReceipt.ts");
+const {
+  CANONICAL_SLIDE_TYPES,
+  SLIDE_TYPE_LABELS,
+  SLIDE_TYPE_OPTIONS,
+} = loadTsModule("slideTypes.ts");
 
 const appSource = readFileSync(join(import.meta.dirname, "App.tsx"), "utf8");
 
-assert.doesNotMatch(appSource, /quote:\s*"引言"/, "legacy quote pages should not be labelled as 引言");
-assert.match(appSource, /quote:\s*"金句"/, "legacy quote pages should be shown as 金句");
-assert.match(appSource, /\{ key: "data", label: "数据" \}/, "data page type must remain selectable");
-assert.match(appSource, /\{ key: "toc", label: "目录" \}/, "directory page type must use the canonical toc key");
-assert.doesNotMatch(appSource, /\{ key: "agenda", label: "目录" \}/, "directory page type selector must not save the legacy agenda key");
+assert.deepEqual(plain(CANONICAL_SLIDE_TYPES), ["cover", "toc", "section", "content", "data", "hero", "quote", "ending"]);
+assert.deepEqual(plain(SLIDE_TYPE_OPTIONS.map((item) => item.key)), plain(CANONICAL_SLIDE_TYPES));
+assert.equal(SLIDE_TYPE_LABELS.hero, "金句");
+assert.equal(SLIDE_TYPE_LABELS.quote, "引用");
+assert.equal(SLIDE_TYPE_LABELS.agenda, undefined, "legacy agenda must not be exposed as a selectable type");
+assert.match(appSource, /SLIDE_TYPE_OPTIONS\.map\(\(opt\) =>/, "slide type selector must use the canonical options contract");
 
 function context(input) {
   return buildGateContext(buildWorkflowState(input), input.revision ?? 0);

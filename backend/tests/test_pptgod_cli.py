@@ -67,6 +67,161 @@ def test_cli_validate_content_plan_returns_json_errors(tmp_path):
     assert any("缺少字段" in error for error in payload["errors"])
 
 
+def test_cli_validate_content_plan_rejects_half_supported_slide_type(tmp_path):
+    plan_path = tmp_path / "half-supported.md"
+    plan_path.write_text(VALID_MARKDOWN.replace("### 类型\ncover", "### 类型\ncontent_split"), encoding="utf-8")
+
+    result = run_cli("validate-content-plan", str(plan_path))
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert any("content_split" in error for error in payload["errors"])
+
+
+def test_cli_capabilities_reads_contract_without_login(monkeypatch, capsys):
+    monkeypatch.setattr(pptgod_cli, "_start_backend", lambda _url: None)
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_get_json",
+        lambda url, tester_id=None: (200, {"ok": True, "contract_version": "1", "service": {"name": "PPT GOD"}}),
+    )
+
+    exit_code = pptgod_cli.main(["capabilities"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["contract_version"] == "1"
+
+
+def test_cli_whoami_uses_default_asang_account(monkeypatch, capsys):
+    def fake_prepare(args, *, start_frontend=False):
+        assert args.tester_name == "阿桑"
+        return "http://backend", "http://frontend", "tester-1"
+
+    monkeypatch.setattr(pptgod_cli, "_prepare_agent_request", fake_prepare)
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_get_json",
+        lambda url, tester_id=None: (200, {"tester_id": tester_id, "display_name": "阿桑"}),
+    )
+
+    exit_code = pptgod_cli.main(["whoami"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["account"]["display_name"] == "阿桑"
+
+
+def test_cli_list_projects_returns_machine_readable_count(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_get_json",
+        lambda url, tester_id=None: (200, [{"id": "p1", "title": "第一份"}, {"id": "p2", "title": "第二份"}]),
+    )
+
+    exit_code = pptgod_cli.main(["list-projects"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["count"] == 2
+    assert payload["projects"][1]["id"] == "p2"
+
+
+def test_cli_doctor_checks_contract_account_and_projects(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+
+    def fake_get(url, tester_id=None):
+        if url.endswith("/agent/capabilities"):
+            return 200, {"contract_version": "1", "service": {"runtime_instance_id": "abc123"}}
+        if url.endswith("/auth/me"):
+            return 200, {"display_name": "阿桑"}
+        return 200, [{"id": "p1"}]
+
+    monkeypatch.setattr(pptgod_cli, "_get_json", fake_get)
+
+    exit_code = pptgod_cli.main(["doctor"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert payload["project_count"] == 1
+    assert payload["capabilities"]["service"]["runtime_instance_id"] == "abc123"
+
+
+def test_cli_update_content_plan_defaults_to_dry_run(monkeypatch, tmp_path, capsys):
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(VALID_MARKDOWN, encoding="utf-8")
+    calls = []
+
+    def fake_prepare(args, *, start_frontend=False):
+        assert args.tester_name == "阿桑"
+        assert start_frontend is False
+        return "http://backend", "http://frontend", "tester-1"
+
+    def fake_agent_post(_backend_url, path, payload, *, tester_id):
+        calls.append((path, payload, tester_id))
+        return 200, {
+            "ok": True,
+            "applied": False,
+            "preview_token": "preview-1",
+            "summary": {"changed": 1, "added": 0, "deleted": 0, "unchanged": 0},
+        }
+
+    monkeypatch.setattr(pptgod_cli, "_prepare_agent_request", fake_prepare)
+    monkeypatch.setattr(pptgod_cli, "_agent_post", fake_agent_post)
+
+    exit_code = pptgod_cli.main(["update-content-plan", "project-1", str(plan_path)])
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0][0] == "/agent/projects/project-1/content-plan/update"
+    assert calls[0][1] == {
+        "markdown": VALID_MARKDOWN,
+        "apply": False,
+        "frontend_base_url": "http://frontend",
+    }
+    assert calls[0][2] == "tester-1"
+    assert json.loads(capsys.readouterr().out)["applied"] is False
+
+
+def test_cli_update_content_plan_apply_repreviews_and_uses_token(monkeypatch, tmp_path, capsys):
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text(VALID_MARKDOWN, encoding="utf-8")
+    payloads = []
+
+    def fake_prepare(_args, *, start_frontend=False):
+        assert start_frontend is False
+        return "http://backend", "http://frontend", "tester-1"
+
+    def fake_agent_post(_backend_url, path, payload, *, tester_id):
+        assert path == "/agent/projects/project-1/content-plan/update"
+        assert tester_id == "tester-1"
+        payloads.append(payload)
+        if not payload["apply"]:
+            return 200, {"ok": True, "applied": False, "preview_token": "preview-1"}
+        return 200, {"ok": True, "applied": True, "preview_token": "preview-1", "summary": {"changed": 1}}
+
+    monkeypatch.setattr(pptgod_cli, "_prepare_agent_request", fake_prepare)
+    monkeypatch.setattr(pptgod_cli, "_agent_post", fake_agent_post)
+
+    exit_code = pptgod_cli.main(["update-content-plan", "project-1", str(plan_path), "--apply"])
+
+    assert exit_code == 0
+    assert len(payloads) == 2
+    assert payloads[0]["apply"] is False
+    assert payloads[1]["apply"] is True
+    assert payloads[1]["expected_preview_token"] == "preview-1"
+    assert json.loads(capsys.readouterr().out)["applied"] is True
+
+
 def test_cli_status_reads_agent_project_status(monkeypatch, capsys):
     def fake_prepare(_args, *, start_frontend=False):
         assert start_frontend is False
@@ -283,6 +438,62 @@ def test_cli_get_generation_status_reads_contract(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["workflow_status"]["project_status"] == "prompt_ready"
 
 
+def test_cli_wait_returns_when_matching_run_succeeds(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_agent_get",
+        lambda *_args, **_kwargs: (
+            200,
+            {
+                "ok": True,
+                "workflow_status": {
+                    "active_run": None,
+                    "last_run": {"id": "run-1", "status": "succeeded"},
+                },
+            },
+        ),
+    )
+
+    exit_code = pptgod_cli.main(["wait", "project-1", "--run-id", "run-1", "--timeout", "0"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["wait_result"] == {"run_id": "run-1", "status": "succeeded", "terminal": True}
+
+
+def test_cli_wait_returns_failure_for_failed_run(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_agent_get",
+        lambda *_args, **_kwargs: (
+            200,
+            {
+                "ok": True,
+                "workflow_status": {
+                    "active_run": None,
+                    "last_run": {"id": "run-2", "status": "failed"},
+                },
+            },
+        ),
+    )
+
+    exit_code = pptgod_cli.main(["wait", "project-1", "--run-id", "run-2", "--timeout", "0"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["wait_result"]["status"] == "failed"
+
+
 def test_cli_retry_failed_slides_posts_contract(monkeypatch, capsys):
     def fake_prepare(_args, *, start_frontend=False):
         return "http://backend", "http://frontend", "tester-1"
@@ -299,6 +510,46 @@ def test_cli_retry_failed_slides_posts_contract(monkeypatch, capsys):
 
     assert exit_code == 0
     assert json.loads(capsys.readouterr().out)["message"] == "Retry started"
+
+
+def test_cli_confirm_prototype_posts_contract(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+
+    def fake_post(_backend_url, path, payload, *, tester_id):
+        assert path == "/agent/projects/project-1/prototype/confirm"
+        assert payload == {"frontend_base_url": "http://frontend"}
+        return 200, {"ok": True, "run": {"id": "run-full"}}
+
+    monkeypatch.setattr(pptgod_cli, "_agent_post", fake_post)
+
+    exit_code = pptgod_cli.main(["confirm-prototype", "project-1"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["run"]["id"] == "run-full"
+
+
+def test_cli_stop_generation_posts_contract(monkeypatch, capsys):
+    monkeypatch.setattr(
+        pptgod_cli,
+        "_prepare_agent_request",
+        lambda _args, start_frontend=False: ("http://backend", "http://frontend", "tester-1"),
+    )
+
+    def fake_post(_backend_url, path, payload, *, tester_id):
+        assert path == "/agent/projects/project-1/runs/stop"
+        assert payload == {"frontend_base_url": "http://frontend"}
+        return 200, {"ok": True, "message": "Generation stopped"}
+
+    monkeypatch.setattr(pptgod_cli, "_agent_post", fake_post)
+
+    exit_code = pptgod_cli.main(["stop-generation", "project-1"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["message"] == "Generation stopped"
 
 
 def test_cli_export_ppt_reads_download_contract(monkeypatch, capsys):

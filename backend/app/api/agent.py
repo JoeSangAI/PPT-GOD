@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -11,30 +12,59 @@ from sqlalchemy.orm import Session
 from app.api import projects as project_api
 from app.api import slides as slides_api
 from app.core.tester_auth import is_local_admin_request, require_existing_tester, require_tester_id, verify_project_access
+from app.core.config import settings
 from app.models.base import get_db
 from app.models.models import Project, Slide
 from app.services.artifact_versions import strip_artifact_meta
 from app.services.content_plan_markdown import (
     ContentPlanMarkdownError,
+    ContentPlanSyncConflictError,
+    content_body_storage_state,
     export_content_plan_markdown,
     import_content_plan_markdown,
     project_ui_url,
+    sync_content_plan_markdown,
 )
 from app.services.run_state import get_active_run, reconcile_project_state, serialize_run
+from app.services.slide_types import CANONICAL_SLIDE_TYPES
 
 
 router = APIRouter(prefix="/agent", tags=["agent"])
+DEFAULT_AGENT_FRONTEND_BASE_URL = "http://localhost:8000"
+AGENT_CONTRACT_VERSION = "1"
+
+AGENT_OPERATIONS = {
+    "project": ["status", "open"],
+    "content_plan": ["import", "export", "update_preview", "update_apply", "confirm"],
+    "visual_direction": ["start_proposals", "get_proposals", "confirm_proposal"],
+    "visual_plan": ["generate_prompts"],
+    "generation": [
+        "generate_prototype",
+        "generate_pages",
+        "status",
+        "retry_failed",
+        "confirm_prototype",
+        "stop",
+    ],
+    "export": ["export_pptx_contract", "download_pptx"],
+}
 
 
 class ImportContentPlanRequest(BaseModel):
     markdown: str = Field(min_length=1)
     title: str | None = None
     source_filename: str | None = None
-    frontend_base_url: str = "http://localhost:5173"
+    frontend_base_url: str = DEFAULT_AGENT_FRONTEND_BASE_URL
 
 
 class AgentActionRequest(BaseModel):
-    frontend_base_url: str = "http://localhost:5173"
+    frontend_base_url: str = DEFAULT_AGENT_FRONTEND_BASE_URL
+
+
+class UpdateContentPlanRequest(AgentActionRequest):
+    markdown: str = Field(min_length=1)
+    apply: bool = False
+    expected_preview_token: str | None = None
 
 
 class StartVisualProposalsRequest(AgentActionRequest):
@@ -58,7 +88,29 @@ class StartSlideGenerationRequest(AgentActionRequest):
 
 
 def _frontend_base_url(payload: AgentActionRequest | None, fallback: str) -> str:
-    return (payload.frontend_base_url if payload else None) or fallback or "http://localhost:5173"
+    return (payload.frontend_base_url if payload else None) or fallback or DEFAULT_AGENT_FRONTEND_BASE_URL
+
+
+@router.get("/capabilities")
+def get_agent_capabilities():
+    runtime_identity = hashlib.sha256(settings.DATABASE_URL.encode("utf-8")).hexdigest()[:12]
+    return {
+        "ok": True,
+        "contract_version": AGENT_CONTRACT_VERSION,
+        "service": {
+            "name": settings.PROJECT_NAME,
+            "version": settings.VERSION,
+            "runtime_instance_id": runtime_identity,
+            "database_backend": settings.DATABASE_URL.split(":", 1)[0],
+        },
+        "slide_types": list(CANONICAL_SLIDE_TYPES),
+        "operations": AGENT_OPERATIONS,
+        "async_contract": {
+            "start_returns_run": True,
+            "terminal_statuses": ["succeeded", "failed", "cancelled", "stale"],
+            "status_endpoint": "/agent/projects/{project_id}/generation-status",
+        },
+    }
 
 
 def _load_accessible_project(db: Session, project_id: str, tester_id: str | None) -> Project:
@@ -88,12 +140,16 @@ def _compact_slides(slides: list[Slide]) -> list[dict]:
     for slide in slides:
         content = slide.content_json if isinstance(slide.content_json, dict) else {}
         text_content = content.get("text_content") if isinstance(content.get("text_content"), dict) else {}
+        body_state = content_body_storage_state(content)
         compact.append(
             {
                 "page_num": slide.page_num,
                 "type": slide.type or content.get("type") or "content",
                 "status": slide.status,
                 "headline": text_content.get("headline") or "",
+                "body": body_state["effective_body"],
+                "body_storage_consistent": body_state["consistent"],
+                "content_blocks_count": body_state["content_blocks_count"],
                 "has_content": bool(slide.content_json),
                 "has_visual": bool(slide.visual_json),
                 "has_prompt": bool(slide.prompt_text),
@@ -281,7 +337,7 @@ def import_content_plan(
 @router.get("/projects/{project_id}/status")
 def get_agent_project_status(
     project_id: str,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -300,7 +356,7 @@ def get_agent_project_status(
 @router.get("/projects/{project_id}/content-plan/export")
 def export_agent_content_plan(
     project_id: str,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -322,11 +378,75 @@ def export_agent_content_plan(
     }
 
 
+@router.post("/projects/{project_id}/content-plan/update")
+def update_agent_content_plan(
+    project_id: str,
+    payload: UpdateContentPlanRequest,
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
+    project = _load_accessible_project(db, project_id, tester_id)
+    active_run = get_active_run(db, project_id)
+    if payload.apply and active_run:
+        raise HTTPException(status_code=409, detail="项目当前有生成任务在运行，请等待任务结束后重新预览并应用内容更新")
+
+    state_before = {
+        "status": project.status,
+        "content_plan_confirmed": bool(project.content_plan_confirmed),
+    }
+    try:
+        receipt = sync_content_plan_markdown(
+            db,
+            project,
+            payload.markdown,
+            apply=payload.apply,
+            expected_preview_token=payload.expected_preview_token,
+        )
+    except ContentPlanSyncConflictError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "内容同步预览已失效", "errors": exc.errors, "warnings": exc.warnings},
+        ) from exc
+    except ContentPlanMarkdownError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "内容规划 Markdown 格式不合格", "errors": exc.errors, "warnings": exc.warnings},
+        ) from exc
+
+    if payload.apply:
+        db.refresh(project)
+    state_after = {
+        "status": project.status,
+        "content_plan_confirmed": bool(project.content_plan_confirmed),
+    }
+    return {
+        "ok": True,
+        "project_id": receipt.project_id,
+        "applied": receipt.applied,
+        "preview_token": receipt.preview_token,
+        "summary": receipt.summary,
+        "changes": receipt.changes,
+        "warnings": receipt.warnings,
+        "readback": receipt.readback,
+        "project_state_before": state_before,
+        "project_state_after": state_after,
+        "project_state_unchanged": state_before == state_after,
+        "ui_url": project_ui_url(project.id, payload.frontend_base_url),
+        "content_review_url": project_ui_url(project.id, payload.frontend_base_url, stage="content"),
+        "next_action": {
+            "type": "apply_update" if not payload.apply else "review_content",
+            "label": "确认差异后使用 --apply" if not payload.apply else "打开内容页复核更新",
+        },
+    }
+
+
 @router.post("/projects/{project_id}/content-plan/confirm")
 def confirm_agent_content_plan(
     project_id: str,
     payload: AgentActionRequest | None = None,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -348,7 +468,7 @@ def confirm_agent_content_plan(
 def start_agent_visual_proposals(
     project_id: str,
     payload: StartVisualProposalsRequest | None = None,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -372,7 +492,7 @@ def start_agent_visual_proposals(
 @router.get("/projects/{project_id}/visual-proposals")
 def get_agent_visual_proposals(
     project_id: str,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -401,7 +521,7 @@ def get_agent_visual_proposals(
 def confirm_agent_visual_proposal(
     project_id: str,
     payload: ConfirmVisualProposalRequest,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -438,7 +558,7 @@ def confirm_agent_visual_proposal(
 async def start_agent_visual_prompts(
     project_id: str,
     payload: StartVisualPromptsRequest | None = None,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -460,7 +580,7 @@ async def start_agent_visual_prompts(
 def start_agent_slide_generation(
     project_id: str,
     payload: StartSlideGenerationRequest | None = None,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -481,7 +601,7 @@ def start_agent_slide_generation(
 @router.get("/projects/{project_id}/generation-status")
 def get_agent_generation_status(
     project_id: str,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -500,7 +620,7 @@ def get_agent_generation_status(
 def retry_agent_failed_slides(
     project_id: str,
     payload: AgentActionRequest | None = None,
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
@@ -514,12 +634,48 @@ def retry_agent_failed_slides(
     }
 
 
+@router.post("/projects/{project_id}/prototype/confirm")
+def confirm_agent_prototype(
+    project_id: str,
+    payload: AgentActionRequest | None = None,
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
+    resolved_frontend = _frontend_base_url(payload, frontend_base_url)
+    _load_accessible_project(db, project_id, tester_id)
+    response = slides_api.confirm_prototype(project_id, db)
+    return {
+        "ok": True,
+        **response,
+        "ui_url": project_ui_url(project_id, resolved_frontend),
+    }
+
+
+@router.post("/projects/{project_id}/runs/stop")
+def stop_agent_generation(
+    project_id: str,
+    payload: AgentActionRequest | None = None,
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
+    resolved_frontend = _frontend_base_url(payload, frontend_base_url)
+    _load_accessible_project(db, project_id, tester_id)
+    response = slides_api.stop_generation(project_id, db)
+    return {
+        "ok": True,
+        **response,
+        "ui_url": project_ui_url(project_id, resolved_frontend),
+    }
+
+
 @router.get("/projects/{project_id}/pptx/export")
 def export_agent_ppt(
     project_id: str,
     prototype: bool = Query(False),
     api_base_url: str = Query("http://127.0.0.1:8000"),
-    frontend_base_url: str = Query("http://localhost:5173"),
+    frontend_base_url: str = Query(DEFAULT_AGENT_FRONTEND_BASE_URL),
     tester_id: str = Depends(require_tester_id),
     db: Session = Depends(get_db),
 ):
