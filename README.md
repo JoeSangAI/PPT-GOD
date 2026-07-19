@@ -1,6 +1,8 @@
 <div align="center">
 
-# PPT God
+<h1>
+  <img src="./docs/readme-assets/ppt-god-logo.png" alt="PPT God — 古希腊掌管 PPT 的神" width="340" />
+</h1>
 
 ### 让 AI PPT 从“能生成”，走向“敢交付”
 
@@ -8,21 +10,25 @@
 
 </div>
 
-![PPT God：整套一致、逐页可控、品牌准确的 PPT 工作流](./docs/readme-assets/hero-showcase.jpg?v=20260719-native)
+![PPT God：封面、数据与场景页面保持跨页一致](./docs/readme-assets/hero-showcase.jpg?v=20260719-single-message)
 
 <p align="center"><sub>首屏中的 Apple Vision Pro 为公开资料 Demo；产品界面经过脱敏，展示内容均可公开。</sub></p>
 
-## 三个公开案例，分别证明三件事
+## 四个关键能力，直接看结果
 
-首屏的 Apple Vision Pro 展示专业品牌与产品交付；下面两个案例分别回答“风格如何选择并落地”与“长内容如何变成课件”。
+你可以直接看到一套 PPT 是否跨页一致，品牌素材是否准确，风格是否可选，以及长内容如何先形成结构。
 
-### 品牌提案：风格可选，也能整套落地
+### 品牌素材：原 Logo、原产品图，准确进入最终页面
 
-![绵棠手礼：从两套风格提案到整套品牌页面](./docs/readme-assets/brand-style-case.jpg?v=20260719-full-width)
+![Apple Vision Pro：原始 Logo 与产品图准确进入最终 PPT](./docs/readme-assets/apple-brand-proof.jpg?v=20260719-single-message)
 
-### 课程课件：长内容先建结构，再形成节奏
+### 风格选择：同一份内容，也可以先看两种方向
 
-![古希腊神话：从长材料、章节结构到成套课程课件](./docs/readme-assets/course-structure-case.jpg?v=20260719-full-width)
+![绵棠手礼：同一份内容的两种风格方向](./docs/readme-assets/brand-style-case.jpg?v=20260719-single-message)
+
+### 内容规划：长材料先变成结构，再进入页面
+
+![古希腊神话：长材料经过内容规划变成四篇章结构](./docs/readme-assets/course-structure-case.jpg?v=20260719-single-message)
 
 ## 你真正买到的，是四种确定性
 
