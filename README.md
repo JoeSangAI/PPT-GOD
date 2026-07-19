@@ -14,9 +14,15 @@
 
 ## 三个公开案例，分别证明三件事
 
-不同案例各自验证一项关键能力：首屏的 Apple Vision Pro 展示专业品牌与产品交付；绵棠手礼展示“先选风格，再整套落地”；古希腊神话展示如何把长内容变成可讲述的课程课件。
+首屏的 Apple Vision Pro 展示专业品牌与产品交付；下面两个案例分别回答“风格如何选择并落地”与“长内容如何变成课件”。
 
-![PPT God 风格选择、品牌提案与课程课件公开案例](./docs/readme-assets/case-variety.jpg?v=20260719-one-case-one-proof)
+### 品牌提案：风格可选，也能整套落地
+
+![绵棠手礼：从两套风格提案到整套品牌页面](./docs/readme-assets/brand-style-case.jpg?v=20260719-full-width)
+
+### 课程课件：长内容先建结构，再形成节奏
+
+![古希腊神话：从长材料、章节结构到成套课程课件](./docs/readme-assets/course-structure-case.jpg?v=20260719-full-width)
 
 ## 你真正买到的，是四种确定性
 
