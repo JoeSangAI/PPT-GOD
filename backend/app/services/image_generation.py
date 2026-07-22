@@ -67,6 +67,11 @@ class _ReferenceUploadProfile:
 def _get_image_client() -> OpenAI:
     global _image_client
     credentials = get_provider_credentials()
+    if not credentials.comet_api_key:
+        raise RuntimeError(
+            "缺少图片生成能力：请在“模型设置”中配置图片模型 API Key；"
+            "如果外部 Agent 能生成页面图，请由 Agent 生成并导入对应页面成果。"
+        )
     if credentials.comet_api_key != (settings.COMET_API_KEY or settings.MINIMAX_API_KEY) or credentials.comet_api_base != settings.COMET_API_BASE.rstrip("/"):
         request_timeout = max(30.0, float(settings.IMAGE_API_TIMEOUT_SECONDS or 125.0))
         timeout = httpx.Timeout(request_timeout, connect=min(30.0, request_timeout))

@@ -39,7 +39,7 @@ def test_same_name_login_requires_matching_passcode():
         get_or_create_tester(db, "阿桑", "wrong-passcode")
     except HTTPException as exc:
         assert exc.status_code == 401
-        assert "密码不正确" in str(exc.detail)
+        assert "本地工作区校验失败" in str(exc.detail)
     else:
         raise AssertionError("expected wrong passcode to be rejected")
 
@@ -60,7 +60,7 @@ def test_project_access_is_scoped_by_tester_id():
         verify_project_access(project, friend.id)
     except HTTPException as exc:
         assert exc.status_code == 403
-        assert "其他测试账号" in str(exc.detail)
+        assert "另一个本地工作区" in str(exc.detail)
     else:
         raise AssertionError("expected another tester to be rejected")
 
@@ -72,7 +72,7 @@ def test_require_existing_tester_rejects_stale_id():
         require_existing_tester(db, "stale-browser-id")
     except HTTPException as exc:
         assert exc.status_code == 401
-        assert "登录状态已失效" in str(exc.detail)
+        assert "本地工作区衔接已失效" in str(exc.detail)
     else:
         raise AssertionError("expected stale tester id to be rejected")
 
@@ -84,7 +84,7 @@ def test_create_project_rejects_stale_tester_before_insert():
         projects_api.create_project(ProjectCreate(title="旧缓存账号"), tester_id="stale-browser-id", db=db)
     except HTTPException as exc:
         assert exc.status_code == 401
-        assert "登录状态已失效" in str(exc.detail)
+        assert "本地工作区衔接已失效" in str(exc.detail)
     else:
         raise AssertionError("expected stale tester id to be rejected")
 

@@ -1,6 +1,8 @@
 from datetime import timedelta
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -387,6 +389,40 @@ def test_style_proposal_api_invalidates_cache_when_visual_chat_requirements_chan
     assert captured["kwargs"]["user_description"] == "用户：不要红色，改成冷白极简、更多留白。"
     refreshed_project = db.query(Project).filter(Project.id == project_id).first()
     assert refreshed_project.style_proposal is None
+    db.close()
+
+
+def test_force_style_proposal_checks_model_before_clearing_previous_proposals(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+
+    project = Project(
+        title="Keep previous visual direction",
+        status="visual_ready",
+        content_plan_confirmed=True,
+        style_proposal={"proposals": [{"name": "仍可使用的旧方案"}]},
+    )
+    db.add(project)
+    db.flush()
+    db.add(Slide(project_id=project.id, page_num=1, content_json={"title": "测试页"}))
+    db.commit()
+    monkeypatch.setattr(
+        projects_api,
+        "missing_provider_capability",
+        lambda *_args, **_kwargs: {
+            "code": "missing_model_capability",
+            "message": "缺少文本生成能力",
+        },
+    )
+
+    with pytest.raises(HTTPException) as blocked:
+        projects_api.create_style_proposals(project.id, force=True, db=db)
+
+    refreshed = db.query(Project).filter(Project.id == project.id).first()
+    assert blocked.value.status_code == 409
+    assert refreshed.style_proposal["proposals"][0]["name"] == "仍可使用的旧方案"
     db.close()
 
 

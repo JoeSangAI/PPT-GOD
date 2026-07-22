@@ -10536,3 +10536,143 @@ button.pg-project-export-link:disabled {
     transition: none !important;
   }
 }
+
+/* Local open-source launch center and capability readiness. */
+.pg-launch-body {
+  display: grid;
+  gap: 14px;
+  margin-top: 20px;
+}
+
+.pg-onboarding-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pg-onboarding-steps li {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  color: #697586;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.pg-onboarding-steps li > b {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 999px;
+  background: #182230;
+  color: #fff;
+  font-size: 11px;
+}
+
+.pg-onboarding-steps strong {
+  display: block;
+  color: #182230;
+  font-size: 12px;
+}
+
+.pg-capability-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  gap: 11px;
+  align-items: start;
+  border: 1px solid #e1e6ed;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 13px 14px;
+}
+
+.pg-capability-row--missing {
+  border-color: rgba(185, 139, 51, 0.3);
+  background: rgba(255, 250, 240, 0.78);
+}
+
+.pg-capability-dot {
+  width: 9px;
+  height: 9px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: #98a2b3;
+  box-shadow: 0 0 0 4px rgba(152, 162, 179, 0.12);
+}
+
+.pg-capability-row--ready .pg-capability-dot {
+  background: #1d9a6c;
+  box-shadow: 0 0 0 4px rgba(29, 154, 108, 0.12);
+}
+
+.pg-capability-row--missing .pg-capability-dot {
+  background: #c58a22;
+  box-shadow: 0 0 0 4px rgba(197, 138, 34, 0.13);
+}
+
+.pg-capability-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #182230;
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.pg-capability-title b {
+  color: #667085;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.pg-capability-row--ready .pg-capability-title b {
+  color: #19724f;
+}
+
+.pg-capability-row--missing .pg-capability-title b {
+  color: #946716;
+}
+
+.pg-capability-copy p {
+  margin: 4px 0 0;
+  color: #697586;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pg-launch-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 9px;
+}
+
+.pg-launch-actions .pg-subtle-button {
+  min-height: 46px;
+}
+
+.pg-provider-header a {
+  color: #855e18;
+  font-weight: 720;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.pg-key-grid--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@media (max-width: 640px) {
+  .pg-onboarding-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .pg-launch-actions {
+    grid-template-columns: 1fr;
+  }
+}

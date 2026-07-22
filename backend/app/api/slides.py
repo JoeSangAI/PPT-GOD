@@ -169,6 +169,7 @@ from app.services.artifact_versions import (
 )
 from app.tasks import generate_slides_task, redis_client
 from app.services.celery_runtime import ensure_celery_worker
+from app.services.runtime_readiness import missing_provider_capability
 from app.services.run_state import (
     apply_project_rollback,
     cancel_active_run,
@@ -199,7 +200,14 @@ router = APIRouter(prefix="/projects", tags=["slides"])
 logger = logging.getLogger(__name__)
 
 
+def _require_provider_capability(capability_id: str, *, action: str) -> None:
+    detail = missing_provider_capability(capability_id, action=action)
+    if detail:
+        raise HTTPException(status_code=409, detail=detail)
+
+
 def ensure_generation_worker_ready():
+    _require_provider_capability("image_generation", action="generate_slides")
     if not ensure_celery_worker(queue=settings.CELERY_IMAGE_QUEUE):
         raise HTTPException(status_code=503, detail="图片生成服务未启动，任务没有开始。请启动 worker 后重试。")
 
@@ -3346,6 +3354,7 @@ def create_content_plan(
         raise HTTPException(status_code=409, detail="当前阶段不能重新生成内容规划，请先回退到内容规划。")
     if _active_run_for_project_action(project, db):
         raise HTTPException(status_code=409, detail="当前项目已有任务正在运行，请等待完成后再开始下一步")
+    _require_provider_capability("text_generation", action="generate_content_plan")
 
     # 优先使用用户传入的 topic，否则用项目标题
     topic = body.topic.strip() if body.topic else project.title
@@ -3471,6 +3480,7 @@ def create_visual_plan(
     body: PageNumsRequest = PageNumsRequest(),
     db: Session = Depends(get_db),
 ):
+    _require_provider_capability("text_generation", action="generate_visual_plan")
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -3577,6 +3587,7 @@ def create_prompts(
     body: PageNumsRequest = PageNumsRequest(),
     db: Session = Depends(get_db),
 ):
+    _require_provider_capability("text_generation", action="generate_prompts")
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -3702,6 +3713,7 @@ async def create_visual_and_prompts(
     db: Session = Depends(get_db),
 ):
     """一步生成视觉方案和生图 Prompt（SSE 流式返回真实进度）。"""
+    _require_provider_capability("text_generation", action="generate_visual_prompts")
     project = db.query(Project).filter(Project.id == project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")

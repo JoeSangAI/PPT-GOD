@@ -5,12 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run test:markdown-emphasis && npm run test:browser-handoff && npm run test:api-response && tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "test:auth-storage": "node src/auth-storage.test.mjs",
     "test:workflow": "node src/workflow.test.mjs",
     "test:isolation": "node src/project-isolation.test.mjs",
+    "test:markdown-emphasis": "node src/markdown-emphasis.test.mjs",
+    "test:browser-handoff": "node src/browser-handoff.test.mjs",
+    "test:api-response": "node src/api-response.test.mjs",
     "test:upload-feedback": "node test-upload-feedback-e2e.mjs",
     "test:low-cost": "npm run build && node test-low-cost-e2e.mjs",
     "test:visual-directive": "node test-visual-directive-e2e.mjs"

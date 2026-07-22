@@ -25,20 +25,21 @@ Do not ask the user to type CLI commands. Run the commands directly when the use
 
 1. Decide whether the user has explicitly asked to use PPT God.
 2. Use the current conversation, files, and project context to prepare content. Ask only when a missing choice would block a useful PPT God handoff.
-3. If bypassing PPT God's internal content Agent, write a strict PPT God content-plan Markdown file under `/Users/Joe_1/Desktop/AI output/YYYY-MM-DD/<task-name>/`.
-4. Validate the content plan before importing it:
+3. Before the first workflow action, run `doctor --json`. Read both capability states. A capability is satisfied only when a BYOK provider is configured or the current Agent will actually produce and hand off the corresponding artifact. Merely running inside Codex, WorkBuddy, or Claude Code does not satisfy it. Use plain `doctor` only when showing a beginner the human-readable explanation.
+4. If bypassing PPT God's internal content Agent, write a strict PPT God content-plan Markdown file under `/Users/Joe_1/Desktop/AI output/YYYY-MM-DD/<task-name>/`.
+5. Validate the content plan before importing it:
 
 ```bash
 python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py validate-content-plan <plan.md>
 ```
 
-5. Import the plan and open the Web UI when confirmation is useful:
+6. Import the plan and open the Web UI when confirmation is useful:
 
 ```bash
 python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py import-content-plan <plan.md> --title "<title>" --open
 ```
 
-6. For an existing project, do not import a duplicate. Preview an in-place update first:
+7. For an existing project, do not import a duplicate. Preview an in-place update first:
 
 ```bash
 python /Users/Joe_1/Desktop/Development/ppt-god/scripts/pptgod_cli.py update-content-plan <project_id> <plan.md>
@@ -51,8 +52,8 @@ After apply, require `readback.ok: true`; this verifies the rich-text editor's
 `content_blocks` body and the Markdown body mirror agree. The integrated local UI
 defaults to `http://localhost:8000`; port 5173 is only for Vite development.
 
-7. Save the returned `project_id`. Use it for later operations.
-8. Use the Web UI at visual or review-heavy stages instead of forcing every choice through chat.
+8. Save the returned `project_id`. Use it for later operations.
+9. Use the Web UI at visual or review-heavy stages instead of forcing every choice through chat.
 
 Do not edit internal fields such as `seed_family` or `visual_language_group` to make
 a slide look different. They are consistency metadata, not public creative controls.
@@ -77,7 +78,9 @@ Common commands:
 - `get-visual-proposals <project_id>`
 - `confirm-visual-proposal <project_id> --index N`
 - `generate-visual-prompts <project_id> --page-nums "1,2"`
+- `import-visual-plan <project_id> <visual-plan.json>` (use when the current Agent provides every page's visual description and ready-to-run image prompt)
 - `generate-slides <project_id> --page-nums "1,2" --prototype`
+- `import-slide-image <project_id> <page_num> <path>` (use when the current Agent generated the final 16:9 page image)
 - `get-generation-status <project_id>`
 - `wait <project_id> --run-id <run_id>`
 - `retry-failed-slides <project_id>`

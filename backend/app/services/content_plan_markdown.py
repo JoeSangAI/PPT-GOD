@@ -219,7 +219,10 @@ def _clean_project_title(value: str | None, fallback: str = "未命名项目") -
 
 
 def project_ui_url(project_id: str, frontend_base_url: str = "http://localhost:5173", *, stage: str | None = None) -> str:
-    url = f"{frontend_base_url.rstrip('/')}/projects/{project_id}"
+    # Keep browser routes outside the /projects API namespace. When the backend
+    # serves the SPA on :8000, a direct /projects/{id} navigation is otherwise
+    # handled as an API request before the SPA fallback can run.
+    url = f"{frontend_base_url.rstrip('/')}/app/projects/{project_id}"
     return f"{url}?stage={stage}" if stage else url
 
 

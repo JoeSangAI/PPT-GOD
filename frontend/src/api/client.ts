@@ -12,9 +12,6 @@ export const API_BASE =
     : import.meta.env.DEV
     ? "http://localhost:8000"
     : "";
-export const CLIENT_PROVIDER_SETTINGS_ENABLED =
-  import.meta.env.VITE_ENABLE_CLIENT_PROVIDER_SETTINGS === "1";
-
 function makeApiUrl(path: string): URL {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const rawUrl = `${API_BASE}${normalizedPath}`;
@@ -23,28 +20,65 @@ function makeApiUrl(path: string): URL {
 
 const AUTH_STORAGE_KEY = "pptgod.mvpAuth";
 const PROVIDER_STORAGE_KEY = "pptgod.providerSettings";
+const AGENT_CONTEXT_STORAGE_PREFIX = "pptgod.agentContext.";
+export const CAPABILITY_REQUIRED_EVENT = "pptgod:capability-required";
 
 export interface MvpAuth {
   testerId: string;
   displayName: string;
 }
 
+export interface AgentCapabilityContext {
+  projectId: string;
+  agentName: string;
+  textGeneration: boolean;
+  imageGeneration: boolean;
+}
+
+export function getStoredAgentContext(projectId?: string | null): AgentCapabilityContext | null {
+  if (!projectId) return null;
+  try {
+    const raw = sessionStorage.getItem(`${AGENT_CONTEXT_STORAGE_PREFIX}${projectId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return {
+      projectId,
+      agentName: String(parsed.agentName || "外部 Agent"),
+      textGeneration: Boolean(parsed.textGeneration),
+      imageGeneration: Boolean(parsed.imageGeneration),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveAgentContext(context: AgentCapabilityContext) {
+  try {
+    sessionStorage.setItem(
+      `${AGENT_CONTEXT_STORAGE_PREFIX}${context.projectId}`,
+      JSON.stringify(context)
+    );
+  } catch {
+    // Agent context is a session convenience; project artifacts remain durable.
+  }
+}
+
 export interface ProviderSettings {
-  minimaxApiKey: string;
-  minimaxApiBase: string;
-  minimaxLlmModel: string;
-  deerApiKey: string;
-  deerApiBase: string;
-  deerImageModel: string;
+  textApiKey: string;
+  textApiBase: string;
+  textModel: string;
+  imageApiKey: string;
+  imageApiBase: string;
+  imageModel: string;
 }
 
 export const DEFAULT_PROVIDER_SETTINGS: ProviderSettings = {
-  minimaxApiKey: "",
-  minimaxApiBase: "https://api.minimaxi.com/v1",
-  minimaxLlmModel: "MiniMax-M3",
-  deerApiKey: "",
-  deerApiBase: "https://api.deerapi.com/v1",
-  deerImageModel: "gpt-image-2",
+  textApiKey: "",
+  textApiBase: "https://api.cometapi.com/v1",
+  textModel: "MiniMax-M3",
+  imageApiKey: "",
+  imageApiBase: "https://api.cometapi.com/v1",
+  imageModel: "gpt-image-2",
 };
 
 function clearLegacyStoredAuth() {
@@ -90,16 +124,17 @@ export function getProviderSettings(): ProviderSettings {
   try {
     const raw = localStorage.getItem(PROVIDER_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : {};
-    const next = { ...DEFAULT_PROVIDER_SETTINGS, ...parsed };
-    if (next.deerApiBase.includes("api.deepapi.com")) {
-      next.deerApiBase = DEFAULT_PROVIDER_SETTINGS.deerApiBase;
-    }
-    if (next.deerImageModel === "GPT-Image-V4" || next.deerImageModel === "gpt-image-2-all") {
-      next.deerImageModel = DEFAULT_PROVIDER_SETTINGS.deerImageModel;
-    }
-    if (next.minimaxLlmModel === "MiniMax-M2.7") {
-      next.minimaxLlmModel = DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel;
-    }
+    const next: ProviderSettings = {
+      textApiKey: parsed.textApiKey ?? parsed.minimaxApiKey ?? "",
+      textApiBase: parsed.textApiBase ?? parsed.minimaxApiBase ?? DEFAULT_PROVIDER_SETTINGS.textApiBase,
+      textModel: parsed.textModel ?? parsed.minimaxLlmModel ?? DEFAULT_PROVIDER_SETTINGS.textModel,
+      imageApiKey: parsed.imageApiKey ?? parsed.cometApiKey ?? parsed.deerApiKey ?? "",
+      imageApiBase: parsed.imageApiBase ?? parsed.cometApiBase ?? parsed.deerApiBase ?? DEFAULT_PROVIDER_SETTINGS.imageApiBase,
+      imageModel: parsed.imageModel ?? parsed.cometImageModel ?? parsed.deerImageModel ?? DEFAULT_PROVIDER_SETTINGS.imageModel,
+    };
+    if (next.imageApiBase.includes("api.deepapi.com")) next.imageApiBase = DEFAULT_PROVIDER_SETTINGS.imageApiBase;
+    if (next.imageModel === "GPT-Image-V4" || next.imageModel === "gpt-image-2-all") next.imageModel = DEFAULT_PROVIDER_SETTINGS.imageModel;
+    if (next.textModel === "MiniMax-M2.7") next.textModel = DEFAULT_PROVIDER_SETTINGS.textModel;
     return next;
   } catch {
     return { ...DEFAULT_PROVIDER_SETTINGS };
@@ -120,22 +155,19 @@ function providerHeaders(): Record<string, string> {
   if (auth?.testerId) {
     headers["x-pptgod-tester-id"] = auth.testerId;
   }
-  if (!CLIENT_PROVIDER_SETTINGS_ENABLED) {
-    return headers;
-  }
   const provider = getProviderSettings();
-  const minimaxApiKey = headerSafe(provider.minimaxApiKey);
-  const minimaxApiBase = headerSafe(provider.minimaxApiBase);
-  const minimaxLlmModel = headerSafe(provider.minimaxLlmModel);
-  const deerApiKey = headerSafe(provider.deerApiKey);
-  const deerApiBase = headerSafe(provider.deerApiBase);
-  const deerImageModel = headerSafe(provider.deerImageModel);
-  if (minimaxApiKey) headers["x-pptgod-minimax-api-key"] = minimaxApiKey;
-  if (minimaxApiKey && minimaxApiBase) headers["x-pptgod-minimax-api-base"] = minimaxApiBase;
-  if (minimaxApiKey && minimaxLlmModel) headers["x-pptgod-minimax-llm-model"] = minimaxLlmModel;
-  if (deerApiKey) headers["x-pptgod-deer-api-key"] = deerApiKey;
-  if (deerApiKey && deerApiBase) headers["x-pptgod-deer-api-base"] = deerApiBase;
-  if (deerApiKey && deerImageModel) headers["x-pptgod-deer-image-model"] = deerImageModel;
+  const textApiKey = headerSafe(provider.textApiKey);
+  const textApiBase = headerSafe(provider.textApiBase);
+  const textModel = headerSafe(provider.textModel);
+  const imageApiKey = headerSafe(provider.imageApiKey);
+  const imageApiBase = headerSafe(provider.imageApiBase);
+  const imageModel = headerSafe(provider.imageModel);
+  if (textApiKey) headers["x-pptgod-text-api-key"] = textApiKey;
+  if (textApiKey && textApiBase) headers["x-pptgod-text-api-base"] = textApiBase;
+  if (textApiKey && textModel) headers["x-pptgod-text-model"] = textModel;
+  if (imageApiKey) headers["x-pptgod-image-api-key"] = imageApiKey;
+  if (imageApiKey && imageApiBase) headers["x-pptgod-image-api-base"] = imageApiBase;
+  if (imageApiKey && imageModel) headers["x-pptgod-image-model"] = imageModel;
   return headers;
 }
 
@@ -185,13 +217,94 @@ export async function fetchAuthMe(): Promise<MvpAuth> {
   return { testerId: data.tester_id, displayName: data.display_name || "测试用户" };
 }
 
-async function checkRes(res: Response) {
+export interface BrowserHandoffResult extends MvpAuth {
+  projectId: string;
+  stage: "project" | "content" | "visual" | "review";
+  agentContext: AgentCapabilityContext;
+}
+
+export async function redeemBrowserHandoff(token: string, projectId: string): Promise<BrowserHandoffResult> {
+  const res = await window.fetch(`${API_BASE}/auth/browser-handoff/redeem`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, project_id: projectId }),
+  });
+  const data = await (await checkRes(res)).json();
+  return {
+    testerId: data.tester_id,
+    displayName: data.display_name || "测试用户",
+    projectId: data.project_id,
+    stage: data.stage,
+    agentContext: {
+      projectId: data.project_id,
+      agentName: data.agent_name || "外部 Agent",
+      textGeneration: Boolean(data.agent_capabilities?.text_generation),
+      imageGeneration: Boolean(data.agent_capabilities?.image_generation),
+    },
+  };
+}
+
+export interface RuntimeCapability {
+  id: "text_generation" | "image_generation";
+  label: string;
+  available: boolean;
+  provider_configured: boolean;
+  agent_supplied: boolean;
+  source: "provider" | "agent" | "missing";
+  api_base: string;
+  model: string;
+  missing_fields: string[];
+  used_for: string[];
+}
+
+export interface RuntimeReadiness {
+  ok: boolean;
+  ready: boolean;
+  standalone_ready: boolean;
+  summary: string;
+  capabilities: {
+    text_generation: RuntimeCapability;
+    image_generation: RuntimeCapability;
+  };
+  missing: string[];
+  principle: string;
+  next_steps: Array<{ capability: string; action: string; message: string }>;
+}
+
+export async function fetchRuntimeReadiness(agentContext?: AgentCapabilityContext | null): Promise<RuntimeReadiness> {
+  const url = makeApiUrl("/agent/readiness");
+  if (agentContext?.textGeneration) url.searchParams.set("agent_text", "true");
+  if (agentContext?.imageGeneration) url.searchParams.set("agent_image", "true");
+  const res = await apiFetch(url.toString());
+  return (await (await checkRes(res)).json()) as RuntimeReadiness;
+}
+
+export class ApiError extends Error {
+  status: number;
+  detail: any;
+
+  constructor(status: number, message: string, detail: any = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+export async function checkRes(res: Response) {
+  const contentType = String(res.headers.get("content-type") || "").toLowerCase();
+  if (res.ok && contentType.includes("text/html")) {
+    throw new ApiError(
+      502,
+      "PPT God 本地服务正在更新，或页面与服务版本不一致。请重新双击“打开 PPT GOD.command”，页面会自动刷新到当前版本。",
+    );
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "Unknown error");
     const isHtml = text.trim().startsWith("<") && text.includes("</");
     if (isHtml) {
       const title = text.match(/<title>(.*?)<\/title>/i)?.[1];
-      throw new Error(`HTTP ${res.status}: ${title || "服务器错误"}`);
+      throw new ApiError(res.status, `HTTP ${res.status}: ${title || "服务器错误"}`);
     }
     // FastAPI 返回 { detail: "..." }，尝试提取
     let json: any = null;
@@ -201,9 +314,14 @@ async function checkRes(res: Response) {
       json = null;
     }
     if (json?.detail) {
-      throw new Error(`HTTP ${res.status}: ${formatApiErrorDetail(json.detail)}`);
+      const message = `HTTP ${res.status}: ${formatApiErrorDetail(json.detail)}`;
+      const error = new ApiError(res.status, message, json.detail);
+      if (["missing_model_capability", "agent_action_required"].includes(String(json.detail?.code || ""))) {
+        window.dispatchEvent(new CustomEvent(CAPABILITY_REQUIRED_EVENT, { detail: json.detail }));
+      }
+      throw error;
     }
-    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+    throw new ApiError(res.status, `HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
   return res;
 }

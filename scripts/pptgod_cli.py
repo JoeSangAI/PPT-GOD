@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 
 
@@ -187,6 +189,44 @@ def _get_json(url: str, *, tester_id: str | None = None) -> tuple[int, dict]:
         return int(exc.code), payload
 
 
+def _post_multipart_file(
+    url: str,
+    file_path: Path,
+    *,
+    fields: dict[str, str] | None = None,
+    tester_id: str | None = None,
+) -> tuple[int, dict]:
+    boundary = f"----pptgod-{uuid.uuid4().hex}"
+    body = bytearray()
+    for key, value in (fields or {}).items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\n'.encode())
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode())
+    body.extend(file_path.read_bytes())
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    if tester_id:
+        headers["x-pptgod-tester-id"] = tester_id
+    request = urllib.request.Request(url, data=bytes(body), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            raw = response.read().decode("utf-8")
+            return int(response.status), _decode_json_body(raw, url=url)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {"detail": raw}
+        return int(exc.code), payload
+
+
 def _download_url_to_file(url: str, output_path: Path, *, tester_id: str | None = None) -> dict:
     headers = {}
     if tester_id:
@@ -209,7 +249,7 @@ def _tester_login(backend_url: str, tester_name: str) -> str:
         {"display_name": tester_name, "passcode": ""},
     )
     if not (200 <= status < 300) or not response.get("tester_id"):
-        raise RuntimeError(f"测试账号登录失败：{response}")
+        raise RuntimeError(f"本地工作区初始化失败：{response}")
     return str(response["tester_id"])
 
 
@@ -243,6 +283,58 @@ def _prepare_agent_request(args, *, start_frontend: bool = False) -> tuple[str, 
             _start_frontend(frontend_url)
     tester_id = _tester_login(backend_url, args.tester_name)
     return backend_url, frontend_url, tester_id
+
+
+def _browser_handoff(
+    backend_url: str,
+    frontend_url: str,
+    *,
+    tester_id: str,
+    project_id: str,
+    stage: str,
+    agent_text: bool = False,
+    agent_image: bool = False,
+    agent_name: str = "外部 Agent",
+) -> tuple[int, dict]:
+    return _post_json(
+        backend_url.rstrip("/") + "/auth/browser-handoff",
+        {
+            "project_id": str(project_id),
+            "stage": str(stage),
+            "frontend_base_url": frontend_url.rstrip("/"),
+            "agent_text": bool(agent_text),
+            "agent_image": bool(agent_image),
+            "agent_name": str(agent_name or "外部 Agent"),
+        },
+        tester_id=tester_id,
+    )
+
+
+def _resolve_authenticated_ui_url(
+    backend_url: str,
+    frontend_url: str,
+    *,
+    tester_id: str,
+    project_id: str,
+    stage: str,
+    agent_text: bool = False,
+    agent_image: bool = False,
+    agent_name: str = "外部 Agent",
+) -> tuple[str | None, dict]:
+    status, response = _browser_handoff(
+        backend_url,
+        frontend_url,
+        tester_id=tester_id,
+        project_id=project_id,
+        stage=stage,
+        agent_text=agent_text,
+        agent_image=agent_image,
+        agent_name=agent_name,
+    )
+    handoff_url = str(response.get("handoff_url") or "")
+    if not (200 <= status < 300) or not handoff_url:
+        return None, {"status": status, "response": response}
+    return handoff_url, response
 
 
 def capabilities_command(args) -> int:
@@ -281,23 +373,76 @@ def list_projects_command(args) -> int:
 def doctor_command(args) -> int:
     backend_url, frontend_url, tester_id = _prepare_agent_request(args)
     cap_status, capabilities = _get_json(backend_url + "/agent/capabilities")
+    readiness_query = urllib.parse.urlencode({
+        "agent_text": str(bool(args.agent_text)).lower(),
+        "agent_image": str(bool(args.agent_image)).lower(),
+    })
+    readiness_status, readiness = _get_json(backend_url + "/agent/readiness?" + readiness_query)
     me_status, account = _get_json(backend_url + "/auth/me", tester_id=tester_id)
     project_status, projects = _get_json(backend_url + "/projects", tester_id=tester_id)
-    ok = all(200 <= status < 300 for status in (cap_status, me_status, project_status))
-    _print_json({
-        "ok": ok,
+    service_ok = all(
+        200 <= status < 300
+        for status in (cap_status, readiness_status, me_status, project_status)
+    )
+    runtime_ready = bool(readiness.get("ready")) if 200 <= readiness_status < 300 else False
+    payload = {
+        "ok": service_ok,
+        "service_ok": service_ok,
+        "runtime_ready": runtime_ready,
+        "complete": service_ok and runtime_ready,
         "backend_url": backend_url,
         "frontend_url": frontend_url,
         "capabilities": capabilities if 200 <= cap_status < 300 else None,
+        "readiness": readiness if 200 <= readiness_status < 300 else None,
         "account": account if 200 <= me_status < 300 else None,
         "project_count": len(projects) if isinstance(projects, list) else None,
         "checks": {
             "capabilities": cap_status,
+            "readiness": readiness_status,
             "account": me_status,
             "projects": project_status,
         },
-    })
-    return 0 if ok else 1
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        _print_doctor_report(payload)
+    return 0 if service_ok and (runtime_ready or not args.strict) else 1
+
+
+def _print_doctor_report(payload: dict) -> None:
+    readiness = payload.get("readiness") or {}
+    capabilities = readiness.get("capabilities") or {}
+    print("\nPPT God 运行检查", file=sys.stderr)
+    print("─" * 28, file=sys.stderr)
+    if not payload.get("service_ok"):
+        print("✗ 本地服务未通过检查。请先启动 PPT God，再重新运行 doctor。", file=sys.stderr)
+        return
+    print("✓ 本地服务已连接", file=sys.stderr)
+    for capability_id in ("text_generation", "image_generation"):
+        item = capabilities.get(capability_id) or {}
+        label = item.get("label") or capability_id
+        if item.get("provider_configured"):
+            print(f"✓ {label}已配置：{item.get('model') or '已选择模型'}", file=sys.stderr)
+        elif item.get("agent_supplied"):
+            print(f"✓ {label}由当前 Agent 提供", file=sys.stderr)
+        else:
+            print(f"○ {label}未配置", file=sys.stderr)
+            if capability_id == "text_generation":
+                print("  用途：内容规划、视觉方向和每页画面描述。", file=sys.stderr)
+                print("  处理：在网页“模型设置”中填写，或由 Agent 导入结构化规划成果。", file=sys.stderr)
+            else:
+                print("  用途：生成整页画面和修改单页。", file=sys.stderr)
+                print("  处理：在网页“模型设置”中填写；Agent 能提供最终页面图时，也可由 Agent 承担。", file=sys.stderr)
+    if not readiness.get("ready"):
+        print(
+            f"\n下一步：打开 {payload.get('frontend_url')}。你可以先进入工作台，缺什么再补什么。",
+            file=sys.stderr,
+        )
+    print(
+        "\n原理：PPT God 负责工作流，不自带模型额度。模型能力来自你的 BYOK 接口或外部 Agent。",
+        file=sys.stderr,
+    )
 
 
 def import_content_plan_command(args) -> int:
@@ -329,8 +474,21 @@ def import_content_plan_command(args) -> int:
         _print_json({"ok": False, "status": status, "response": response})
         return 1
 
-    if args.open and response.get("ui_url"):
-        webbrowser.open(response["ui_url"])
+    if args.open:
+        handoff_url, handoff = _resolve_authenticated_ui_url(
+            backend_url,
+            frontend_url,
+            tester_id=tester_id,
+            project_id=str(response.get("project_id") or ""),
+            stage="content",
+            agent_text=True,
+            agent_name=getattr(args, "agent_name", "外部 Agent"),
+        )
+        if not handoff_url:
+            _print_json({"ok": False, "error": "项目已导入，但浏览器身份交接失败", "handoff": handoff, "response": response})
+            return 1
+        response["authenticated_ui_url"] = handoff_url
+        response["opened"] = bool(webbrowser.open(handoff_url))
     _print_json(response)
     return 0
 
@@ -378,8 +536,21 @@ def update_content_plan_command(args) -> int:
         _print_json({"ok": False, "status": status, "response": response, "preview": preview})
         return 1
 
-    if args.open and response.get("content_review_url"):
-        webbrowser.open(str(response["content_review_url"]))
+    if args.open:
+        handoff_url, handoff = _resolve_authenticated_ui_url(
+            backend_url,
+            frontend_url,
+            tester_id=tester_id,
+            project_id=str(args.project_id),
+            stage="content",
+            agent_text=True,
+            agent_name=getattr(args, "agent_name", "外部 Agent"),
+        )
+        if not handoff_url:
+            _print_json({"ok": False, "error": "内容已更新，但浏览器身份交接失败", "handoff": handoff, "response": response})
+            return 1
+        response["authenticated_ui_url"] = handoff_url
+        response["opened"] = bool(webbrowser.open(handoff_url))
     _print_json(response)
     return 0
 
@@ -413,19 +584,26 @@ def open_project_command(args) -> int:
         _print_json({"ok": False, "status": status, "response": response})
         return 1
 
-    ui_urls = response.get("ui_urls") if isinstance(response.get("ui_urls"), dict) else {}
-    ui_url = ui_urls.get(args.stage) or response.get("ui_url")
-    if args.stage == "review":
-        ui_url = ui_urls.get("project") or ui_url
-    if not ui_url:
-        _print_json({"ok": False, "error": "项目状态响应缺少 ui_url", "response": response})
+    handoff_url, handoff = _resolve_authenticated_ui_url(
+        backend_url,
+        frontend_url,
+        tester_id=tester_id,
+        project_id=str(args.project_id),
+        stage=args.stage,
+        agent_text=bool(getattr(args, "agent_text", False)),
+        agent_image=bool(getattr(args, "agent_image", False)),
+        agent_name=getattr(args, "agent_name", "外部 Agent"),
+    )
+    if not handoff_url:
+        _print_json({"ok": False, "error": "浏览器身份交接失败", "handoff": handoff, "response": response})
         return 1
 
     if not args.print_only:
-        webbrowser.open(str(ui_url))
+        webbrowser.open(handoff_url)
     response["opened"] = not args.print_only
     response["selected_stage"] = args.stage
-    response["selected_ui_url"] = ui_url
+    response["selected_ui_url"] = handoff_url
+    response["handoff_expires_in_seconds"] = handoff.get("expires_in_seconds")
     _print_json(response)
     return 0
 
@@ -456,8 +634,40 @@ def export_content_plan_command(args) -> int:
     return 0
 
 
-def _post_agent_action(args, path: str, payload: dict) -> int:
+def _provider_capability_error(backend_url: str, capability_id: str) -> dict | None:
+    status, readiness = _get_json(backend_url.rstrip("/") + "/agent/readiness")
+    capability = (readiness.get("capabilities") or {}).get(capability_id) or {}
+    if 200 <= status < 300 and capability.get("provider_configured"):
+        return None
+    label = capability.get("label") or ("文本生成" if capability_id == "text_generation" else "图片生成")
+    message = (
+        f"当前命令需要 PPT God 后端直接调用{label}，但 CLI 环境还没有对应的模型配置。"
+        "浏览器中保存的 Key 不会自动暴露给 CLI。请在 backend/.env 中配置，"
+        "或改由当前 Agent 生成并导入对应成果。"
+    )
+    print(f"\n○ {label}未配置\n  {message}", file=sys.stderr)
+    return {
+        "ok": False,
+        "error": "missing_model_capability",
+        "capability": capability_id,
+        "message": message,
+        "readiness": readiness if 200 <= status < 300 else None,
+    }
+
+
+def _post_agent_action(
+    args,
+    path: str,
+    payload: dict,
+    *,
+    required_capability: str | None = None,
+) -> int:
     backend_url, frontend_url, tester_id = _prepare_agent_request(args)
+    if required_capability:
+        preflight_error = _provider_capability_error(backend_url, required_capability)
+        if preflight_error:
+            _print_json(preflight_error)
+            return 1
     request_payload = {"frontend_base_url": frontend_url, **payload}
     status, response = _agent_post(backend_url, path, request_payload, tester_id=tester_id)
     if not (200 <= status < 300):
@@ -477,7 +687,12 @@ def start_visual_proposals_command(args) -> int:
     payload = {"force": bool(args.force)}
     if args.user_description:
         payload["user_description"] = args.user_description
-    return _post_agent_action(args, f"/agent/projects/{project_path}/visual-proposals/start", payload)
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/visual-proposals/start",
+        payload,
+        required_capability="text_generation",
+    )
 
 
 def get_visual_proposals_command(args) -> int:
@@ -530,7 +745,34 @@ def generate_visual_prompts_command(args) -> int:
         payload["page_nums"] = page_nums
     if args.stage_context:
         payload["stage_context"] = args.stage_context
-    return _post_agent_action(args, f"/agent/projects/{project_path}/visual-prompts/start", payload)
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/visual-prompts/start",
+        payload,
+        required_capability="text_generation",
+    )
+
+
+def import_visual_plan_command(args) -> int:
+    plan_path = Path(args.path).expanduser()
+    if not plan_path.is_file():
+        _print_json({"ok": False, "error": f"画面方案文件不存在：{plan_path}"})
+        return 1
+    try:
+        raw = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _print_json({"ok": False, "error": f"无法读取画面方案 JSON：{exc}"})
+        return 1
+    payload = {"pages": raw} if isinstance(raw, list) else raw
+    if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
+        _print_json({"ok": False, "error": "画面方案 JSON 需要包含 pages 数组，或直接使用页面数组。"})
+        return 1
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/visual-plan/import",
+        payload,
+    )
 
 
 def generate_slides_command(args) -> int:
@@ -539,7 +781,52 @@ def generate_slides_command(args) -> int:
     page_nums = _parse_page_nums(args.page_nums)
     if page_nums:
         payload["page_nums"] = page_nums
-    return _post_agent_action(args, f"/agent/projects/{project_path}/slides/generate", payload)
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/slides/generate",
+        payload,
+        required_capability="image_generation",
+    )
+
+
+def import_slide_image_command(args) -> int:
+    image_path = Path(args.path).expanduser()
+    if not image_path.is_file():
+        _print_json({"ok": False, "error": f"页面图片不存在：{image_path}"})
+        return 1
+    backend_url, frontend_url, tester_id = _prepare_agent_request(args, start_frontend=args.open)
+    project_path = urllib.parse.quote(str(args.project_id), safe="")
+    status, response = _post_multipart_file(
+        backend_url + f"/agent/projects/{project_path}/slides/{args.page_num}/image",
+        image_path,
+        fields={"source": args.source, "frontend_base_url": frontend_url},
+        tester_id=tester_id,
+    )
+    if not (200 <= status < 300):
+        _print_json({"ok": False, "status": status, "response": response})
+        return 1
+    if args.open:
+        handoff_url, handoff = _resolve_authenticated_ui_url(
+            backend_url,
+            frontend_url,
+            tester_id=tester_id,
+            project_id=str(args.project_id),
+            stage="review",
+            agent_image=True,
+            agent_name=getattr(args, "agent_name", "外部 Agent"),
+        )
+        if not handoff_url:
+            _print_json({
+                "ok": False,
+                "error": "页面图已导入，但浏览器项目衔接失败",
+                "handoff": handoff,
+                "response": response,
+            })
+            return 1
+        response["authenticated_ui_url"] = handoff_url
+        response["opened"] = bool(webbrowser.open(handoff_url))
+    _print_json(response)
+    return 0
 
 
 def get_generation_status_command(args) -> int:
@@ -620,12 +907,22 @@ def wait_command(args) -> int:
 
 def retry_failed_slides_command(args) -> int:
     project_path = urllib.parse.quote(str(args.project_id), safe="")
-    return _post_agent_action(args, f"/agent/projects/{project_path}/slides/retry-failed", {})
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/slides/retry-failed",
+        {},
+        required_capability="image_generation",
+    )
 
 
 def confirm_prototype_command(args) -> int:
     project_path = urllib.parse.quote(str(args.project_id), safe="")
-    return _post_agent_action(args, f"/agent/projects/{project_path}/prototype/confirm", {})
+    return _post_agent_action(
+        args,
+        f"/agent/projects/{project_path}/prototype/confirm",
+        {},
+        required_capability="image_generation",
+    )
 
 
 def stop_generation_command(args) -> int:
@@ -702,11 +999,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_projects_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
     list_projects_parser.set_defaults(func=list_projects_command)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Verify service contract, account, and project connection")
+    doctor_parser = subparsers.add_parser("doctor", help="检查本地服务，并用人话说明当前还缺什么模型能力")
     doctor_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME))
     doctor_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
     doctor_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
     doctor_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
+    doctor_parser.add_argument("--agent-text", action="store_true", help="当前 Agent 会提供文本规划成果")
+    doctor_parser.add_argument("--agent-image", action="store_true", help="当前 Agent 会提供最终页面图片")
+    doctor_parser.add_argument("--json", action="store_true", help="只输出供 Agent 读取的 JSON")
+    doctor_parser.add_argument("--strict", action="store_true", help="文本和图片能力未全部就绪时返回失败状态")
     doctor_parser.set_defaults(func=doctor_command)
 
     validate_parser = subparsers.add_parser("validate-content-plan", help="Validate strict content-plan Markdown")
@@ -718,6 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--title", default=None, help="Project title. Defaults to Markdown H1, then filename.")
     import_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that will own the imported project")
     import_parser.add_argument("--open", action="store_true", help="Open the content review UI after import")
+    import_parser.add_argument("--agent-name", default=os.getenv("PPTGOD_AGENT_NAME", "外部 Agent"), help="Name shown in the GUI handoff, such as Codex or WorkBuddy")
     import_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend/frontend services")
     import_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
     import_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
@@ -731,6 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("path", help="Path to strict content-plan Markdown")
     update_parser.add_argument("--apply", action="store_true", help="Apply the previewed diff in place; default is dry-run only")
     update_parser.add_argument("--open", action="store_true", help="Open the content review UI after a successful apply")
+    update_parser.add_argument("--agent-name", default=os.getenv("PPTGOD_AGENT_NAME", "外部 Agent"), help="Name shown in the GUI handoff")
     update_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
     update_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend/frontend services")
     update_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
@@ -749,6 +1052,9 @@ def build_parser() -> argparse.ArgumentParser:
     open_parser.add_argument("project_id", help="PPT God project id")
     open_parser.add_argument("--stage", choices=["project", "content", "visual", "review"], default="project")
     open_parser.add_argument("--print-only", action="store_true", help="Print the resolved URL without opening a browser")
+    open_parser.add_argument("--agent-text", action="store_true", help="The current Agent will provide text planning artifacts")
+    open_parser.add_argument("--agent-image", action="store_true", help="The current Agent will provide final slide images")
+    open_parser.add_argument("--agent-name", default=os.getenv("PPTGOD_AGENT_NAME", "外部 Agent"), help="Name shown in the GUI handoff")
     open_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME), help="PPT God tester name that owns the project")
     open_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend/frontend services")
     open_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
@@ -811,6 +1117,18 @@ def build_parser() -> argparse.ArgumentParser:
     visual_prompts_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
     visual_prompts_parser.set_defaults(func=generate_visual_prompts_command)
 
+    import_visual_plan_parser = subparsers.add_parser(
+        "import-visual-plan",
+        help="导入外部 Agent 生成的每页画面描述和生图 Prompt",
+    )
+    import_visual_plan_parser.add_argument("project_id", help="Existing PPT God project id")
+    import_visual_plan_parser.add_argument("path", help="Path to visual-plan JSON")
+    import_visual_plan_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME))
+    import_visual_plan_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local backend service")
+    import_visual_plan_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    import_visual_plan_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
+    import_visual_plan_parser.set_defaults(func=import_visual_plan_command)
+
     generate_slides_parser = subparsers.add_parser("generate-slides", help="Start PPT slide image generation")
     generate_slides_parser.add_argument("project_id", help="PPT God project id")
     generate_slides_parser.add_argument("--page-nums", default=None, help="Optional comma-separated page numbers, such as 1,3,5")
@@ -820,6 +1138,22 @@ def build_parser() -> argparse.ArgumentParser:
     generate_slides_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
     generate_slides_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
     generate_slides_parser.set_defaults(func=generate_slides_command)
+
+    import_slide_image_parser = subparsers.add_parser(
+        "import-slide-image",
+        help="把外部 Agent 生成的 16:9 页面图导入指定页",
+    )
+    import_slide_image_parser.add_argument("project_id", help="Existing PPT God project id")
+    import_slide_image_parser.add_argument("page_num", type=int, help="Target page number")
+    import_slide_image_parser.add_argument("path", help="Path to a 16:9 PNG, JPG, or WebP image")
+    import_slide_image_parser.add_argument("--source", default="external_agent", help="Artifact source label")
+    import_slide_image_parser.add_argument("--open", action="store_true", help="Open the visual workspace after import")
+    import_slide_image_parser.add_argument("--agent-name", default=os.getenv("PPTGOD_AGENT_NAME", "外部 Agent"), help="Name shown in the GUI handoff")
+    import_slide_image_parser.add_argument("--tester-name", default=os.getenv("PPTGOD_TESTER_NAME", DEFAULT_TESTER_NAME))
+    import_slide_image_parser.add_argument("--no-start", action="store_true", help="Do not auto-start local services")
+    import_slide_image_parser.add_argument("--backend-url", default="http://127.0.0.1:8000")
+    import_slide_image_parser.add_argument("--frontend-url", default=DEFAULT_FRONTEND_URL)
+    import_slide_image_parser.set_defaults(func=import_slide_image_command)
 
     generation_status_parser = subparsers.add_parser("get-generation-status", help="Read generation workflow status")
     generation_status_parser.add_argument("project_id", help="PPT God project id")
