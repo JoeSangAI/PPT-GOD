@@ -19,6 +19,12 @@ MINIMAX_LLM_MODEL_HEADER = "x-pptgod-minimax-llm-model"
 COMET_API_KEY_HEADER = "x-pptgod-comet-api-key"
 COMET_API_BASE_HEADER = "x-pptgod-comet-api-base"
 COMET_IMAGE_MODEL_HEADER = "x-pptgod-comet-image-model"
+TEXT_API_KEY_HEADER = "x-pptgod-text-api-key"
+TEXT_API_BASE_HEADER = "x-pptgod-text-api-base"
+TEXT_MODEL_HEADER = "x-pptgod-text-model"
+IMAGE_API_KEY_HEADER = "x-pptgod-image-api-key"
+IMAGE_API_BASE_HEADER = "x-pptgod-image-api-base"
+IMAGE_MODEL_HEADER = "x-pptgod-image-model"
 TESTER_NAME_HEADER = "x-pptgod-tester-name"
 
 TASK_CREDENTIAL_TTL_SECONDS = 12 * 60 * 60
@@ -69,12 +75,24 @@ class ProviderCredentials:
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "ProviderCredentials":
         return cls(
-            minimax_api_key=_clean_secret(headers.get(MINIMAX_API_KEY_HEADER)),
-            minimax_api_base=_clean_base_url(headers.get(MINIMAX_API_BASE_HEADER)),
-            minimax_llm_model=str(headers.get(MINIMAX_LLM_MODEL_HEADER) or "").strip(),
-            comet_api_key=_clean_secret(headers.get(COMET_API_KEY_HEADER)),
-            comet_api_base=_clean_base_url(headers.get(COMET_API_BASE_HEADER)),
-            comet_image_model=str(headers.get(COMET_IMAGE_MODEL_HEADER) or "").strip(),
+            minimax_api_key=_clean_secret(
+                headers.get(TEXT_API_KEY_HEADER) or headers.get(MINIMAX_API_KEY_HEADER)
+            ),
+            minimax_api_base=_clean_base_url(
+                headers.get(TEXT_API_BASE_HEADER) or headers.get(MINIMAX_API_BASE_HEADER)
+            ),
+            minimax_llm_model=str(
+                headers.get(TEXT_MODEL_HEADER) or headers.get(MINIMAX_LLM_MODEL_HEADER) or ""
+            ).strip(),
+            comet_api_key=_clean_secret(
+                headers.get(IMAGE_API_KEY_HEADER) or headers.get(COMET_API_KEY_HEADER)
+            ),
+            comet_api_base=_clean_base_url(
+                headers.get(IMAGE_API_BASE_HEADER) or headers.get(COMET_API_BASE_HEADER)
+            ),
+            comet_image_model=str(
+                headers.get(IMAGE_MODEL_HEADER) or headers.get(COMET_IMAGE_MODEL_HEADER) or ""
+            ).strip(),
             tester_name=str(headers.get(TESTER_NAME_HEADER) or "").strip()[:80],
         )
 

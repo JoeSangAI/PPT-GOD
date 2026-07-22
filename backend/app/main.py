@@ -107,14 +107,15 @@ _ensure_runtime_mvp_schema()
 if settings.IMAGE_GEN_MODE == "real":
     missing = []
     if not settings.MINIMAX_API_KEY:
-        missing.append("MINIMAX_API_KEY")
+        missing.append("文本生成能力")
     if not settings.COMET_API_KEY:
-        missing.append("COMET_API_KEY")
+        missing.append("图片生成能力")
     if missing:
         import warnings
         warnings.warn(
-            f"IMAGE_GEN_MODE=real but missing API keys: {', '.join(missing)}. "
-            "Set them in .env or switch to IMAGE_GEN_MODE=mock/cached.",
+            f"PPT God 已启动，但服务端尚未配置：{', '.join(missing)}。"
+            "这不会阻止进入工作台；可在网页“模型设置”中按需填写 BYOK，"
+            "或运行 `python scripts/pptgod_cli.py doctor` 查看当前缺少的能力。",
             stacklevel=2,
         )
 
@@ -158,7 +159,7 @@ async def mvp_context_and_project_guard(request: Request, call_next):
                 if project and project.tester_id and project.tester_id != tester_id and not local_admin_allowed:
                     return JSONResponse(
                         status_code=403,
-                        content={"detail": "这个项目属于其他测试账号，请切换账号后再试"},
+                        content={"detail": "这个项目来自另一个本地工作区，请从创建它的 Agent 或 CLI 重新打开"},
                     )
             finally:
                 db.close()

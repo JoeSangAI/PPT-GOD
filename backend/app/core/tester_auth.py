@@ -72,7 +72,7 @@ def get_or_create_tester(db: Session, display_name: str, passcode: str = "") -> 
     tester = db.query(TesterUser).filter(TesterUser.login_key == login_key).first()
     if tester:
         if not verify_passcode(tester.passcode_hash, passcode):
-            raise HTTPException(status_code=401, detail="测试账号密码不正确，请重新输入")
+            raise HTTPException(status_code=401, detail="本地工作区校验失败，请重新从原入口打开")
         tester.display_name = cleaned_name
         tester.last_login_at = utc_now()
         db.commit()
@@ -98,7 +98,7 @@ def tester_id_from_header(x_pptgod_tester_id: Optional[str] = Header(default=Non
 def require_tester_id(x_pptgod_tester_id: Optional[str] = Header(default=None)) -> str:
     tester_id = tester_id_from_header(x_pptgod_tester_id)
     if not tester_id:
-        raise HTTPException(status_code=401, detail="请先登录测试账号")
+        raise HTTPException(status_code=401, detail="缺少本地工作区标识，请从 PPT God 启动页或 CLI 重新进入")
     if tester_id == LOCAL_ADMIN_TESTER_ID and not is_local_admin_request(tester_id):
         raise HTTPException(status_code=403, detail="本地管理员账号只能在本机地址使用")
     return tester_id
@@ -107,7 +107,7 @@ def require_tester_id(x_pptgod_tester_id: Optional[str] = Header(default=None)) 
 def require_existing_tester(db: Session, tester_id: str) -> TesterUser:
     tester = db.query(TesterUser).filter(TesterUser.id == tester_id).first()
     if not tester:
-        raise HTTPException(status_code=401, detail="登录状态已失效，请退出后重新进入 PPT God")
+        raise HTTPException(status_code=401, detail="本地工作区衔接已失效，请从原 Agent 或 CLI 重新打开")
     return tester
 
 
@@ -117,5 +117,5 @@ def verify_project_access(project: Project | None, tester_id: str | None) -> Pro
     if is_local_admin_request(tester_id):
         return project
     if project.tester_id and project.tester_id != tester_id:
-        raise HTTPException(status_code=403, detail="这个项目属于其他测试账号，请切换账号后再试")
+        raise HTTPException(status_code=403, detail="这个项目来自另一个本地工作区，请从创建它的 Agent 或 CLI 重新打开")
     return project

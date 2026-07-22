@@ -17,38 +17,10 @@ import { Table } from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
 import TableCell from "@tiptap/extension-table-cell";
 import TableHeader from "@tiptap/extension-table-header";
+import { fixMarkedBoldHtml, normalizeMarkdownEmphasis } from "./markdownEmphasis";
 import { SLIDE_TYPE_COLORS, SLIDE_TYPE_LABELS, SLIDE_TYPE_OPTIONS } from "./slideTypes";
 import PptGodLogo from "./components/PptGodLogo";
 import { overlayPlacementStyle } from "./overlayPlacement";
-
-// 修复 marked 无法解析 **text标点**后接字符 的粗体（CommonMark 规范限制）
-const fixMarkedBoldHtml = (html: string): string => {
-  return html.replace(/\*\*([^*]+?)\*\*([^<\s])/g, "<strong>$1</strong>$2");
-};
-
-const normalizeMarkdownEmphasis = (md: string): string => {
-  const cleanLine = (line: string, delimiter: string) => {
-    const positions: number[] = [];
-    let idx = line.indexOf(delimiter);
-    while (idx !== -1) {
-      positions.push(idx);
-      idx = line.indexOf(delimiter, idx + delimiter.length);
-    }
-    if (positions.length % 2 === 0) return line;
-    const leadingWhitespace = line.match(/^\s*/)?.[0] || "";
-    const stripped = line.slice(leadingWhitespace.length);
-    if (stripped.startsWith(delimiter)) return `${line}${delimiter}`;
-    if (line.trimEnd().endsWith(delimiter)) {
-      return `${leadingWhitespace}${delimiter}${line.slice(leadingWhitespace.length)}`;
-    }
-    const removeAt = positions[positions.length - 1];
-    return line.slice(0, removeAt) + line.slice(removeAt + delimiter.length);
-  };
-  return (md || "")
-    .split("\n")
-    .map((line) => cleanLine(cleanLine(line, "**"), "__"))
-    .join("\n");
-};
 
 function replaceMarkdownOpeningTag(html: string, tag: string, attrs: string): string {
   return html.replace(new RegExp(`<${tag}\\b[^>]*>`, "g"), `<${tag} ${attrs}>`);
@@ -1675,7 +1647,13 @@ function SlideReadinessIcons({
   );
 }
 
-function App() {
+function App({
+  initialProjectId,
+  initialStage = "project",
+}: {
+  initialProjectId?: string;
+  initialStage?: "project" | "content" | "visual" | "review";
+}) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const selectedProjectIdRef = useRef<string | null>(null);
@@ -2404,7 +2382,7 @@ function App() {
   const [leftWidth, setLeftWidth] = useState(256);
   const [rightWidth, setRightWidth] = useState(320);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
-  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(true);
   const isResizing = useRef<"left" | "right" | null>(null);
   const resizeStartX = useRef(0);
   const resizeStartWidth = useRef(0);
@@ -3126,13 +3104,18 @@ function App() {
         contentPlanStartingAtRef.current = 0;
       }
       setOperatingProjectId(null);
-        removeLoadingMsg();
+      removeLoadingMsg();
       const message = "内容规划生成失败：" + (err.message || "未知错误");
+      const capabilityMessage = err?.detail?.message;
+      const needsCapability = ["missing_model_capability", "agent_action_required"].includes(String(err?.detail?.code || ""));
+      showToast(capabilityMessage || message, needsCapability ? "info" : "error");
       updateProjectChatMessages(projectId, "content", (prev) => [
         ...prev,
         {
           role: "agent",
-          content: "❌ 生成失败：" + message + "。请告诉我你的主题，我会重新生成。",
+          content: needsCapability
+            ? `⚠️ ${capabilityMessage || message}\n\n👉 项目内容已保留。请按刚刚弹出的提示配置模型，或回到 Agent 继续。`
+            : "❌ 生成失败：" + message + "。请告诉我你的主题，我会重新生成。",
           agentRole: "content",
         },
       ]);
@@ -3141,14 +3124,18 @@ function App() {
   };
 
 
-  // 页面加载时从 localStorage 恢复上次选中的项目，Agent 角色由项目状态推断
+  // 页面加载时优先打开 CLI/Web 深链指定项目，否则恢复上次选中的项目。
   useEffect(() => {
     clearLegacyChatStorageIfNeeded();
-    const savedProjectId = localStorage.getItem("ppt_god_last_project_id");
+    const savedProjectId = initialProjectId || localStorage.getItem("ppt_god_last_project_id");
     loadProjects().then((loadedProjects) => {
       if (!savedProjectId) return;
       const target = loadedProjects.find((p) => p.id === savedProjectId);
-      if (target) selectProject(target);
+      if (!target) return;
+      void selectProject(target).then(() => {
+        if (initialStage === "content") setCurrentAgentRole("content");
+        if (initialStage === "visual") setCurrentAgentRole("visual");
+      });
     });
   }, []);
 
@@ -11525,7 +11512,8 @@ const EDITOR_MARKDOWN_ALLOWED_ATTR = ["href", "title", "target", "rel", "colspan
 
 const markdownToEditorHtml = (markdown: string): string => {
   const normalized = normalizeMarkdownEmphasis(markdown || "");
-  const html = (marked.parse(normalized, { async: false }) as string) || "";
+  const parsedHtml = (marked.parse(normalized, { async: false }) as string) || "";
+  const html = fixMarkedBoldHtml(parsedHtml);
   return DOMPurify.sanitize(html, {
     ALLOWED_TAGS: EDITOR_MARKDOWN_ALLOWED_TAGS,
     ALLOWED_ATTR: EDITOR_MARKDOWN_ALLOWED_ATTR,
