@@ -549,6 +549,11 @@ def _clear_slide_outputs(slide: Slide, *, visual: bool, prompt: bool = True, ima
     slide.error_msg = None
 
 
+def _has_external_page_artifact(slide: Slide) -> bool:
+    visual = slide.visual_json if isinstance(slide.visual_json, dict) else {}
+    return bool(slide.image_path and str(visual.get("artifact_source") or "").strip())
+
+
 def apply_project_rollback(project: Project, slides: list[Slide], target_stage: str) -> str:
     """
     Move a project back to a durable workflow boundary and clear only downstream
@@ -631,13 +636,23 @@ def enforce_project_invariants(project: Project, slides: list[Slide]) -> str:
 
     if not project.selected_style:
         # Style selection is the dependency for visual plans, prompts and
-        # images. A project can have proposals here, but not downstream output.
+        # provider-generated images. Final page images imported by an external
+        # Agent are already complete artifacts and must not be deleted merely
+        # because the Agent skipped PPT God's internal style/prompt stages.
+        external_page_artifacts = [slide for slide in slides if _has_external_page_artifact(slide)]
         if project.status in {"prompt_ready", "prototype_ready", "completed", "failed"} or any(
             s.visual_json or s.prompt_text or s.image_path for s in slides
         ):
             for slide in slides:
+                if _has_external_page_artifact(slide):
+                    slide.status = "completed"
+                    slide.error_msg = None
+                    continue
                 _clear_slide_outputs(slide, visual=True)
                 slide.status = "pending"
+        if external_page_artifacts:
+            project.status = "completed" if len(external_page_artifacts) == len(slides) else "prototype_ready"
+            return project.status
         project.status = "visual_ready"
         return project.status
 

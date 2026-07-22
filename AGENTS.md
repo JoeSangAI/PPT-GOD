@@ -14,6 +14,8 @@ Global rules from `/Users/Joe_1/.codex/AGENTS.md` apply.
 
 Keep user-facing copy based on the user's job-to-be-done. Do not expose internal implementation terms unless they help the user make a concrete decision.
 
+Design the first-run path for users with zero technical prerequisite knowledge. Lowering the barrier means moving detection, routing, and configuration complexity into the product, not writing a longer tutorial. Let users begin before optional setup, automatically use what the system or current Agent can genuinely provide, and interrupt only when progress is truly blocked. At that point, explain in plain language what is missing, why it is needed, and the single next action; preserve progress so the user can continue from the same place afterward.
+
 Treat user feedback as likely feedback about the PPT artifact, not just chat. If the Agent says it will change, generate, confirm, switch, retry, or apply something, there must be a corresponding workflow action or a visible reason why no action ran.
 
 Prefer source-level fixes over downstream cleanup. Do not solve broad product failures with one-off keyword patches, demo-specific logic, stale defaults, or hidden fallback.
@@ -24,7 +26,9 @@ Keep the product architecture simple. Use model intelligence for intent and judg
 
 Treat Agent integration as a workflow-contract problem, not a CLI-vs-MCP problem. PPT God core capabilities should be implemented once in backend/core services, then exposed through multiple entry points: Web GUI for visual confirmation and precise human control, CLI for local Agent/dev workflows, and MCP for standardized cross-Agent integration. CLI and MCP must stay thin adapters over the same workflow contracts; do not duplicate business logic inside either layer.
 
-For image generation, the default direction is direct full-slide image generation. Do not introduce a default workflow that generates a background image and then programmatically types slide text on top, unless Joe explicitly asks for an overlay/paste workflow.
+For design-led pages, direct full-slide image generation remains the preferred default. Fact-sensitive assets such as logos, QR codes, product UI, charts, customer evidence, and approved final KVs must be placed from the original asset rather than redrawn, imitated, or regenerated.
+
+Treat revision requests as an explicit change budget. Local feedback defaults to a local edit that preserves already approved content, assets, and layout decisions. Widen the change only when the user asks for a broader revision or the local fix cannot solve the shared cause.
 
 For retrospective or rule updates, review `MEMORY.md` before changing project rules.
 
@@ -39,3 +43,5 @@ For product behavior changes, verify the actual path in the app when possible: p
 For bug fixes, verify the original failure path no longer fails. Do not rely only on code inspection.
 
 For user-facing copy or PPT output changes, inspect the visible result and confirm it reads like product language, not implementation language.
+
+For PPT delivery, generation and export success are not sufficient. Inspect the exact current export, render and review every changed page at a readable size, recheck each risk previously raised by the user, and state any remaining uncertainty before calling the deck final.

@@ -64,7 +64,10 @@ def get_llm_client() -> OpenAI:
     credentials = get_provider_credentials()
     if credentials.minimax_api_key != settings.MINIMAX_API_KEY or credentials.minimax_api_base != settings.MINIMAX_API_BASE.rstrip("/"):
         if not credentials.minimax_api_key:
-            raise RuntimeError("请先在登录页填写文本/规划接口 API Key。")
+            raise RuntimeError(
+                "缺少文本生成能力：请在“模型设置”中配置文本模型 API Key；"
+                "如果由外部 Agent 负责，请先导入内容规划与后续结构化成果。"
+            )
         cache_key = (credentials.minimax_api_key, credentials.minimax_api_base)
         with _client_lock:
             client = _client_cache.get(cache_key)
@@ -77,6 +80,9 @@ def get_llm_client() -> OpenAI:
             if _client is None:
                 api_key = settings.MINIMAX_API_KEY
                 if not api_key:
-                    raise RuntimeError("请先在登录页填写文本/规划接口 API Key。")
+                    raise RuntimeError(
+                        "缺少文本生成能力：请在“模型设置”中配置文本模型 API Key；"
+                        "如果由外部 Agent 负责，请先导入内容规划与后续结构化成果。"
+                    )
                 _client = _make_llm_client(api_key, credentials.minimax_api_base)
     return _client

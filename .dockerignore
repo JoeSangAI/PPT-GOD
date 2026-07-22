@@ -1,5 +1,9 @@
 .git
 .DS_Store
+.env
+.env.*
+**/.env
+**/.env.*
 .pptgod-data
 .playwright-cli
 .pytest_cache

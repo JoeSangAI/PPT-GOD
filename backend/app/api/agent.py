@@ -5,8 +5,9 @@ import hashlib
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session
 
 from app.api import projects as project_api
@@ -15,7 +16,7 @@ from app.core.tester_auth import is_local_admin_request, require_existing_tester
 from app.core.config import settings
 from app.models.base import get_db
 from app.models.models import Project, Slide
-from app.services.artifact_versions import strip_artifact_meta
+from app.services.artifact_versions import dependency_signature, strip_artifact_meta, with_artifact_meta, with_stale_flags
 from app.services.content_plan_markdown import (
     ContentPlanMarkdownError,
     ContentPlanSyncConflictError,
@@ -26,6 +27,8 @@ from app.services.content_plan_markdown import (
     sync_content_plan_markdown,
 )
 from app.services.run_state import get_active_run, reconcile_project_state, serialize_run
+from app.services.runtime_readiness import build_runtime_readiness
+from app.services.slide_artifacts import SlideArtifactError, import_slide_image_artifact
 from app.services.slide_types import CANONICAL_SLIDE_TYPES
 
 
@@ -37,10 +40,11 @@ AGENT_OPERATIONS = {
     "project": ["status", "open"],
     "content_plan": ["import", "export", "update_preview", "update_apply", "confirm"],
     "visual_direction": ["start_proposals", "get_proposals", "confirm_proposal"],
-    "visual_plan": ["generate_prompts"],
+    "visual_plan": ["import", "generate_prompts"],
     "generation": [
         "generate_prototype",
         "generate_pages",
+        "import_page_image",
         "status",
         "retry_failed",
         "confirm_prototype",
@@ -82,6 +86,18 @@ class StartVisualPromptsRequest(AgentActionRequest):
     stage_context: str | None = None
 
 
+class ImportVisualPlanPage(BaseModel):
+    page_num: int = Field(ge=1)
+    visual_description: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)
+    visual_json: dict[str, Any] | None = None
+
+
+class ImportVisualPlanRequest(AgentActionRequest):
+    pages: list[ImportVisualPlanPage] = Field(min_length=1)
+    selected_style: dict[str, Any] | None = None
+
+
 class StartSlideGenerationRequest(AgentActionRequest):
     page_nums: list[int] | None = None
     prototype: bool = False
@@ -111,6 +127,14 @@ def get_agent_capabilities():
             "status_endpoint": "/agent/projects/{project_id}/generation-status",
         },
     }
+
+
+@router.get("/readiness")
+def get_runtime_readiness(
+    agent_text: bool = Query(False),
+    agent_image: bool = Query(False),
+):
+    return build_runtime_readiness(agent_text=agent_text, agent_image=agent_image)
 
 
 def _load_accessible_project(db: Session, project_id: str, tester_id: str | None) -> Project:
@@ -192,10 +216,18 @@ def _next_action(project: Project, slides: list[Slide], frontend_base_url: str) 
             "label": "生成 PPT 页面",
             "url": project_ui_url(project.id, frontend_base_url),
         }
-    if slides and any(slide.image_path for slide in slides):
+    if slides and all(slide.image_path for slide in slides):
         return {
             "type": "export_ppt",
             "label": "导出 PPT",
+            "url": project_ui_url(project.id, frontend_base_url),
+        }
+    if slides and any(slide.image_path for slide in slides):
+        missing_pages = [slide.page_num for slide in slides if not slide.image_path]
+        return {
+            "type": "import_or_generate_remaining_slides",
+            "label": f"继续完成剩余 {len(missing_pages)} 页",
+            "missing_page_nums": missing_pages,
             "url": project_ui_url(project.id, frontend_base_url),
         }
     if project.status in {"planning", "visual_ready"}:
@@ -351,6 +383,51 @@ def get_agent_project_status(
         db.refresh(project)
 
     return _agent_project_status_response(project, slides, active_run, frontend_base_url)
+
+
+@router.post("/projects/{project_id}/slides/{page_num}/image")
+def import_agent_slide_image(
+    project_id: str,
+    page_num: int,
+    file: UploadFile = File(...),
+    source: str = Form("external_agent"),
+    frontend_base_url: str = Form(DEFAULT_AGENT_FRONTEND_BASE_URL),
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
+    project = _load_accessible_project(db, project_id, tester_id)
+    if not project.content_plan_confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "content_confirmation_required",
+                "message": "请先确认内容规划，再导入最终页面图；否则后续内容调整会使页面图失效。",
+                "next_action": {
+                    "type": "confirm_content_plan",
+                    "label": "先确认内容规划",
+                },
+            },
+        )
+    slide = (
+        db.query(Slide)
+        .filter(Slide.project_id == project_id, Slide.page_num == page_num)
+        .first()
+    )
+    if not slide:
+        raise HTTPException(status_code=404, detail=f"第 {page_num} 页不存在。")
+    try:
+        receipt = import_slide_image_artifact(
+            db,
+            project,
+            slide,
+            file.file.read(),
+            source=source,
+        )
+    except SlideArtifactError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    receipt["ui_url"] = project_ui_url(project_id, frontend_base_url, stage="review")
+    return receipt
 
 
 @router.get("/projects/{project_id}/content-plan/export")
@@ -573,6 +650,79 @@ async def start_agent_visual_prompts(
         "ok": True,
         **response,
         "ui_url": project_ui_url(project_id, resolved_frontend, stage="visual"),
+    }
+
+
+@router.post("/projects/{project_id}/visual-plan/import")
+def import_agent_visual_plan(
+    project_id: str,
+    payload: ImportVisualPlanRequest,
+    tester_id: str = Depends(require_tester_id),
+    db: Session = Depends(get_db),
+):
+    """Import Agent-authored visual descriptions and ready-to-run image prompts."""
+    project = _load_accessible_project(db, project_id, tester_id)
+    if not project.content_plan_confirmed:
+        raise HTTPException(status_code=409, detail="请先确认内容规划，再导入画面方案。")
+
+    requested_pages = [item.page_num for item in payload.pages]
+    if len(requested_pages) != len(set(requested_pages)):
+        raise HTTPException(status_code=400, detail="画面方案中存在重复页码。")
+
+    slides = _project_slides(db, project_id)
+    slide_by_page = {slide.page_num: slide for slide in slides}
+    missing_pages = [page_num for page_num in requested_pages if page_num not in slide_by_page]
+    if missing_pages:
+        raise HTTPException(status_code=404, detail=f"项目中不存在这些页码：{missing_pages}")
+
+    if payload.selected_style is not None or not project.selected_style:
+        selected_style = payload.selected_style or {
+            "name": "Agent 提供的视觉方向",
+            "description": "视觉方向、页面画面描述和生图 Prompt 由外部 Agent 提供。",
+            "source": "external_agent",
+        }
+        project = project_api.update_project_style(
+            project_id,
+            project_api.StyleUpdateRequest(selected_style=selected_style),
+            tester_id=tester_id,
+            db=db,
+        )
+        slides = _project_slides(db, project_id)
+        slide_by_page = {slide.page_num: slide for slide in slides}
+
+    artifact_deps = dependency_signature(project, slides)
+    for item in payload.pages:
+        slide = slide_by_page[item.page_num]
+        visual = dict(item.visual_json or {})
+        visual["visual_description"] = item.visual_description.strip()
+        visual["artifact_source"] = "external_agent"
+        slide.visual_json = with_stale_flags(
+            with_artifact_meta(
+                visual,
+                kind="visual_plan",
+                dependencies=artifact_deps,
+                prompt_dependencies=artifact_deps,
+            ),
+            content=False,
+            visual=False,
+            image=False,
+        )
+        flag_modified(slide, "visual_json")
+        slide.prompt_text = item.prompt.strip()
+        slide.image_path = None
+        slide.error_msg = None
+        slide.status = "prompt_ready"
+
+    project.status = "prompt_ready" if all(slide.prompt_text for slide in slides) else "visual_ready"
+    db.commit()
+    db.refresh(project)
+    return {
+        "ok": True,
+        "project_id": project.id,
+        "imported_page_nums": requested_pages,
+        "project_status": project.status,
+        "ui_url": project_ui_url(project.id, payload.frontend_base_url, stage="visual"),
+        "next_action": _next_action(project, slides, payload.frontend_base_url),
     }
 
 

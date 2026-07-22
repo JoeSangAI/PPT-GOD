@@ -14,6 +14,40 @@
 
 <p align="center"><sub>首屏中的 Apple Vision Pro 为公开资料 Demo；产品界面经过脱敏，展示内容均可公开。</sub></p>
 
+> [!IMPORTANT]
+> **PPT God 是本地开源的 BYOK 工作流，不是自带模型额度的在线服务。** 不需要注册或登录；没有 API Key 也可以先进入工作台。独立完成全流程时通常需要文本模型和图片模型；如果外部 Agent 已经生成并导入了对应成果，就不需要重复配置那一项。
+
+## 3 分钟启动
+
+先安装并打开 [Docker Desktop](https://www.docker.com/products/docker-desktop/)，然后选择一种启动方式。
+
+### macOS：双击启动（推荐）
+
+```bash
+git clone https://github.com/JoeSangAI/PPT-GOD.git
+cd PPT-GOD
+```
+
+在项目文件夹里双击 **`打开 PPT GOD.command`**。它会自动检查 Docker、同步最新代码、启动服务，并主动打开浏览器。以后再次使用，仍然双击同一个文件即可。
+
+### Windows / Linux / 终端启动
+
+```bash
+docker compose up --build -d
+```
+
+打开 `http://localhost:8000`。启动页不是登录页：可以直接进入工作台，也会显示“文本生成”和“图片生成”是否就绪，并告诉你缺少的能力会影响哪一步。
+
+- 想省事：可以从 [CometAPI 模型大厅](https://www.cometapi.com/pricing/) 选择文本和图片模型，同一枚 Key 可以用于两项。
+- 想自由组合：也可以使用任意兼容 OpenAI Chat Completions / Images 的服务和模型。
+- 人在终端使用：先运行 `python scripts/pptgod_cli.py doctor`，它会用人话说明当前缺什么。
+- 由 Agent 使用：运行 `python scripts/pptgod_cli.py doctor --json`，只返回稳定的机器可读结果。
+
+完整说明见 [从启动、BYOK 到 Agent 接入](./docs/getting-started.md)。
+
+> [!CAUTION]
+> **不要把真实 API Key 写进 README、Issue、截图或提交到 Git。** 网页中填写的 Key 只保存在当前浏览器，运行任务时才交给本机服务；仓库中的 `backend/.env.example` 只有空白占位符。换浏览器或换地址后如果显示“未配置”，请在该浏览器的“模型设置”中重新填写，不要把 Key 写进项目文件。
+
 ## 四个关键能力，直接看结果
 
 你可以直接看到一套 PPT 是否跨页一致，品牌素材是否准确，风格是否可选，以及长内容如何先形成结构。
@@ -74,7 +108,7 @@
 
 ## 当前状态与开始使用
 
-PPT God 正在持续迭代，目前主要以本地整合版和定向测试方式使用。正式的一键安装与公开体验入口准备中。
+PPT God 正在持续迭代，目前以本地开源版使用，不提供官方在线托管或内置模型额度。
 
 - 想持续关注：可以 Star 或 Watch 本仓库。
 - 想反馈问题或提出需求：欢迎通过 [Issues](https://github.com/JoeSangAI/PPT-GOD/issues) 留言。
@@ -83,13 +117,28 @@ PPT God 正在持续迭代，目前主要以本地整合版和定向测试方式
 <details>
 <summary><strong>Agent / CLI 接入</strong></summary>
 
-外部 Agent 可以先检查本地服务、账号和项目连接：
+外部 Agent 第一次调用时，必须先检查本地服务和模型能力：
 
 ```bash
 python scripts/pptgod_cli.py doctor
+python scripts/pptgod_cli.py doctor --json
 python scripts/pptgod_cli.py capabilities
 python scripts/pptgod_cli.py whoami
 python scripts/pptgod_cli.py list-projects
+```
+
+`doctor` 会区分文本生成与图片生成，并明确说明每一项由 BYOK 提供、由 Agent 提供，还是仍然缺失。Agent 不应仅凭“运行在 Codex / WorkBuddy / Claude Code 中”就假定模型能力已经具备。
+
+Agent 自带生图能力时，可以把 16:9 最终页面图直接交回项目，不需要再配置 PPT God 的图片模型：
+
+```bash
+python scripts/pptgod_cli.py import-slide-image <project_id> <page_num> path/to/slide.png
+```
+
+Agent 负责内容和视觉文本、但最终页面仍由 PPT God 的图片模型生成时，可以继续导入每页画面描述和生图 Prompt：
+
+```bash
+python scripts/pptgod_cli.py import-visual-plan <project_id> path/to/visual-plan.json
 ```
 
 更新已有项目的内容规划时，默认只预览差异；确认后再应用：
@@ -99,7 +148,7 @@ python scripts/pptgod_cli.py update-content-plan <project_id> path/to/plan.md
 python scripts/pptgod_cli.py update-content-plan <project_id> path/to/plan.md --apply --open
 ```
 
-完整格式和工作流见 [Agent 内容规划说明](./docs/agent/content-planning-playbook.md)。
+完整格式和工作流见 [上手指南](./docs/getting-started.md) 与 [Agent 内容规划说明](./docs/agent/content-planning-playbook.md)。
 
 </details>
 

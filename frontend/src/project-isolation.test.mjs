@@ -1020,6 +1020,11 @@ assert.match(
   /className="pg-agent-command-sentence"[\s\S]*<span>将修改<\/span>[\s\S]*\{agentScopeButtonLabel\}[\s\S]*<span>的<\/span>[\s\S]*\{agentAreaButtonLabel\}/,
   "Agent command bar must read as a fill-in sentence: 将修改 [范围] 的 [区域]"
 );
+assert.match(
+  source,
+  /const \[rightCollapsed, setRightCollapsed\] = useState\(true\);/,
+  "Agent sidebar must be collapsed on initial load while preserving its existing open controls"
+);
 assert.doesNotMatch(
   source,
   /pg-agent-tabs[\s\S]{0,2400}内容总监[\s\S]{0,2400}视觉总监[\s\S]{0,2400}单页微调/,

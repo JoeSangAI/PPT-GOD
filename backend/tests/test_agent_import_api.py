@@ -1,7 +1,9 @@
 import asyncio
+from io import BytesIO
 
 import pytest
 from fastapi import HTTPException
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -12,6 +14,8 @@ from app.models.base import Base
 from app.models.models import Project, Slide
 from app.services.content_plan_markdown import validate_content_plan_markdown
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
+from app.services.slide_artifacts import SlideArtifactError, import_slide_image_artifact
+from app.core.config import settings
 
 
 VALID_MARKDOWN = """# 外部 Agent 导入测试
@@ -69,7 +73,7 @@ def test_agent_import_content_plan_creates_project_for_local_admin():
     slides = db.query(Slide).filter(Slide.project_id == response["project_id"]).all()
     assert response["ok"] is True
     assert response["slides_count"] == 1
-    assert response["ui_url"].endswith(f"/projects/{project.id}?stage=content")
+    assert response["ui_url"].endswith(f"/app/projects/{project.id}?stage=content")
     assert project.title == "外部 Agent 导入测试"
     assert project.status == "planning"
     assert project.tester_id is None
@@ -92,6 +96,158 @@ def test_agent_import_content_plan_rejects_invalid_markdown():
     assert exc.value.status_code == 400
     assert "缺少字段" in str(exc.value.detail)
     assert db.query(Project).count() == 0
+
+
+def _image_bytes(size=(1600, 900)) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, "#2b2f36").save(output, format="PNG")
+    return output.getvalue()
+
+
+def test_agent_can_import_a_final_slide_image_without_image_provider(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Agent image import", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending", content_json={})
+    db.add(slide)
+    db.commit()
+    monkeypatch.setattr(settings, "OUTPUT_DIR", str(tmp_path))
+
+    receipt = import_slide_image_artifact(
+        db,
+        project,
+        slide,
+        _image_bytes(),
+        source="codex_imagegen",
+    )
+
+    assert receipt["ok"] is True
+    assert receipt["project_status"] == "completed"
+    assert slide.status == "completed"
+    assert slide.visual_json["artifact_source"] == "codex_imagegen"
+    assert slide.image_path.endswith(".png")
+    assert (tmp_path / project.id / "agent-artifacts").is_dir()
+
+
+def test_agent_slide_image_import_rejects_non_widescreen_artifact(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Bad ratio", status="planning")
+    db.add(project)
+    db.flush()
+    slide = Slide(project_id=project.id, page_num=1, status="pending", content_json={})
+    db.add(slide)
+    db.commit()
+    monkeypatch.setattr(settings, "OUTPUT_DIR", str(tmp_path))
+
+    with pytest.raises(SlideArtifactError, match="16:9"):
+        import_slide_image_artifact(db, project, slide, _image_bytes((1200, 900)))
+
+
+def test_agent_page_image_requires_content_confirmation_and_survives_status_reconciliation(tmp_path, monkeypatch):
+    db = make_session()
+    project = Project(title="Agent page handoff", status="planning", content_plan_confirmed=False)
+    db.add(project)
+    db.flush()
+    db.add_all([
+        Slide(project_id=project.id, page_num=1, status="pending", content_json={"page_num": 1}),
+        Slide(project_id=project.id, page_num=2, status="pending", content_json={"page_num": 2}),
+    ])
+    db.commit()
+    monkeypatch.setattr(settings, "OUTPUT_DIR", str(tmp_path))
+    token = set_current_request_is_local(True)
+    try:
+        with pytest.raises(HTTPException) as blocked:
+            agent_api.import_agent_slide_image(
+                project.id,
+                1,
+                file=type("Upload", (), {"file": BytesIO(_image_bytes())})(),
+                tester_id=LOCAL_ADMIN_TESTER_ID,
+                db=db,
+            )
+        assert blocked.value.status_code == 409
+        assert blocked.value.detail["code"] == "content_confirmation_required"
+
+        project.content_plan_confirmed = True
+        project.status = "visual_ready"
+        db.commit()
+        receipt = agent_api.import_agent_slide_image(
+            project.id,
+            1,
+            file=type("Upload", (), {"file": BytesIO(_image_bytes())})(),
+            source="codex_imagegen",
+            frontend_base_url="http://localhost:5173",
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+        status = agent_api.get_agent_project_status(
+            project.id,
+            frontend_base_url="http://localhost:5173",
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+    finally:
+        reset_current_request_is_local(token)
+
+    imported_slide = db.query(Slide).filter(Slide.project_id == project.id, Slide.page_num == 1).first()
+    assert receipt["project_status"] == "prototype_ready"
+    assert receipt["ui_url"].endswith(f"/app/projects/{project.id}?stage=review")
+    assert imported_slide.image_path
+    assert imported_slide.status == "completed"
+    assert status["project"]["status"] == "prototype_ready"
+    assert status["next_action"]["type"] == "import_or_generate_remaining_slides"
+    assert status["next_action"]["missing_page_nums"] == [2]
+
+
+def test_agent_can_import_visual_plan_and_prompts_without_text_provider():
+    db = make_session()
+    project = Project(
+        title="Agent visual plan",
+        status="visual_ready",
+        content_plan_confirmed=True,
+    )
+    db.add(project)
+    db.flush()
+    db.add_all([
+        Slide(project_id=project.id, page_num=1, status="pending", content_json={"page_num": 1}),
+        Slide(project_id=project.id, page_num=2, status="pending", content_json={"page_num": 2}),
+    ])
+    db.commit()
+    token = set_current_request_is_local(True)
+    try:
+        response = agent_api.import_agent_visual_plan(
+            project.id,
+            agent_api.ImportVisualPlanRequest(
+                frontend_base_url="http://localhost:5173",
+                pages=[
+                    agent_api.ImportVisualPlanPage(
+                        page_num=1,
+                        visual_description="深蓝背景上的单一金色标题。",
+                        prompt="Create a 16:9 title slide with a deep blue background.",
+                    ),
+                    agent_api.ImportVisualPlanPage(
+                        page_num=2,
+                        visual_description="左右对照的两栏信息图。",
+                        prompt="Create a 16:9 two-column comparison slide.",
+                    ),
+                ],
+            ),
+            tester_id=LOCAL_ADMIN_TESTER_ID,
+            db=db,
+        )
+    finally:
+        reset_current_request_is_local(token)
+
+    refreshed = db.query(Project).filter(Project.id == project.id).first()
+    slides = db.query(Slide).filter(Slide.project_id == project.id).order_by(Slide.page_num).all()
+    assert response["ok"] is True
+    assert response["project_status"] == "prompt_ready"
+    assert response["next_action"]["type"] == "generate_slides"
+    assert refreshed.selected_style["name"] == "Agent 提供的视觉方向"
+    assert slides[0].status == "prompt_ready"
+    assert slides[0].visual_json["visual_description"].startswith("深蓝背景")
+    assert slides[0].visual_json["artifact_source"] == "external_agent"
+    assert slides[1].prompt_text.startswith("Create a 16:9")
 
 
 def test_agent_project_status_returns_handoff_state():

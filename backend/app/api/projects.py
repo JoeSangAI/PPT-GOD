@@ -22,6 +22,7 @@ from app.services.run_state import apply_project_rollback, cancel_active_run, cr
 from app.services.content_director import is_content_director_contract, normalize_content_director_contract
 from app.services.source_intent import normalize_intent_contract
 from app.services.style_proposal import STYLE_PROPOSAL_POLICY_VERSION
+from app.services.runtime_readiness import missing_provider_capability
 from app.celery_app import celery_app
 from celery.result import AsyncResult
 
@@ -321,6 +322,7 @@ def create_style_proposals(
 
     # 如果已有有效的风格提案且未强制重新生成，只有在素材指纹一致时才返回缓存。
     # 这样用户上传/删除参考图后，不会继续看到旧的“无素材推荐”或过期提案。
+    invalidate_cached_proposal = False
     if not force and project.style_proposal and project.style_proposal.get("proposals"):
         cached_asset_signature = project.style_proposal.get("asset_signature")
         cached_content_signature = project.style_proposal.get("content_signature")
@@ -354,6 +356,13 @@ def create_style_proposals(
                 "Style proposal cache invalidated for project=%s: cached assets, content, requirements, or policy changed",
                 project_id,
             )
+        invalidate_cached_proposal = True
+
+    capability_detail = missing_provider_capability("text_generation", action="generate_visual_proposals")
+    if capability_detail:
+        raise HTTPException(status_code=409, detail=capability_detail)
+
+    if invalidate_cached_proposal:
         project.style_proposal = None
         if has_global_style_ref:
             project.selected_style = None

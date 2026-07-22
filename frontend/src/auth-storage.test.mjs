@@ -91,8 +91,10 @@ const legacyAuth = JSON.stringify({
   const sessionStorage = makeStorage();
   const { DEFAULT_PROVIDER_SETTINGS } = loadClient({ localStorage, sessionStorage });
 
-  assert.equal(DEFAULT_PROVIDER_SETTINGS.minimaxLlmModel, "MiniMax-M3");
-  assert.equal(DEFAULT_PROVIDER_SETTINGS.deerImageModel, "gpt-image-2");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.textModel, "MiniMax-M3");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.imageModel, "gpt-image-2");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.textApiBase, "https://api.cometapi.com/v1");
+  assert.equal(DEFAULT_PROVIDER_SETTINGS.imageApiBase, "https://api.cometapi.com/v1");
 }
 
 {
@@ -107,6 +109,6 @@ const legacyAuth = JSON.stringify({
 
   const provider = getProviderSettings();
 
-  assert.equal(provider.minimaxLlmModel, "MiniMax-M3");
-  assert.equal(provider.deerImageModel, "gpt-image-2");
+  assert.equal(provider.textModel, "MiniMax-M3");
+  assert.equal(provider.imageModel, "gpt-image-2");
 }

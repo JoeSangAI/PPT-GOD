@@ -189,7 +189,7 @@ def test_import_content_plan_markdown_creates_project_and_pending_slides():
     assert project.title == "AI 时代消费者决策路径"
     assert project.status == "planning"
     assert project.content_plan_confirmed is False
-    assert receipt.ui_url.endswith(f"/projects/{project.id}?stage=content")
+    assert receipt.ui_url.endswith(f"/app/projects/{project.id}?stage=content")
     assert [slide.page_num for slide in slides] == [1, 2]
     assert slides[0].status == "pending"
     assert slides[0].content_json["text_content"]["headline"] == "AI 时代消费者决策路径"
